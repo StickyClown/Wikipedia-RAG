@@ -1,0 +1,11 @@
+# Repository-scoped Codex defaults.
+# User authentication/model preferences belong in ~/.codex/config.toml.
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+# Keep project instructions focused. Root AGENTS.md links to detailed files.
+project_doc_max_bytes = 65536
+
+# Do not enable danger-full-access here. Use an explicit CLI flag only inside
+# an externally isolated disposable environment.

@@ -1,0 +1,61 @@
+openapi: 3.1.0
+info:
+  title: Production RAG Platform API
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, const: ok}
+  /ready:
+    get:
+      operationId: ready
+      responses:
+        '200':
+          description: Required dependencies are ready
+        '503':
+          description: One or more required dependencies are unavailable
+  /api/v1/chat:
+    post:
+      operationId: createChatRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema: {type: string}
+        '422':
+          description: Request validation failure
+        '502':
+          description: Model provider failure
+components:
+  schemas:
+    ChatRequest:
+      type: object
+      additionalProperties: false
+      required: [message]
+      properties:
+        message: {type: string, minLength: 1, maxLength: 32000}
+        conversation_id: {type: [string, 'null'], format: uuid}
+        knowledge_base_ids:
+          type: array
+          items: {type: string, format: uuid}
+          maxItems: 50
+        mode: {type: string, enum: [normal, extended], default: normal}
+        stream: {type: boolean, default: true}
+        client_request_id: {type: [string, 'null'], maxLength: 128}
