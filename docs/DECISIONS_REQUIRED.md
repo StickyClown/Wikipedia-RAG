@@ -1,6 +1,6 @@
 # Decisions still required from the owner
 
-Эти вопросы не блокируют самый первый bootstrap/vertical slice, но должны быть закрыты до соответствующего этапа.
+Эти вопросы не блокируют локальный Docker-first MVP, но должны быть закрыты до соответствующего scale, production или local-GPU этапа.
 
 ## Before external deployment
 
@@ -14,7 +14,8 @@
 
 ## Before Wikipedia ingestion at scale
 
-- [ ] Wikipedia languages and exact ZIM snapshots.
+- [x] First local source: Russian Wikimedia XML pages-articles multistream dump `ruwiki-20260701`.
+- [ ] Additional Wikipedia languages and future exact ZIM snapshots.
 - [ ] Maximum corpus size and available disk.
 - [ ] Whether citations point to local article viewer, canonical web URL or both.
 - [ ] Required update cadence for snapshots.

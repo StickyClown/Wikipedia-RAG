@@ -25,3 +25,7 @@ uploads/
 secrets/
 *.pem
 *.key
+zip/
+*.xml.bz2
+*-index.txt.bz2
+openrouter_key.txt

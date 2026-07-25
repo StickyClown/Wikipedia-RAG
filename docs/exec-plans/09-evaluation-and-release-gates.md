@@ -35,6 +35,15 @@ make release-gate
 
 ## Progress
 
-- [ ] Plan refined.
-- [ ] Implemented.
-- [ ] Reviewed.
+- [x] Plan refined for local MVP.
+- [x] Implemented mini eval and release-gate command.
+- [x] Reviewed with local checks.
+
+## MVP status
+
+- Implemented `make eval` and `make release-gate` wrappers backed by deterministic local API checks.
+- Verified `uv run python -m wikipediarag.cli release-gate` exits 0 after import.
+
+## Remaining production work
+
+- Versioned datasets, regression budgets, ablations, persisted evaluation runs and CI publication gates remain future hardening.

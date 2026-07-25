@@ -23,7 +23,7 @@ FastAPI request проходит через Model Gateway к OpenRouter-compatib
 
 ### Release B — Wikipedia RAG
 
-ZIM импортируется детерминированно; BM25 и dense retrieval работают параллельно; RRF и reranker формируют evidence; ответ содержит валидные citations; retrieval debugger показывает причины выбора.
+Wikimedia XML `pages-articles` bzip2 multistream dump импортируется детерминированно; ZIM остаётся дополнительным будущим адаптером. BM25 и dense retrieval работают параллельно; RRF и reranker формируют evidence; ответ содержит валидные citations; retrieval debugger показывает причины выбора.
 
 ### Release C — Universal documents
 
@@ -40,7 +40,7 @@ Bounded orchestrator выполняет decomposition/iterative retrieval тол
 ## Functional requirements
 
 1. Multi-tenant users, memberships and knowledge bases.
-2. Wikipedia ZIM and uploaded-document ingestion.
+2. Wikipedia XML multistream, future ZIM adapter and uploaded-document ingestion.
 3. Versioned canonical artifacts and deterministic chunk IDs.
 4. BM25 + dense retrieval, RRF, cross-encoder reranking.
 5. Dedup, source/page quotas, selective neighbor/parent expansion and token-budget packing.

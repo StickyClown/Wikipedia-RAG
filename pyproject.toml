@@ -1,0 +1,63 @@
+[project]
+name = "wikipediarag"
+version = "0.1.0"
+description = "Local Docker-first Russian Wikipedia RAG MVP"
+readme = "README_START_HERE.md"
+requires-python = ">=3.12"
+dependencies = [
+  "asyncpg>=0.30.0",
+  "boto3>=1.35.0",
+  "fastapi>=0.115.0",
+  "httpx>=0.27.0",
+  "mwparserfromhell>=0.6.6",
+  "opensearch-py>=2.7.1",
+  "orjson>=3.10.7",
+  "pydantic>=2.9.0",
+  "pydantic-settings>=2.5.2",
+  "python-multipart>=0.0.9",
+  "redis>=5.0.8",
+  "sqlalchemy[asyncio]>=2.0.34",
+  "uvicorn[standard]>=0.30.6",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.11.2",
+  "pytest>=8.3.2",
+  "pytest-asyncio>=0.24.0",
+  "ruff>=0.6.8",
+]
+
+[project.scripts]
+wikipediarag-api = "wikipediarag.api_app:main"
+wikipediarag-gateway = "wikipediarag.gateway_app:main"
+wikipediarag-mock-provider = "wikipediarag.mock_provider_app:main"
+wikipediarag-worker = "wikipediarag.worker:main"
+wikipediarag = "wikipediarag.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wikipediarag"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["docs", "prompts", "README_START_HERE.md", "OFFICIAL_CODEX_REFERENCES.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

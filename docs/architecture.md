@@ -8,7 +8,7 @@ status: "Architecture baseline"
 
 # Production RAG Platform
 
-Единый архитектурный документ для локальной production-ready RAG-платформы с Wikipedia ZIM, загрузкой произвольных документов, гибридным поиском, прозрачной диагностикой retrieval и отдельным режимом расширенного агентного поиска.
+Единый архитектурный документ для локальной production-ready RAG-платформы с Wikimedia XML dump как основным доступным источником Wikipedia, будущим ZIM-адаптером, загрузкой произвольных документов, гибридным поиском, прозрачной диагностикой retrieval и отдельным режимом расширенного агентного поиска.
 
 > **Главное решение:** весь продукт работает в Docker. Сейчас все модели вызываются через OpenRouter. Целевая локальная схема — отдельные `llama-server` из `llama.cpp` для генерации, embeddings и reranking. Прикладной код не знает, где физически запущена модель: он обращается только к внутреннему Model Gateway по OpenAI-совместимому контракту.
 
@@ -72,7 +72,7 @@ status: "Architecture baseline"
 | Object storage | MinIO/S3 |
 | Cache/queue/limits | Redis или Valkey |
 | Документы | Docling как структурный parser; Apache Tika как broad-format detector/fallback |
-| Wikipedia | ZIM + libzim, отдельный специализированный ingestion adapter |
+| Wikipedia | Wikimedia XML pages-articles bzip2 multistream для local MVP; ZIM + libzim как будущий специализированный adapter |
 | Оркестрация обычного RAG | Собная typed state machine на Python |
 | Extended Search | LangGraph или собственный bounded agent loop; один orchestrator |
 | Observability | OpenTelemetry + Phoenix + Prometheus/Grafana + собственные retrieval events |
@@ -98,7 +98,7 @@ flowchart TB
     IW[Ingestion Workers]
     D[Docling]
     T[Apache Tika]
-    Z[ZIM / libzim]
+    Z[Wikipedia XML / future ZIM]
     OR[OpenRouter]
     LC1[llama-server: chat]
     LC2[llama-server: embeddings]
@@ -477,7 +477,8 @@ feedback
 Object storage хранит:
 
 - оригинальный upload;
-- ZIM snapshots;
+- Wikimedia XML dump snapshots;
+- future ZIM snapshots;
 - normalized Docling JSON;
 - Tika text/metadata output;
 - page images и extracted figures;
@@ -572,12 +573,12 @@ Redis не хранит единственную копию критичных �
 
 ```mermaid
 flowchart LR
-    U[Upload / URL / ZIM / connector]
+    U[Upload / URL / Wikipedia XML / ZIM / connector]
     S[Security & MIME detection]
     R[Parser router]
     D[Docling]
     T[Apache Tika]
-    Z[libzim adapter]
+    Z[Wikipedia XML adapter / future libzim]
     N[Canonical normalization]
     E[Structural enrichment]
     C[Template-based chunking]
@@ -651,11 +652,11 @@ Docling отдаёт единое document representation и поддержив�
 
 Tika работает как отдельный CPU-сервис на порту 9998. Внешний доступ запрещён.
 
-### 7.2.3. libzim — специализированный путь Wikipedia/Kiwix
+### 7.2.3. Wikimedia XML и future libzim — специализированный путь Wikipedia/Kiwix
 
-ZIM не следует прогонять через generic parser. Используется собственный adapter:
+Wikimedia XML dump и ZIM не следует прогонять через generic parser. Используется собственный adapter:
 
-- перечисление entries;
+- потоковое чтение XML или перечисление ZIM entries;
 - redirects;
 - canonical title/URL;
 - HTML extraction;
@@ -667,7 +668,8 @@ ZIM не следует прогонять через generic parser. Испол
 ### 7.2.4. Parser decision tree
 
 ```text
-ZIM ---------------------------------> libzim
+Wikimedia XML multistream -----------> XML stream adapter
+ZIM ---------------------------------> future libzim adapter
 PDF / Office / image / EPUB ---------> Docling
 Legacy/unknown/archive/email --------> Tika first
 HTML/Markdown/plain text ------------> lightweight/Docling
@@ -775,7 +777,7 @@ Template управляет:
 | Template | Для чего | Основной parser | Chunking |
 |---|---|---|---|
 | `general` | универсальные документы | Docling → Tika fallback | section-aware, 300–450 tokens |
-| `wikipedia` | Wikipedia ZIM | libzim | heading/paragraph aware |
+| `wikipedia` | Wikipedia XML/ZIM | XML stream adapter / future libzim | heading/paragraph aware |
 | `book` | книги, manuals | Docling | chapter/section, neighbor links |
 | `paper` | научные статьи | Docling | abstract/method/results/references aware |
 | `legal` | законы, договоры | Docling/Tika | article/clause hierarchy, minimal overlap |
@@ -860,21 +862,30 @@ UI должен позволять:
 
 ---
 
-## 9. Wikipedia ZIM ingestion
+## 9. Wikipedia ingestion
 
 ## 9.1. Источник
 
-ZIM + libzim остаются основным способом локальной загрузки Wikipedia.
+Для local MVP основным доступным источником является Wikimedia XML `pages-articles` bzip2 multistream dump и соответствующий multistream index. ZIM + libzim остаются будущим специализированным адаптером.
 
 Хранить:
 
-- ZIM file checksum;
+- XML dump checksum;
+- multistream index checksum;
 - snapshot date;
 - language;
 - source/catalog metadata;
-- libzim version;
+- parser/adapter version;
 - extraction config;
 - index version.
+
+Index validation:
+
+- index is UTF-8 bzip2 text;
+- each row has `offset:page_id:title`;
+- offsets are monotonic non-decreasing, because multiple pages can share one compressed stream;
+- unique offsets are grouped into stream jobs;
+- sampled unique offsets point inside the compressed XML file and start with a bzip2 stream signature.
 
 ## 9.2. Page representation
 
@@ -1607,7 +1618,7 @@ GET    /api/v1/evaluations/runs/{id}
 
 1. **Chat** — citations, mode toggle, source drawer.
 2. **Knowledge Bases** — список, размер, health, active index version.
-3. **Document Upload** — drag-and-drop, URL, ZIM, template selector.
+3. **Document Upload** — drag-and-drop, URL, Wikipedia XML/ZIM, template selector.
 4. **Ingestion Jobs** — progress, stages, warnings, retries.
 5. **Document Preview** — pages, canonical structure, chunks.
 6. **Template Studio** — clone/edit/version/compare.
@@ -1825,7 +1836,7 @@ ingestion:
 - embeddings batch на ingestion;
 - rerank batch документов в одном request;
 - OpenSearch bulk indexing;
-- ZIM pages потоково, без загрузки snapshot в RAM;
+- Wikipedia XML/ZIM pages потоково, без загрузки snapshot в RAM;
 - async I/O для object storage;
 - bounded queues для memory control.
 
@@ -2001,7 +2012,7 @@ reranker:
 
 ## 22.1. Что оставить
 
-- Wikipedia ZIM + libzim;
+- Wikipedia XML + future ZIM/libzim;
 - OpenSearch;
 - section-aware chunks;
 - BM25;
@@ -2068,7 +2079,7 @@ rag-platform/
     ingestion-orchestrator/
     worker-docling/
     worker-tika-client/
-    worker-zim/
+    worker-wiki/
     evaluator/
     ui/
 
@@ -2099,7 +2110,7 @@ rag-platform/
     load/
 
   scripts/
-    import_zim.py
+    import_wiki_xml.py
     reindex.py
     smoke_models.py
     benchmark_retrieval.py
@@ -2116,6 +2127,7 @@ rag-platform/
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
+
 @dataclass(frozen=True)
 class SearchQuery:
     text: str
@@ -2123,6 +2135,7 @@ class SearchQuery:
     knowledge_base_ids: tuple[str, ...]
     filters: dict[str, object]
     trace_id: str
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -2135,11 +2148,14 @@ class Candidate:
     ranks: dict[str, int]
     metadata: dict[str, object]
 
+
 class Retriever(Protocol):
     async def search(self, query: SearchQuery, top_k: int) -> Sequence[Candidate]: ...
 
+
 class FusionStrategy(Protocol):
     def fuse(self, result_sets: Sequence[Sequence[Candidate]]) -> Sequence[Candidate]: ...
+
 
 class Reranker(Protocol):
     async def rerank(
@@ -2156,6 +2172,7 @@ class Reranker(Protocol):
 class DocumentParser(Protocol):
     async def parse(self, source: "DocumentSource", config: dict) -> "CanonicalDocument": ...
 
+
 class ChunkingStrategy(Protocol):
     def chunk(
         self,
@@ -2170,7 +2187,9 @@ class ChunkingStrategy(Protocol):
 class ModelGatewayClient:
     async def chat(self, alias: str, messages: list[dict], **kwargs) -> dict: ...
     async def embeddings(self, alias: str, inputs: list[str], **kwargs) -> list[list[float]]: ...
-    async def rerank(self, alias: str, query: str, documents: list[str], **kwargs) -> list[dict]: ...
+    async def rerank(
+        self, alias: str, query: str, documents: list[str], **kwargs
+    ) -> list[dict]: ...
 ```
 
 Бизнес-код не импортирует OpenRouter SDK и не вызывает llama.cpp напрямую.
@@ -2194,7 +2213,7 @@ class ModelGatewayClient:
 
 ## Phase 1 — Wikipedia fast RAG
 
-- ZIM/libzim ingestion;
+- Wikimedia XML multistream ingestion;
 - canonical page model;
 - Wikipedia template;
 - BM25+dense parallel retrieval;
@@ -2319,7 +2338,7 @@ Qwen3-Embedding-4B default, 8B challenger, 0.6B latency baseline
 Cohere Rerank v3.5 temporary remote reranker
 OpenSearch BM25 + HNSW + service-side RRF
 PostgreSQL + Redis/Valkey + MinIO
-Docling + Apache Tika + libzim
+Docling + Apache Tika + Wikipedia XML adapter + future libzim
 OpenTelemetry + Phoenix + Prometheus/Grafana
 Docker Compose
 ```
@@ -2362,7 +2381,7 @@ switchable bounded Extended Search for multi-hop/conflict/coverage gaps
 upload
 -> security/MIME
 -> parser router
--> Docling or Tika or libzim
+-> Docling, Tika, Wikimedia XML or future libzim
 -> canonical document
 -> versioned template
 -> chunks
@@ -2411,7 +2430,7 @@ upload
 - OpenSearch k-NN vector: https://docs.opensearch.org/latest/mappings/supported-field-types/knn-vector/
 - OpenSearch methods/HNSW: https://docs.opensearch.org/latest/mappings/supported-field-types/knn-methods-engines/
 
-### Wikipedia/ZIM
+### Wikipedia XML/ZIM
 
 - libzim: https://github.com/openzim/libzim
 - openZIM: https://openzim.org/
@@ -2438,4 +2457,3 @@ upload
 8. **Agent:** opt-in/auto-gated Extended Search with hard budgets.
 9. **Logging:** retrieval-specific events plus OTel traces from day one.
 10. **Production:** versioned artifacts, staging indexes, atomic publication, no CUDA in application containers.
-

@@ -36,6 +36,15 @@ make eval EVAL_SET=wiki-mini
 
 ## Progress
 
-- [ ] Plan refined.
-- [ ] Implemented.
-- [ ] Reviewed.
+- [x] Plan refined for local MVP.
+- [x] Implemented for local MVP.
+- [x] Reviewed with local checks.
+
+## MVP status
+
+- Implemented bounded evidence context, stable evidence IDs, deterministic citation validation and explicit insufficient-evidence responses.
+- Verified chat SSE returns cited Russian answers after Wikipedia import.
+
+## Remaining production work
+
+- Claim-level verification, answer repair loops and larger citation precision/recall reports remain future hardening.

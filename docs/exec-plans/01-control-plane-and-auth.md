@@ -37,6 +37,16 @@ make smoke
 
 ## Progress
 
-- [ ] Plan refined after Phase 0 code exists.
-- [ ] Implemented.
-- [ ] Reviewed.
+- [x] Plan refined after Phase 0 code exists.
+- [x] Implemented local development tenant/user seed and server-owned tenant scope.
+- [ ] Production auth/RBAC implemented.
+- [x] Reviewed local MVP scope.
+
+## MVP status
+
+- Implemented seeded local tenant, user, membership and knowledge base.
+- Retrieval, upload, query-run and debugger paths use server-owned default tenant context rather than client-provided tenant filters.
+
+## Remaining production work
+
+- OIDC, role matrix enforcement, production auth-disabled guard and audit log remain deferred.

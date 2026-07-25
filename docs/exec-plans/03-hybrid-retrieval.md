@@ -37,6 +37,16 @@ make eval EVAL_SET=wiki-mini
 
 ## Progress
 
-- [ ] Plan refined.
-- [ ] Implemented.
-- [ ] Reviewed.
+- [x] Plan refined for local MVP.
+- [x] Implemented for local MVP.
+- [x] Reviewed with local checks.
+
+## MVP status
+
+- Implemented tenant-scoped BM25 through OpenSearch and deterministic dense retrieval fallback over stored embeddings.
+- Implemented service-side RRF, rerank through Model Gateway, dedup/page quota and persisted retrieval events.
+- Verified `POST /api/v1/search:debug` returns BM25, dense, RRF, rerank and context stages.
+
+## Remaining production work
+
+- HNSW tuning/load tests, timeout degradation tests and larger Recall@K evaluation remain future hardening.

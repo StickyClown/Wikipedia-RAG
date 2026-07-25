@@ -35,6 +35,16 @@ make test-e2e TEST=ui-chat-debugger
 
 ## Progress
 
-- [ ] Plan refined.
-- [ ] Implemented.
-- [ ] Reviewed.
+- [x] Plan refined for local MVP.
+- [x] Implemented for local MVP.
+- [x] Reviewed with local checks.
+
+## MVP status
+
+- Implemented React/Vite UI for chat, Wikipedia import, upload and retrieval debugger.
+- Verified UI HTTP 200 and `pnpm lint`, `pnpm typecheck`, `pnpm format:check`, `pnpm build`.
+- Verified debugger API with `{"query":"Россия","top_k":5}`.
+
+## Remaining production work
+
+- Browser-level E2E for visual source drawer states and timing waterfall remains future hardening.

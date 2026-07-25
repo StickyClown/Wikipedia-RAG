@@ -1,0 +1,42 @@
+services:
+  llama-chat:
+    profiles: ["local-models"]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda-b5124
+    command: ["-m", "/models/generator.gguf", "--alias", "generator-fast", "--host", "0.0.0.0", "--port", "8080", "--n-gpu-layers", "99", "--parallel", "4", "--metrics"]
+    volumes:
+      - ./models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  llama-embed:
+    profiles: ["local-models"]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda-b5124
+    command: ["-m", "/models/embedding.gguf", "--alias", "embed-default", "--embedding", "--pooling", "last", "--host", "0.0.0.0", "--port", "8080", "--metrics"]
+    volumes:
+      - ./models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  llama-rerank:
+    profiles: ["local-models"]
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda-b5124
+    command: ["-m", "/models/reranker.gguf", "--alias", "rerank-default", "--reranking", "--host", "0.0.0.0", "--port", "8080", "--metrics"]
+    volumes:
+      - ./models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

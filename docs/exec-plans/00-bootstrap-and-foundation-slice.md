@@ -132,20 +132,24 @@ Then inspect the persisted query run and trace using documented commands.
 
 ## Progress
 
-- [ ] M0.1
-- [ ] M0.2
-- [ ] M0.3
-- [ ] M0.4
-- [ ] M0.5
+- [x] M0.1
+- [x] M0.2
+- [x] M0.3
+- [x] M0.4
+- [x] M0.5
 
 ## Discoveries
 
-None yet.
+- Concurrent API/worker/manual migration startup can race on `CREATE EXTENSION IF NOT EXISTS citext`; schema bootstrap now uses a PostgreSQL transaction advisory lock.
+- In this Codex Windows environment GNU Make is visible through WSL, while `uv` and `pnpm` are host Windows commands. README documents WSL setup expectations.
 
 ## Decision log
 
-None yet.
+- Use one Python package for API, worker, gateway and mock provider in the local MVP, while preserving service boundaries through separate container commands.
+- Keep mock provider as the default model provider so tests and demo never require a real OpenRouter key.
 
 ## Final evidence
 
-Not executed.
+- `docker compose run --rm api python -m wikipediarag.migrate`: exit 0.
+- `GET /ready`: exit 0, `postgres=ok`, `model_gateway=ok`.
+- `uv run python -m wikipediarag.cli smoke`: exit 0, ordered SSE lifecycle received.

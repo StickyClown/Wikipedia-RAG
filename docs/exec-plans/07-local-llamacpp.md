@@ -40,6 +40,15 @@ make load MODEL_PROFILE=local
 ## Progress
 
 - [ ] Hardware decisions completed.
-- [ ] Plan refined.
-- [ ] Implemented.
-- [ ] Reviewed.
+- [x] Plan refined for local MVP scaffold.
+- [x] Docker profile scaffold implemented.
+- [x] Mock provider contract reviewed.
+
+## MVP status
+
+- Added optional `compose.llamacpp.yaml` profile and `make smoke-models PROVIDER=llamacpp` command surface.
+- Default MVP remains mock/OpenRouter-compatible and does not require GPU or GGUF files.
+
+## Remaining production work
+
+- Real llama.cpp execution requires local model artifacts, licenses, checksums, GPU/RAM decision and provider parity/load tests.

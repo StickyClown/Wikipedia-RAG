@@ -16,6 +16,16 @@
 5. Failed jobs do not publish partial content.
 6. Reprocessing from a saved canonical artifact must not require repeating OCR unless explicitly requested.
 
+## Wikipedia XML multistream
+
+1. The local MVP treats Wikimedia XML `pages-articles` bzip2 multistream as the primary Wikipedia source.
+2. The multistream index is valid only when every UTF-8 line follows `offset:page_id:title`.
+3. Index offsets must be monotonic non-decreasing. Equal offsets are valid because many pages can belong to one bzip2 stream.
+4. Import work is grouped by unique bzip2 stream offsets after sampled offsets are verified against the compressed XML file signature.
+5. Workers must not load the full multi-gigabyte dump or full decompressed XML into memory.
+6. Checkpoints advance only after a stream's durable DB/object-storage/search writes complete.
+7. Imported Wikipedia content preserves namespace, title, page ID, revision ID, timestamp, redirect target and source wikitext provenance.
+
 ## Models
 
 1. Application services use logical aliases.

@@ -39,6 +39,15 @@ make eval EVAL_SET=wiki-multihop COMPARE=normal,extended
 
 ## Progress
 
-- [ ] Plan refined.
-- [ ] Implemented.
-- [ ] Reviewed.
+- [x] Plan refined for bounded local MVP.
+- [x] Implemented bounded local MVP.
+- [x] Reviewed with local checks.
+
+## MVP status
+
+- Implemented a bounded single-orchestrator loop with local retrieval tool usage, evidence ledger, duplicate/step budget guard and persisted stop reason.
+- Unit tests cover budget and loop-break behavior.
+
+## Remaining production work
+
+- Query decomposition, parallel subqueries, coverage scoring and UI state-transition visualization remain future hardening.

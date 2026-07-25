@@ -1,151 +1,170 @@
-# Production RAG Platform — Codex starter pack
+# WikipediaRag local MVP
 
-Этот каталог содержит не готовое приложение, а **управляющий пакет для его последовательной реализации в Codex**.
+Локальный Docker-first MVP для RAG по русской Wikipedia. Основной источник Wikipedia в этом репозитории - Wikimedia XML `pages-articles` bzip2 multistream dump; ZIM/libzim оставлены как будущий adapter.
 
-## Что уже зафиксировано
+## Что входит
 
-- продукт: локальная production-ready RAG-платформа;
-- первый источник: Wikipedia ZIM;
-- backend: Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2, Alembic, asyncpg;
-- frontend: React, Vite, TypeScript;
-- инфраструктура MVP: Docker Compose, PostgreSQL, OpenSearch, MinIO, Redis/Valkey;
-- очередь MVP: Dramatiq + Redis/Valkey;
-- модели сейчас: OpenRouter через внутренний Model Gateway;
-- локальные модели позже: три отдельных `llama-server`;
-- обычный retrieval: BM25 + dense + RRF + reranking;
-- agent mode: только по сигналу сложности и нехватки доказательств.
+- FastAPI backend, worker и Model Gateway на Python 3.12.
+- React + Vite + TypeScript web UI.
+- PostgreSQL, Valkey/Redis, MinIO, OpenSearch и OpenTelemetry Collector через Docker Compose.
+- Mock model provider для локальной демонстрации и тестов без внешнего ключа.
+- Optional OpenRouter provider через `.env`, если задан `OPENROUTER_API_KEY`.
+- Optional llama.cpp Docker profile в `compose.llamacpp.yaml`.
+- Импорт `ruwiki-20260701-pages-articles-multistream.xml.bz2` с checkpoint, progress, cancel/resume и restart recovery.
+- Section-aware chunking, deterministic IDs, BM25 + dense retrieval, RRF, rerank, citations, insufficient-evidence mode, retrieval debugger, upload UTF-8 documents, bounded Extended Search и mini eval.
 
-Все эти решения являются стартовыми defaults. Изменять их можно только отдельным ADR.
+## Требования Windows
 
-## Состав пакета
+1. Docker Desktop с включенным WSL2 backend.
+2. Git.
+3. Python 3.12 и `uv`.
+4. Node.js 22.14+ и `pnpm`.
+5. GNU Make в WSL или другой совместимый `make`.
 
-1. `AGENTS.md` — обязательные правила Codex для всего репозитория.
-2. `SPEC.md` — стабильная спецификация продукта.
-3. `.agent/PLANS.md` — формат исполняемых планов.
-4. `.codex/config.toml` — безопасные repo-level настройки Codex.
-5. `docs/architecture.md` — исходная подробная архитектура.
-6. `docs/decisions/` — принятые и ожидающие решения.
-7. `docs/contracts/` — API, БД и системные инварианты.
-8. `docs/quality/` — Definition of Done, security и evaluation gates.
-9. `docs/exec-plans/` — последовательность реализации.
-10. `prompts/` — готовые команды для Codex.
-11. `.env.example` — перечень секретов и настроек, но без реальных значений.
+В текущем Windows окружении Codex `make` доступен через WSL, но `uv`/`pnpm` доступны как Windows-команды. На чистой машине проще установить `uv` и `pnpm` внутри WSL, затем запускать команды из WSL в каталоге репозитория.
 
-## Рекомендуемый способ запуска
+## Данные Wikipedia
 
-### Вариант A: Codex CLI
-
-#### 1. Установите Codex
-
-macOS/Linux:
-
-```bash
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
-
-Windows PowerShell:
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
-
-Альтернативы:
-
-```bash
-npm install -g @openai/codex
-# или на macOS
-brew install --cask codex
-```
-
-#### 2. Создайте рабочий Git-репозиторий
-
-```bash
-unzip rag_codex_starter_pack.zip
-mv rag_codex_starter_pack rag-platform
-cd rag-platform
-git init -b main
-git add .
-git commit -m "docs: initialize Codex implementation pack"
-```
-
-Windows PowerShell:
-
-```powershell
-Expand-Archive .\rag_codex_starter_pack.zip -DestinationPath .
-Rename-Item .\rag_codex_starter_pack rag-platform
-Set-Location .\rag-platform
-git init -b main
-git add .
-git commit -m "docs: initialize Codex implementation pack"
-```
-
-#### 3. Запустите Codex и войдите через ChatGPT
-
-```bash
-codex
-```
-
-При первом запуске выберите **Sign in with ChatGPT**.
-
-#### 4. Проверьте, что инструкции прочитаны
-
-В интерактивной сессии отправьте:
+Большие dump-файлы являются локальными data assets и исключены из Git:
 
 ```text
-Перечисли все AGENTS.md и другие управляющие документы, которые ты загрузил. Ничего не изменяй.
+zip/ruwiki-20260701-pages-articles-multistream.xml.bz2
+zip/ruwiki-20260701-pages-articles-multistream-index.txt.bz2
 ```
 
-Codex должен назвать корневой `AGENTS.md`, `SPEC.md`, `.agent/PLANS.md` и текущий ExecPlan.
+Проверенные свойства локального dump:
 
-#### 5. Запустите первый план
+- XML archive size: `6,135,514,301` bytes.
+- Index archive size: `65,980,533` bytes.
+- Оба файла имеют bzip2 signature `BZh9`.
+- Index UTF-8, формат строк `offset:page_id:title`.
+- Offsets являются monotonic non-decreasing; повторяющиеся offsets означают страницы в одном bzip2 stream.
 
-Включите Plan mode командой `/plan` и вставьте содержимое:
-
-```text
-prompts/00_REVIEW_AND_START.md
-```
-
-Сначала Codex должен проверить план и перечислить блокирующие противоречия. Если критических противоречий нет, дайте вторую команду из `prompts/01_IMPLEMENT_CURRENT_PLAN.md`.
-
-### Вариант B: приложение Codex / режим Codex в ChatGPT desktop
-
-1. Создайте локальный каталог `rag-platform` из ZIP.
-2. Откройте каталог как новый Codex project.
-3. Убедитесь, что primary folder указывает на корень, где лежит `AGENTS.md`.
-4. Откройте новый thread, включите `/plan` и вставьте `prompts/00_REVIEW_AND_START.md`.
-5. После проверки плана создайте отдельный thread для реализации первого milestone.
-
-## Режим разрешений
-
-Для первого запуска используйте безопасный режим:
+## Первый запуск
 
 ```bash
-codex --cd . --sandbox workspace-write --ask-for-approval on-request
+cp .env.example .env
+make dev-up
 ```
 
-Не применяйте `--dangerously-bypass-approvals-and-sandbox` на основной машине. Полный доступ допустим только внутри отдельной одноразовой VM/контейнера без секретов и важных файлов.
+URL:
 
-## Порядок работы
+- Web UI: http://localhost:5173
+- API health: http://localhost:8000/health
+- API readiness: http://localhost:8000/ready
+- Model Gateway: http://localhost:8081
+- Mock provider: http://localhost:8082
+- MinIO console: http://localhost:9001
+- OpenSearch: http://localhost:9200
 
-- Одна Codex-сессия — один понятный milestone или один review.
-- Не запускайте сразу все планы.
-- После каждого milestone проверяйте diff и создавайте commit.
-- Перед следующим планом запускайте `/review` или prompt `prompts/02_REVIEW_MILESTONE.md`.
-- Реальные ключи храните только в `.env`, никогда не в Git.
-- Phase 3 нельзя принимать без сведений о GPU/RAM из `docs/DECISIONS_REQUIRED.md`.
+## Импорт Wikipedia
 
-## Первый полезный результат
+Малый development-импорт:
 
-Первый ExecPlan заканчивается узким вертикальным срезом:
+```bash
+make import-wiki-small WIKI_LIMIT=10000
+```
+
+Для быстрой проверки можно указать меньший лимит:
+
+```bash
+make import-wiki-small WIKI_LIMIT=1000
+```
+
+Полный resumable импорт всего dump:
+
+```bash
+make import-wiki-full
+```
+
+Job progress доступен через UI и API:
+
+```bash
+curl http://localhost:8000/api/v1/ingestion-jobs/<job_id>
+```
+
+Cancel/resume:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/ingestion-jobs/<job_id>:cancel
+curl -X POST http://localhost:8000/api/v1/ingestion-jobs/<job_id>:resume
+```
+
+## Проверки
+
+Одна команда полной проверки:
+
+```bash
+make check-all
+```
+
+Отдельные команды:
+
+```bash
+make lint
+make format-check
+make typecheck
+make test-unit
+make test-integration
+make test-e2e
+make smoke
+make eval
+```
+
+UI checks:
+
+```bash
+cd services/ui
+pnpm lint
+pnpm typecheck
+pnpm format:check
+pnpm build
+```
+
+Model Gateway smoke:
+
+```bash
+make smoke-models PROVIDER=mock
+```
+
+## Демонстрационный вопрос
+
+После малого импорта откройте http://localhost:5173 и задайте:
 
 ```text
-POST /api/v1/chat
-→ FastAPI
-→ Model Gateway
-→ mock/OpenRouter-compatible provider
-→ SSE stream
-→ query_run в PostgreSQL
-→ OpenTelemetry trace
+Что такое Россия?
 ```
 
-Retrieval, Wikipedia и UI в этот первый срез не входят.
+Ожидается ответ на русском с citation IDs вида `[S1]`, списком sources и retrieval debugger stages: BM25, dense, RRF, rerank, context.
+
+## OpenRouter
+
+По умолчанию используется `MODEL_PROVIDER=mock`, поэтому тесты и демонстрация не требуют ключа.
+
+Для OpenRouter добавьте ключ только в локальный `.env`:
+
+```env
+MODEL_PROVIDER=openrouter
+OPENROUTER_API_KEY=...
+```
+
+Не храните ключи в `openrouter_key.txt`, Git или документации.
+
+## llama.cpp profile
+
+GPU/GGUF не требуются для MVP. Подготовлен optional profile:
+
+```bash
+docker compose -f compose.yaml -f compose.llamacpp.yaml --profile llamacpp up -d
+make smoke-models PROVIDER=llamacpp
+```
+
+Перед реальным запуском llama.cpp нужны локальные model artifacts, лицензии, checksums и hardware decision из `docs/DECISIONS_REQUIRED.md`.
+
+## Остановка
+
+```bash
+make down
+```
+
+Команда останавливает контейнеры без удаления volumes.

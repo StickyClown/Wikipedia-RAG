@@ -37,6 +37,15 @@ make test-e2e TEST=document-ingestion
 
 ## Progress
 
-- [ ] Plan refined.
-- [ ] Implemented.
-- [ ] Reviewed.
+- [x] Plan refined for local MVP upload subset.
+- [x] Implemented UTF-8 text upload subset.
+- [x] Reviewed with local checks.
+
+## MVP status
+
+- Implemented local small UTF-8 text upload endpoint with deterministic chunks and OpenSearch indexing.
+- Verified upload of `baikal-note.txt` and retrieval of the uploaded document as top evidence.
+
+## Remaining production work
+
+- PDF, DOCX, PPTX, XLSX, image, Docling, Tika, parser isolation and preview/reprocess workflows remain deferred.
