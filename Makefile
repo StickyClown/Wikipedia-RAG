@@ -2,8 +2,9 @@ SHELL := /bin/sh
 WIKI_LIMIT ?= 10000
 TEST ?=
 PROVIDER ?= mock
+EVAL_COUNT ?= 150
 
-.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e smoke eval check-all import-wiki-small import-wiki-full smoke-models release-gate
+.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e smoke eval eval-smoke eval-generate eval-full check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate
 
 bootstrap:
 	uv sync --all-groups
@@ -47,6 +48,15 @@ smoke:
 eval:
 	uv run python -m wikipediarag.cli eval
 
+eval-smoke:
+	uv run python -m wikipediarag.cli eval-smoke --count 10
+
+eval-generate:
+	uv run python -m wikipediarag.cli eval-generate --count $(EVAL_COUNT)
+
+eval-full:
+	uv run python -m wikipediarag.cli eval-full --count $(EVAL_COUNT)
+
 check-all: lint format-check typecheck test-unit test-integration test-e2e smoke eval
 
 import-wiki-small:
@@ -55,8 +65,14 @@ import-wiki-small:
 import-wiki-full:
 	uv run python -m wikipediarag.cli import-wiki --full --wait
 
+import-zim-small:
+	uv run python -m wikipediarag.cli import-zim --limit $(WIKI_LIMIT) --wait
+
 smoke-models:
 	uv run python -m wikipediarag.cli smoke-models --provider $(PROVIDER)
 
 release-gate:
 	uv run python -m wikipediarag.cli release-gate
+
+demo-release-gate:
+	uv run python -m wikipediarag.cli demo-release-gate

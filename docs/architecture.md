@@ -1,16 +1,33 @@
 ---
 title: "Production RAG Platform: архитектура, ingestion, retrieval и agentic search"
-version: "0.2"
-date: "2026-07-24"
+version: "0.3"
+date: "2026-07-27"
 language: "ru"
-status: "Architecture baseline"
+status: "Implementation authority after ExecPlan 13"
 ---
 
 # Production RAG Platform
 
-Единый архитектурный документ для локальной production-ready RAG-платформы с Wikimedia XML dump как основным доступным источником Wikipedia, будущим ZIM-адаптером, загрузкой произвольных документов, гибридным поиском, прозрачной диагностикой retrieval и отдельным режимом расширенного агентного поиска.
+Единый архитектурный документ для локальной production-ready RAG-платформы с ZIM/libzim + Kiwix как основным реальным demo-source Wikipedia, Wikimedia XML как поддерживаемым fallback, загрузкой пользовательских документов, гибридным поиском, прозрачной диагностикой retrieval и отдельным режимом расширенного агентного поиска.
 
 > **Главное решение:** весь продукт работает в Docker. Сейчас все модели вызываются через OpenRouter. Целевая локальная схема — отдельные `llama-server` из `llama.cpp` для генерации, embeddings и reranking. Прикладной код не знает, где физически запущена модель: он обращается только к внутреннему Model Gateway по OpenAI-совместимому контракту.
+
+---
+
+## 0. Current implementation snapshot
+
+Этот раздел фиксирует фактическое состояние после ExecPlan 13. Он важен для LLM handoff: если концептуальные будущие разделы ниже звучат шире, приоритет имеет этот snapshot и текущие contracts/status.
+
+- Рабочий MVP - Docker-first локальная Wikipedia RAG система на русском корпусе.
+- Основной реальный источник - один русский Wikipedia ZIM в `./zim`, обслуживаемый Kiwix и читаемый worker через libzim. XML multistream остаётся supported regression/local fallback.
+- `sota_mvp` использует OpenRouter через Model Gateway для chat, embeddings и rerank; mock provider доступен только через явные mock aliases и `test_mock`.
+- Runtime stack: FastAPI API, background worker, Model Gateway, React/Vite UI, PostgreSQL, OpenSearch, MinIO, Redis/Valkey, Kiwix, OpenTelemetry Collector.
+- Retrieval profile-driven: BM25 + dense retrieval, RRF, cross-encoder rerank, dedup/page quota, selective parent expansion, token-budget context packing.
+- Chat отвечает через SSE, возвращает evidence IDs `[S1]`, `[S2]`, source links, retrieval trace, citation validation и safe timing summaries.
+- `/api/v1/search:debug` запускает retrieval-only debug path без answer generation и без conditional Extended Search harness.
+- Extended Search реализован как bounded MVP: simple trigger, простая декомпозиция на subqueries, повторные вызовы normal `retrieve()`, evidence ledger, budgets и persisted stop reason.
+- Trusted-v3 retrieval metrics для `sota_mvp_normal`: page recall `@10=0.9709`, chunk recall `@10=0.9200`, MRR@10 `0.8844`, nDCG@10 `0.8756`, p50 `1688 ms`, p95 `5927 ms`, 21 retrieval miss, error rate `0`.
+- Главные текущие зоны роста: настоящий multi-hop planning, reviewed eval splits, claim-level support checking, production auth/tenancy, universal document parsing, local llama.cpp quality gates и operational SLO hardening.
 
 ---
 
@@ -61,7 +78,7 @@ status: "Architecture baseline"
 |---|---|
 | Контейнеризация | Docker Compose в начале; Kubernetes-ready контейнеры и stateless-сервисы |
 | API | Python, FastAPI, Pydantic, async I/O, SSE для стриминга |
-| UI | React + Vite; минимальный MVP допустимо начать с HTMX/Jinja |
+| UI | React + Vite + TypeScript |
 | Model serving сейчас | OpenRouter |
 | Model serving целевой | `llama.cpp` / `llama-server`, отдельный сервер на роль модели |
 | Универсальный доступ к моделям | Внутренний Model Gateway с OpenAI-совместимыми endpoint-ами |
@@ -72,8 +89,8 @@ status: "Architecture baseline"
 | Object storage | MinIO/S3 |
 | Cache/queue/limits | Redis или Valkey |
 | Документы | Docling как структурный parser; Apache Tika как broad-format detector/fallback |
-| Wikipedia | Wikimedia XML pages-articles bzip2 multistream для local MVP; ZIM + libzim как будущий специализированный adapter |
-| Оркестрация обычного RAG | Собная typed state machine на Python |
+| Wikipedia | ZIM + libzim + Kiwix как текущий real demo source; Wikimedia XML pages-articles bzip2 multistream как fallback |
+| Оркестрация обычного RAG | Собственная typed state machine на Python |
 | Extended Search | LangGraph или собственный bounded agent loop; один orchestrator |
 | Observability | OpenTelemetry + Phoenix + Prometheus/Grafana + собственные retrieval events |
 | Background jobs | Celery, Dramatiq, Arq или Temporal позже; для MVP предпочтительно Dramatiq/Arq |
@@ -98,7 +115,7 @@ flowchart TB
     IW[Ingestion Workers]
     D[Docling]
     T[Apache Tika]
-    Z[Wikipedia XML / future ZIM]
+    Z[Wikipedia ZIM / XML fallback]
     OR[OpenRouter]
     LC1[llama-server: chat]
     LC2[llama-server: embeddings]
@@ -158,6 +175,46 @@ flowchart TB
 - обновлять embeddings или parser без остановки чата;
 - использовать разные GPU для chat, embeddings и reranker;
 - держать API-контейнер без CUDA и тяжёлых ML-зависимостей.
+
+### 3.2. Текущая бизнес-логика и основные потоки
+
+#### 3.2.1. ZIM ingestion
+
+Реальный demo import начинается с одного `.zim` файла в `./zim`. Kiwix показывает полный архив, а worker читает тот же файл read-only через libzim. Worker:
+
+- пропускает service/assets/metadata entries и слишком короткие/пустые страницы;
+- сохраняет redirects как alias/provenance, но не считает их в `WIKI_LIMIT` и не режет на chunks;
+- принимает только canonical non-redirect article pages до заданного лимита;
+- строит source URL из `KIWIX_PUBLIC_BASE_URL`, Kiwix book identifier и точного `zim_entry_path`;
+- режет документ на section-aware parent/child chunks с deterministic IDs;
+- считает document/chunk embeddings через Model Gateway;
+- пишет metadata/provenance в PostgreSQL, artifacts в object-storage contour, online representation в OpenSearch;
+- публикует versioned index через alias только после durable writes.
+
+Checkpoint продвигается только после durable DB/object-storage/search writes. Это делает import resumable и защищает от частично опубликованного индекса.
+
+#### 3.2.2. XML fallback ingestion
+
+Wikimedia XML `pages-articles` bzip2 multistream остаётся поддерживаемым fallback. Он нужен для regression/development и исторической совместимости ADR-007. XML path валидирует bzip2 signatures, UTF-8 index rows, `offset:page_id:title` и monotonic non-decreasing offsets. Он не является основным demo-source после ADR-008.
+
+#### 3.2.3. Chat and answer path
+
+Chat request создаёт `query_run`, request ID и trace ID, выбирает server-owned tenant/knowledge base context и запускает normal retrieval или Extended Search. Итоговый evidence manifest передаётся generator model. Модель обязана отвечать только по supplied evidence и ставить citation IDs после утверждений. После генерации deterministic citation validator проверяет, что все ссылки существуют, не являются phantom/unused и указывают на supplied evidence.
+
+SSE contract:
+
+- `run.started` - query run создан;
+- `message.delta` - ответ и evidence;
+- `usage.updated` - retrieval events, citation validation, provider usage/cost и `timings_ms`;
+- `run.completed` или `run.failed` - terminal state.
+
+Если evidence недостаточно, включается insufficient-evidence mode. Система должна дать явный квалифицированный отказ или ограниченный ответ, а не заполнять пробелы модельной догадкой.
+
+#### 3.2.4. Debugging and evaluation
+
+`POST /api/v1/search:debug` выполняет retrieval без генерации. Он нужен для анализа candidates, ranks, scores, policy decisions и per-stage timings. Для answer quality нужно использовать `/api/v1/chat` или evaluation runners, потому что `/search:debug` не проверяет citations и не запускает conditional harness.
+
+Evaluation subsystem хранит JSONL artifacts под `artifacts/eval/`. Retrieval-only runner сравнивает BM25-only, dense-only, hybrid RRF, hybrid rerank и `sota_mvp_normal` через public `/search:debug`. `sota_mvp_conditional_harness` в retrieval-only режиме intentionally unsupported; harness quality проверяется answer/eval run через chat path.
 
 ---
 
@@ -477,8 +534,8 @@ feedback
 Object storage хранит:
 
 - оригинальный upload;
+- ZIM archive snapshots;
 - Wikimedia XML dump snapshots;
-- future ZIM snapshots;
 - normalized Docling JSON;
 - Tika text/metadata output;
 - page images и extracted figures;
@@ -578,7 +635,7 @@ flowchart LR
     R[Parser router]
     D[Docling]
     T[Apache Tika]
-    Z[Wikipedia XML adapter / future libzim]
+    Z[ZIM/libzim and XML adapters]
     N[Canonical normalization]
     E[Structural enrichment]
     C[Template-based chunking]
@@ -652,7 +709,7 @@ Docling отдаёт единое document representation и поддержив�
 
 Tika работает как отдельный CPU-сервис на порту 9998. Внешний доступ запрещён.
 
-### 7.2.3. Wikimedia XML и future libzim — специализированный путь Wikipedia/Kiwix
+### 7.2.3. ZIM/libzim и Wikimedia XML — специализированный путь Wikipedia/Kiwix
 
 Wikimedia XML dump и ZIM не следует прогонять через generic parser. Используется собственный adapter:
 
@@ -669,7 +726,7 @@ Wikimedia XML dump и ZIM не следует прогонять через gene
 
 ```text
 Wikimedia XML multistream -----------> XML stream adapter
-ZIM ---------------------------------> future libzim adapter
+ZIM ---------------------------------> libzim adapter
 PDF / Office / image / EPUB ---------> Docling
 Legacy/unknown/archive/email --------> Tika first
 HTML/Markdown/plain text ------------> lightweight/Docling
@@ -777,7 +834,7 @@ Template управляет:
 | Template | Для чего | Основной parser | Chunking |
 |---|---|---|---|
 | `general` | универсальные документы | Docling → Tika fallback | section-aware, 300–450 tokens |
-| `wikipedia` | Wikipedia XML/ZIM | XML stream adapter / future libzim | heading/paragraph aware |
+| `wikipedia` | Wikipedia ZIM/XML | libzim adapter / XML stream adapter | heading/paragraph aware |
 | `book` | книги, manuals | Docling | chapter/section, neighbor links |
 | `paper` | научные статьи | Docling | abstract/method/results/references aware |
 | `legal` | законы, договоры | Docling/Tika | article/clause hierarchy, minimal overlap |
@@ -866,10 +923,12 @@ UI должен позволять:
 
 ## 9.1. Источник
 
-Для local MVP основным доступным источником является Wikimedia XML `pages-articles` bzip2 multistream dump и соответствующий multistream index. ZIM + libzim остаются будущим специализированным адаптером.
+Для real demo MVP основным источником является один локальный Wikipedia ZIM, обслуживаемый Kiwix и читаемый worker через libzim. Wikimedia XML `pages-articles` bzip2 multistream dump и соответствующий multistream index остаются поддерживаемым regression/local fallback.
 
 Хранить:
 
+- ZIM checksum, filename, archive id и Kiwix book identifier;
+- exact `zim_entry_path` для source URL;
 - XML dump checksum;
 - multistream index checksum;
 - snapshot date;
@@ -1059,6 +1118,29 @@ flowchart LR
     V --> F
     F --> R --> D --> X --> C --> G --> CV --> A
 ```
+
+## 11.0. Текущий runtime path
+
+Фактическая реализация normal retrieval находится в `src/wikipediarag/retrieval.py`; OpenSearch запросы - в `src/wikipediarag/search_index.py`; profiles - в `config/retrieval.yaml`.
+
+Runtime steps:
+
+1. **Profile loading.** API передаёт `retrieval_profile` и validated `retrieval_overrides`. `get_retrieval_profile()` собирает inherited profile, валидирует, что включён хотя бы один first-stage retriever, и запрещает `rrf`, если BM25 или dense отключён.
+2. **Provider strictness.** `sota_mvp` требует real provider и не должен делать silent fallback на mock/hash behavior. Mock paths доступны только через explicit mock aliases/profile.
+3. **Knowledge base index alias.** Retrieval читает active index из tenant-scoped knowledge base metadata. Если active index не задан, используется default read alias.
+4. **Query normalization.** Сейчас online code делает whitespace cleanup. Конфигурационные поля `query_rewrite` и `query_decomposition` существуют, но полноценный LLM rewrite/decomposition не является always-on normal path.
+5. **Parallel first stage.** BM25 и dense запускаются параллельно через `asyncio.gather`, если оба включены profile.
+6. **Server-side filters.** И BM25, и vector query получают `tenant_id` и `knowledge_base_id` filters внутри server code. Клиентский raw tenant filter не принимается как authority.
+7. **BM25.** OpenSearch `multi_match` ищет по `title^3`, `section_path_text^2` и `content`; raw `_score` сохраняется как `scores.bm25`, rank - как `ranks.bm25`.
+8. **Dense.** Query embedding считается через Model Gateway alias `embed_default` с instruction для factual Russian Wikipedia retrieval. OpenSearch `knn` ищет по `embedding`; score/rank сохраняются как `scores.dense` и `ranks.dense`.
+9. **Fusion.** Service-side RRF добавляет `rrf_bm25`, `rrf_dense`, `rrf_total`. BM25/vector scores не калибруются в одну шкалу.
+10. **Rerank.** Cross-encoder reranker получает documents вида `title + section path + chunk content`, возвращает relevance scores, после чего candidates сортируются по `rerank`, затем `rrf_total`.
+11. **Postprocess.** Deterministic policies удаляют near-duplicates по content hash, применяют `page_quota`, selective parent expansion и token-budget context packing.
+12. **Evidence manifest.** Итоговые chunks нумеруются как `[S1]`, `[S2]`, ... и содержат `chunk_id`, title, section path, content, source URL, scores, ranks и metadata.
+13. **Insufficient evidence.** Если evidence меньше `final_evidence_min`, `RetrievalResult.insufficient_evidence=true`; answer layer должен отвечать в insufficient-evidence mode.
+14. **Trace.** Retrieval events сохраняются как `retrieval_stage`: `profile`, `query`, `bm25`, `dense`, `rrf`, `rerank`, `policy`, `context`, `timings`.
+
+Timing payloads являются безопасными numeric summaries. Normal run может включать `bm25`, `dense_embedding`, `dense_search`, `dense_total`, `fusion`, `rerank`, `context`, `retrieval_total`; chat usage дополнительно включает `generation_total`, `model_chat`, `answer_parse`, `citation_validation`. Payload не должен содержать prompts, raw provider bodies, document text, secrets или exception details.
 
 ## 11.1. Query normalization
 
@@ -1296,6 +1378,30 @@ Verifier — второй model pass только когда:
 ---
 
 ## 13. Extended Search / agent mode
+
+## 13.0. Текущий MVP status
+
+Extended Search уже реализован как bounded single-orchestrator MVP, но он не равен production-grade multi-hop planner.
+
+Фактическое поведение:
+
+- включается вручную через chat mode `extended` или автоматически по простым textual markers;
+- trigger markers включают `сравни`, `сравнение`, `отличается`, `почему`, `как связано`, `между`, `multi-hop`, `несколько`, `конфликт`, `что общего`, а также несколько `?`;
+- `_build_subqueries()` строит subqueries простым split по `?` и русскому ` и `;
+- каждый subquery вызывает обычный `retrieve()` с тем же retrieval profile;
+- evidence объединяется по unique `chunk_id`;
+- state хранит `evidence_ledger`, `visited_pages`, `tool_call_hashes`, coverage и stop reason;
+- duplicate tool call, отсутствие нового evidence, stalled coverage и hard budgets останавливают loop;
+- final result renumbered как `[S1]`, `[S2]`, ... и передаётся обычному answer generation/citation path;
+- persisted `agent_runs` хранит stop reason, state и budgets.
+
+Ограничения текущего MVP:
+
+- нет полноценного semantic query decomposition;
+- нет entity linking и явного bridge discovery;
+- `follow_links`, `search_within_document`, `compare_evidence`, `verify_claims` перечислены как allowed tools, но текущий harness фактически использует search calls поверх normal retrieval;
+- `/api/v1/search:debug` не запускает conditional harness, поэтому retrieval-only eval не измеряет пользу Extended Search;
+- anchored multi-hop может выглядеть успешным из-за сильных title/entity tokens в исходном вопросе, а не из-за настоящего chain planning.
 
 ## 13.1. Когда включается
 
@@ -2012,7 +2118,7 @@ reranker:
 
 ## 22.1. Что оставить
 
-- Wikipedia XML + future ZIM/libzim;
+- ZIM/libzim + Wikipedia XML fallback;
 - OpenSearch;
 - section-aware chunks;
 - BM25;
@@ -2323,6 +2429,24 @@ class ModelGatewayClient:
 | Parser exploit | isolated containers, no network, limits, scanning |
 | Correlated generator/judge | independent human set or separate judge model later |
 
+## 27.1. Точки роста для следующих ExecPlan
+
+Эти пункты являются actionable backlog, а не новыми implicit requirements для текущего milestone.
+Связанный design backlog для следующих проектировочных итераций: `docs/design/RAG_IMPROVEMENT_ROADMAP.md`.
+
+| Область | Проблема | Следующее улучшение |
+|---|---|---|
+| Multi-hop retrieval | Anchored multi-hop часто работает, но hidden bridge без явных title/entity tokens слабее | Добавить typed decomposition, entity linking, bridge discovery, `follow_links` и `search_within_document` как реальные tools |
+| Extended Search | MVP использует простой split query и повторный normal retrieval | Ввести planner, parallel subqueries, run-local cache, coverage model, conflict resolver и UI state-transition trace |
+| Evaluation | Trusted tasks пока `train/unreviewed`; locked dev/test slices отсутствуют | Разделить reviewed train/dev/test, добавить human review ownership и immutable release-gate suites |
+| Claim faithfulness | Citation validator проверяет ID/наличие, но claim-level semantic support ограничен | Добавить claim-to-source-span support checker и repair/refusal policy при unsupported claims |
+| Latency/SLO | Trusted-v3 p95 для `sota_mvp_normal` около `5927 ms`, выше целевого warm retrieval SLO | Профилировать dense/rerank/OpenSearch stages, добавить caching, tune top-N, провести load test |
+| Tenancy/auth | Local MVP использует seeded/default tenant | Реализовать OIDC/SSO, role matrix, tenant onboarding, access regression tests и retention/delete policy |
+| Universal documents | Small UTF-8 upload есть, production PDF/Office/images path не закрыт | Изолировать parsers, добавить malware scanning, object artifacts, preview/reprocess contract и parser templates |
+| Local llama.cpp | Compose profile подготовлен, но model artifacts и quality gates не утверждены | Закрыть GPU/VRAM/license/checksum decisions, smoke/quality gates и alias migration runbook |
+| Index lifecycle | Versioned names есть, но production rollback/snapshot drills требуют hardening | Добавить staging validation, alias rollback test, OpenSearch snapshot policy и index compatibility checks |
+| Provider exposure | OpenRouter phase может отправлять prompts/document-derived text внешнему provider | Получить owner decision по data residency, user document policy, retention и cost/error budgets |
+
 ---
 
 ## 28. Итоговая рекомендуемая конфигурация
@@ -2333,12 +2457,15 @@ class ModelGatewayClient:
 FastAPI + React
 Custom thin Model Gateway
 OpenRouter for chat, embeddings and rerank
-Qwen3.6-35B-A3B generator/verifier baseline
-Qwen3-Embedding-4B default, 8B challenger, 0.6B latency baseline
+Qwen3.6-35B-A3B generator baseline
+Qwen3.5-9B fast/verifier baseline
+Qwen3-Embedding-8B default embedding alias with 1024 dimensions
 Cohere Rerank v3.5 temporary remote reranker
 OpenSearch BM25 + HNSW + service-side RRF
 PostgreSQL + Redis/Valkey + MinIO
-Docling + Apache Tika + Wikipedia XML adapter + future libzim
+ZIM/libzim + Kiwix current demo source
+Wikimedia XML adapter as regression/local fallback
+Docling + Apache Tika as target universal-document parsers
 OpenTelemetry + Phoenix + Prometheus/Grafana
 Docker Compose
 ```
@@ -2381,7 +2508,7 @@ switchable bounded Extended Search for multi-hop/conflict/coverage gaps
 upload
 -> security/MIME
 -> parser router
--> Docling, Tika, Wikimedia XML or future libzim
+-> Docling, Tika, Wikimedia XML or ZIM/libzim
 -> canonical document
 -> versioned template
 -> chunks

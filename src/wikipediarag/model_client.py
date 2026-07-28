@@ -1,29 +1,104 @@
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 import httpx
 
 from wikipediarag.config import Settings, get_settings
 
+MAX_PROVIDER_ATTEMPTS = 3
+TRANSIENT_PROVIDER_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
-async def chat_completion(messages: list[dict[str, str]], settings: Settings | None = None) -> str:
+
+async def chat_completion(
+    messages: list[dict[str, str]],
+    settings: Settings | None = None,
+    *,
+    alias: str = "generator_main",
+    response_format: dict[str, Any] | None = None,
+    max_provider_attempts: int = MAX_PROVIDER_ATTEMPTS,
+) -> dict[str, Any]:
     resolved = settings or get_settings()
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            f"{resolved.model_gateway_url.rstrip('/')}/v1/chat/completions",
-            json={"model": "generator_fast", "messages": messages, "stream": False},
-        )
-        response.raise_for_status()
-        payload = response.json()
+    payload: dict[str, Any] = {"model": alias, "messages": messages, "stream": False}
+    if response_format is not None:
+        payload["response_format"] = response_format
+    return await _post_json(
+        f"{resolved.model_gateway_url.rstrip('/')}/v1/chat/completions",
+        payload,
+        timeout_seconds=120,
+        max_attempts=max_provider_attempts,
+    )
+
+
+async def chat_completion_text(
+    messages: list[dict[str, str]],
+    settings: Settings | None = None,
+    *,
+    alias: str = "generator_main",
+    response_format: dict[str, Any] | None = None,
+) -> str:
+    payload = await chat_completion(messages, settings, alias=alias, response_format=response_format)
     return str(payload["choices"][0]["message"]["content"])
 
 
-async def embeddings(inputs: list[str], settings: Settings | None = None) -> list[list[float]]:
+async def embeddings(
+    inputs: list[str],
+    settings: Settings | None = None,
+    *,
+    alias: str = "embed_default",
+    dimensions: int | None = None,
+    query_instruction: str | None = None,
+) -> tuple[list[list[float]], dict[str, Any]]:
     resolved = settings or get_settings()
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            f"{resolved.model_gateway_url.rstrip('/')}/v1/embeddings",
-            json={"model": "embed_default", "input": inputs},
-        )
-        response.raise_for_status()
-        payload = response.json()
-    return [list(item["embedding"]) for item in payload["data"]]
+    prepared = [f"{query_instruction}\n{text}" if query_instruction else text for text in inputs]
+    request: dict[str, Any] = {"model": alias, "input": prepared}
+    if dimensions is not None:
+        request["dimensions"] = dimensions
+    payload = await _post_json(
+        f"{resolved.model_gateway_url.rstrip('/')}/v1/embeddings",
+        request,
+        timeout_seconds=150,
+    )
+    return [list(item["embedding"]) for item in payload["data"]], dict(payload.get("usage") or {})
+
+
+async def rerank(
+    query: str,
+    documents: list[str],
+    settings: Settings | None = None,
+    *,
+    alias: str = "rerank_default",
+    top_n: int | None = None,
+) -> dict[str, Any]:
+    resolved = settings or get_settings()
+    return await _post_json(
+        f"{resolved.model_gateway_url.rstrip('/')}/v1/rerank",
+        {"model": alias, "query": query, "documents": documents, "top_n": top_n or len(documents)},
+        timeout_seconds=120,
+    )
+
+
+async def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: float,
+    max_attempts: int = MAX_PROVIDER_ATTEMPTS,
+) -> dict[str, Any]:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    for attempt in range(max_attempts):
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                response = await client.post(url, json=payload)
+            response.raise_for_status()
+            return dict(response.json())
+        except (httpx.NetworkError, httpx.TimeoutException):
+            if attempt + 1 == max_attempts:
+                raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in TRANSIENT_PROVIDER_STATUS_CODES or attempt + 1 == max_attempts:
+                raise
+        await asyncio.sleep(2**attempt)
+    raise RuntimeError("unreachable provider retry state")

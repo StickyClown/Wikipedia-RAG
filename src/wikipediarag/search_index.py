@@ -7,6 +7,7 @@ from opensearchpy import OpenSearch
 from opensearchpy.helpers import bulk
 
 from wikipediarag.config import Settings, get_settings
+from wikipediarag.ids import stable_hash
 from wikipediarag.wiki_dump import Chunk
 
 PHYSICAL_INDEX = "wiki-chunks-v1"
@@ -14,17 +15,42 @@ READ_ALIAS = "wiki-chunks-read"
 WRITE_ALIAS = "wiki-chunks-write"
 
 
+def build_index_names(
+    *,
+    source_type: str,
+    snapshot_id: str,
+    retrieval_profile: str,
+    embedding_alias: str,
+    embedding_dimensions: int,
+) -> dict[str, str]:
+    suffix = stable_hash([source_type, snapshot_id, retrieval_profile, embedding_alias, embedding_dimensions], 16)
+    return {
+        "version_id": f"{source_type}:{snapshot_id}:{retrieval_profile}:{embedding_alias}:{embedding_dimensions}",
+        "physical": f"wiki-chunks-{suffix}",
+        "read_alias": f"wiki-chunks-read-{suffix}",
+        "write_alias": f"wiki-chunks-write-{suffix}",
+    }
+
+
 def get_client(settings: Settings | None = None) -> OpenSearch:
     resolved = settings or get_settings()
     return OpenSearch(hosts=[resolved.opensearch_url], verify_certs=False, ssl_show_warn=False)
 
 
-def ensure_index(settings: Settings | None = None) -> None:
+def ensure_index(
+    settings: Settings | None = None,
+    *,
+    physical_index: str = PHYSICAL_INDEX,
+    read_alias: str = READ_ALIAS,
+    write_alias: str = WRITE_ALIAS,
+    dimensions: int | None = None,
+) -> None:
     resolved = settings or get_settings()
+    vector_dimensions = dimensions or resolved.embedding_dimensions
     client = get_client(resolved)
-    if not client.indices.exists(index=PHYSICAL_INDEX):
+    if not client.indices.exists(index=physical_index):
         client.indices.create(
-            index=PHYSICAL_INDEX,
+            index=physical_index,
             body={
                 "settings": {"index": {"knn": True, "number_of_shards": 1, "number_of_replicas": 0}},
                 "mappings": {
@@ -40,7 +66,7 @@ def ensure_index(settings: Settings | None = None) -> None:
                         "content": {"type": "text"},
                         "embedding": {
                             "type": "knn_vector",
-                            "dimension": resolved.embedding_dimensions,
+                            "dimension": vector_dimensions,
                             "space_type": "cosinesimil",
                         },
                         "source_uri": {"type": "keyword", "index": False},
@@ -48,13 +74,14 @@ def ensure_index(settings: Settings | None = None) -> None:
                         "prev_chunk_id": {"type": "keyword"},
                         "next_chunk_id": {"type": "keyword"},
                         "content_hash": {"type": "keyword"},
+                        "metadata": {"type": "object", "enabled": True},
                     }
                 },
             },
         )
-    for alias in (READ_ALIAS, WRITE_ALIAS):
+    for alias in (read_alias, write_alias):
         if not client.indices.exists_alias(name=alias):
-            client.indices.put_alias(index=PHYSICAL_INDEX, name=alias)
+            client.indices.put_alias(index=physical_index, name=alias)
 
 
 def bulk_index_chunks(
@@ -63,14 +90,24 @@ def bulk_index_chunks(
     tenant_id: str,
     knowledge_base_id: str,
     settings: Settings | None = None,
+    write_alias: str = WRITE_ALIAS,
+    dimensions: int | None = None,
+    physical_index: str = PHYSICAL_INDEX,
+    read_alias: str = READ_ALIAS,
 ) -> int:
     resolved = settings or get_settings()
-    ensure_index(resolved)
+    ensure_index(
+        resolved,
+        physical_index=physical_index,
+        read_alias=read_alias,
+        write_alias=write_alias,
+        dimensions=dimensions,
+    )
     client = get_client(resolved)
     actions = [
         {
             "_op_type": "index",
-            "_index": WRITE_ALIAS,
+            "_index": write_alias,
             "_id": chunk.id,
             "_source": {
                 "tenant_id": tenant_id,
@@ -88,6 +125,7 @@ def bulk_index_chunks(
                 "prev_chunk_id": chunk.prev_chunk_id,
                 "next_chunk_id": chunk.next_chunk_id,
                 "content_hash": chunk.content_hash,
+                "metadata": chunk.metadata,
             },
         }
         for chunk in chunks
@@ -105,12 +143,13 @@ def bm25_search(
     knowledge_base_id: str,
     top_k: int,
     settings: Settings | None = None,
+    read_alias: str = READ_ALIAS,
 ) -> list[dict[str, Any]]:
     resolved = settings or get_settings()
     ensure_index(resolved)
     client = get_client(resolved)
     response = client.search(
-        index=READ_ALIAS,
+        index=read_alias,
         body={
             "size": top_k,
             "query": {
@@ -134,6 +173,35 @@ def bm25_search(
     return [_hit_to_candidate(hit, "bm25") for hit in response["hits"]["hits"]]
 
 
+def dense_search(
+    query_vector: list[float],
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    top_k: int,
+    settings: Settings | None = None,
+    read_alias: str = READ_ALIAS,
+) -> list[dict[str, Any]]:
+    resolved = settings or get_settings()
+    client = get_client(resolved)
+    response = client.search(
+        index=read_alias,
+        body={
+            "size": top_k,
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"tenant_id": tenant_id}},
+                        {"term": {"knowledge_base_id": knowledge_base_id}},
+                    ],
+                    "must": [{"knn": {"embedding": {"vector": query_vector, "k": top_k}}}],
+                }
+            },
+        },
+    )
+    return [_hit_to_candidate(hit, "dense") for hit in response["hits"]["hits"]]
+
+
 def _hit_to_candidate(hit: dict[str, Any], stage: str) -> dict[str, Any]:
     source = hit["_source"]
     return {
@@ -147,4 +215,5 @@ def _hit_to_candidate(hit: dict[str, Any], stage: str) -> dict[str, Any]:
         "scores": {stage: float(hit.get("_score") or 0.0)},
         "ranks": {},
         "embedding": source.get("embedding", []),
+        "metadata": source.get("metadata", {}),
     }

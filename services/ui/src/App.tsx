@@ -6,6 +6,7 @@ import {
   Play,
   RotateCw,
   Search,
+  SlidersHorizontal,
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
@@ -33,6 +34,7 @@ type Evidence = {
 type RetrievalEvent = {
   stage: string;
   payload: unknown;
+  event_type?: string;
 };
 
 type SsePayload = {
@@ -43,12 +45,34 @@ type SsePayload = {
   };
 };
 
+type RetrievalOverrideState = {
+  bm25Enabled: boolean;
+  denseEnabled: boolean;
+  rerankEnabled: boolean;
+  fusionMode: "rrf" | "none";
+  parentExpansion: "off" | "selective" | "always";
+  extendedSearchMode: "off" | "conditional" | "always";
+  topK: number;
+};
+
 export function App() {
   const [ready, setReady] = useState("checking");
   const [limit, setLimit] = useState(1000);
   const [job, setJob] = useState<Job | null>(null);
   const [question, setQuestion] = useState("Что такое Россия?");
   const [mode, setMode] = useState<"normal" | "extended">("normal");
+  const [retrievalProfile, setRetrievalProfile] = useState("sota_mvp");
+  const [debugTopK, setDebugTopK] = useState(12);
+  const [bm25Enabled, setBm25Enabled] = useState(true);
+  const [denseEnabled, setDenseEnabled] = useState(true);
+  const [rerankEnabled, setRerankEnabled] = useState(true);
+  const [fusionMode, setFusionMode] = useState<"rrf" | "none">("rrf");
+  const [parentExpansion, setParentExpansion] = useState<
+    "off" | "selective" | "always"
+  >("selective");
+  const [extendedSearchMode, setExtendedSearchMode] = useState<
+    "off" | "conditional" | "always"
+  >("conditional");
   const [answer, setAnswer] = useState("");
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [queryRunId, setQueryRunId] = useState("");
@@ -66,7 +90,7 @@ export function App() {
   const chunks = useMemo(() => job?.progress?.chunks_indexed ?? 0, [job]);
 
   async function startImport() {
-    const response = await fetch(`${API_BASE}/api/v1/wikipedia/imports`, {
+    const response = await fetch(`${API_BASE}/api/v1/wikipedia/zim-imports`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ limit }),
@@ -92,7 +116,21 @@ export function App() {
     const response = await fetch(`${API_BASE}/api/v1/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: question, mode, stream: true }),
+      body: JSON.stringify({
+        message: question,
+        mode,
+        stream: true,
+        retrieval_profile: retrievalProfile,
+        retrieval_overrides: buildRetrievalOverrides({
+          bm25Enabled,
+          denseEnabled,
+          rerankEnabled,
+          fusionMode,
+          parentExpansion,
+          extendedSearchMode,
+          topK: debugTopK,
+        }),
+      }),
     });
     const reader = response.body?.getReader();
     if (!reader) return;
@@ -197,6 +235,104 @@ export function App() {
             value={question}
             onChange={(event) => setQuestion(event.target.value)}
           />
+          <details className="advanced">
+            <summary>
+              <SlidersHorizontal size={16} /> Advanced retrieval settings
+            </summary>
+            <div className="advanced-grid">
+              <label>
+                Profile
+                <select
+                  value={retrievalProfile}
+                  onChange={(event) => setRetrievalProfile(event.target.value)}
+                >
+                  <option value="sota_mvp">sota_mvp</option>
+                  <option value="test_mock">test_mock</option>
+                  <option value="bm25_only">bm25_only</option>
+                  <option value="rewrite_off">rewrite_off</option>
+                  <option value="parent_expansion_off">
+                    parent_expansion_off
+                  </option>
+                </select>
+              </label>
+              <label>
+                Top K
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={debugTopK}
+                  onChange={(event) => setDebugTopK(Number(event.target.value))}
+                />
+              </label>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={bm25Enabled}
+                  onChange={(event) => setBm25Enabled(event.target.checked)}
+                />
+                BM25
+              </label>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={denseEnabled}
+                  onChange={(event) => setDenseEnabled(event.target.checked)}
+                />
+                Dense
+              </label>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={rerankEnabled}
+                  onChange={(event) => setRerankEnabled(event.target.checked)}
+                />
+                Rerank
+              </label>
+              <label>
+                Fusion
+                <select
+                  value={fusionMode}
+                  onChange={(event) =>
+                    setFusionMode(event.target.value as "rrf" | "none")
+                  }
+                >
+                  <option value="rrf">rrf</option>
+                  <option value="none">none</option>
+                </select>
+              </label>
+              <label>
+                Parent expansion
+                <select
+                  value={parentExpansion}
+                  onChange={(event) =>
+                    setParentExpansion(
+                      event.target.value as "off" | "selective" | "always",
+                    )
+                  }
+                >
+                  <option value="selective">selective</option>
+                  <option value="off">off</option>
+                  <option value="always">always</option>
+                </select>
+              </label>
+              <label>
+                Extended Search
+                <select
+                  value={extendedSearchMode}
+                  onChange={(event) =>
+                    setExtendedSearchMode(
+                      event.target.value as "off" | "conditional" | "always",
+                    )
+                  }
+                >
+                  <option value="conditional">conditional</option>
+                  <option value="off">off</option>
+                  <option value="always">always</option>
+                </select>
+              </label>
+            </div>
+          </details>
           <div className="row">
             <select
               value={mode}
@@ -227,9 +363,9 @@ export function App() {
             <div className="sources">
               {evidence.map((item) => (
                 <article key={item.evidence_id}>
-                  <strong>
+                  <a href={item.source_url} target="_blank" rel="noreferrer">
                     [{item.evidence_id}] {item.title}
-                  </strong>
+                  </a>
                   <span>{item.section_path.join(" / ")}</span>
                   <p>{item.content}</p>
                 </article>
@@ -242,14 +378,77 @@ export function App() {
           <div className="debugger">
             <h2>Retrieval Debugger</h2>
             {events.map((event, index) => (
-              <pre key={`${event.stage}-${index}`}>
-                {JSON.stringify(event, null, 2)}
-              </pre>
+              <DebugStage key={`${event.stage}-${index}`} event={event} />
             ))}
           </div>
         )}
       </section>
     </main>
+  );
+}
+
+function buildRetrievalOverrides(state: RetrievalOverrideState) {
+  return {
+    retrieval: {
+      bm25: state.bm25Enabled,
+      dense: state.denseEnabled,
+      fusion: state.fusionMode,
+      rerank: state.rerankEnabled,
+      top_k: state.topK,
+    },
+    postprocess: {
+      parent_expansion: state.parentExpansion,
+      extended_search: state.extendedSearchMode,
+    },
+  };
+}
+
+function DebugStage({ event }: { event: RetrievalEvent }) {
+  const payload =
+    typeof event.payload === "object" && event.payload !== null
+      ? (event.payload as Record<string, unknown>)
+      : (event as unknown as Record<string, unknown>);
+  const stage = String(payload.stage ?? event.stage);
+  const rawCandidates = payload.candidates;
+  const candidates = Array.isArray(rawCandidates)
+    ? rawCandidates
+        .filter((candidate): candidate is Record<string, unknown> => {
+          return typeof candidate === "object" && candidate !== null;
+        })
+        .slice(0, 10)
+    : [];
+  return (
+    <section className="debug-stage">
+      <h3>{stage}</h3>
+      {candidates.length > 0 ? (
+        <table>
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Ranks</th>
+              <th>Scores</th>
+            </tr>
+          </thead>
+          <tbody>
+            {candidates.map((row, index) => {
+              return (
+                <tr key={`${stage}-${index}`}>
+                  <td>{String(row.title ?? row.chunk_id ?? "")}</td>
+                  <td>
+                    <code>{JSON.stringify(row.ranks ?? {})}</code>
+                  </td>
+                  <td>
+                    <code>{JSON.stringify(row.scores ?? {})}</code>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      ) : (
+        <pre>{JSON.stringify(payload, null, 2)}</pre>
+      )}
+    </section>
   );
 }
 

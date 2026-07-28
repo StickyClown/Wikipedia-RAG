@@ -10,6 +10,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY pyproject.toml README_START_HERE.md ./
 COPY src ./src
+COPY config ./config
 RUN pip install --no-cache-dir .
 
 EXPOSE 8080 8000

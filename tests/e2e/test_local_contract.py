@@ -10,3 +10,5 @@ def test_compose_and_ui_contract_exist() -> None:
     assert "opensearch" in compose
     assert "model-gateway" in compose
     assert "mock-provider" in compose
+    assert "kiwix" in compose
+    assert "./zim:/zim:ro" in compose

@@ -68,6 +68,14 @@ services:
       - "4317:4317"
       - "4318:4318"
 
+  kiwix:
+    image: ghcr.io/kiwix/kiwix-serve:3.8.2
+    command: ["*.zim"]
+    ports:
+      - "8083:8080"
+    volumes:
+      - ./zim:/data:ro
+
   mock-provider:
     build:
       context: .
@@ -85,6 +93,9 @@ services:
     command: python -m wikipediarag.gateway_app
     environment:
       MODEL_PROVIDER: ${MODEL_PROVIDER:-mock}
+      RETRIEVAL_PROFILE: ${RETRIEVAL_PROFILE:-test_mock}
+      MODELS_CONFIG_PATH: ${MODELS_CONFIG_PATH:-/app/config/models.yaml}
+      RETRIEVAL_CONFIG_PATH: ${RETRIEVAL_CONFIG_PATH:-/app/config/retrieval.yaml}
       MOCK_PROVIDER_URL: http://mock-provider:8080
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
@@ -108,10 +119,19 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET:-rag-artifacts}
       OPENSEARCH_URL: ${OPENSEARCH_URL:-http://opensearch:9200}
       MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL:-http://model-gateway:8080}
+      RETRIEVAL_PROFILE: ${RETRIEVAL_PROFILE:-test_mock}
+      MODELS_CONFIG_PATH: ${MODELS_CONFIG_PATH:-/app/config/models.yaml}
+      RETRIEVAL_CONFIG_PATH: ${RETRIEVAL_CONFIG_PATH:-/app/config/retrieval.yaml}
       WIKI_XML_PATH: ${WIKI_XML_PATH:-/data/ruwiki-20260701-pages-articles-multistream.xml.bz2}
       WIKI_INDEX_PATH: ${WIKI_INDEX_PATH:-/data/ruwiki-20260701-pages-articles-multistream-index.txt.bz2}
+      ZIM_DIR: ${ZIM_DIR:-/zim}
+      ZIM_FILENAME: ${ZIM_FILENAME:-}
+      KIWIX_PUBLIC_BASE_URL: ${KIWIX_PUBLIC_BASE_URL:-http://localhost:8083}
+      KIWIX_INTERNAL_BASE_URL: ${KIWIX_INTERNAL_BASE_URL:-http://kiwix:8080}
+      KIWIX_BOOK_NAME: ${KIWIX_BOOK_NAME:-}
     volumes:
       - ./zip:/data:ro
+      - ./zim:/zim:ro
     ports:
       - "8000:8000"
     depends_on:
@@ -140,10 +160,19 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET:-rag-artifacts}
       OPENSEARCH_URL: ${OPENSEARCH_URL:-http://opensearch:9200}
       MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL:-http://model-gateway:8080}
+      RETRIEVAL_PROFILE: ${RETRIEVAL_PROFILE:-test_mock}
+      MODELS_CONFIG_PATH: ${MODELS_CONFIG_PATH:-/app/config/models.yaml}
+      RETRIEVAL_CONFIG_PATH: ${RETRIEVAL_CONFIG_PATH:-/app/config/retrieval.yaml}
       WIKI_XML_PATH: ${WIKI_XML_PATH:-/data/ruwiki-20260701-pages-articles-multistream.xml.bz2}
       WIKI_INDEX_PATH: ${WIKI_INDEX_PATH:-/data/ruwiki-20260701-pages-articles-multistream-index.txt.bz2}
+      ZIM_DIR: ${ZIM_DIR:-/zim}
+      ZIM_FILENAME: ${ZIM_FILENAME:-}
+      KIWIX_PUBLIC_BASE_URL: ${KIWIX_PUBLIC_BASE_URL:-http://localhost:8083}
+      KIWIX_INTERNAL_BASE_URL: ${KIWIX_INTERNAL_BASE_URL:-http://kiwix:8080}
+      KIWIX_BOOK_NAME: ${KIWIX_BOOK_NAME:-}
     volumes:
       - ./zip:/data:ro
+      - ./zim:/zim:ro
     depends_on:
       api:
         condition: service_started

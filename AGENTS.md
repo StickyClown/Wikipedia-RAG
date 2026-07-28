@@ -64,6 +64,13 @@ For each milestone:
 7. Update `docs/STATUS.md` with exact commands and results.
 8. Do not mark complete while required checks fail.
 
+## Long-running command observability
+
+- Do not run long commands silently. Any command expected to take more than a few minutes must expose live progress, status polling, or append-only logs that make the current stage, processed/total counts, last update time and failure state visible.
+- If an existing CLI does not provide real-time progress, first add or use a status/logging wrapper before running it for a milestone.
+- Do not leave a long-running eval, ingestion, release-gate, provider-backed generation or benchmark command running when its progress cannot be inspected.
+- If a long command is interrupted or times out, immediately check for remaining processes, stop only the affected command if needed, and record the partial artifact state before continuing.
+
 ## Commands contract
 
 Until the bootstrap milestone creates the commands, document missing commands rather than inventing successful results. After bootstrap, the repository must expose stable commands through `make`:

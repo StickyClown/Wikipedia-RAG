@@ -29,7 +29,7 @@ Correctness, faithfulness, citation precision/recall, claim coverage, unsupporte
 
 ## Operational metrics
 
-p50/p95/p99 per stage, OpenSearch latency, queue wait, embedding throughput, rerank latency, TTFT, tokens/sec, ingestion rate, parser degradation, provider cost and GPU memory.
+p50/p95/p99 per stage, OpenSearch latency, queue wait, embedding throughput, rerank latency, TTFT, tokens/sec, ingestion rate, parser degradation, provider cost and GPU memory. Local JSONL eval reports must keep stage timing metrics separate from retrieval/answer quality metrics.
 
 ## Required ablation order
 
@@ -48,4 +48,4 @@ p50/p95/p99 per stage, OpenSearch latency, queue wait, embedding throughput, rer
 
 Do not publish a new pipeline/model/index if it regresses critical slices, increases no-answer false positives beyond budget, fails citation thresholds, exceeds SLO/cost limits or lacks tested rollback.
 
-Evaluation output must be machine-readable and stored under `artifacts/eval/` or object storage, never committed when large.
+Evaluation output must be machine-readable and stored under `artifacts/eval/` or object storage, never committed when large. The first local ZIM implementation uses JSONL artifacts plus manifests and does not add database tables.

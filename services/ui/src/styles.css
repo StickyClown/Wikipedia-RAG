@@ -71,6 +71,25 @@ textarea {
   font: inherit;
 }
 
+label {
+  display: grid;
+  gap: 5px;
+  color: #3d4a51;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+label.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+}
+
+label.checkbox input {
+  min-height: auto;
+}
+
 button {
   display: inline-flex;
   align-items: center;
@@ -168,6 +187,16 @@ textarea {
   padding-left: 12px;
 }
 
+.sources a {
+  color: #155f79;
+  font-weight: 720;
+  text-decoration: none;
+}
+
+.sources a:hover {
+  text-decoration: underline;
+}
+
 .sources span {
   display: block;
   color: #5d6970;
@@ -181,6 +210,51 @@ pre {
   border-radius: 6px;
   background: #172026;
   color: #d6e4e8;
+}
+
+.advanced {
+  margin: 12px 0;
+  border-top: 1px solid #d9e0e4;
+  border-bottom: 1px solid #d9e0e4;
+  padding: 10px 0;
+}
+
+.advanced summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.debug-stage {
+  margin-top: 12px;
+  overflow: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th,
+td {
+  border-bottom: 1px solid #d9e0e4;
+  padding: 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+code {
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {
@@ -203,5 +277,9 @@ pre {
   input,
   select {
     width: 100%;
+  }
+
+  .advanced-grid {
+    grid-template-columns: 1fr;
   }
 }

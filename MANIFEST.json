@@ -45,5 +45,5 @@
     "prompts/03_FIX_REVIEW_FINDINGS.md",
     "prompts/04_PLAN_NEXT_PHASE.md"
   ],
-  "active_exec_plan": "docs/exec-plans/00-bootstrap-and-foundation-slice.md"
+  "active_exec_plan": "docs/exec-plans/10-zim-kiwix-openrouter-demo-mvp.md"
 }

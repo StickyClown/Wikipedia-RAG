@@ -1,16 +1,20 @@
 # WikipediaRag local MVP
 
-Локальный Docker-first MVP для RAG по русской Wikipedia. Основной источник Wikipedia в этом репозитории - Wikimedia XML `pages-articles` bzip2 multistream dump; ZIM/libzim оставлены как будущий adapter.
+Локальный Docker-first MVP для RAG по русской Wikipedia. Реальный демонстрационный путь использует один русский Wikipedia ZIM: Kiwix показывает полный архив, а worker через `python-libzim` индексирует первые 10 000 валидных canonical article entries. Wikimedia XML `pages-articles` bzip2 multistream adapter сохранён как regression/local fallback.
+
+## Architecture and LLM handoff
+
+Этот файл является operator runbook: здесь собраны setup, import и validation commands. Для передачи проекта инженеру или LLM-агенту сначала откройте [README.md](README.md), где описаны бизнес-логика, runtime контуры, retrieval pipeline, multi-hop ограничения, evaluation snapshot и backlog роста. Архитектурный источник истины остаётся [docs/architecture.md](docs/architecture.md).
 
 ## Что входит
 
 - FastAPI backend, worker и Model Gateway на Python 3.12.
 - React + Vite + TypeScript web UI.
-- PostgreSQL, Valkey/Redis, MinIO, OpenSearch и OpenTelemetry Collector через Docker Compose.
+- PostgreSQL, Valkey/Redis, MinIO, OpenSearch, Kiwix и OpenTelemetry Collector через Docker Compose.
 - Mock model provider для локальной демонстрации и тестов без внешнего ключа.
-- Optional OpenRouter provider через `.env`, если задан `OPENROUTER_API_KEY`.
+- OpenRouter provider через Model Gateway для `sota_mvp`; mock provider остаётся для `test_mock`.
 - Optional llama.cpp Docker profile в `compose.llamacpp.yaml`.
-- Импорт `ruwiki-20260701-pages-articles-multistream.xml.bz2` с checkpoint, progress, cancel/resume и restart recovery.
+- Импорт ZIM с checkpoint, progress, cancel/resume и restart recovery; XML import path сохранён.
 - Section-aware chunking, deterministic IDs, BM25 + dense retrieval, RRF, rerank, citations, insufficient-evidence mode, retrieval debugger, upload UTF-8 documents, bounded Extended Search и mini eval.
 
 ## Требования Windows
@@ -23,7 +27,22 @@
 
 В текущем Windows окружении Codex `make` доступен через WSL, но `uv`/`pnpm` доступны как Windows-команды. На чистой машине проще установить `uv` и `pnpm` внутри WSL, затем запускать команды из WSL в каталоге репозитория.
 
-## Данные Wikipedia
+## Данные Wikipedia ZIM
+
+Для реального demo-MVP положите один настоящий русский Wikipedia ZIM в каталог:
+
+```text
+zim/*.zim
+```
+
+Один и тот же каталог монтируется read-only:
+
+- в Kiwix как `/data`;
+- в API/worker как `/zim`.
+
+Kiwix обслуживает полный архив на http://localhost:8083. RAG импортирует только первые 10 000 canonical non-redirect article pages. Source links строятся из `KIWIX_PUBLIC_BASE_URL`, имени книги и точного `zim_entry_path`, полученного из libzim.
+
+## XML fallback data
 
 Большие dump-файлы являются локальными data assets и исключены из Git:
 
@@ -54,10 +73,19 @@ URL:
 - API readiness: http://localhost:8000/ready
 - Model Gateway: http://localhost:8081
 - Mock provider: http://localhost:8082
+- Kiwix: http://localhost:8083
 - MinIO console: http://localhost:9001
 - OpenSearch: http://localhost:9200
 
-## Импорт Wikipedia
+## ZIM demo import
+
+```bash
+make import-zim-small WIKI_LIMIT=10000
+```
+
+Эта команда создаёт async job, потоково читает `/zim/*.zim`, пропускает assets/metadata/service entries, не считает redirects в лимит, пишет checkpoint и индексирует chunks в profile-specific OpenSearch index version.
+
+## XML fallback import
 
 Малый development-импорт:
 
@@ -109,6 +137,7 @@ make test-integration
 make test-e2e
 make smoke
 make eval
+make smoke-models PROVIDER=mock
 ```
 
 UI checks:
@@ -125,6 +154,8 @@ Model Gateway smoke:
 
 ```bash
 make smoke-models PROVIDER=mock
+make smoke-models PROVIDER=openrouter
+make demo-release-gate
 ```
 
 ## Демонстрационный вопрос
@@ -135,20 +166,21 @@ make smoke-models PROVIDER=mock
 Что такое Россия?
 ```
 
-Ожидается ответ на русском с citation IDs вида `[S1]`, списком sources и retrieval debugger stages: BM25, dense, RRF, rerank, context.
+Ожидается ответ на русском с citation IDs вида `[S1]`, списком clickable sources и retrieval debugger stages: profile/query, BM25, dense, RRF, rerank, policy/context, harness при Extended Search.
 
 ## OpenRouter
 
-По умолчанию используется `MODEL_PROVIDER=mock`, поэтому тесты и демонстрация не требуют ключа.
-
-Для OpenRouter добавьте ключ только в локальный `.env`:
+Для реального `sota_mvp` demo добавьте ключ только в локальный `.env`:
 
 ```env
 MODEL_PROVIDER=openrouter
+RETRIEVAL_PROFILE=sota_mvp
 OPENROUTER_API_KEY=...
+ZIM_DIR=/zim
+KIWIX_PUBLIC_BASE_URL=http://localhost:8083
 ```
 
-Не храните ключи в `openrouter_key.txt`, Git или документации.
+`sota_mvp` не делает silent fallback на mock. Если OpenRouter key/model/embedding/rerank smoke fails, readiness/query должны падать безопасно. Не храните ключи в `openrouter_key.txt`, Git или документации.
 
 ## llama.cpp profile
 

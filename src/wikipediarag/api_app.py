@@ -13,11 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
+from wikipediarag.answerability import should_try_extended_search
 from wikipediarag.answering import generate_answer
 from wikipediarag.config import get_settings
 from wikipediarag.db import connect, ensure_schema, json_dumps
 from wikipediarag.embedding import embed_text
-from wikipediarag.extended import run_extended_search
+from wikipediarag.extended import run_extended_search, should_start_extended
 from wikipediarag.ids import stable_hash
 from wikipediarag.repository import (
     complete_query_run,
@@ -30,6 +31,8 @@ from wikipediarag.repository import (
     request_resume,
 )
 from wikipediarag.retrieval import retrieve
+from wikipediarag.retrieval_contract import KnowledgeBaseNotReady, validate_active_retrieval_contract
+from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import (
     ChatRequest,
     DebugSearchRequest,
@@ -37,6 +40,7 @@ from wikipediarag.schemas import (
     KnowledgeBaseCreate,
     SseEvent,
     UploadResponse,
+    ZimImportRequest,
 )
 from wikipediarag.search_index import bulk_index_chunks
 from wikipediarag.wiki_dump import Chunk
@@ -113,6 +117,7 @@ async def create_wikipedia_import(payload: ImportRequest) -> dict[str, str]:
         "xml_path": payload.xml_path or str(settings.wiki_xml_path),
         "index_path": payload.index_path or str(settings.wiki_index_path),
         "snapshot_id": payload.snapshot_id or settings.wiki_snapshot_id,
+        "retrieval_profile": settings.retrieval_profile,
     }
     async with connect() as conn:
         job_id = await create_ingestion_job(
@@ -120,6 +125,30 @@ async def create_wikipedia_import(payload: ImportRequest) -> dict[str, str]:
             settings.default_tenant_id,
             settings.default_kb_id,
             "wikipedia_xml",
+            config,
+        )
+    return {"job_id": str(job_id)}
+
+
+@app.post("/api/v1/wikipedia/zim-imports")
+async def create_zim_import(payload: ZimImportRequest) -> dict[str, str]:
+    settings = get_settings()
+    config = {
+        "limit": payload.limit or 10000,
+        "zim_path": payload.zim_path,
+        "zim_dir": str(settings.zim_dir),
+        "zim_filename": payload.zim_filename or settings.zim_filename,
+        "snapshot_id": payload.snapshot_id,
+        "kiwix_public_base_url": settings.kiwix_public_base_url,
+        "kiwix_book_name": settings.kiwix_book_name,
+        "retrieval_profile": settings.retrieval_profile,
+    }
+    async with connect() as conn:
+        job_id = await create_ingestion_job(
+            conn,
+            settings.default_tenant_id,
+            settings.default_kb_id,
+            "wikipedia_zim",
             config,
         )
     return {"job_id": str(job_id)}
@@ -243,6 +272,24 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
     settings = get_settings()
     request_id = str(uuid.uuid4())
     trace_id = stable_hash([request_id, payload.message], 32)
+    active_profile = get_retrieval_profile(
+        payload.retrieval_profile,
+        settings,
+        payload.retrieval_overrides,
+    )
+    kb_id = payload.knowledge_base_ids[0] if payload.knowledge_base_ids else settings.default_kb_id
+    try:
+        async with connect() as conn:
+            await validate_active_retrieval_contract(
+                conn,
+                tenant_id=settings.default_tenant_id,
+                knowledge_base_id=kb_id,
+                profile=active_profile,
+                retrieval_overrides=payload.retrieval_overrides,
+                settings=settings,
+            )
+    except KnowledgeBaseNotReady as exc:
+        raise _kb_not_ready_http(exc, request_id) from exc
     async with connect() as conn:
         query_run_id = await create_query_run(
             conn,
@@ -268,8 +315,11 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
         )
         try:
             async with connect() as conn:
-                kb_id = payload.knowledge_base_ids[0] if payload.knowledge_base_ids else settings.default_kb_id
-                if payload.mode.value == "extended":
+                use_harness_first = payload.mode.value == "extended" or (
+                    active_profile.postprocess.extended_search in {"always", "conditional"}
+                    and should_start_extended(payload.message)
+                )
+                if use_harness_first:
                     retrieval = await run_extended_search(
                         conn,
                         payload.message,
@@ -278,6 +328,8 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                         query_run_id=str(query_run_id),
                         trace_id=trace_id,
                         settings=settings,
+                        profile=active_profile,
+                        profile_overrides=payload.retrieval_overrides,
                     )
                 else:
                     retrieval = await retrieve(
@@ -288,8 +340,30 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                         query_run_id=str(query_run_id),
                         trace_id=trace_id,
                         settings=settings,
+                        profile=active_profile,
                     )
-            answer, validation = await generate_answer(payload.message, retrieval)
+                    if (
+                        retrieval.answerability
+                        and should_try_extended_search(retrieval.answerability)
+                        and active_profile.postprocess.extended_search
+                        in {
+                            "always",
+                            "conditional",
+                        }
+                    ):
+                        retrieval = await run_extended_search(
+                            conn,
+                            payload.message,
+                            tenant_id=settings.default_tenant_id,
+                            knowledge_base_id=kb_id,
+                            query_run_id=str(query_run_id),
+                            trace_id=trace_id,
+                            settings=settings,
+                            profile=active_profile,
+                            profile_overrides=payload.retrieval_overrides,
+                        )
+            answer, validation = await generate_answer(payload.message, retrieval, settings, active_profile)
+            timings_ms = _combined_timings(retrieval.model_dump(), validation)
             sequence += 1
             yield _event(
                 SseEvent(
@@ -310,7 +384,11 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                     request_id=request_id,
                     query_run_id=str(query_run_id),
                     sequence=sequence,
-                    data={"retrieval": retrieval.model_dump(), "citation_validation": validation},
+                    data={
+                        "retrieval": retrieval.model_dump(),
+                        "citation_validation": validation,
+                        "timings_ms": timings_ms,
+                    },
                 )
             )
             async with connect() as conn:
@@ -318,7 +396,18 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                     conn,
                     query_run_id=str(query_run_id),
                     answer=answer,
-                    usage={"citations": validation.get("citations", [])},
+                    usage={
+                        "citations": validation.get("citations", []),
+                        "generation_usage": validation.get("usage", {}),
+                        "provider": validation.get("provider"),
+                        "provider_cost": validation.get("provider_cost"),
+                        "model_alias": validation.get("model_alias"),
+                        "timings_ms": timings_ms,
+                        "index_contract_id": retrieval.index_contract_id,
+                        "run_contract_id": retrieval.run_contract_id,
+                    },
+                    model_alias=str(validation.get("model_alias") or ""),
+                    provider_request_id=str(validation.get("provider_request_id") or ""),
                 )
             sequence += 1
             yield _event(
@@ -330,6 +419,10 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                     data={"answer": answer},
                 )
             )
+        except asyncio.CancelledError:
+            async with connect() as conn:
+                await fail_query_run(conn, query_run_id=str(query_run_id), error_code="ClientDisconnected")
+            raise
         except Exception as exc:
             async with connect() as conn:
                 await fail_query_run(conn, query_run_id=str(query_run_id), error_code=type(exc).__name__)
@@ -359,17 +452,23 @@ async def query_run_retrieval(query_run_id: str) -> dict[str, Any]:
 async def search_debug(payload: DebugSearchRequest) -> dict[str, Any]:
     settings = get_settings()
     trace_id = stable_hash(["debug", payload.message], 32)
+    profile = get_retrieval_profile(payload.retrieval_profile, settings, payload.retrieval_overrides)
     async with connect() as conn:
-        result = await retrieve(
-            conn,
-            payload.message,
-            tenant_id=settings.default_tenant_id,
-            knowledge_base_id=settings.default_kb_id,
-            query_run_id=None,
-            trace_id=trace_id,
-            settings=settings,
-            top_k=payload.top_k,
-        )
+        try:
+            result = await retrieve(
+                conn,
+                payload.message,
+                tenant_id=settings.default_tenant_id,
+                knowledge_base_id=settings.default_kb_id,
+                query_run_id=None,
+                trace_id=trace_id,
+                settings=settings,
+                top_k=payload.top_k,
+                profile=profile,
+                profile_overrides=payload.retrieval_overrides,
+            )
+        except KnowledgeBaseNotReady as exc:
+            raise _kb_not_ready_http(exc, trace_id) from exc
     return result.model_dump()
 
 
@@ -379,6 +478,45 @@ def _event(event: SseEvent) -> str:
 
 def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(_jsonable(data), ensure_ascii=False)}\n\n"
+
+
+def _combined_timings(retrieval: dict[str, Any], validation: dict[str, object]) -> dict[str, int]:
+    timings: dict[str, int] = {}
+    for event in retrieval.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        if event.get("stage") == "timings" and isinstance(event.get("timings_ms"), dict):
+            timings.update(_safe_timing_dict(event["timings_ms"]))
+        if event.get("stage") == "harness_tool" and isinstance(event.get("latency_ms"), int | float):
+            timings["extended_tool_search_total"] = timings.get("extended_tool_search_total", 0) + int(
+                event["latency_ms"]
+            )
+        if event.get("stage") == "harness" and isinstance(event.get("timings_ms"), dict):
+            timings.update(_safe_timing_dict(event["timings_ms"]))
+    validation_timings = validation.get("timings_ms")
+    if isinstance(validation_timings, dict):
+        timings.update(_safe_timing_dict(validation_timings))
+    return timings
+
+
+def _safe_timing_dict(payload: dict[Any, Any]) -> dict[str, int]:
+    return {
+        str(key): max(0, int(value)) for key, value in payload.items() if isinstance(value, int | float) and str(key)
+    }
+
+
+def _kb_not_ready_http(exc: KnowledgeBaseNotReady, request_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "code": exc.code,
+                "message": str(exc),
+                "request_id": request_id,
+                "details": exc.details,
+            }
+        },
+    )
 
 
 def _jsonable(value: Any) -> Any:

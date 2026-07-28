@@ -5,7 +5,7 @@ import io
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from wikipediarag.embedding import embed_text
@@ -58,6 +58,7 @@ class Chunk:
     source_url: str
     content_hash: str
     embedding: list[float]
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 def validate_index(index_path: Path, xml_path: Path, sample_unique_offsets: int = 32) -> dict[str, int]:
@@ -230,6 +231,7 @@ def chunks_for_page(
                 source_url=f"https://ru.wikipedia.org/wiki/{page.title.replace(' ', '_')}",
                 content_hash=content_hash,
                 embedding=embed_text(f"{page.title}\n{content}", dimensions),
+                metadata={"source_type": "wikipedia_xml", "snapshot_id": snapshot_id},
             )
         ]
 
@@ -274,6 +276,7 @@ def chunks_for_page(
                     source_url=f"https://ru.wikipedia.org/wiki/{page.title.replace(' ', '_')}",
                     content_hash=content_hash,
                     embedding=embed_text(f"{page.title}\n{' / '.join(section.path)}\n{content}", dimensions),
+                    metadata={"source_type": "wikipedia_xml", "snapshot_id": snapshot_id},
                 )
             )
             start = end
@@ -302,6 +305,7 @@ def link_neighbors(chunks: list[Chunk]) -> list[Chunk]:
                 source_url=chunk.source_url,
                 content_hash=chunk.content_hash,
                 embedding=chunk.embedding,
+                metadata=chunk.metadata,
             )
         )
     return linked

@@ -147,6 +147,7 @@ async def upsert_wiki_page_and_chunks(
         "timestamp": page.timestamp,
         "redirect_target": page.redirect_target,
         "namespace": page.namespace,
+        "snapshot_id": snapshot_id,
     }
     await conn.execute(
         text(
@@ -220,7 +221,7 @@ async def upsert_chunk(
             "source_url": chunk.source_url,
             "embedding": json_dumps(chunk.embedding),
             "content_hash": chunk.content_hash,
-            "metadata": json_dumps({}),
+            "metadata": json_dumps(chunk.metadata),
         },
     )
 
@@ -234,7 +235,7 @@ async def fetch_chunks_for_dense_scan(
     result = await conn.execute(
         text(
             """
-            SELECT id, title, section_path, content, source_url, embedding, page_id, document_id
+            SELECT id, title, section_path, content, source_url, embedding, page_id, document_id, metadata
             FROM chunks
             WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id
             ORDER BY created_at DESC
@@ -244,6 +245,117 @@ async def fetch_chunks_for_dense_scan(
         {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "limit": limit},
     )
     return [dict(row) for row in result.mappings()]
+
+
+async def upsert_document(
+    conn: AsyncConnection,
+    *,
+    document_id: str,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_type: str,
+    title: str,
+    source_uri: str,
+    metadata: dict[str, Any],
+) -> None:
+    await conn.execute(
+        text(
+            """
+            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata)
+            VALUES (:id, :tenant_id, :kb_id, :source_type, :title, :source_uri, CAST(:metadata AS jsonb))
+            ON CONFLICT (id) DO UPDATE
+            SET title = EXCLUDED.title,
+                source_uri = EXCLUDED.source_uri,
+                metadata = EXCLUDED.metadata,
+                updated_at = now()
+            """
+        ),
+        {
+            "id": document_id,
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "source_type": source_type,
+            "title": title,
+            "source_uri": source_uri,
+            "metadata": json_dumps(metadata),
+        },
+    )
+
+
+async def save_index_version(
+    conn: AsyncConnection,
+    *,
+    index_version_id: str,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_type: str,
+    snapshot_id: str,
+    retrieval_profile: str,
+    embedding_alias: str,
+    embedding_dimensions: int,
+    physical_index: str,
+    read_alias: str,
+    write_alias: str,
+    metadata: dict[str, Any],
+) -> None:
+    await conn.execute(
+        text(
+            """
+            INSERT INTO index_versions(
+              id, tenant_id, knowledge_base_id, source_type, snapshot_id, retrieval_profile,
+              embedding_alias, embedding_dimensions, physical_index, read_alias, write_alias, metadata
+            )
+            VALUES (
+              :id, :tenant_id, :kb_id, :source_type, :snapshot_id, :retrieval_profile,
+              :embedding_alias, :embedding_dimensions, :physical_index, :read_alias, :write_alias,
+              CAST(:metadata AS jsonb)
+            )
+            ON CONFLICT (id) DO UPDATE
+            SET status = 'active',
+                metadata = EXCLUDED.metadata,
+                updated_at = now()
+            """
+        ),
+        {
+            "id": index_version_id,
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "source_type": source_type,
+            "snapshot_id": snapshot_id,
+            "retrieval_profile": retrieval_profile,
+            "embedding_alias": embedding_alias,
+            "embedding_dimensions": embedding_dimensions,
+            "physical_index": physical_index,
+            "read_alias": read_alias,
+            "write_alias": write_alias,
+            "metadata": json_dumps(metadata),
+        },
+    )
+
+
+async def load_index_version_by_read_alias(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    read_alias: str,
+) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT *
+            FROM index_versions
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND read_alias = :read_alias
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "read_alias": read_alias},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
 
 
 async def insert_retrieval_event(
@@ -334,6 +446,8 @@ async def complete_query_run(
     query_run_id: str,
     answer: str,
     usage: dict[str, Any],
+    model_alias: str | None = None,
+    provider_request_id: str | None = None,
 ) -> None:
     await conn.execute(
         text(
@@ -341,12 +455,20 @@ async def complete_query_run(
             UPDATE query_runs
             SET status = 'completed',
                 answer = :answer,
+                model_alias = :model_alias,
+                provider_request_id = :provider_request_id,
                 usage = CAST(:usage AS jsonb),
                 completed_at = now()
             WHERE id = :id
             """
         ),
-        {"id": query_run_id, "answer": answer, "usage": json_dumps(usage)},
+        {
+            "id": query_run_id,
+            "answer": answer,
+            "usage": json_dumps(usage),
+            "model_alias": model_alias,
+            "provider_request_id": provider_request_id,
+        },
     )
 
 
@@ -376,3 +498,37 @@ async def list_knowledge_bases(conn: AsyncConnection, tenant_id: str) -> list[di
         {"tenant_id": tenant_id},
     )
     return [dict(row) for row in result.mappings()]
+
+
+async def get_knowledge_base(conn: AsyncConnection, tenant_id: str, knowledge_base_id: str) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, name, active_index, created_at
+            FROM knowledge_bases
+            WHERE tenant_id = :tenant_id AND id = :kb_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def set_knowledge_base_active_index(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    active_index: str,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE knowledge_bases
+            SET active_index = :active_index, updated_at = now()
+            WHERE tenant_id = :tenant_id AND id = :kb_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "active_index": active_index},
+    )

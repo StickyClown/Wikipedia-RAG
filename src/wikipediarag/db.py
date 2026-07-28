@@ -60,6 +60,25 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
 );
 CREATE INDEX IF NOT EXISTS ix_knowledge_bases_tenant ON knowledge_bases(tenant_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS index_versions (
+  id text PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+  source_type text NOT NULL,
+  snapshot_id text NOT NULL,
+  retrieval_profile text NOT NULL,
+  embedding_alias text NOT NULL,
+  embedding_dimensions int NOT NULL,
+  physical_index text NOT NULL,
+  read_alias text NOT NULL,
+  write_alias text NOT NULL,
+  status text NOT NULL DEFAULT 'active',
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_index_versions_tenant ON index_versions(tenant_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS documents (
   id text PRIMARY KEY,
   tenant_id uuid NOT NULL REFERENCES tenants(id),
@@ -163,6 +182,7 @@ CREATE INDEX IF NOT EXISTS ix_agent_runs_tenant ON agent_runs(tenant_id, created
 
 
 _engine: AsyncEngine | None = None
+_engine_url: str | None = None
 
 
 def json_dumps(value: Any) -> str:
@@ -170,16 +190,17 @@ def json_dumps(value: Any) -> str:
 
 
 def get_engine(settings: Settings | None = None) -> AsyncEngine:
-    global _engine
-    if _engine is None:
-        resolved = settings or get_settings()
+    global _engine, _engine_url
+    resolved = settings or get_settings()
+    if _engine is None or _engine_url != resolved.database_url:
         _engine = create_async_engine(resolved.database_url, pool_pre_ping=True)
+        _engine_url = resolved.database_url
     return _engine
 
 
 @asynccontextmanager
-async def connect() -> AsyncIterator[AsyncConnection]:
-    engine = get_engine()
+async def connect(settings: Settings | None = None) -> AsyncIterator[AsyncConnection]:
+    engine = get_engine(settings)
     async with engine.begin() as conn:
         yield conn
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -61,7 +62,10 @@ async def chat_completions(payload: dict[str, Any]) -> dict[str, Any]:
     messages = payload.get("messages", [])
     user_text = "\n".join(str(item.get("content", "")) for item in messages if item.get("role") == "user")
     evidences = EVIDENCE_RE.findall(user_text)
-    if not evidences:
+    response_format = payload.get("response_format")
+    if isinstance(response_format, dict) and response_format.get("type") == "json_object" and not evidences:
+        answer = json.dumps({"ok": True}, ensure_ascii=False)
+    elif not evidences:
         answer = "Недостаточно доказательств в локальной базе, чтобы надёжно ответить на вопрос."
     else:
         first_id, title, body = evidences[0]

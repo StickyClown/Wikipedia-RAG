@@ -1,0 +1,108 @@
+profiles:
+  sota_mvp:
+    source: zim
+    version: 1
+    model_aliases:
+      embed: embed_default
+      generator_fast: generator_fast
+      generator_main: generator_main
+      verifier: verifier
+      rerank: rerank_default
+    chunking:
+      parent_child: true
+      child_tokens_min: 180
+      child_tokens_max: 220
+      parent_tokens_min: 700
+      parent_tokens_max: 900
+      hard_overlap: 0
+      preserve_sections: true
+      preserve_paragraphs: true
+    retrieval:
+      bm25: true
+      dense: true
+      fusion: rrf
+      bm25_top_k: 100
+      dense_top_k: 100
+      fusion_top_k: 60
+      rerank: true
+      rerank_top_k: 50
+      query_rewrite: conditional
+      query_decomposition: conditional
+      top_k: 12
+    postprocess:
+      dedup: true
+      page_quota: 2
+      parent_expansion: selective
+      context_packing: token_budget
+      final_evidence_min: 6
+      final_evidence_max: 12
+      max_context_tokens: 30000
+      claim_support_checker: false
+      extended_search: conditional
+    answer:
+      citations_required: true
+      deterministic_citation_validation: true
+      insufficient_evidence_mode: true
+
+  test_mock:
+    source: xml
+    version: 1
+    model_aliases:
+      embed: mock_embed_default
+      generator_fast: mock_generator_fast
+      generator_main: mock_generator_main
+      verifier: mock_verifier
+      rerank: mock_rerank_default
+    chunking:
+      parent_child: true
+      child_tokens_min: 180
+      child_tokens_max: 220
+      parent_tokens_min: 700
+      parent_tokens_max: 900
+      hard_overlap: 0
+      preserve_sections: true
+      preserve_paragraphs: true
+    retrieval:
+      bm25: true
+      dense: true
+      fusion: rrf
+      bm25_top_k: 60
+      dense_top_k: 60
+      fusion_top_k: 40
+      rerank: true
+      rerank_top_k: 20
+      query_rewrite: "off"
+      query_decomposition: "off"
+      top_k: 10
+    postprocess:
+      dedup: true
+      page_quota: 3
+      parent_expansion: selective
+      context_packing: token_budget
+      final_evidence_min: 2
+      final_evidence_max: 10
+      max_context_tokens: 12000
+      claim_support_checker: false
+      extended_search: "off"
+    answer:
+      citations_required: true
+      deterministic_citation_validation: true
+      insufficient_evidence_mode: true
+
+  bm25_only:
+    based_on: sota_mvp
+    retrieval:
+      bm25: true
+      dense: false
+      fusion: none
+      rerank: false
+
+  rewrite_off:
+    based_on: sota_mvp
+    retrieval:
+      query_rewrite: "off"
+
+  parent_expansion_off:
+    based_on: sota_mvp
+    postprocess:
+      parent_expansion: "off"
