@@ -1,165 +1,192 @@
-# WikipediaRag: LLM handoff и обзор проекта
+# WikipediaRag
 
-WikipediaRag - локальная Docker-first RAG-платформа для вопросов по русской Wikipedia и будущим пользовательским базам знаний. Цель продукта - давать ответы с проверяемыми источниками, показывать полный retrieval trace и позволять инженеру улучшать качество поиска на фиксированных evaluation наборах.
+Local Docker-first RAG MVP for Russian Wikipedia. The current real demo path uses one local Russian Wikipedia ZIM file: Kiwix serves the full archive, while the worker indexes a bounded canonical article subset through `python-libzim`. Wikimedia XML `pages-articles` multistream remains a supported regression/local fallback.
 
-Этот файл предназначен для нового инженера или LLM-агента: он описывает текущее устройство, бизнес-логику, ограничения и точки роста. Практические команды запуска и импорта остаются в [README_START_HERE.md](README_START_HERE.md). Архитектурный источник истины - [docs/architecture.md](docs/architecture.md).
+For Codex and engineer handoff, use this repository-level source set:
 
-## Текущее состояние
+- `AGENTS.md` - working protocol, scope control and safety rules.
+- `README.md` - current runbook and project handoff.
+- `docs/architecture.md` - compact architecture, contracts, invariants and decisions.
+- `docs/STATUS.md` - current state, latest validation evidence and blockers.
 
-Текущий milestone: ExecPlan 13 завершён. Рабочий MVP использует:
+## Current State
 
-- ZIM/libzim + Kiwix как основной реальный demo-source русской Wikipedia.
-- Wikimedia XML `pages-articles` как поддерживаемый regression/local fallback.
-- FastAPI backend, worker и Model Gateway на Python 3.12.
+Active milestone: ExecPlan 22 behavior is implemented and deterministic validation passed. Provider-backed reviewed release-gate execution is blocked because OpenRouter access currently returns `403 Forbidden`; the latest reviewed gate status remains completed but failed on quality metrics from the prior run.
+
+Implemented local MVP capabilities:
+
+- FastAPI API, worker and Model Gateway on Python 3.12.
 - React + Vite + TypeScript UI.
-- PostgreSQL, OpenSearch, MinIO, Redis/Valkey, Kiwix и OpenTelemetry Collector в Docker Compose.
-- OpenRouter через Model Gateway для `sota_mvp`; mock provider только для `test_mock` и локальных тестов.
-- Hybrid retrieval: BM25 + dense vector search, service-side RRF, rerank, dedup/page quota, selective parent expansion, token-budget context packing.
-- Ответы с evidence IDs `[S1]`, `[S2]` и deterministic citation validation.
-- Retrieval debugger через `/api/v1/search:debug` и persisted events.
-- Bounded Extended Search MVP для сложных/сравнительных запросов.
-- Trusted evaluation artifacts для retrieval-only и answer-eval прогонов.
+- PostgreSQL, OpenSearch, MinIO, Redis/Valkey, Kiwix and OpenTelemetry Collector via Docker Compose.
+- Model Gateway aliases for OpenRouter-backed `sota_mvp`; mock aliases are explicit and only for tests/local demo.
+- ZIM/libzim ingestion with checkpoints, redirects as provenance, deterministic chunks and Kiwix source URLs.
+- XML multistream fallback ingestion for regression/development.
+- Hybrid retrieval: BM25, dense search, service-side RRF, rerank, dedup/page quota, parent expansion and token-budget context packing.
+- Chat SSE with evidence IDs, source links, retrieval trace, answerability gate, citation validation and safe timings.
+- Retrieval debugger via `POST /api/v1/search:debug`.
+- Bounded Extended Search MVP with multi-query search and tenant-scoped neighbor expansion.
+- Local JSONL evaluation, trusted dataset generation, reviewed freeze workflow and release-gate runner.
 
-## Бизнес-логика
+## Requirements
 
-Платформа решает задачу доверяемого поиска и ответа по локальному корпусу. Пользователь не должен верить модели "на слово": каждый factual claim должен опираться на evidence chunk, а система должна показать, почему именно этот chunk попал в контекст.
+- Docker Desktop or compatible Docker Compose runtime.
+- Python 3.12 and `uv`.
+- Node.js 22.14+ and `pnpm`.
+- GNU Make when available. In this Windows Codex environment `make` may be absent, so equivalent `uv`/`pnpm` commands are acceptable and must be recorded exactly.
 
-Основные роли продукта:
+Do not commit `.env`, API keys, ZIM snapshots, model files, generated indices, uploads or evaluation artifacts.
 
-- конечный пользователь задаёт вопрос и получает ответ с citations;
-- оператор импортирует Wikipedia snapshot и следит за health/readiness;
-- инженер retrieval quality смотрит stage events, ablation reports и misses;
-- будущий администратор tenant управляет knowledge bases, доступами и retention.
+## Data
 
-Главная бизнес-инварианта: RAG должен быть воспроизводимым. Документы, chunks, embedding aliases, index versions, retrieval profiles и eval datasets фиксируются так, чтобы результат можно было объяснить и сравнить после изменения модели или индекса.
+Place one real Russian Wikipedia ZIM file under:
 
-## Runtime контуры
+```text
+zim/*.zim
+```
 
-Система разделена на несколько контуров.
+The same directory is mounted read-only into:
 
-| Контур | Компоненты | Ответственность |
-|---|---|---|
-| API/UI | FastAPI, React UI | chat, SSE, debugger, job APIs, upload MVP |
-| Ingestion | worker, PostgreSQL, MinIO, OpenSearch | импорт ZIM/XML, chunking, embeddings, публикация индекса |
-| Retrieval | OpenSearch, Model Gateway, retrieval profile | BM25, dense, RRF, rerank, context assembly |
-| Model | Model Gateway, OpenRouter, mock provider, future llama.cpp | chat, embeddings, rerank через логические aliases |
-| Storage | PostgreSQL, MinIO, OpenSearch, Redis/Valkey | metadata, artifacts, online search representation, queue/cache |
-| Observability | retrieval events, OTel Collector, reports | traceability, timings, eval summaries |
+- Kiwix as `/data`;
+- API/worker as `/zim`.
 
-Business code не вызывает OpenRouter напрямую. Все model operations идут через Model Gateway и aliases:
+Kiwix serves the full archive on `http://localhost:8083`. The RAG import indexes only the requested number of canonical non-redirect article pages. Redirects are persisted as provenance/aliases and do not count toward `WIKI_LIMIT`.
 
-- `embed_default`
-- `generator_fast`
-- `generator_main`
-- `verifier`
-- `rerank_default`
+Optional XML fallback data is local-only and ignored by Git:
 
-Для `sota_mvp` эти aliases являются real-provider путём. Он не должен тихо падать на mock/hash embeddings. Mock aliases (`mock_embed_default`, `mock_generator_fast`, `mock_generator_main`, `mock_verifier`, `mock_rerank_default`) используются явно в тестах и локальном mock profile.
+```text
+zip/ruwiki-20260701-pages-articles-multistream.xml.bz2
+zip/ruwiki-20260701-pages-articles-multistream-index.txt.bz2
+```
 
-## Ingestion lifecycle
+## Run
 
-Основной demo path:
+```bash
+cp .env.example .env
+make up
+```
 
-1. Оператор кладёт один русский `.zim` в `./zim`.
-2. Kiwix обслуживает этот же файл read-only как локальную Wikipedia.
-3. Worker через libzim читает `/zim/*.zim`.
-4. Service/assets/metadata entries пропускаются.
-5. Redirect entries сохраняются как provenance/aliases, но не chunked и не входят в `WIKI_LIMIT`.
-6. Canonical article pages нормализуются, режутся на parent/child chunks и получают deterministic IDs.
-7. Для child chunks считаются embeddings через Model Gateway.
-8. PostgreSQL хранит metadata/provenance, MinIO предназначен для artifacts, OpenSearch хранит online search representation.
-9. Index version строится из source snapshot, retrieval profile, embedding alias и dimensions.
-10. Read alias публикует актуальную версию индекса.
+Useful local URLs:
 
-XML fallback остаётся поддерживаемым путём для regression/development. Он не является основным demo-source после ADR-008.
+- Web UI: `http://localhost:5173`
+- API health: `http://localhost:8000/health`
+- API readiness: `http://localhost:8000/ready`
+- Model Gateway: `http://localhost:8081`
+- Mock provider: `http://localhost:8082`
+- Kiwix: `http://localhost:8083`
+- MinIO console: `http://localhost:9001`
+- OpenSearch: `http://localhost:9200`
 
-## Chat lifecycle
+If GNU Make is unavailable, inspect `Makefile` and run the equivalent `uv` or `docker compose` command directly.
 
-Обычный `/api/v1/chat` поток:
+## Import
 
-1. API создаёт `query_run` с request/trace ID.
-2. Выбирается tenant и knowledge base из server-owned контекста, а не из raw client tenant filter.
-3. Загружается retrieval profile, обычно `sota_mvp`.
-4. Выполняется normal retrieval или, при trigger/explicit mode, Extended Search.
-5. Evidence chunks получают IDs `[S1]`, `[S2]`, ...
-6. Generator получает только собранный evidence context.
-7. Ответ парсится и проходит deterministic citation validation.
-8. SSE отдаёт `run.started`, `message.delta`, `usage.updated`, `run.completed` или `run.failed`.
-9. `usage.updated` содержит retrieval events, citation validation и safe `timings_ms`.
-10. `query_runs.usage` сохраняет итоговые usage/timing/provider metadata без prompts и raw provider bodies.
+Small ZIM demo import:
 
-Если evidence меньше `final_evidence_min`, включается insufficient-evidence behavior: система должна вернуть квалифицированный отказ или ограниченный ответ без неподтверждённых claims.
+```bash
+make import-zim-small WIKI_LIMIT=10000
+```
 
-## Retrieval pipeline
+XML fallback import:
 
-Текущий normal retrieval реализован в `src/wikipediarag/retrieval.py`:
+```bash
+make import-wiki-small WIKI_LIMIT=10000
+```
 
-1. **Profile loading.** `config/retrieval.yaml` задаёт switches и лимиты: BM25, dense, RRF, rerank, top_k, parent expansion, page quota, token budget.
-2. **Query normalization.** Сейчас это минимальная whitespace normalization. Conditional rewrite/decomposition есть в profile, но не реализованы как полноценный normal-path planner.
-3. **Index selection.** Используется active OpenSearch read alias knowledge base; fallback - `wiki-chunks-read`.
-4. **BM25.** OpenSearch `multi_match` по `title^3`, `section_path_text^2`, `content`.
-5. **Dense retrieval.** Query embedding считается через `embed_default`, затем OpenSearch `knn` ищет по `embedding`.
-6. **Tenant/KB safety.** И BM25, и vector query получают server-side filters `tenant_id` и `knowledge_base_id`.
-7. **Fusion.** RRF объединяет ranks BM25 и dense без попытки калибровать разные score шкалы.
-8. **Rerank.** Cross-encoder reranker получает `query`, title, section path и chunk content, затем переупорядочивает top candidates.
-9. **Postprocess.** Dedup по content hash, page quota, selective parent expansion и token-budget packing.
-10. **Evidence.** Итоговые chunks возвращаются как `Evidence` с source URL, scores, ranks и metadata.
-11. **Trace.** Каждая стадия пишет events: `profile`, `query`, `bm25`, `dense`, `rrf`, `rerank`, `policy`, `context`, `timings`.
+Job status and controls:
 
-`/api/v1/search:debug` запускает retrieval без генерации. Он полезен для качества поиска, но не проверяет качество ответа и citation validation.
+```bash
+curl http://localhost:8000/api/v1/ingestion-jobs/<job_id>
+curl -X POST http://localhost:8000/api/v1/ingestion-jobs/<job_id>:cancel
+curl -X POST http://localhost:8000/api/v1/ingestion-jobs/<job_id>:resume
+```
 
-## Multi-hop: что реально работает
+Checkpoints advance only after durable DB/object-storage/OpenSearch writes. Failed jobs must not publish partial content.
 
-Важно не переоценивать текущий multi-hop. Retrieval-only evaluation показывает, что `sota_mvp_normal` часто находит multi-hop evidence, но это в основном происходит потому, что вопросы содержат сильные anchors: названия альбомов, фильмов, групп, годы, числа, редкие entity strings.
+## Validation
 
-Пример: вопрос про альбомы `1184` Windir и `12` Face находит `1184 (альбом)` и `12 (альбом)` одним hybrid query, потому что оба title явно есть в вопросе. Это multi-hop для ответа, но не сложный поиск скрытой цепочки.
+Preferred stable commands:
 
-Ограничения:
+```bash
+make lint
+make format-check
+make typecheck
+make test-unit
+make test-integration
+make test-e2e
+make smoke
+make eval
+make smoke-models PROVIDER=mock
+```
 
-- `/api/v1/search:debug` не запускает conditional Extended Search harness.
-- `sota_mvp_conditional_harness` в retrieval-only report помечается unsupported.
-- Normal retrieval не делает настоящую entity linking/decomposition/follow-links стратегию.
-- Текущий Extended Search MVP дробит запрос простыми правилами и повторно вызывает normal `retrieve()`.
+Direct Python equivalents commonly used in this environment:
 
-Следовательно, текущая система хорошо работает на anchored multi-hop, но слабее на скрытых bridge-вопросах, где один hop нужно сначала вывести из другого.
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src tests
+uv run pytest tests/unit tests/integration tests/e2e -q
+uv run python -m wikipediarag.cli smoke-models --provider mock
+```
 
-## Evaluation snapshot
+UI checks:
 
-Последний зафиксированный trusted-v3 retrieval result для `sota_mvp_normal`:
+```bash
+cd services/ui
+pnpm lint
+pnpm typecheck
+pnpm format:check
+pnpm build
+```
 
-- Page recall `@10 = 0.9709`
-- Chunk recall `@10 = 0.9200`
-- MRR@10 `0.8844`
-- nDCG@10 `0.8756`
-- Path completion `0.8836`
-- p50 latency `1688 ms`
-- p95 latency `5927 ms`
-- Retrieval miss count `21`
-- Error rate `0`
+Provider-backed validation:
 
-Это сильный сигнал для current anchored Wikipedia slice, но не release gate для production. Все trusted records пока `train/unreviewed`; human-reviewed dev/test splits ещё не введены.
+```bash
+uv run python -m wikipediarag.cli smoke-models --provider openrouter --gateway http://localhost:8081
+uv run python -m wikipediarag.cli eval-release-gate-status --suite reviewed-wikipedia-smoke-v1 --json
+uv run python -m wikipediarag.cli eval-release-gate --suite reviewed-wikipedia-smoke-v1 --api http://localhost:8000
+```
 
-## Known risks and growth backlog
+Do not start a provider-backed release gate while API readiness is degraded.
 
-Приоритетные точки роста:
+## OpenRouter
 
-1. **Multi-hop planning.** Добавить нормальную decomposition, entity linking, search-within-document/follow-links и coverage scoring. Это нужно, чтобы решать bridge-вопросы без явных title anchors.
-2. **Extended Search hardening.** Заменить простой split по `?`/`и` на typed planner, parallel subqueries, tool result cache, better stop criteria и UI trace state transitions.
-3. **Evaluation quality.** Разделить trusted dataset на reviewed train/dev/test, добавить locked slices для multi-hop, unanswerable, redirects, hard negatives и citation failures.
-4. **Citation faithfulness.** Усилить claim-to-evidence validation: проверять не только наличие `[Sx]`, но и поддержку каждого claim соответствующим source span.
-5. **Document ingestion.** Реальный universal document path для PDF/Office/images пока не production-ready; нужны parser isolation, malware scanning, object-storage artifacts и reprocess contracts.
-6. **Auth/tenancy.** Сейчас local MVP использует seeded/default tenant. Production требует OIDC/SSO, role matrix, tenant onboarding, retention/deletion и cross-tenant regression tests.
-7. **Local llama.cpp.** Compose profile подготовлен, но production switch требует model artifacts, licenses, checksums, GPU/VRAM sizing и quality gates.
-8. **Operational SLO.** p95 retrieval в real eval выше целевого warm SLO 800 ms; нужна профилировка OpenSearch/vector/rerank, caching и load tests.
-9. **Index lifecycle.** Dynamic index naming есть, но production needs atomic alias publication, rollback drills, snapshots and migration discipline for committed indices.
-10. **Cost and safety.** OpenRouter-backed runs incur cost and provider exposure. Нужно закрыть owner decisions: можно ли отправлять пользовательские documents во внешний provider, какие residency/retention правила действуют.
+For real `sota_mvp` runs, configure only local `.env`:
 
-## Где читать дальше
+```env
+MODEL_PROVIDER=openrouter
+RETRIEVAL_PROFILE=sota_mvp
+OPENROUTER_API_KEY=...
+ZIM_DIR=/zim
+KIWIX_PUBLIC_BASE_URL=http://localhost:8083
+```
 
-- [README_START_HERE.md](README_START_HERE.md) - запуск, импорт, smoke/eval commands.
-- [docs/architecture.md](docs/architecture.md) - архитектурный источник истины.
-- [docs/STATUS.md](docs/STATUS.md) - фактическое состояние, команды и результаты.
-- [docs/contracts/API_CONTRACT.md](docs/contracts/API_CONTRACT.md) - public API и SSE contract.
-- [docs/contracts/DOMAIN_INVARIANTS.md](docs/contracts/DOMAIN_INVARIANTS.md) - safety/tenancy/indexing invariants.
-- [docs/contracts/EVALUATION_CONTRACT.md](docs/contracts/EVALUATION_CONTRACT.md) - evaluation artifacts and CLI contract.
-- [docs/DECISIONS_REQUIRED.md](docs/DECISIONS_REQUIRED.md) - owner decisions before production/local-GPU phases.
+`sota_mvp` must not silently fall back to mock aliases or hash embeddings. Model Gateway `/health` is liveness only; `/ready` reports provider/capability degradation. In local `warn` smoke mode, a failed OpenRouter startup smoke keeps the gateway inspectable but unhealthy for OpenRouter aliases.
+
+## llama.cpp
+
+The local model target is three internal `llama-server` roles behind Model Gateway: chat, embeddings and rerank. The optional compose profile exists, but real use requires owner decisions on hardware, VRAM, model licenses, checksums and quality gates.
+
+```bash
+docker compose -f compose.yaml -f compose.llamacpp.yaml --profile llamacpp up -d
+make smoke-models PROVIDER=llamacpp
+```
+
+Application code must use Model Gateway aliases and must not call OpenRouter or `llama-server` directly.
+
+## Demo
+
+After import, open `http://localhost:5173` and ask:
+
+```text
+Что такое Россия?
+```
+
+Expected behavior: Russian answer with citation IDs such as `[S1]`, clickable Kiwix source links and retrieval debugger stages for profile/query, BM25, dense, RRF, rerank, policy/context and optional Extended Search.
+
+## Main Risks
+
+- OpenRouter access, model churn, external provider exposure and cost.
+- Current local MVP uses a seeded/default tenant; production auth/tenancy remains future work.
+- Universal PDF/Office/image ingestion is not production-ready.
+- Warm retrieval p95 in real eval has exceeded the target SLO and needs profiling.
+- Reviewed release gate is blocked until OpenRouter access and remaining quality findings are resolved.

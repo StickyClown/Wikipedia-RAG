@@ -2,7 +2,7 @@
 name = "wikipediarag"
 version = "0.1.0"
 description = "Local Docker-first Russian Wikipedia RAG MVP"
-readme = "README_START_HERE.md"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "asyncpg>=0.30.0",
@@ -48,7 +48,7 @@ packages = ["src/wikipediarag"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-extend-exclude = ["docs", "prompts", "README_START_HERE.md", "OFFICIAL_CODEX_REFERENCES.md"]
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
