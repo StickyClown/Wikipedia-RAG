@@ -105,6 +105,7 @@ def _config_summary(
     citation_precision: float = 1.0,
     unsupported_claim_rate: float = 0.0,
     unanswerable_accuracy: float = 1.0,
+    cited_hard_negative_rate: float = 0.0,
     latency_p95_ms: float = 100.0,
     mixed_contracts: bool = False,
 ) -> ConfigSummary:
@@ -116,6 +117,7 @@ def _config_summary(
             "citation_precision": citation_precision,
             "unsupported_claim_rate": unsupported_claim_rate,
             "unanswerable_accuracy": unanswerable_accuracy,
+            "cited_hard_negative_rate": cited_hard_negative_rate,
             "latency_p95_ms": latency_p95_ms,
         },
         by_family={
@@ -135,6 +137,7 @@ def _config_summary(
 def _retrieval_summary(
     *,
     false_positive_evidence_rate: float = 0.0,
+    dangerous_false_positive_evidence_rate: float = 0.0,
     page_recall_at_10: float = 1.0,
     latency_p95_ms: float = 100.0,
 ) -> RetrievalConfigSummary:
@@ -145,6 +148,7 @@ def _retrieval_summary(
         task_count=1,
         metrics={
             "false_positive_evidence_rate": false_positive_evidence_rate,
+            "dangerous_false_positive_evidence_rate": dangerous_false_positive_evidence_rate,
             "latency_p95_ms": latency_p95_ms,
         },
         by_family={
@@ -209,7 +213,11 @@ def test_release_gate_blocks_test_failures_and_keeps_dev_diagnostic() -> None:
         test_answer=_answer_run("test-answer", _config_summary(mixed_contracts=True, unsupported_claim_rate=1.0)),
         test_retrieval=_retrieval_run(
             "test-retrieval",
-            _retrieval_summary(false_positive_evidence_rate=0.5, latency_p95_ms=130.0),
+            _retrieval_summary(
+                false_positive_evidence_rate=0.5,
+                dangerous_false_positive_evidence_rate=0.5,
+                latency_p95_ms=130.0,
+            ),
         ),
     )
 
@@ -220,11 +228,58 @@ def test_release_gate_blocks_test_failures_and_keeps_dev_diagnostic() -> None:
         "index_contract_id",
         "contract_ids",
         "unsupported_claim_rate",
-        "false_positive_evidence_rate",
+        "dangerous_false_positive_evidence_rate",
     } <= blocking_metrics
     assert "latency_p95_ms" in blocking_metrics
     assert "citation_precision" in diagnostic_metrics
     assert "single_hop_factual.page_recall_at_10" in diagnostic_metrics
+
+
+def test_release_gate_keeps_legacy_false_positive_diagnostic_only() -> None:
+    report = evaluate_release_gate(
+        suite="suite",
+        baseline={},
+        dev_answer=_answer_run("dev-answer", _config_summary()),
+        dev_retrieval=_retrieval_run("dev-retrieval", _retrieval_summary()),
+        test_answer=_answer_run("test-answer", _config_summary()),
+        test_retrieval=_retrieval_run(
+            "test-retrieval",
+            _retrieval_summary(false_positive_evidence_rate=0.5, dangerous_false_positive_evidence_rate=0.0),
+        ),
+    )
+
+    assert report["passed"] is True
+    assert report["blocking_failures"] == []
+
+
+def test_release_gate_blocks_answer_cited_hard_negative() -> None:
+    report = evaluate_release_gate(
+        suite="suite",
+        baseline={},
+        dev_answer=_answer_run("dev-answer", _config_summary()),
+        dev_retrieval=_retrieval_run("dev-retrieval", _retrieval_summary()),
+        test_answer=_answer_run("test-answer", _config_summary(cited_hard_negative_rate=1.0)),
+        test_retrieval=_retrieval_run("test-retrieval", _retrieval_summary()),
+    )
+
+    assert report["passed"] is False
+    assert {item["metric"] for item in report["blocking_failures"]} == {"cited_hard_negative_rate"}
+
+
+def test_release_gate_does_not_require_unanswerable_metric_when_split_has_none() -> None:
+    answer_summary = _config_summary()
+    answer_summary.metrics.pop("unanswerable_accuracy")
+    report = evaluate_release_gate(
+        suite="suite",
+        baseline={},
+        dev_answer=_answer_run("dev-answer", _config_summary()),
+        dev_retrieval=_retrieval_run("dev-retrieval", _retrieval_summary()),
+        test_answer=_answer_run("test-answer", answer_summary),
+        test_retrieval=_retrieval_run("test-retrieval", _retrieval_summary()),
+    )
+
+    assert report["passed"] is True
+    assert report["blocking_failures"] == []
 
 
 def test_format_release_gate_progress_omits_question_text() -> None:
@@ -267,9 +322,19 @@ async def test_eval_release_gate_writes_top_level_status_and_timings(
     write_review_pool(input_path=input_path, output_suite="suite-status")
     freeze_reviewed_suite(suite="suite-status", dev_count=1, test_count=1)
     progress_events: list[tuple[ReleaseGateStatus, str]] = []
+    answer_batch_sizes: list[int] = []
+    answer_run_ids: list[str] = []
+    answer_reuse_completed: list[object] = []
+    retrieval_batch_sizes: list[int] = []
+    retrieval_run_ids: list[str] = []
 
     async def fake_run_suite(*args: object, **kwargs: object) -> EvalRunManifest:
         manifest = cast(EvalDatasetManifest, args[0])
+        answer_batch_size = kwargs.get("batch_size")
+        assert isinstance(answer_batch_size, int)
+        answer_batch_sizes.append(answer_batch_size)
+        answer_run_ids.append(str(kwargs.get("run_id") or ""))
+        answer_reuse_completed.append(kwargs.get("reuse_completed"))
         callback = kwargs.get("progress_callback")
         if callable(callback):
             callback(
@@ -281,6 +346,7 @@ async def test_eval_release_gate_writes_top_level_status_and_timings(
                     dataset_hash=manifest.dataset_hash,
                     dataset_path=manifest.jsonl_path,
                     run_dir=f"answer/{manifest.dataset_name}",
+                    batch_size=answer_batch_sizes[-1],
                     total_configs=1,
                     total_tasks=1,
                     total_task_runs=1,
@@ -302,12 +368,17 @@ async def test_eval_release_gate_writes_top_level_status_and_timings(
             dataset_hash=manifest.dataset_hash,
             dataset_path=manifest.jsonl_path,
             created_at="2026-07-28T00:00:01Z",
+            batch_size=answer_batch_sizes[-1],
             config_summaries=[_config_summary()],
             run_dir=f"answer/{manifest.dataset_name}",
         )
 
     async def fake_run_retrieval_suite(*args: object, **kwargs: object) -> RetrievalRunManifest:
         manifest = cast(EvalDatasetManifest, args[0])
+        retrieval_batch_size = kwargs.get("batch_size")
+        assert isinstance(retrieval_batch_size, int)
+        retrieval_batch_sizes.append(retrieval_batch_size)
+        retrieval_run_ids.append(str(kwargs.get("run_id") or ""))
         callback = kwargs.get("progress_callback")
         if callable(callback):
             callback(
@@ -362,16 +433,29 @@ async def test_eval_release_gate_writes_top_level_status_and_timings(
     assert {"dev_answer", "dev_retrieval", "test_answer", "test_retrieval", "gate_evaluation", "total"} <= set(
         report["timings_ms"]
     )
-    assert report["release_gate_run"]["run_id"] == "suite-status-release-gate"
+    assert "-suite-status-release-gate-" in report["release_gate_run"]["run_id"]
+    assert report["release_gate_run"]["report_id"] == report["release_gate_run"]["run_id"]
+    assert report["config_snapshot"]["config_id"] == "sota_mvp_normal"
     assert any(event == "child_task_completed" for _, event in progress_events)
     assert progress_events[-1][1] == "run_completed"
+    assert answer_batch_sizes == [6, 6]
+    assert all(run_id and "-answer-" in run_id for run_id in answer_run_ids)
+    assert answer_reuse_completed == [False, False]
+    assert retrieval_batch_sizes == [10, 10]
+    assert all(run_id and "-retrieval-" in run_id for run_id in retrieval_run_ids)
 
     status = load_release_gate_status("suite-status")
     assert status.state == "completed"
     assert status.passed is True
     assert status.blocking_failures == 0
-    status_path = tmp_path / "eval" / "release-gates" / "suite-status" / "suite-status-release-gate" / "status.json"
+    assert status.report_id == status.run_id
+    assert status.report_path.endswith("report.json")
+    assert status.stage_report_paths["dev_answer"].endswith("manifest.json")
+    explicit_status = load_release_gate_status("suite-status", report_id=status.report_id)
+    assert explicit_status.run_id == status.run_id
+    status_path = Path(status.run_dir) / "status.json"
     assert status_path.exists()
+    assert read_json(Path(status.report_path))["passed"] is True
     events_text = status_path.parent.joinpath("logs", "events.jsonl").read_text(encoding="utf-8")
     assert '"event":"run_started"' in events_text
     assert "Что подтверждает" not in events_text

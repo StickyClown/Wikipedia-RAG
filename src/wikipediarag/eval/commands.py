@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from math import ceil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.eval.api_client import EvalApiClient, HttpEvalApiClient, RetrievalEvalApiClient
@@ -10,6 +11,7 @@ from wikipediarag.eval.artifacts import (
     ARTIFACT_ROOT,
     DATASET_NAME,
     load_latest_dataset,
+    read_jsonl,
     utc_now_iso,
     write_json,
     write_jsonl,
@@ -27,17 +29,27 @@ from wikipediarag.eval.retrieval_runner import (
     load_latest_retrieval_status,
     load_retrieval_status,
     run_retrieval_suite,
+    run_retrieval_task,
 )
 from wikipediarag.eval.review import eval_release_gate as run_reviewed_release_gate
-from wikipediarag.eval.review import freeze_reviewed_suite, load_release_gate_status, write_review_pool
-from wikipediarag.eval.runner import _eval_overrides, run_suite, run_task
+from wikipediarag.eval.review import (
+    freeze_reviewed_suite,
+    load_locked_split_manifest,
+    load_locked_split_tasks,
+    load_release_gate_status,
+    write_review_pool,
+)
+from wikipediarag.eval.runner import _eval_overrides, eval_configs, run_suite, run_task
 from wikipediarag.eval.schemas import (
+    CandidateRef,
     EvalConfig,
     EvalDatasetManifest,
     EvalGenerateRunStatus,
+    EvalTask,
     EvalTaskResult,
     ReleaseGateStatus,
     RetrievalEvalStatus,
+    RetrievalTaskResult,
     TaskFamily,
 )
 from wikipediarag.eval.settings import adapt_eval_settings
@@ -170,6 +182,7 @@ async def eval_run(
     *,
     suite: str = DATASET_NAME,
     api: str,
+    batch_size: int = 6,
     settings: Settings | None = None,
     client: EvalApiClient | None = None,
     progress_callback: Any | None = None,
@@ -179,6 +192,7 @@ async def eval_run(
         manifest,
         tasks,
         api=api,
+        batch_size=batch_size,
         settings=adapt_eval_settings(settings or get_settings()),
         client=client,
         progress_callback=progress_callback,
@@ -269,7 +283,7 @@ async def eval_full(
         settings=resolved,
         progress_callback=progress_callback,
     )
-    run = await eval_run(suite=dataset.dataset_name, api=api, settings=resolved)
+    run = await eval_run(suite=dataset.dataset_name, api=api, batch_size=6, settings=resolved)
     report = eval_report_latest()
     return {"passed": True, "smoke": smoke, "dataset": dataset.model_dump(mode="json"), "run": run, "report": report}
 
@@ -372,5 +386,300 @@ async def eval_release_gate(
     )
 
 
-def eval_release_gate_status(*, suite: str) -> ReleaseGateStatus:
-    return load_release_gate_status(suite)
+def eval_release_gate_status(*, suite: str, report_id: str | None = None) -> ReleaseGateStatus:
+    return load_release_gate_status(suite, report_id=report_id)
+
+
+async def eval_reviewed_short(
+    *,
+    suite: str,
+    split: str,
+    task_ids: list[str],
+    api: str,
+    config_id: str = "sota_mvp_normal",
+    batch_size: int = 6,
+    retrieval_batch_size: int = 10,
+    run_answer: bool = True,
+    run_retrieval: bool = True,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    if split not in {"dev", "test"}:
+        raise ValueError("--split must be dev or test")
+    if not task_ids:
+        raise ValueError("at least one --task-id is required")
+    if not run_answer and not run_retrieval:
+        raise ValueError("at least one of answer or retrieval must be enabled")
+    if batch_size < 1 or retrieval_batch_size < 1:
+        raise ValueError("batch sizes must be >= 1")
+    resolved = adapt_eval_settings(settings or get_settings())
+    locked_split = cast(Literal["dev", "test"], split)
+    manifest, _payload = load_locked_split_manifest(suite, locked_split)
+    tasks = load_locked_split_tasks(manifest, locked_split)
+    task_by_id = {task.task_id: task for task in tasks}
+    missing = [task_id for task_id in task_ids if task_id not in task_by_id]
+    selected = [task_by_id[task_id] for task_id in task_ids if task_id in task_by_id]
+    if not selected:
+        raise ValueError(f"none of the requested task IDs exist in {suite}/{split}: {missing}")
+    config = _single_eval_config(config_id, resolved)
+    client = HttpEvalApiClient(
+        kiwix_public_base_url=resolved.kiwix_public_base_url,
+        kiwix_internal_base_url=resolved.kiwix_internal_base_url,
+    )
+    answer_results: list[EvalTaskResult] = []
+    retrieval_results: list[RetrievalTaskResult] = []
+    if run_answer:
+        answer_results = await _run_short_answer_tasks(
+            selected,
+            config,
+            api=api,
+            manifest=manifest,
+            client=client,
+            settings=resolved,
+            batch_size=batch_size,
+        )
+    if run_retrieval:
+        retrieval_results = await _run_short_retrieval_tasks(
+            selected,
+            config,
+            api=api,
+            manifest=manifest,
+            client=client,
+            settings=resolved,
+            batch_size=retrieval_batch_size,
+        )
+    return {
+        "suite": suite,
+        "split": split,
+        "config_id": config_id,
+        "task_ids": [task.task_id for task in selected],
+        "missing_task_ids": missing,
+        "batch_size": batch_size,
+        "retrieval_batch_size": retrieval_batch_size,
+        "answer": [_short_answer_payload(result) for result in answer_results],
+        "retrieval": [_short_retrieval_payload(result) for result in retrieval_results],
+    }
+
+
+def _single_eval_config(config_id: str, settings: Settings) -> EvalConfig:
+    configs = {config.config_id: config for config in eval_configs(settings)}
+    if config_id not in configs:
+        raise ValueError(f"unknown eval config: {config_id}")
+    return configs[config_id]
+
+
+async def _run_short_answer_tasks(
+    tasks: list[EvalTask],
+    config: EvalConfig,
+    *,
+    api: str,
+    manifest: EvalDatasetManifest,
+    client: HttpEvalApiClient,
+    settings: Settings,
+    batch_size: int,
+) -> list[EvalTaskResult]:
+    semaphore = asyncio.Semaphore(batch_size)
+
+    async def run_one(task: EvalTask) -> EvalTaskResult:
+        async with semaphore:
+            return await run_task(task, config, api=api, manifest=manifest, client=client, settings=settings)
+
+    return list(await asyncio.gather(*(run_one(task) for task in tasks)))
+
+
+async def _run_short_retrieval_tasks(
+    tasks: list[EvalTask],
+    config: EvalConfig,
+    *,
+    api: str,
+    manifest: EvalDatasetManifest,
+    client: HttpEvalApiClient,
+    settings: Settings,
+    batch_size: int,
+) -> list[RetrievalTaskResult]:
+    semaphore = asyncio.Semaphore(batch_size)
+
+    async def run_one(index: int, task: EvalTask) -> RetrievalTaskResult:
+        async with semaphore:
+            return await run_retrieval_task(
+                task,
+                config,
+                api=api,
+                manifest=manifest,
+                client=client,
+                settings=settings,
+                batch_index=1,
+                task_index=index,
+            )
+
+    return list(await asyncio.gather(*(run_one(index, task) for index, task in enumerate(tasks, start=1))))
+
+
+def _short_answer_payload(result: EvalTaskResult) -> dict[str, Any]:
+    return {
+        "task_id": result.task_id,
+        "status": result.status,
+        "answer": result.answer,
+        "citations": result.citations,
+        "cited_chunk_ids": result.cited_chunk_ids,
+        "answerability_status": result.usage.get("answerability_status"),
+        "insufficient_evidence": result.usage.get("insufficient_evidence"),
+        "scores": result.scores.model_dump(mode="json") if result.scores else None,
+        "timings_ms": result.latency_ms,
+        "query_run_id": result.query_run_id,
+        "trace_id": result.trace_id,
+        "errors": result.errors,
+    }
+
+
+def _short_retrieval_payload(result: RetrievalTaskResult) -> dict[str, Any]:
+    return {
+        "task_id": result.task_id,
+        "status": result.status,
+        "scores": result.scores.model_dump(mode="json") if result.scores else None,
+        "timings_ms": result.latency_ms,
+        "trace_id": result.trace_id,
+        "top_candidates": [
+            {
+                "rank": candidate.rank,
+                "title": candidate.title,
+                "document_id": candidate.document_id,
+                "chunk_id": candidate.chunk_id,
+                "scores": candidate.scores,
+            }
+            for candidate in result.final_candidates[:5]
+        ],
+        "errors": result.errors,
+    }
+
+
+def eval_task_diagnostics(
+    *,
+    suite: str,
+    split: str,
+    task_ids: list[str],
+    config_id: str = "sota_mvp_normal",
+) -> dict[str, Any]:
+    if split not in {"dev", "test"}:
+        raise ValueError("--split must be dev or test")
+    if not task_ids:
+        raise ValueError("at least one --task-id is required")
+    locked_split = cast(Literal["dev", "test"], split)
+    manifest, _payload = load_locked_split_manifest(suite, locked_split)
+    tasks = load_locked_split_tasks(manifest, locked_split)
+    task_by_id = {task.task_id: task for task in tasks}
+    answer_results = _latest_answer_results(manifest, config_id)
+    retrieval_results = _latest_retrieval_results(manifest, config_id)
+    missing = [task_id for task_id in task_ids if task_id not in task_by_id]
+    return {
+        "suite": suite,
+        "split": split,
+        "config_id": config_id,
+        "missing_task_ids": missing,
+        "tasks": [
+            _diagnostic_task_payload(
+                task_by_id[task_id],
+                answer=answer_results.get(task_id),
+                retrieval=retrieval_results.get(task_id),
+            )
+            for task_id in task_ids
+            if task_id in task_by_id
+        ],
+    }
+
+
+def _latest_answer_results(manifest: EvalDatasetManifest, config_id: str) -> dict[str, EvalTaskResult]:
+    run_dir = ARTIFACT_ROOT / "runs" / manifest.dataset_name / f"{manifest.dataset_name}-{manifest.dataset_hash[:12]}"
+    rows: list[EvalTaskResult] = []
+    for path in _sorted_result_paths(run_dir / "results", config_id):
+        rows.extend(read_jsonl(path, EvalTaskResult))
+    return {row.task_id: row for row in rows}
+
+
+def _latest_retrieval_results(manifest: EvalDatasetManifest, config_id: str) -> dict[str, RetrievalTaskResult]:
+    suite_dir = ARTIFACT_ROOT / "retrieval-runs" / manifest.dataset_name
+    rows: list[RetrievalTaskResult] = []
+    for path in sorted(
+        suite_dir.glob(f"*/results/{config_id}-*.jsonl"),
+        key=lambda item: item.stat().st_mtime,
+    ):
+        rows.extend(read_jsonl(path, RetrievalTaskResult))
+    return {row.task_id: row for row in rows}
+
+
+def _sorted_result_paths(results_dir: Path, config_id: str) -> list[Path]:
+    return sorted(results_dir.glob(f"{config_id}-*.jsonl"), key=lambda item: item.stat().st_mtime)
+
+
+def _diagnostic_task_payload(
+    task: EvalTask,
+    *,
+    answer: EvalTaskResult | None,
+    retrieval: RetrievalTaskResult | None,
+) -> dict[str, Any]:
+    cited_chunks = set(answer.cited_chunk_ids if answer else [])
+    hard_negative_pages = set(task.hard_negative_page_ids)
+    return {
+        "task_id": task.task_id,
+        "task_family": task.task_family,
+        "unanswerable": task.unanswerable,
+        "question": task.question,
+        "expected": {
+            "reference_answer": task.reference_answer,
+            "accepted_answers": task.accepted_answers,
+            "gold_page_ids": task.gold_page_ids,
+            "gold_chunk_ids": task.gold_chunk_ids,
+            "gold_evidence": [item.model_dump(mode="json") for item in task.gold_evidence],
+        },
+        "answer": None
+        if answer is None
+        else {
+            "status": answer.status,
+            "answer": answer.answer,
+            "citations": answer.citations,
+            "cited_chunk_ids": answer.cited_chunk_ids,
+            "answerability_status": answer.usage.get("answerability_status"),
+            "insufficient_evidence": answer.usage.get("insufficient_evidence"),
+            "scores": answer.scores.model_dump(mode="json") if answer.scores else None,
+            "timings_ms": answer.latency_ms,
+            "query_run_id": answer.query_run_id,
+            "trace_id": answer.trace_id,
+            "top_candidates": [
+                _candidate_payload(candidate, hard_negative_pages=hard_negative_pages, cited_chunks=cited_chunks)
+                for candidate in answer.reranked_candidates[:10]
+            ],
+            "errors": answer.errors,
+        },
+        "retrieval": None
+        if retrieval is None
+        else {
+            "status": retrieval.status,
+            "scores": retrieval.scores.model_dump(mode="json") if retrieval.scores else None,
+            "timings_ms": retrieval.latency_ms,
+            "trace_id": retrieval.trace_id,
+            "top_candidates": [
+                _candidate_payload(candidate, hard_negative_pages=hard_negative_pages, cited_chunks=cited_chunks)
+                for candidate in retrieval.final_candidates[:10]
+            ],
+            "errors": retrieval.errors,
+        },
+        "hard_negative_page_ids": task.hard_negative_page_ids,
+    }
+
+
+def _candidate_payload(
+    candidate: CandidateRef,
+    *,
+    hard_negative_pages: set[str],
+    cited_chunks: set[str],
+) -> dict[str, Any]:
+    return {
+        "rank": candidate.rank,
+        "title": candidate.title,
+        "document_id": candidate.document_id,
+        "section_id": candidate.section_id,
+        "chunk_id": candidate.chunk_id,
+        "scores": candidate.scores,
+        "hard_negative": candidate.document_id in hard_negative_pages,
+        "cited": candidate.chunk_id in cited_chunks,
+        "source_url": candidate.source_url,
+    }

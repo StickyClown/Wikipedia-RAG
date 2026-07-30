@@ -34,7 +34,10 @@ class RetrievalEvalCliReporter:
         self._stream = stream or sys.stdout
 
     def __call__(self, status: RetrievalEvalStatus, event: str) -> None:
-        print(format_retrieval_progress(status, event), file=self._stream, flush=True)
+        try:
+            print(format_retrieval_progress(status, event), file=self._stream, flush=True)
+        except OSError:
+            return
 
 
 def format_retrieval_progress(status: RetrievalEvalStatus, event: str) -> str:
@@ -92,6 +95,7 @@ async def run_retrieval_suite(
     rerun_failed: bool = False,
     settings: Settings | None = None,
     client: RetrievalEvalApiClient | None = None,
+    config_ids: set[str] | None = None,
     progress_callback: RetrievalProgressCallback | None = None,
 ) -> RetrievalRunManifest:
     if batch_size < 1:
@@ -101,7 +105,7 @@ async def run_retrieval_suite(
     resolved = settings or get_settings()
     actual_run_id = resume_run_id or run_id or f"{manifest.dataset_name}-{manifest.dataset_hash[:12]}-retrieval"
     run_dir = _run_dir(manifest.dataset_name, actual_run_id)
-    configs = eval_configs(resolved)
+    configs = _filter_configs(eval_configs(resolved), config_ids)
     supported_configs = [config for config in configs if _is_supported(config)]
     api_client = client or HttpEvalApiClient()
     started_at = utc_now_iso()
@@ -404,6 +408,9 @@ def _aggregate_retrieval_results(
         ),
         "retrieved_gold_leak_rate": aggregate(score.retrieved_gold_leak_rate for score in scores),
         "false_positive_evidence_rate": aggregate(score.false_positive_evidence_rate for score in scores),
+        "dangerous_false_positive_evidence_rate": aggregate(
+            score.dangerous_false_positive_evidence_rate for score in scores
+        ),
         "hard_negative_page_hit_at_10": aggregate(score.hard_negative_page_hit_at_10 for score in scores),
         "hard_negative_page_hit_at_20": aggregate(score.hard_negative_page_hit_at_20 for score in scores),
         "gold_vs_hard_negative_rank_margin": aggregate(
@@ -528,6 +535,16 @@ def _unsupported_summary(config: EvalConfig, tasks: list[EvalTask]) -> Retrieval
 
 def _is_supported(config: EvalConfig) -> bool:
     return config.config_id != "sota_mvp_conditional_harness"
+
+
+def _filter_configs(configs: list[EvalConfig], config_ids: set[str] | None) -> list[EvalConfig]:
+    if not config_ids:
+        return configs
+    filtered = [config for config in configs if config.config_id in config_ids]
+    missing = sorted(config_ids - {config.config_id for config in filtered})
+    if missing:
+        raise ValueError(f"unknown eval config IDs: {missing}")
+    return filtered
 
 
 async def _run_retrieval_config_tasks(

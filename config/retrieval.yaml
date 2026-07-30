@@ -42,7 +42,17 @@ profiles:
     answer:
       citations_required: true
       deterministic_citation_validation: true
+      verification:
+        citation_validation: strict
+        claim_verification: "off"
       insufficient_evidence_mode: true
+
+  sota_mvp_verified:
+    based_on: sota_mvp
+    answer:
+      verification:
+        citation_validation: strict
+        claim_verification: llm_strict
 
   test_mock:
     source: xml
@@ -87,6 +97,9 @@ profiles:
     answer:
       citations_required: true
       deterministic_citation_validation: true
+      verification:
+        citation_validation: strict
+        claim_verification: "off"
       insufficient_evidence_mode: true
 
   bm25_only:
@@ -106,3 +119,11 @@ profiles:
     based_on: sota_mvp
     postprocess:
       parent_expansion: "off"
+
+  upload_sota_mvp:
+    based_on: sota_mvp
+    source: upload
+
+  upload_mock:
+    based_on: test_mock
+    source: upload

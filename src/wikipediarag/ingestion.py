@@ -6,15 +6,37 @@ from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+
+from sqlalchemy import text
 
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.db import connect
+from wikipediarag.document_ingestion import (
+    ParserServiceError,
+    UploadValidationError,
+    chunks_for_normalized_document,
+    normalize_uploaded_document,
+    normalized_document_hash,
+    safe_public_metadata,
+    sha256_hex,
+    validate_upload_bytes,
+)
+from wikipediarag.ids import stable_hash
 from wikipediarag.model_client import embeddings
 from wikipediarag.model_registry import get_model_registry
 from wikipediarag.repository import (
+    claim_next_ingestion_job_item,
     get_job,
+    get_knowledge_base,
+    insert_document_artifact,
+    load_document_version,
+    load_index_version_by_read_alias,
     save_index_version,
     set_knowledge_base_active_index,
+    summarize_ingestion_job_items,
+    update_document_version,
+    update_ingestion_job_item,
     update_job,
     upsert_chunk,
     upsert_document,
@@ -31,7 +53,7 @@ from wikipediarag.search_index import (
     bulk_index_chunks,
     ensure_index,
 )
-from wikipediarag.storage import put_text
+from wikipediarag.storage import get_bytes, put_text
 from wikipediarag.wiki_dump import (
     Chunk,
     chunks_for_page,
@@ -712,11 +734,452 @@ async def _set_zim_cancelled(
         )
 
 
+async def process_document_upload(job: dict[str, Any], settings: Settings | None = None) -> None:
+    resolved = settings or get_settings()
+    job_id = str(job["id"])
+    await _mark_running(job_id)
+    while True:
+        if await _cancel_requested(job_id):
+            await _cancel_remaining_items(job_id)
+            await _finalize_document_upload_job(job_id)
+            return
+        items: list[dict[str, Any]] = []
+        async with connect() as conn:
+            for _ in range(max(1, resolved.document_ingestion_item_concurrency)):
+                item = await claim_next_ingestion_job_item(conn, job_id)
+                if item is None:
+                    break
+                items.append(item)
+        if not items:
+            await _finalize_document_upload_job(job_id)
+            return
+        await asyncio.gather(*(_process_document_upload_item(item, resolved) for item in items))
+        await _save_document_upload_job_progress(job_id, "processing")
+
+
+async def _process_document_upload_item(item: dict[str, Any], settings: Settings) -> None:
+    item_id = str(item["id"])
+    job_id = str(item["job_id"])
+    document_id = str(item["document_id"])
+    document_version_id = str(item["document_version_id"])
+    tenant_id = str(item["tenant_id"])
+    kb_id = str(item["knowledge_base_id"])
+    stage = "received"
+    try:
+        version = await _load_required_document_version(tenant_id, document_version_id)
+        original_key = str(version["original_artifact_key"])
+        source_metadata = dict(version.get("source_metadata") or {})
+        public_metadata = dict(version.get("public_metadata") or {})
+        filename = str(public_metadata.get("filename") or source_metadata.get("filename") or document_id)
+        content_type = str(public_metadata.get("content_type") or "application/octet-stream")
+        expected_size = int(public_metadata.get("size_bytes") or 0)
+        expected_sha256 = str(public_metadata.get("checksum_sha256") or version["content_hash"])
+        parser_options = dict(version.get("parser_options") or {})
+        parser_profile = str(parser_options.get("profile") or "standard")
+
+        stage = "read_original"
+        await _update_item_stage(item_id, stage, {"stage": stage})
+        data = await asyncio.to_thread(get_bytes, original_key, settings)
+        stage = "validating"
+        validation = validate_upload_bytes(
+            data,
+            filename=filename,
+            supplied_content_type=content_type,
+            expected_size_bytes=expected_size,
+            expected_sha256=expected_sha256,
+            settings=settings,
+        )
+        await _update_item_stage(
+            item_id,
+            stage,
+            {
+                "stage": stage,
+                "bytes_received": validation.size_bytes,
+                "detected_mime": validation.detected_mime,
+            },
+        )
+        async with connect() as conn:
+            await update_document_version(
+                conn,
+                document_version_id,
+                status="validating",
+                validation=validation.model_dump(mode="json"),
+            )
+
+        stage = "parsing"
+        await _update_item_stage(item_id, stage, {"stage": stage})
+        async with connect() as conn:
+            await update_document_version(conn, document_version_id, status="parsing")
+        normalized = await normalize_uploaded_document(
+            data,
+            validation=validation,
+            parser_profile=parser_profile,
+            settings=settings,
+        )
+        normalized_hash = normalized_document_hash(normalized)
+        normalized_key = f"documents/{tenant_id}/{document_id}/{document_version_id}/normalized.json"
+        normalized_payload = normalized.model_dump_json(indent=2)
+        parser_report_key = f"documents/{tenant_id}/{document_id}/{document_version_id}/parser-report.json"
+        parser_report_payload = json.dumps(
+            {
+                "schema_version": "parser_report_v1",
+                "parser_route": normalized.parser_route,
+                "parser_name": normalized.parser_name,
+                "parser_version": normalized.parser_version,
+                "parser_options": normalized.parser_options,
+                "warnings": normalized.warnings,
+                "metadata": normalized.metadata.model_dump(mode="json"),
+                "source_metadata": normalized.source_metadata,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        await asyncio.to_thread(put_text, normalized_key, normalized_payload, settings)
+        await asyncio.to_thread(put_text, parser_report_key, parser_report_payload, settings)
+        public = safe_public_metadata(
+            validation=validation,
+            metadata=normalized.metadata,
+            normalized_hash=normalized_hash,
+            parser_route=normalized.parser_route,
+            parser_name=normalized.parser_name,
+            parser_version=normalized.parser_version,
+            warnings=normalized.warnings,
+        )
+        async with connect() as conn:
+            await update_document_version(
+                conn,
+                document_version_id,
+                status="normalized",
+                normalized_hash=normalized_hash,
+                normalized_artifact_key=normalized_key,
+                parser_route=normalized.parser_route,
+                parser_name=normalized.parser_name,
+                parser_version=normalized.parser_version,
+                parser_options=normalized.parser_options,
+                extracted_metadata=normalized.metadata.model_dump(mode="json"),
+                public_metadata=public,
+                warnings=normalized.warnings,
+            )
+            await insert_document_artifact(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=document_id,
+                document_version_id=document_version_id,
+                kind="normalized",
+                object_key=normalized_key,
+                content_type="application/json; charset=utf-8",
+                size_bytes=len(normalized_payload.encode("utf-8")),
+                checksum_sha256=sha256_hex(normalized_payload.encode("utf-8")),
+                metadata={"schema_version": normalized.schema_version},
+            )
+            await insert_document_artifact(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=document_id,
+                document_version_id=document_version_id,
+                kind="parser_report",
+                object_key=parser_report_key,
+                content_type="application/json; charset=utf-8",
+                size_bytes=len(parser_report_payload.encode("utf-8")),
+                checksum_sha256=sha256_hex(parser_report_payload.encode("utf-8")),
+                metadata={"schema_version": "parser_report_v1"},
+            )
+
+        stage = "chunking"
+        target = await _resolve_upload_index_target(tenant_id, kb_id, settings)
+        source_url = f"{settings.api_public_base_url.rstrip('/')}/api/v1/documents/{quote(document_id, safe='')}"
+        chunks = chunks_for_normalized_document(
+            normalized,
+            document_id=document_id,
+            document_version_id=document_version_id,
+            source_url=source_url,
+            dimensions=target["embedding_dimensions"],
+        )
+        await _update_item_stage(item_id, stage, {"stage": stage, "chunks_staged": len(chunks)})
+
+        stage = "embedding"
+        embedded_chunks = await _embed_chunks(
+            chunks,
+            target["profile"],
+            int(target["embedding_dimensions"]),
+            settings,
+        )
+
+        stage = "indexing"
+        await _update_item_stage(item_id, stage, {"stage": stage, "chunks_staged": len(embedded_chunks)})
+        staged_chunks = _with_publication_status(embedded_chunks, "staged")
+        async with connect() as conn:
+            for chunk in staged_chunks:
+                await upsert_chunk(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, chunk=chunk)
+        published_chunks = _with_publication_status(embedded_chunks, "published")
+        indexed = await asyncio.to_thread(
+            bulk_index_chunks,
+            published_chunks,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            settings=settings,
+            write_alias=str(target["write_alias"]),
+            physical_index=str(target["physical_index"]),
+            read_alias=str(target["read_alias"]),
+            dimensions=int(target["embedding_dimensions"]),
+        )
+        if indexed != len(embedded_chunks):
+            raise RuntimeError("indexed chunk count did not match staged chunk count")
+
+        stage = "published"
+        async with connect() as conn:
+            for chunk in published_chunks:
+                await upsert_chunk(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, chunk=chunk)
+            await update_document_version(conn, document_version_id, status="published")
+            await update_ingestion_job_item(
+                conn,
+                item_id,
+                status=JobStatus.completed,
+                stage=stage,
+                progress={
+                    "stage": stage,
+                    "parser_route": normalized.parser_route,
+                    "chunks_staged": len(embedded_chunks),
+                    "chunks_published": indexed,
+                },
+            )
+        await _save_document_upload_job_progress(job_id, stage)
+    except asyncio.CancelledError:
+        raise
+    except UploadValidationError as exc:
+        await _fail_document_upload_item(item_id, document_version_id, stage, exc.code, exc.safe_message)
+    except ParserServiceError as exc:
+        await _fail_document_upload_item(item_id, document_version_id, stage, exc.code, exc.safe_message)
+    except Exception as exc:
+        await _fail_document_upload_item(
+            item_id, document_version_id, stage, type(exc).__name__, "document ingestion failed"
+        )
+
+
+async def _resolve_upload_index_target(tenant_id: str, kb_id: str, settings: Settings) -> dict[str, Any]:
+    async with connect() as conn:
+        kb = await get_knowledge_base(conn, tenant_id, kb_id)
+        if kb is None:
+            raise ValueError("knowledge base is not available")
+        read_alias = str(kb.get("active_index") or READ_ALIAS)
+        row = await load_index_version_by_read_alias(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            read_alias=read_alias,
+        )
+        if row is not None:
+            profile = get_retrieval_profile(settings.retrieval_profile, settings)
+            embedding_alias = str(row["embedding_alias"])
+            if profile.model_aliases.embed != embedding_alias:
+                profile = profile.model_copy(deep=True)
+                profile.model_aliases.embed = embedding_alias
+            return {
+                "profile": profile,
+                "embedding_dimensions": int(row["embedding_dimensions"]),
+                "physical_index": str(row["physical_index"]),
+                "read_alias": str(row["read_alias"]),
+                "write_alias": str(row["write_alias"]),
+            }
+
+        profile_name = (
+            "upload_sota_mvp" if settings.retrieval_profile in {"sota_mvp", "sota_mvp_verified"} else "upload_mock"
+        )
+        profile = get_retrieval_profile(profile_name, settings)
+        embed_alias = profile.model_aliases.embed
+        dimensions = profile.embedding_dimensions(settings.embedding_dimensions)
+        upload_snapshot_id = f"default-upload-{stable_hash([tenant_id, kb_id], 16)}"
+        index_names = build_index_names(
+            source_type="upload",
+            snapshot_id=upload_snapshot_id,
+            retrieval_profile=profile.name,
+            embedding_alias=embed_alias,
+            embedding_dimensions=dimensions,
+        )
+        index_contract = build_index_contract(
+            index_version=index_names["version_id"],
+            source_type="upload",
+            snapshot_id=upload_snapshot_id,
+            physical_index=index_names["physical"],
+            read_alias=index_names["read_alias"],
+            embedding_alias=embed_alias,
+            embedding_dimensions=dimensions,
+            profile=profile,
+            settings=settings,
+        )
+        await save_index_version(
+            conn,
+            index_version_id=index_names["version_id"],
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            source_type="upload",
+            snapshot_id=upload_snapshot_id,
+            retrieval_profile=profile.name,
+            embedding_alias=embed_alias,
+            embedding_dimensions=dimensions,
+            physical_index=index_names["physical"],
+            read_alias=index_names["read_alias"],
+            write_alias=index_names["write_alias"],
+            metadata=index_contract_metadata(index_contract),
+        )
+        await set_knowledge_base_active_index(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            active_index=index_names["read_alias"],
+        )
+        return {
+            "profile": profile,
+            "embedding_dimensions": dimensions,
+            "physical_index": index_names["physical"],
+            "read_alias": index_names["read_alias"],
+            "write_alias": index_names["write_alias"],
+        }
+
+
+async def _load_required_document_version(tenant_id: str, document_version_id: str) -> dict[str, Any]:
+    async with connect() as conn:
+        version = await load_document_version(conn, tenant_id, document_version_id)
+    if version is None:
+        raise ValueError("document version is not available")
+    return version
+
+
+async def _update_item_stage(item_id: str, stage: str, progress: dict[str, Any]) -> None:
+    async with connect() as conn:
+        await update_ingestion_job_item(conn, item_id, stage=stage, progress=progress)
+
+
+async def _fail_document_upload_item(
+    item_id: str,
+    document_version_id: str,
+    stage: str,
+    code: str,
+    safe_message: str,
+) -> None:
+    async with connect() as conn:
+        await update_document_version(conn, document_version_id, status="failed", warnings=[code])
+        await update_ingestion_job_item(
+            conn,
+            item_id,
+            status=JobStatus.failed,
+            stage=stage,
+            progress={"stage": stage, "safe_error_code": code},
+            error_code=code,
+            error_message=safe_message,
+        )
+
+
+async def _cancel_remaining_items(job_id: str) -> None:
+    async with connect() as conn:
+        await conn.execute(
+            text(
+                """
+                UPDATE ingestion_job_items
+                SET status = 'cancelled',
+                    stage = 'cancelled',
+                    completed_at = now(),
+                    updated_at = now()
+                WHERE job_id = :job_id AND status IN ('received','running')
+                """
+            ),
+            {"job_id": job_id},
+        )
+
+
+async def _save_document_upload_job_progress(job_id: str, stage: str) -> None:
+    async with connect() as conn:
+        summary = await summarize_ingestion_job_items(conn, job_id)
+        latest = await _latest_document_upload_item_progress(conn, job_id)
+        await update_job(
+            conn,
+            job_id,
+            progress={
+                "stage": stage,
+                "documents_total": summary["total"],
+                "documents_completed": summary["completed"],
+                "documents_failed": summary["failed"],
+                "documents_cancelled": summary["cancelled"],
+                **latest,
+            },
+        )
+
+
+async def _finalize_document_upload_job(job_id: str) -> None:
+    async with connect() as conn:
+        summary = await summarize_ingestion_job_items(conn, job_id)
+        if summary["received"] or summary["running"]:
+            return
+        status = (
+            JobStatus.failed
+            if summary["failed"]
+            else JobStatus.cancelled
+            if summary["cancelled"]
+            else JobStatus.completed
+        )
+        latest = await _latest_document_upload_item_progress(conn, job_id)
+        await update_job(
+            conn,
+            job_id,
+            status=status,
+            progress={
+                "stage": "terminal",
+                "documents_total": summary["total"],
+                "documents_completed": summary["completed"],
+                "documents_failed": summary["failed"],
+                "documents_cancelled": summary["cancelled"],
+                **latest,
+            },
+        )
+
+
+async def _latest_document_upload_item_progress(conn: Any, job_id: str) -> dict[str, Any]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT stage, progress, error_code
+            FROM ingestion_job_items
+            WHERE job_id = :job_id
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        ),
+        {"job_id": job_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        return {}
+    latest = dict(row)
+    progress = dict(latest["progress"] or {})
+    safe: dict[str, Any] = {"stage": latest["stage"]}
+    for key in (
+        "bytes_received",
+        "parser_route",
+        "chunks_staged",
+        "chunks_published",
+        "safe_error_code",
+        "detected_mime",
+    ):
+        if key in progress:
+            safe[key] = progress[key]
+    if latest.get("error_code"):
+        safe["safe_error_code"] = latest["error_code"]
+    return safe
+
+
+def _with_publication_status(chunks: list[Chunk], status: str) -> list[Chunk]:
+    return [replace(chunk, metadata={**chunk.metadata, "publication_status": status}) for chunk in chunks]
+
+
 async def process_job(job: dict[str, Any], settings: Settings | None = None) -> None:
     if job["kind"] == "wikipedia_xml":
         await process_wiki_import(job, settings)
     elif job["kind"] == "wikipedia_zim":
         await process_zim_import(job, settings)
+    elif job["kind"] == "document_upload":
+        await process_document_upload(job, settings)
     else:
         raise ValueError(f"unsupported ingestion job kind {job['kind']}")
 

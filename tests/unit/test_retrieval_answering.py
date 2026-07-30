@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
-from wikipediarag.answering import generate_answer, validate_citations
+from wikipediarag.answering import generate_answer, validate_citations, validate_citations_with_policy
 from wikipediarag.config import Settings
-from wikipediarag.retrieval import build_stage_events, rrf_fuse
+from wikipediarag.retrieval import build_stage_events, postprocess_candidates, rrf_fuse
 from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import AnswerabilityDecision, AnswerabilityStatus, Evidence, RetrievalResult
 
@@ -39,6 +40,43 @@ def test_citation_validator_rejects_unknown_ids() -> None:
     result = validate_citations("Россия — государство [S2]", evidence)
     assert result["valid"] is False
     assert result["unknown"] == ["S2"]
+
+
+def test_citation_validation_can_be_disabled_with_policy() -> None:
+    evidence = [
+        Evidence(
+            evidence_id="S1",
+            chunk_id="c1",
+            title="Россия",
+            section_path=["Россия"],
+            content="Россия - государство.",
+            source_url="https://ru.wikipedia.org/wiki/Россия",
+        )
+    ]
+
+    result = validate_citations_with_policy("Факт [S2]", evidence, mode="off")
+
+    assert result["valid"] is True
+    assert result["status"] == "disabled_by_policy"
+    assert result["citations"] == ["S2"]
+
+
+def test_citation_validation_warn_records_underlying_failure() -> None:
+    evidence = [
+        Evidence(
+            evidence_id="S1",
+            chunk_id="c1",
+            title="Россия",
+            section_path=["Россия"],
+            content="Россия - государство.",
+            source_url="https://ru.wikipedia.org/wiki/Россия",
+        )
+    ]
+
+    result = validate_citations_with_policy("Факт [S2]", evidence, mode="warn")
+
+    assert result["valid"] is True
+    assert result["citation_validation_valid"] is False
 
 
 def test_retrieval_stage_events_include_additive_timings() -> None:
@@ -76,6 +114,41 @@ def test_retrieval_stage_events_include_additive_timings() -> None:
     assert next(event for event in events if event["stage"] == "context")["latency_ms"] == 15
     assert next(event for event in events if event["stage"] == "context")["stage_latency_ms"] == 2
     assert next(event for event in events if event["stage"] == "timings")["timings_ms"]["retrieval_total"] == 15
+
+
+def test_postprocess_drops_explicit_negative_title_from_final_context() -> None:
+    profile = get_retrieval_profile("test_mock", Settings())
+    selected, events = postprocess_candidates(
+        [
+            _candidate("c1", "Россия", page_id=1),
+            _candidate("c2", "Канада", page_id=2),
+        ],
+        profile,
+        requested_top_k=10,
+        query="Ответь по «Россия»; «Канада» дана только как отвлекающий контекст, не используй её.",
+    )
+
+    assert [item["title"] for item in selected] == ["Россия"]
+    dropped = [event for event in events if event.get("reason") == "EXPLICIT_NEGATIVE_TITLE"]
+    assert dropped
+    assert dropped[0]["chunk_id"] == "c2"
+    assert dropped[0]["negative_evidence_policy_version"] == "explicit_negative_title_v1"
+
+
+def test_postprocess_keeps_quoted_title_without_negative_marker() -> None:
+    profile = get_retrieval_profile("test_mock", Settings())
+    selected, events = postprocess_candidates(
+        [
+            _candidate("c1", "Россия", page_id=1),
+            _candidate("c2", "Канада", page_id=2),
+        ],
+        profile,
+        requested_top_k=10,
+        query="Сравни «Россия» и «Канада» по площади.",
+    )
+
+    assert [item["title"] for item in selected] == ["Россия", "Канада"]
+    assert not [event for event in events if event.get("reason") == "EXPLICIT_NEGATIVE_TITLE"]
 
 
 @pytest.mark.asyncio
@@ -131,6 +204,65 @@ async def test_generate_answer_returns_generation_timings(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_generate_answer_strict_claim_verifier_blocks_unsupported_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = [
+        Evidence(
+            evidence_id="S1",
+            chunk_id="c1",
+            title="Россия",
+            section_path=["Россия"],
+            content="Россия - государство.",
+            source_url="http://localhost/source",
+        )
+    ]
+    retrieval = RetrievalResult(query="Россия", trace_id="trace", evidence=evidence, events=[])
+    profile = get_retrieval_profile(
+        "test_mock",
+        Settings(),
+        overrides={"answer": {"verification": {"claim_verification": "deterministic_strict"}}},
+    )
+
+    async def fake_chat_completion(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "answer_markdown": "Марс является столицей Венеры [S1]",
+                                "claims": [
+                                    {
+                                        "claim_id": "c1",
+                                        "text": "Марс является столицей Венеры",
+                                        "evidence_ids": ["S1"],
+                                        "type": "fact",
+                                    }
+                                ],
+                                "insufficient_evidence": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ],
+            "usage": {"total_tokens": 5},
+            "provider": "mock",
+        }
+
+    monkeypatch.setattr("wikipediarag.answering.chat_completion", fake_chat_completion)
+
+    answer, validation = await generate_answer("Где находится Россия?", retrieval, Settings(), profile)
+
+    assert "не прошёл claim-level проверку" in answer
+    claim_verification = validation["claim_verification"]
+    assert isinstance(claim_verification, dict)
+    assert claim_verification["status"] == "blocked"
+    assert validation["insufficient_evidence"] is True
+
+
+@pytest.mark.asyncio
 async def test_generate_answer_insufficient_evidence_has_no_provider_timing() -> None:
     profile = get_retrieval_profile("test_mock", Settings())
     retrieval = RetrievalResult(query="q", trace_id="trace", evidence=[], events=[], insufficient_evidence=True)
@@ -171,6 +303,45 @@ async def test_generate_answer_unanswerable_gate_skips_provider(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_generate_answer_missing_fact_gate_skips_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = get_retrieval_profile("test_mock", Settings())
+    evidence = [
+        Evidence(
+            evidence_id="S1",
+            chunk_id="c1",
+            title="Россия",
+            section_path=["Россия"],
+            content="Россия - государство в Восточной Европе и Северной Азии.",
+            source_url="http://localhost/source",
+            scores={"rerank": 0.94},
+        )
+    ]
+    retrieval = RetrievalResult(
+        query="Какой официальный серийный номер указан в локальном snapshot для «Россия»?",
+        trace_id="trace",
+        evidence=evidence,
+        events=[],
+        insufficient_evidence=True,
+        answerability=AnswerabilityDecision(
+            status=AnswerabilityStatus.unanswerable,
+            confidence=0.82,
+            reason="answer_bearing_terms_missing",
+        ),
+    )
+
+    async def fail_chat_completion(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("provider should not be called")
+
+    monkeypatch.setattr("wikipediarag.answering.chat_completion", fail_chat_completion)
+
+    answer, validation = await generate_answer(retrieval.query, retrieval, Settings(), profile)
+
+    assert "Недостаточно доказательств" in answer
+    assert validation["answerability_status"] == "UNANSWERABLE"
+    assert validation["usage"] == {}
+
+
+@pytest.mark.asyncio
 async def test_generate_answer_conflicting_gate_skips_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     profile = get_retrieval_profile("test_mock", Settings())
     retrieval = RetrievalResult(
@@ -204,3 +375,18 @@ async def test_generate_answer_conflicting_gate_skips_provider(monkeypatch: pyte
 
     assert validation["answerability_status"] == "CONFLICTING"
     assert validation["usage"] == {}
+
+
+def _candidate(chunk_id: str, title: str, *, page_id: int) -> dict[str, Any]:
+    return {
+        "chunk_id": chunk_id,
+        "document_id": f"doc-{page_id}",
+        "page_id": page_id,
+        "title": title,
+        "section_path": [title],
+        "content": f"{title} - тестовый фрагмент.",
+        "source_url": f"http://localhost/source/{page_id}",
+        "scores": {"rerank": 0.9},
+        "ranks": {"rerank": page_id},
+        "metadata": {},
+    }

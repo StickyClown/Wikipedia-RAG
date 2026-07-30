@@ -59,10 +59,20 @@ class HttpEvalApiClient:
             with client.stream("POST", f"{api.rstrip('/')}/api/v1/chat", json=payload) as response:
                 response.raise_for_status()
                 events = list(iter_sse(response.iter_lines()))
+        started = _event_data(events, "run.started") or {}
         failed = [event for event in events if event["event"] == "run.failed"]
         if failed:
-            return {"events": events, "failed": True, "error": "run.failed"}
-        started = _event_data(events, "run.started") or {}
+            failed_event = failed[-1]
+            failed_data = dict(failed_event.get("data") or {})
+            return {
+                "events": events,
+                "failed": True,
+                "failed_event": failed_event,
+                "error": str(failed_data.get("code") or failed_data.get("error") or "run.failed"),
+                "query_run_id": failed_event.get("query_run_id") or started.get("query_run_id"),
+                "trace_id": failed_data.get("trace_id")
+                or (started.get("data", {}).get("trace_id") if isinstance(started.get("data"), dict) else None),
+            }
         message = _event_data(events, "message.delta") or {}
         usage = _event_data(events, "usage.updated") or {}
         completed = _event_data(events, "run.completed") or {}

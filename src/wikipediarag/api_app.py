@@ -4,11 +4,12 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
@@ -16,15 +17,22 @@ from sqlalchemy import text
 from wikipediarag.answerability import should_try_extended_search
 from wikipediarag.answering import generate_answer
 from wikipediarag.config import get_settings
-from wikipediarag.db import connect, ensure_schema, json_dumps
-from wikipediarag.embedding import embed_text
+from wikipediarag.db import connect, ensure_schema
+from wikipediarag.document_ingestion import UploadValidationError, safe_upload_filename
 from wikipediarag.extended import run_extended_search, should_start_extended
 from wikipediarag.ids import stable_hash
 from wikipediarag.repository import (
     complete_query_run,
+    create_document_upload_records,
     create_ingestion_job,
     create_query_run,
+    create_reprocess_job,
+    create_upload_session,
     fail_query_run,
+    get_document_public,
+    get_knowledge_base,
+    get_upload_session,
+    list_document_versions_public,
     list_knowledge_bases,
     load_retrieval_events,
     request_cancel,
@@ -36,14 +44,17 @@ from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import (
     ChatRequest,
     DebugSearchRequest,
+    DocumentReprocessResponse,
     ImportRequest,
     KnowledgeBaseCreate,
     SseEvent,
-    UploadResponse,
+    UploadCompleteResponse,
+    UploadSessionAccepted,
+    UploadSessionComplete,
+    UploadSessionCreate,
     ZimImportRequest,
 )
-from wikipediarag.search_index import bulk_index_chunks
-from wikipediarag.wiki_dump import Chunk
+from wikipediarag.storage import create_presigned_put_url, head_object
 
 app = FastAPI(title="WikipediaRag API")
 app.add_middleware(
@@ -77,8 +88,9 @@ async def ready() -> dict[str, Any]:
         components["postgres"] = "failed"
     try:
         async with httpx.AsyncClient(timeout=3) as client:
-            response = await client.get(f"{settings.model_gateway_url.rstrip('/')}/health")
-            components["model_gateway"] = "ok" if response.status_code == 200 else "failed"
+            response = await client.get(f"{settings.model_gateway_url.rstrip('/')}/ready")
+            gateway_ready = response.status_code == 200 and response.json().get("status") == "ok"
+            components["model_gateway"] = "ok" if gateway_ready else "failed"
     except Exception:
         components["model_gateway"] = "failed"
     status = "ok" if all(value == "ok" for value in components.values()) else "degraded"
@@ -193,78 +205,155 @@ async def resume_ingestion_job(job_id: str) -> dict[str, str]:
     return {"status": "resume_requested"}
 
 
-@app.post("/api/v1/uploads")
-async def upload_document(file: UploadFile = File(...)) -> UploadResponse:  # noqa: B008
+@app.post("/api/v1/uploads/sessions")
+async def create_upload_session_endpoint(payload: UploadSessionCreate) -> UploadSessionAccepted:
     settings = get_settings()
-    data = await file.read()
-    if len(data) > 2_000_000:
-        raise HTTPException(status_code=413, detail="file too large for development upload")
     try:
-        text_content = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(status_code=415, detail="development upload supports UTF-8 text") from exc
-    document_hash = stable_hash([file.filename, text_content], 24)
-    document_id = f"upload:{document_hash}"
-    title = file.filename or "uploaded document"
-    words = text_content.split()
-    chunks: list[Chunk] = []
-    for index in range(0, max(len(words), 1), 220):
-        body = " ".join(words[index : index + 220]) or text_content
-        chunk_id = "upload:" + stable_hash([document_id, index, body], 32)
-        chunks.append(
-            Chunk(
-                id=chunk_id,
-                document_id=document_id,
-                page_id=0,
-                revision_id=0,
-                title=title,
-                section_path=(title,),
-                content=body,
-                parent_chunk_id=None,
-                prev_chunk_id=None,
-                next_chunk_id=None,
-                source_uri=f"upload://{document_id}",
-                source_url=f"upload://{document_id}",
-                content_hash=stable_hash([body]),
-                embedding=embed_text(body, settings.embedding_dimensions),
-            )
-        )
+        filename = safe_upload_filename(payload.filename)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=422, detail={"error": {"code": exc.code, "message": exc.safe_message}}) from exc
+    kb_id = payload.knowledge_base_id or settings.default_kb_id
     async with connect() as conn:
-        await conn.execute(
-            text(
-                """
-                INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata)
-                VALUES (:id, :tenant_id, :kb_id, 'upload_text', :title, :source_uri,
-                        CAST(:metadata AS jsonb))
-                ON CONFLICT (id) DO NOTHING
-                """
-            ),
-            {
-                "id": document_id,
-                "tenant_id": settings.default_tenant_id,
-                "kb_id": settings.default_kb_id,
-                "title": title,
-                "source_uri": f"upload://{document_id}",
-                "metadata": json_dumps({"filename": file.filename}),
-            },
+        kb = await get_knowledge_base(conn, settings.default_tenant_id, kb_id)
+    if kb is None:
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+    object_key = (
+        f"uploads/{settings.default_tenant_id}/{stable_hash([filename, payload.checksum_sha256], 16)}/"
+        f"{payload.checksum_sha256}"
+    )
+    async with connect() as conn:
+        session_id, expires_at = await create_upload_session(
+            conn,
+            tenant_id=settings.default_tenant_id,
+            knowledge_base_id=kb_id,
+            filename=filename,
+            content_type=payload.content_type,
+            size_bytes=payload.size_bytes,
+            checksum_sha256=payload.checksum_sha256.lower(),
+            object_key=object_key,
+            parser_profile=payload.parser_profile,
+            metadata=payload.metadata,
+            ttl_seconds=settings.upload_session_ttl_seconds,
         )
-        from wikipediarag.repository import upsert_chunk
-
-        for chunk in chunks:
-            await upsert_chunk(
-                conn,
-                tenant_id=settings.default_tenant_id,
-                knowledge_base_id=settings.default_kb_id,
-                chunk=chunk,
-            )
-    await asyncio.to_thread(
-        bulk_index_chunks,
-        chunks,
-        tenant_id=settings.default_tenant_id,
-        knowledge_base_id=settings.default_kb_id,
+    upload_url = await asyncio.to_thread(
+        create_presigned_put_url,
+        object_key,
+        content_type=payload.content_type,
+        expires_seconds=settings.upload_session_ttl_seconds,
         settings=settings,
     )
-    return UploadResponse(document_id=document_id, chunks_indexed=len(chunks))
+    return UploadSessionAccepted(
+        upload_session_id=str(session_id),
+        upload_url=upload_url,
+        expires_at=expires_at,
+        required_headers={"Content-Type": payload.content_type},
+    )
+
+
+@app.post("/api/v1/uploads/sessions/{upload_session_id}:complete")
+async def complete_upload_session_endpoint(
+    upload_session_id: str,
+    payload: UploadSessionComplete | None = None,
+) -> UploadCompleteResponse:
+    settings = get_settings()
+    async with connect() as conn:
+        session = await get_upload_session(
+            conn,
+            tenant_id=settings.default_tenant_id,
+            upload_session_id=upload_session_id,
+        )
+    if session is None:
+        raise HTTPException(status_code=404, detail="upload session not found")
+    if str(session["status"]) not in {"created", "uploaded"}:
+        raise HTTPException(status_code=409, detail="upload session is not completable")
+    expires_at = session["expires_at"]
+    if isinstance(expires_at, datetime) and expires_at < datetime.now(UTC):
+        raise HTTPException(status_code=409, detail="upload session expired")
+    try:
+        head = await asyncio.to_thread(head_object, str(session["object_key"]), settings)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail="uploaded object is not available") from exc
+    if int(head["content_length"]) != int(session["size_bytes"]):
+        raise HTTPException(status_code=409, detail="uploaded object size mismatch")
+    document_hash = stable_hash(
+        [
+            settings.default_tenant_id,
+            str(session["knowledge_base_id"]),
+            str(session["checksum_sha256"]),
+            str(session["filename"]),
+        ],
+        24,
+    )
+    document_id = f"doc:{document_hash}"
+    document_version_id = "docv:" + stable_hash(
+        [
+            document_id,
+            str(session["checksum_sha256"]),
+            str(session["parser_profile"]),
+            "normalized_document_v1",
+        ],
+        32,
+    )
+    session_metadata = dict(session.get("metadata") or {})
+    if payload is not None:
+        session_metadata.update(payload.metadata)
+    async with connect() as conn:
+        job_id = await create_document_upload_records(
+            conn,
+            tenant_id=settings.default_tenant_id,
+            knowledge_base_id=str(session["knowledge_base_id"]),
+            upload_session={**session, "metadata": session_metadata},
+            document_id=document_id,
+            document_version_id=document_version_id,
+            content_hash=str(session["checksum_sha256"]),
+            metadata=session_metadata,
+        )
+    return UploadCompleteResponse(
+        document_id=document_id,
+        document_version_id=document_version_id,
+        job_id=str(job_id),
+        status="received",
+    )
+
+
+@app.get("/api/v1/documents/{document_id}")
+async def get_document(document_id: str) -> dict[str, Any]:
+    settings = get_settings()
+    async with connect() as conn:
+        document = await get_document_public(conn, settings.default_tenant_id, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    return cast(dict[str, Any], _jsonable(document))
+
+
+@app.get("/api/v1/documents/{document_id}/versions")
+async def get_document_versions(document_id: str) -> dict[str, Any]:
+    settings = get_settings()
+    async with connect() as conn:
+        versions = await list_document_versions_public(conn, settings.default_tenant_id, document_id)
+    return {"document_id": document_id, "versions": _jsonable(versions)}
+
+
+@app.post("/api/v1/documents/{document_id}:reprocess")
+async def reprocess_document(document_id: str) -> DocumentReprocessResponse:
+    settings = get_settings()
+    async with connect() as conn:
+        document = await get_document_public(conn, settings.default_tenant_id, document_id)
+        if document is None or not document.get("current_version_id"):
+            raise HTTPException(status_code=404, detail="document not found")
+        job_id = await create_reprocess_job(
+            conn,
+            tenant_id=settings.default_tenant_id,
+            knowledge_base_id=str(document["knowledge_base_id"]),
+            document_id=document_id,
+            document_version_id=str(document["current_version_id"]),
+        )
+    return DocumentReprocessResponse(
+        document_id=document_id,
+        document_version_id=str(document["current_version_id"]),
+        job_id=str(job_id),
+        status="received",
+    )
 
 
 @app.post("/api/v1/chat")
@@ -304,6 +393,9 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
 
     async def event_stream() -> AsyncIterator[str]:
         sequence = 1
+        current_stage = "question_received"
+        last_successful_stage = "question_received"
+        retrieval: Any | None = None
         yield _event(
             SseEvent(
                 event="run.started",
@@ -315,11 +407,14 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
         )
         try:
             async with connect() as conn:
+                current_stage = "path_selected"
                 use_harness_first = payload.mode.value == "extended" or (
                     active_profile.postprocess.extended_search in {"always", "conditional"}
                     and should_start_extended(payload.message)
                 )
+                last_successful_stage = "path_selected"
                 if use_harness_first:
+                    current_stage = "extended_search"
                     retrieval = await run_extended_search(
                         conn,
                         payload.message,
@@ -331,7 +426,9 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                         profile=active_profile,
                         profile_overrides=payload.retrieval_overrides,
                     )
+                    last_successful_stage = "extended_search"
                 else:
+                    current_stage = "retrieval"
                     retrieval = await retrieve(
                         conn,
                         payload.message,
@@ -342,6 +439,7 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                         settings=settings,
                         profile=active_profile,
                     )
+                    last_successful_stage = "retrieval"
                     if (
                         retrieval.answerability
                         and should_try_extended_search(retrieval.answerability)
@@ -351,6 +449,7 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                             "conditional",
                         }
                     ):
+                        current_stage = "extended_search"
                         retrieval = await run_extended_search(
                             conn,
                             payload.message,
@@ -362,7 +461,10 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                             profile=active_profile,
                             profile_overrides=payload.retrieval_overrides,
                         )
+                        last_successful_stage = "extended_search"
+            current_stage = "answer_generation"
             answer, validation = await generate_answer(payload.message, retrieval, settings, active_profile)
+            last_successful_stage = "answer_generation"
             timings_ms = _combined_timings(retrieval.model_dump(), validation)
             sequence += 1
             yield _event(
@@ -392,6 +494,7 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                 )
             )
             async with connect() as conn:
+                current_stage = "query_run_complete"
                 await complete_query_run(
                     conn,
                     query_run_id=str(query_run_id),
@@ -409,6 +512,7 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                     model_alias=str(validation.get("model_alias") or ""),
                     provider_request_id=str(validation.get("provider_request_id") or ""),
                 )
+                last_successful_stage = "query_run_complete"
             sequence += 1
             yield _event(
                 SseEvent(
@@ -427,13 +531,20 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
             async with connect() as conn:
                 await fail_query_run(conn, query_run_id=str(query_run_id), error_code=type(exc).__name__)
             sequence += 1
+            failure = _safe_failure_payload(
+                exc,
+                stage=current_stage,
+                last_successful_stage=last_successful_stage,
+                trace_id=trace_id,
+                retrieval=retrieval,
+            )
             yield _event(
                 SseEvent(
                     event="run.failed",
                     request_id=request_id,
                     query_run_id=str(query_run_id),
                     sequence=sequence,
-                    data={"error": "chat run failed"},
+                    data=failure,
                 )
             )
 
@@ -453,13 +564,14 @@ async def search_debug(payload: DebugSearchRequest) -> dict[str, Any]:
     settings = get_settings()
     trace_id = stable_hash(["debug", payload.message], 32)
     profile = get_retrieval_profile(payload.retrieval_profile, settings, payload.retrieval_overrides)
+    kb_id = payload.knowledge_base_ids[0] if payload.knowledge_base_ids else settings.default_kb_id
     async with connect() as conn:
         try:
             result = await retrieve(
                 conn,
                 payload.message,
                 tenant_id=settings.default_tenant_id,
-                knowledge_base_id=settings.default_kb_id,
+                knowledge_base_id=kb_id,
                 query_run_id=None,
                 trace_id=trace_id,
                 settings=settings,
@@ -502,6 +614,87 @@ def _combined_timings(retrieval: dict[str, Any], validation: dict[str, object]) 
 def _safe_timing_dict(payload: dict[Any, Any]) -> dict[str, int]:
     return {
         str(key): max(0, int(value)) for key, value in payload.items() if isinstance(value, int | float) and str(key)
+    }
+
+
+def _safe_failure_payload(
+    exc: Exception,
+    *,
+    stage: str,
+    last_successful_stage: str,
+    trace_id: str,
+    retrieval: Any | None,
+) -> dict[str, Any]:
+    return {
+        "error": "chat run failed",
+        "stage": stage,
+        "code": type(exc).__name__,
+        "retryable": _retryable_error(exc),
+        "attempt": 1,
+        "last_successful_stage": last_successful_stage,
+        "trace_id": trace_id,
+        "safe_message": type(exc).__name__,
+        "retrieval": _safe_retrieval_snapshot(retrieval),
+    }
+
+
+def _retryable_error(exc: Exception) -> bool:
+    return type(exc).__name__ not in {"ValueError", "ValidationError", "KnowledgeBaseNotReady"}
+
+
+def _safe_retrieval_snapshot(retrieval: Any | None) -> dict[str, Any]:
+    if retrieval is None:
+        return {}
+    payload = retrieval.model_dump() if hasattr(retrieval, "model_dump") else {}
+    evidence = []
+    for item in payload.get("evidence", []):
+        if not isinstance(item, dict):
+            continue
+        evidence.append(
+            {
+                "evidence_id": item.get("evidence_id"),
+                "chunk_id": item.get("chunk_id"),
+                "title": item.get("title"),
+                "source_url": item.get("source_url"),
+                "scores": item.get("scores", {}),
+            }
+        )
+    events = []
+    for event in payload.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        safe_event = {
+            "stage": event.get("stage"),
+            "count": event.get("count"),
+            "latency_ms": event.get("latency_ms"),
+            "stage_latency_ms": event.get("stage_latency_ms"),
+            "top": event.get("top", []),
+            "run_contract_id": event.get("run_contract_id"),
+            "index_contract_id": event.get("index_contract_id"),
+        }
+        candidates = []
+        for candidate in list(event.get("candidates") or [])[:20]:
+            if isinstance(candidate, dict):
+                candidates.append(
+                    {
+                        "chunk_id": candidate.get("chunk_id"),
+                        "title": candidate.get("title"),
+                        "source_url": candidate.get("source_url"),
+                        "scores": candidate.get("scores", {}),
+                        "ranks": candidate.get("ranks", {}),
+                    }
+                )
+        if candidates:
+            safe_event["candidates"] = candidates
+        if event.get("decision"):
+            safe_event["decision"] = event.get("decision")
+        events.append(safe_event)
+    return {
+        "trace_id": payload.get("trace_id", ""),
+        "index_contract_id": payload.get("index_contract_id", ""),
+        "run_contract_id": payload.get("run_contract_id", ""),
+        "evidence": evidence,
+        "events": events,
     }
 
 

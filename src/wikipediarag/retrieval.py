@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
 
@@ -21,6 +22,21 @@ from wikipediarag.search_index import bm25_search, dense_search
 QUERY_EMBEDDING_INSTRUCTION = (
     "Represent this query for retrieving factual answers from the local Russian Wikipedia corpus."
 )
+NEGATIVE_EVIDENCE_POLICY_VERSION = "explicit_negative_title_v1"
+_NEGATIVE_TITLE_MARKERS = (
+    "не используй",
+    "не использовать",
+    "исключи",
+    "исключить",
+    "отвлекающий",
+    "отвлекающего",
+    "дистрактор",
+    "distractor",
+    "ignore",
+    "do not use",
+    "exclude",
+)
+_QUOTED_TITLE_RE = re.compile(r"[«\"“]([^»\"”]{2,160})[»\"”]")
 
 
 async def retrieve(
@@ -103,7 +119,7 @@ async def retrieve(
     )
     timings_ms["rerank"] = _elapsed_ms(rerank_started)
     context_started = time.perf_counter()
-    selected, policy_events = postprocess_candidates(reranked, profile, requested_top_k)
+    selected, policy_events = postprocess_candidates(reranked, profile, requested_top_k, query=normalized_query)
     timings_ms["context"] = _elapsed_ms(context_started)
     timings_ms["retrieval_total"] = _elapsed_ms(started)
     events = build_stage_events(
@@ -393,15 +409,31 @@ def postprocess_candidates(
     candidates: list[dict[str, Any]],
     profile: RetrievalProfile,
     requested_top_k: int,
+    *,
+    query: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     events: list[dict[str, Any]] = []
     selected: list[dict[str, Any]] = []
     page_counts: dict[int, int] = {}
     seen_hashes: set[str] = set()
+    negative_titles = extract_explicit_negative_titles(query)
     max_evidence = min(requested_top_k, profile.postprocess.final_evidence_max)
     token_budget = profile.postprocess.max_context_tokens
     used_tokens = 0
     for candidate in candidates:
+        matched_negative_title = _matched_negative_title(candidate, negative_titles)
+        if matched_negative_title:
+            events.append(
+                {
+                    "stage": "policy",
+                    "decision": "dropped",
+                    "chunk_id": candidate["chunk_id"],
+                    "reason": "EXPLICIT_NEGATIVE_TITLE",
+                    "negative_evidence_policy_version": NEGATIVE_EVIDENCE_POLICY_VERSION,
+                    "matched_negative_title": matched_negative_title,
+                }
+            )
+            continue
         metadata = dict(candidate.get("metadata") or {})
         content_hash = str(metadata.get("content_hash") or candidate.get("chunk_id"))
         if profile.postprocess.dedup and content_hash in seen_hashes:
@@ -461,6 +493,54 @@ def postprocess_candidates(
         if len(selected) >= max_evidence:
             break
     return selected, events
+
+
+def extract_explicit_negative_titles(query: str) -> set[str]:
+    normalized_query = query.casefold()
+    if not any(marker in normalized_query for marker in _NEGATIVE_TITLE_MARKERS):
+        return set()
+    titles: set[str] = set()
+    for match in _QUOTED_TITLE_RE.finditer(query):
+        clause = _quote_clause(query, match.start(), match.end()).casefold()
+        if any(marker in clause for marker in _NEGATIVE_TITLE_MARKERS):
+            normalized_title = normalize_for_embedding(match.group(1))
+            if normalized_title:
+                titles.add(normalized_title)
+    return titles
+
+
+def _quote_clause(query: str, start: int, end: int) -> str:
+    left = start
+    while left > 0 and query[left - 1] not in ".!?;\n\r":
+        left -= 1
+    right = end
+    while right < len(query) and query[right] not in ".!?;\n\r":
+        right += 1
+    return query[left:right]
+
+
+def _matched_negative_title(candidate: dict[str, Any], negative_titles: set[str]) -> str | None:
+    if not negative_titles:
+        return None
+    for alias in _candidate_title_aliases(candidate):
+        normalized_alias = normalize_for_embedding(alias)
+        if normalized_alias in negative_titles:
+            return normalized_alias
+    return None
+
+
+def _candidate_title_aliases(candidate: dict[str, Any]) -> list[str]:
+    metadata = dict(candidate.get("metadata") or {})
+    aliases: list[str] = [str(candidate.get("title") or "")]
+    aliases.extend(str(item) for item in candidate.get("section_path") or [] if isinstance(item, str))
+    for key in ("redirect_title", "redirect_source_title", "alias_title", "matched_title"):
+        value = metadata.get(key)
+        if isinstance(value, str):
+            aliases.append(value)
+    raw_aliases = metadata.get("aliases")
+    if isinstance(raw_aliases, list):
+        aliases.extend(str(value) for value in raw_aliases if isinstance(value, str))
+    return aliases
 
 
 def build_stage_events(

@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,6 +15,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://rag:change-me-local-only@localhost:5432/rag"
     redis_url: str = "redis://localhost:6379/0"
     minio_endpoint: str = "http://localhost:9000"
+    minio_public_endpoint: str = "http://localhost:9000"
     minio_access_key: str = "local-minio"
     minio_secret_key: str = "change-me-local-only"  # noqa: S105
     minio_bucket: str = "rag-artifacts"
@@ -21,6 +23,7 @@ class Settings(BaseSettings):
     model_gateway_url: str = "http://localhost:8081"
     mock_provider_url: str = "http://localhost:8082"
     model_provider: str = "mock"
+    model_gateway_startup_smoke: Literal["required", "warn", "off"] = "required"
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     models_config_path: Path = Path("config/models.yaml")
@@ -36,6 +39,17 @@ class Settings(BaseSettings):
     kiwix_public_base_url: str = "http://localhost:8083"
     kiwix_internal_base_url: str = "http://kiwix:8080"
     kiwix_book_name: str = ""
+    api_public_base_url: str = "http://localhost:8000"
+
+    xberg_url: str = "http://localhost:8091"
+    docling_url: str = "http://localhost:8092"
+    metadata_service_url: str = "http://localhost:8090"
+    document_parser_services_required: bool = False
+    document_parser_timeout_seconds: int = 180
+    document_ingestion_item_concurrency: int = 2
+    upload_session_ttl_seconds: int = 900
+    upload_max_bytes: int = 100 * 1024 * 1024
+    upload_json_max_depth: int = 32
 
     default_tenant_id: str = "11111111-1111-4111-8111-111111111111"
     default_user_id: str = "22222222-2222-4222-8222-222222222222"

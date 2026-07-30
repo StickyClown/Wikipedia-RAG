@@ -1,0 +1,66 @@
+{
+  "schema_version": "document_corpus_manifest_v1",
+  "sources": [
+    {
+      "id": "cuad",
+      "name": "Contract Understanding Atticus Dataset",
+      "kind": "legal_contracts",
+      "license": "CC BY 4.0",
+      "homepage": "https://www.atticusprojectai.org/cuad/",
+      "notes": "Primary future legal contract corpus; per-document extraction from the CUAD archive is intentionally deferred."
+    },
+    {
+      "id": "courtlistener",
+      "name": "CourtListener Bulk Legal Data",
+      "kind": "case_law",
+      "license": "Free of known copyright restrictions",
+      "homepage": "https://wiki.free.law/c/courtlistener/help/api/bulk-data/bulk-legal-data",
+      "notes": "Future case-law CSV/text corpus source; archive ingestion remains out of scope for this slice."
+    },
+    {
+      "id": "sec_edgar",
+      "name": "SEC EDGAR",
+      "kind": "public_filings",
+      "license": "Public SEC filing",
+      "homepage": "https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data",
+      "notes": "Pinned HTML/TXT filing samples are safe for optional network-enabled corpus verification."
+    },
+    {
+      "id": "govinfo",
+      "name": "GovInfo",
+      "kind": "government_publications",
+      "license": "Public U.S. government publications",
+      "homepage": "https://api.govinfo.gov/docs/",
+      "notes": "Optional legal/regulatory source after the first corpus gate is stable."
+    },
+    {
+      "id": "eurlex",
+      "name": "EUR-Lex",
+      "kind": "eu_legal_regulatory",
+      "license": "EU public legal information",
+      "homepage": "https://eur-lex.europa.eu/content/help/data-reuse/webservice.html",
+      "notes": "Optional multilingual legal/regulatory source after the first corpus gate is stable."
+    }
+  ],
+  "documents": [
+    {
+      "id": "sec-aapl-2023-8k-text",
+      "enabled": true,
+      "source_id": "sec_edgar",
+      "filename": "sec-aapl-2023-8k.txt",
+      "content_type": "text/plain",
+      "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019323000005/0000320193-23-000005.txt",
+      "sha256": "6366fd10365eb5660667d9fa1900b8e0e6e93f9c04190b72da5499ed8946ee6f",
+      "license": "Public SEC filing",
+      "parser_profile": "standard",
+      "expected_outcome": "completed",
+      "expected_language": "en",
+      "expected_parser_route": "local_text_adapter",
+      "retrieval_query": "Apple Inc 2023 Form 8-K",
+      "metadata": {
+        "corpus_family": "legal_financial_filing",
+        "domain": "public_company_reporting"
+      }
+    }
+  ]
+}

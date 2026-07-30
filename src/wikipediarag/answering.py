@@ -5,9 +5,10 @@ import re
 import time
 from typing import Any
 
+from wikipediarag.claim_verifier import claim_verification_blocks, verify_claims
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.model_client import chat_completion
-from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profile
+from wikipediarag.retrieval_profile import CitationValidationMode, RetrievalProfile, get_retrieval_profile
 from wikipediarag.schemas import AnswerabilityStatus, Evidence, RetrievalResult
 from wikipediarag.zim_dump import build_kiwix_source_url
 
@@ -56,6 +57,7 @@ async def generate_answer(
         "model_chat": 0,
         "answer_parse": 0,
         "citation_validation": 0,
+        "claim_verification": 0,
     }
     resolved = settings or get_settings()
     active_profile = profile or get_retrieval_profile(settings=resolved)
@@ -131,10 +133,11 @@ async def generate_answer(
     timings_ms["answer_parse"] = _elapsed_ms(parse_started)
     answer = str(draft["answer_markdown"])
     validation_started = time.perf_counter()
-    validation = validate_citations(
+    validation = validate_citations_with_policy(
         answer,
         retrieval.evidence,
         claims=list(draft.get("claims") or []),
+        mode=active_profile.answer.verification.citation_validation,
         settings=resolved,
     )
     timings_ms["citation_validation"] = _elapsed_ms(validation_started)
@@ -153,11 +156,34 @@ async def generate_answer(
             f"Краткий подтверждённый фрагмент: {retrieval.evidence[0].content[:500]} [S1]"
         )
         validation_started = time.perf_counter()
-        validation = validate_citations(repaired, retrieval.evidence, claims=[], settings=resolved)
+        validation = validate_citations_with_policy(
+            repaired,
+            retrieval.evidence,
+            claims=[],
+            mode=active_profile.answer.verification.citation_validation,
+            settings=resolved,
+        )
         timings_ms["citation_validation"] += _elapsed_ms(validation_started)
         validation["usage"] = usage
         validation["timings_ms"] = {**timings_ms, "generation_total": _elapsed_ms(started)}
         return repaired, validation
+    claim_payload = await verify_claims(
+        list(draft.get("claims") or []),
+        retrieval.evidence,
+        settings=resolved,
+        profile=active_profile,
+    )
+    timings_ms["claim_verification"] = int(dict(claim_payload.get("timings_ms") or {}).get("claim_verification", 0))
+    validation["claim_verification"] = claim_payload
+    if claim_verification_blocks(claim_payload):
+        answer = (
+            "Ответ не прошёл claim-level проверку по supplied evidence, поэтому я не буду выдавать его как "
+            "подтверждённый. Уточните запрос или расширьте набор источников."
+        )
+        validation["valid"] = True
+        validation["insufficient_evidence"] = True
+        validation["timings_ms"] = {**timings_ms, "generation_total": _elapsed_ms(started)}
+        return answer, validation
     validation["timings_ms"] = {**timings_ms, "generation_total": _elapsed_ms(started)}
     return answer, validation
 
@@ -207,6 +233,37 @@ def validate_citations(
         "claims": claims_payload,
         "insufficient_evidence": False,
     }
+
+
+def validate_citations_with_policy(
+    answer: str,
+    evidence: list[Evidence],
+    *,
+    claims: list[dict[str, Any]] | None = None,
+    mode: CitationValidationMode = "strict",
+    settings: Settings | None = None,
+) -> dict[str, object]:
+    if mode == "off":
+        return {
+            "valid": True,
+            "status": "disabled_by_policy",
+            "policy": {"citation_validation": mode},
+            "citations": CITATION_RE.findall(answer),
+            "unknown": [],
+            "allowed": sorted(item.evidence_id for item in evidence),
+            "unsupported_claims": [],
+            "phantom_claim_citations": [],
+            "source_url_errors": [],
+            "claims": claims or [],
+            "insufficient_evidence": False,
+        }
+    validation = validate_citations(answer, evidence, claims=claims, settings=settings)
+    validation["status"] = "completed"
+    validation["policy"] = {"citation_validation": mode}
+    if mode == "warn":
+        validation["citation_validation_valid"] = validation["valid"]
+        validation["valid"] = True
+    return validation
 
 
 def _parse_answer_draft(content: str, evidence: list[Evidence], *, strict: bool) -> dict[str, Any]:

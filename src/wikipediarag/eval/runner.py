@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, TextIO
 
+from wikipediarag.answerability import GATE_VERSION as ANSWERABILITY_GATE_VERSION
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.eval.api_client import EvalApiClient, HttpEvalApiClient
 from wikipediarag.eval.artifacts import ARTIFACT_ROOT, append_jsonl, read_json, read_jsonl, utc_now_iso, write_json
@@ -27,13 +29,20 @@ from wikipediarag.retrieval_profile import get_retrieval_profile
 
 type EvalRunProgressCallback = Callable[[EvalRunStatus, str], None]
 
+DEFAULT_ANSWER_EVAL_BATCH_SIZE = 6
+ANSWER_EVAL_MAX_ATTEMPTS = 3
+EVAL_SEMANTICS_VERSION = "reviewed_gate_semantics_v4"
+
 
 class EvalRunCliReporter:
     def __init__(self, stream: TextIO | None = None) -> None:
         self._stream = stream or sys.stdout
 
     def __call__(self, status: EvalRunStatus, event: str) -> None:
-        print(format_eval_run_progress(status, event), file=self._stream, flush=True)
+        try:
+            print(format_eval_run_progress(status, event), file=self._stream, flush=True)
+        except OSError:
+            return
 
 
 def format_eval_run_progress(status: EvalRunStatus, event: str) -> str:
@@ -44,6 +53,7 @@ def format_eval_run_progress(status: EvalRunStatus, event: str) -> str:
     return (
         f"[{_format_elapsed(status.elapsed_seconds)}] state={event}{config}"
         f" task={status.current_task_index}/{status.total_tasks}{task}"
+        f" batch_size={status.batch_size}"
         f" processed={status.processed_task_runs}/{status.total_task_runs}"
         f"{latency} avg_s={status.avg_seconds_per_task:.2f} eta={eta}"
     )
@@ -57,6 +67,7 @@ def format_eval_run_status(status: EvalRunStatus) -> str:
             f"progress processed={status.processed_task_runs}/{status.total_task_runs}"
             f" completed={status.completed_task_runs}"
             f" failed={status.failed_task_runs}"
+            f" batch_size={status.batch_size}"
         ),
         (
             f"current config={status.current_config_id or '-'}"
@@ -81,9 +92,10 @@ def format_eval_run_status(status: EvalRunStatus) -> str:
 def eval_configs(settings: Settings | None = None) -> list[EvalConfig]:
     resolved = settings or get_settings()
     base_profile = "sota_mvp"
-    specs: list[tuple[str, dict[str, Any], Literal["normal", "extended", "auto"]]] = [
+    specs: list[tuple[str, str, dict[str, Any], Literal["normal", "extended", "auto"]]] = [
         (
             "bm25_only",
+            base_profile,
             {
                 "retrieval": {"bm25": True, "dense": False, "fusion": "none", "rerank": False},
                 "postprocess": {"parent_expansion": "off", "extended_search": "off"},
@@ -92,6 +104,7 @@ def eval_configs(settings: Settings | None = None) -> list[EvalConfig]:
         ),
         (
             "dense_only",
+            base_profile,
             {
                 "retrieval": {"bm25": False, "dense": True, "fusion": "none", "rerank": False},
                 "postprocess": {"parent_expansion": "off", "extended_search": "off"},
@@ -100,6 +113,7 @@ def eval_configs(settings: Settings | None = None) -> list[EvalConfig]:
         ),
         (
             "hybrid_rrf",
+            base_profile,
             {
                 "retrieval": {"bm25": True, "dense": True, "fusion": "rrf", "rerank": False},
                 "postprocess": {"parent_expansion": "off", "extended_search": "off"},
@@ -108,6 +122,7 @@ def eval_configs(settings: Settings | None = None) -> list[EvalConfig]:
         ),
         (
             "hybrid_rerank",
+            base_profile,
             {
                 "retrieval": {"bm25": True, "dense": True, "fusion": "rrf", "rerank": True},
                 "postprocess": {"parent_expansion": "selective", "extended_search": "off"},
@@ -116,29 +131,40 @@ def eval_configs(settings: Settings | None = None) -> list[EvalConfig]:
         ),
         (
             "sota_mvp_normal",
+            base_profile,
+            {"postprocess": {"extended_search": "conditional"}},
+            "normal",
+        ),
+        (
+            "sota_mvp_verified",
+            "sota_mvp_verified",
             {"postprocess": {"extended_search": "off"}},
             "normal",
         ),
         (
             "sota_mvp_conditional_harness",
+            base_profile,
             {},
             "normal",
         ),
     ]
     configs: list[EvalConfig] = []
-    for config_id, overrides, mode in specs:
+    for config_id, profile_name, overrides, mode in specs:
         merged = _eval_overrides(overrides)
-        profile = get_retrieval_profile(base_profile, resolved, merged)
+        profile = get_retrieval_profile(profile_name, resolved, merged)
         payload = {
-            "profile": base_profile,
+            "profile": profile_name,
             "overrides": merged,
             "mode": mode,
+            "answerability_gate_version": ANSWERABILITY_GATE_VERSION,
+            "eval_semantics_version": EVAL_SEMANTICS_VERSION,
             "model_aliases": profile.model_aliases.model_dump(),
+            "verification": profile.answer.verification.model_dump(mode="json"),
         }
         configs.append(
             EvalConfig(
                 config_id=config_id,
-                retrieval_profile=base_profile,
+                retrieval_profile=profile_name,
                 retrieval_overrides=merged,
                 mode=mode,
                 config_hash=stable_json_hash(payload),
@@ -153,14 +179,22 @@ async def run_suite(
     tasks: list[EvalTask],
     *,
     api: str,
+    run_id: str | None = None,
+    report_id: str = "",
+    reuse_completed: bool = True,
     settings: Settings | None = None,
     client: EvalApiClient | None = None,
+    batch_size: int = DEFAULT_ANSWER_EVAL_BATCH_SIZE,
+    config_ids: set[str] | None = None,
     progress_callback: EvalRunProgressCallback | None = None,
 ) -> EvalRunManifest:
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
     resolved = settings or get_settings()
-    run_id = f"{manifest.dataset_name}-{manifest.dataset_hash[:12]}"
-    run_dir = ARTIFACT_ROOT / "runs" / manifest.dataset_name / run_id
-    configs = eval_configs(resolved)
+    resolved_run_id = run_id or f"{manifest.dataset_name}-{manifest.dataset_hash[:12]}"
+    resolved_report_id = report_id or resolved_run_id
+    run_dir = ARTIFACT_ROOT / "runs" / manifest.dataset_name / resolved_run_id
+    configs = _filter_configs(eval_configs(resolved), config_ids)
     api_client = client or HttpEvalApiClient(
         kiwix_public_base_url=resolved.kiwix_public_base_url,
         kiwix_internal_base_url=resolved.kiwix_internal_base_url,
@@ -170,13 +204,19 @@ async def run_suite(
     started = time.perf_counter()
     status = _initial_status(
         manifest,
-        run_id=run_id,
+        run_id=resolved_run_id,
+        report_id=resolved_report_id,
         run_dir=run_dir,
         configs=configs,
         started_at=started_at,
-        processed_task_runs=_processed_count(run_dir, configs),
-        completed_task_runs=_completed_count(run_dir),
-        failed_task_runs=_failed_count(run_dir),
+        batch_size=batch_size,
+        processed_task_runs=_processed_count(
+            run_dir,
+            configs,
+            eval_run_id=None if reuse_completed else resolved_run_id,
+        ),
+        completed_task_runs=_completed_count(run_dir, eval_run_id=None if reuse_completed else resolved_run_id),
+        failed_task_runs=_failed_count(run_dir, eval_run_id=None if reuse_completed else resolved_run_id),
     )
     _write_status(status)
     _log_event(run_dir, "run_started", status=status)
@@ -188,7 +228,12 @@ async def run_suite(
                 started=started,
                 current_task_id="",
                 current_task_index=0,
-                processed_task_runs=_processed_count(run_dir, configs),
+                processed_task_runs=_processed_count(
+                    run_dir,
+                    configs,
+                    eval_run_id=None if reuse_completed else resolved_run_id,
+                ),
+                count_eval_run_id=None if reuse_completed else resolved_run_id,
             ).model_copy(
                 update={
                     "phase": "config_running",
@@ -201,42 +246,36 @@ async def run_suite(
             _log_event(run_dir, "config_started", status=status, config=config)
             _emit(progress_callback, status, "config_started")
             results_path = _results_path(run_dir, config)
-            existing = _latest_results(results_path)
-            for task_index, task in enumerate(tasks, start=1):
-                if task.task_id in existing and existing[task.task_id].status in {"completed", "reused"}:
-                    continue
-                status = _advance_status(
-                    status,
-                    started=started,
-                    current_task_id=task.task_id,
-                    current_task_index=task_index,
-                    processed_task_runs=_processed_count(run_dir, configs),
-                )
-                _write_status(status)
-                _log_event(run_dir, "task_started", status=status, config=config, task=task)
-                _emit(progress_callback, status, "task_started")
-                result = await run_task(task, config, api=api, manifest=manifest, client=api_client, settings=resolved)
-                append_jsonl(results_path, result)
-                existing[task.task_id] = result
-                status = _advance_status(
-                    status,
-                    started=started,
-                    current_task_id=task.task_id,
-                    current_task_index=task_index,
-                    processed_task_runs=_processed_count(run_dir, configs),
-                    last_latency_ms=int(result.latency_ms.get("total", 0)),
-                )
-                _write_status(status)
-                _log_event(
-                    run_dir,
-                    "task_completed" if result.status == "completed" else "task_failed",
-                    status=status,
-                    config=config,
-                    task=task,
-                    errors=result.errors,
-                )
-                _emit(progress_callback, status, "task_completed" if result.status == "completed" else "task_failed")
-            results = read_jsonl(results_path, EvalTaskResult)
+            existing = _latest_results(results_path) if reuse_completed else {}
+            root_run_contract_id = _eval_root_run_contract_id(manifest, config)
+            status = await _run_config_with_backfill(
+                status,
+                started=started,
+                run_dir=run_dir,
+                configs=configs,
+                config=config,
+                tasks=tasks,
+                existing=existing,
+                results_path=results_path,
+                report_id=resolved_report_id,
+                run_started_at=started_at,
+                reuse_completed=reuse_completed,
+                root_run_contract_id=root_run_contract_id,
+                batch_size=batch_size,
+                api=api,
+                manifest=manifest,
+                client=api_client,
+                settings=resolved,
+                progress_callback=progress_callback,
+            )
+            results = list(
+                _latest_results(
+                    results_path,
+                    eval_run_id=resolved_run_id if not reuse_completed else None,
+                    dataset_hash=manifest.dataset_hash if not reuse_completed else None,
+                    config_hash=config.config_hash,
+                ).values()
+            )
             summary = summarize_config(config, tasks, results)
             summaries.append(summary)
             write_json(run_dir / "summaries" / f"{config.config_id}.json", summary.model_dump(mode="json"))
@@ -245,17 +284,24 @@ async def run_suite(
                 started=started,
                 current_task_id="",
                 current_task_index=0,
-                processed_task_runs=_processed_count(run_dir, configs),
+                processed_task_runs=_processed_count(
+                    run_dir,
+                    configs,
+                    eval_run_id=None if reuse_completed else resolved_run_id,
+                ),
+                count_eval_run_id=None if reuse_completed else resolved_run_id,
             )
             _write_status(status)
             _log_event(run_dir, "config_completed", status=status, config=config)
             _emit(progress_callback, status, "config_completed")
         run_manifest = EvalRunManifest(
-            run_id=run_id,
+            run_id=resolved_run_id,
+            report_id=resolved_report_id,
             suite=manifest.dataset_name,
             dataset_hash=manifest.dataset_hash,
             dataset_path=manifest.jsonl_path,
             created_at=utc_now_iso(),
+            batch_size=batch_size,
             config_summaries=summaries,
             run_dir=str(run_dir),
         )
@@ -266,7 +312,12 @@ async def run_suite(
             started=started,
             current_task_id="",
             current_task_index=0,
-            processed_task_runs=_processed_count(run_dir, configs),
+            processed_task_runs=_processed_count(
+                run_dir,
+                configs,
+                eval_run_id=None if reuse_completed else resolved_run_id,
+            ),
+            count_eval_run_id=None if reuse_completed else resolved_run_id,
         ).model_copy(
             update={
                 "state": "completed",
@@ -285,7 +336,12 @@ async def run_suite(
             started=started,
             current_task_id=status.current_task_id,
             current_task_index=status.current_task_index,
-            processed_task_runs=_processed_count(run_dir, configs),
+            processed_task_runs=_processed_count(
+                run_dir,
+                configs,
+                eval_run_id=None if reuse_completed else resolved_run_id,
+            ),
+            count_eval_run_id=None if reuse_completed else resolved_run_id,
         ).model_copy(
             update={
                 "state": "failed",
@@ -308,24 +364,74 @@ async def run_task(
     manifest: EvalDatasetManifest,
     client: EvalApiClient,
     settings: Settings,
+    eval_run_id: str = "",
+    report_id: str = "",
+    run_started_at: str = "",
+    root_run_contract_id: str = "",
 ) -> EvalTaskResult:
     started = time.perf_counter()
-    try:
-        payload = client.run_chat(
-            task.question,
-            api=api,
-            retrieval_profile=config.retrieval_profile,
-            retrieval_overrides=config.retrieval_overrides,
-            mode=config.mode,
-        )
+    attempt_records: list[dict[str, Any]] = []
+    for attempt in range(1, ANSWER_EVAL_MAX_ATTEMPTS + 1):
+        try:
+            payload = await asyncio.to_thread(
+                client.run_chat,
+                task.question,
+                api=api,
+                retrieval_profile=config.retrieval_profile,
+                retrieval_overrides=config.retrieval_overrides,
+                mode=config.mode,
+            )
+        except Exception as exc:
+            total_ms = int((time.perf_counter() - started) * 1000)
+            failure = _failure_from_exception(exc, attempt=attempt)
+            attempt_records.append(failure)
+            if attempt < ANSWER_EVAL_MAX_ATTEMPTS:
+                await asyncio.sleep(min(2.0, 0.5 * attempt))
+                continue
+            return _failed_result(
+                task,
+                config,
+                manifest,
+                _failure_message(failure, attempt),
+                total_ms,
+                eval_run_id=eval_run_id,
+                report_id=report_id,
+                run_started_at=run_started_at,
+                root_run_contract_id=root_run_contract_id,
+                attempt_records=attempt_records,
+                failure=failure,
+            )
         total_ms = int((time.perf_counter() - started) * 1000)
         if payload.get("failed"):
-            return _failed_result(task, config, manifest, str(payload.get("error") or "chat failed"), total_ms)
+            failure = _failure_from_payload(payload, attempt=attempt)
+            attempt_records.append(failure)
+            if attempt < ANSWER_EVAL_MAX_ATTEMPTS:
+                await asyncio.sleep(min(2.0, 0.5 * attempt))
+                continue
+            return _failed_result(
+                task,
+                config,
+                manifest,
+                _failure_message(failure, attempt),
+                total_ms,
+                eval_run_id=eval_run_id,
+                report_id=report_id,
+                run_started_at=run_started_at,
+                root_run_contract_id=root_run_contract_id,
+                payload=payload,
+                attempt_records=attempt_records,
+                failure=failure,
+            )
         usage_event = dict(payload.get("usage") or {})
         usage_data = dict(usage_event.get("data") or {})
         retrieval = dict(usage_data.get("retrieval") or {})
         validation = dict(usage_data.get("citation_validation") or {})
         contract_ids = _contract_ids_from_payload(retrieval)
+        retrieval_contract_ids = _retrieval_contract_ids_from_payload(retrieval)
+        tool_contract_ids = _tool_contract_ids_from_payload(retrieval)
+        effective_run_contract_id = root_run_contract_id or contract_ids.get("run_contract_id", "")
+        if effective_run_contract_id:
+            contract_ids["run_contract_id"] = effective_run_contract_id
         answer = str(payload.get("answer") or "")
         prefusion, reranked = await _extract_candidates(retrieval, settings)
         evidence = list(retrieval.get("evidence") or [])
@@ -333,7 +439,7 @@ async def run_task(
         cited_chunk_ids = _cited_chunk_ids(cited_ids, evidence)
         cited_urls = _cited_urls(cited_ids, evidence)
         gold_urls = [item.source_url for item in task.gold_evidence if item.source_url]
-        kiwix_ok = all(client.url_ok(url) for url in [*gold_urls, *cited_urls] if url)
+        kiwix_ok = await asyncio.to_thread(_all_urls_ok, client, [*gold_urls, *cited_urls])
         scores = score_task(
             task,
             answer=answer,
@@ -351,12 +457,21 @@ async def run_task(
             "total_tokens": _usage_int(validation.get("usage"), "total_tokens"),
             "estimated_cost_usd": _cost(validation),
             "model_calls": model_calls,
+            "attempts": attempt,
+            "retry_errors": [str(record.get("safe_message") or record.get("code") or "") for record in attempt_records],
+            "attempt_records": attempt_records,
+            "answerability_status": validation.get("answerability_status"),
+            "insufficient_evidence": validation.get("insufficient_evidence"),
             "raw_generation_usage": validation.get("usage", {}),
         }
         return EvalTaskResult(
             task_id=task.task_id,
             config_id=config.config_id,
             config_hash=config.config_hash,
+            eval_run_id=eval_run_id,
+            report_id=report_id,
+            run_started_at=run_started_at,
+            dataset_hash=manifest.dataset_hash,
             status="completed",
             question=task.question,
             answer=answer,
@@ -365,6 +480,14 @@ async def run_task(
             retrieved_candidates=prefusion,
             reranked_candidates=reranked,
             mode_selected="harness" if _used_harness(retrieval) else "normal",
+            run_contract_id=effective_run_contract_id,
+            execution_path=_execution_path(retrieval),
+            path_selection_reason=_path_selection_reason(config, retrieval),
+            retrieval_contract_ids=retrieval_contract_ids,
+            tool_contract_ids=tool_contract_ids,
+            step_events=_step_events_from_payload(payload, config=config, attempt=attempt),
+            attempts=attempt,
+            last_successful_stage="task_completed",
             latency_ms={"total": total_ms, "retrieval": retrieval_latency, **timings_ms},
             usage=usage,
             scores=scores,
@@ -379,37 +502,177 @@ async def run_task(
             model_aliases=config.model_aliases,
             contract_ids=contract_ids,
         )
-    except Exception as exc:
-        total_ms = int((time.perf_counter() - started) * 1000)
-        return _failed_result(task, config, manifest, type(exc).__name__ + ": " + str(exc), total_ms)
+    total_ms = int((time.perf_counter() - started) * 1000)
+    return _failed_result(
+        task,
+        config,
+        manifest,
+        "chat failed without result",
+        total_ms,
+        eval_run_id=eval_run_id,
+        report_id=report_id,
+        run_started_at=run_started_at,
+        root_run_contract_id=root_run_contract_id,
+        attempt_records=attempt_records,
+        failure={
+            "stage": "chat",
+            "code": "empty_result",
+            "retryable": True,
+            "safe_message": "chat failed without result",
+            "last_successful_stage": "",
+            "attempt": ANSWER_EVAL_MAX_ATTEMPTS,
+        },
+    )
+
+
+async def _run_config_with_backfill(
+    status: EvalRunStatus,
+    *,
+    started: float,
+    run_dir: Path,
+    configs: list[EvalConfig],
+    config: EvalConfig,
+    tasks: list[EvalTask],
+    existing: dict[str, EvalTaskResult],
+    results_path: Path,
+    report_id: str,
+    run_started_at: str,
+    reuse_completed: bool,
+    root_run_contract_id: str,
+    batch_size: int,
+    api: str,
+    manifest: EvalDatasetManifest,
+    client: EvalApiClient,
+    settings: Settings,
+    progress_callback: EvalRunProgressCallback | None,
+) -> EvalRunStatus:
+    eligible = [
+        (task_index, task)
+        for task_index, task in enumerate(tasks, start=1)
+        if task.task_id not in existing or existing[task.task_id].status not in {"completed", "reused"}
+    ]
+    pending: dict[asyncio.Task[EvalTaskResult], tuple[int, EvalTask]] = {}
+    next_index = 0
+
+    async def schedule_next(current_status: EvalRunStatus) -> EvalRunStatus:
+        nonlocal next_index
+        if next_index >= len(eligible):
+            return current_status
+        task_index, task = eligible[next_index]
+        next_index += 1
+        updated = _advance_status(
+            current_status,
+            started=started,
+            current_task_id=task.task_id,
+            current_task_index=task_index,
+            processed_task_runs=_processed_count(
+                run_dir,
+                configs,
+                eval_run_id=None if reuse_completed else current_status.run_id,
+            ),
+            count_eval_run_id=None if reuse_completed else current_status.run_id,
+        )
+        _write_status(updated)
+        _log_event(run_dir, "task_started", status=updated, config=config, task=task)
+        _emit(progress_callback, updated, "task_started")
+        future = asyncio.create_task(
+            run_task(
+                task,
+                config,
+                api=api,
+                manifest=manifest,
+                client=client,
+                settings=settings,
+                eval_run_id=status.run_id,
+                report_id=report_id,
+                run_started_at=run_started_at,
+                root_run_contract_id=root_run_contract_id,
+            )
+        )
+        pending[future] = (task_index, task)
+        return updated
+
+    try:
+        while next_index < len(eligible) and len(pending) < batch_size:
+            status = await schedule_next(status)
+        while pending:
+            done, _pending = await asyncio.wait(pending.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for finished in done:
+                task_index, task = pending.pop(finished)
+                result = await finished
+                append_jsonl(results_path, result)
+                existing[task.task_id] = result
+                status = _advance_status(
+                    status,
+                    started=started,
+                    current_task_id=task.task_id,
+                    current_task_index=task_index,
+                    processed_task_runs=_processed_count(
+                        run_dir,
+                        configs,
+                        eval_run_id=None if reuse_completed else status.run_id,
+                    ),
+                    count_eval_run_id=None if reuse_completed else status.run_id,
+                    last_latency_ms=int(result.latency_ms.get("total", 0)),
+                )
+                _write_status(status)
+                event = "task_completed" if result.status == "completed" else "task_failed"
+                _log_event(run_dir, event, status=status, config=config, task=task, errors=result.errors)
+                _emit(progress_callback, status, event)
+                status = await schedule_next(status)
+        return status
+    finally:
+        for future in pending:
+            future.cancel()
+        if pending:
+            await asyncio.gather(*pending.keys(), return_exceptions=True)
 
 
 def summarize_config(config: EvalConfig, tasks: list[EvalTask], results: list[EvalTaskResult]) -> ConfigSummary:
     task_by_id = {task.task_id: task for task in tasks}
-    completed = [result for result in results if result.scores is not None]
-    answerable = [result for result in completed if not task_by_id[result.task_id].unanswerable]
-    metrics = _aggregate_results(completed, answerable)
+    latest = list({result.task_id: result for result in results}.values())
+    completed = [result for result in latest if result.scores is not None]
+    answerable = [
+        result for result in completed if (task := task_by_id.get(result.task_id)) is not None and not task.unanswerable
+    ]
+    unanswerable = [
+        result for result in completed if (task := task_by_id.get(result.task_id)) is not None and task.unanswerable
+    ]
+    metrics = _aggregate_results(completed, answerable, unanswerable)
     by_family: dict[str, dict[str, float]] = {}
     for family in sorted({task.task_family for task in tasks}):
-        family_results = [result for result in completed if task_by_id[result.task_id].task_family == family]
-        family_answerable = [result for result in family_results if not task_by_id[result.task_id].unanswerable]
-        by_family[str(family)] = _aggregate_results(family_results, family_answerable)
+        family_results = [
+            result
+            for result in completed
+            if (task := task_by_id.get(result.task_id)) is not None and task.task_family == family
+        ]
+        family_answerable = [
+            result
+            for result in family_results
+            if (task := task_by_id.get(result.task_id)) is not None and not task.unanswerable
+        ]
+        family_unanswerable = [
+            result
+            for result in family_results
+            if (task := task_by_id.get(result.task_id)) is not None and task.unanswerable
+        ]
+        by_family[str(family)] = _aggregate_results(family_results, family_answerable, family_unanswerable)
     failed = [
         result.task_id
-        for result in results
+        for result in latest
         if result.status == "failed"
         or result.scores is None
         or _task_failed_threshold(task_by_id.get(result.task_id), result.scores)
     ]
-    contract_ids = _summary_contract_ids(results)
+    contract_ids = _summary_contract_ids(latest)
     return ConfigSummary(
         config_id=config.config_id,
         config_hash=config.config_hash,
-        task_count=len(results),
+        task_count=len(latest),
         metrics=metrics,
         by_family=by_family,
         failed_task_ids=sorted(set(failed)),
-        errors=[error for result in results for error in result.errors] + _contract_mix_errors(contract_ids),
+        errors=[error for result in latest for error in result.errors] + _contract_mix_errors(contract_ids),
         contract_ids=contract_ids,
     )
 
@@ -422,7 +685,10 @@ async def _extract_candidates(
     prefusion_raw = (
         _stage_candidates(events, "rrf") or _stage_candidates(events, "bm25") or _stage_candidates(events, "dense")
     )
-    reranked_raw = _stage_candidates(events, "rerank") or prefusion_raw
+    context_raw = _stage_candidates(events, "context")
+    evidence_raw = _evidence_candidates(retrieval)
+    reranked_raw = _stage_candidates(events, "rerank") or context_raw or evidence_raw or prefusion_raw
+    prefusion_raw = prefusion_raw or context_raw or evidence_raw
     ids = [str(item.get("chunk_id")) for item in [*prefusion_raw, *reranked_raw] if item.get("chunk_id")]
     refs = await load_chunk_refs(ids, settings=settings)
     return _candidate_refs(prefusion_raw, refs, "prefusion"), _candidate_refs(reranked_raw, refs, "rerank")
@@ -459,6 +725,28 @@ def _stage_candidates(events: list[dict[str, Any]], stage: str) -> list[dict[str
     return []
 
 
+def _evidence_candidates(retrieval: dict[str, Any]) -> list[dict[str, Any]]:
+    evidence = retrieval.get("evidence")
+    if not isinstance(evidence, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        chunk_id = str(item.get("chunk_id") or "")
+        if not chunk_id:
+            continue
+        candidates.append(
+            {
+                "chunk_id": chunk_id,
+                "title": item.get("title"),
+                "source_url": item.get("source_url"),
+                "scores": item.get("scores") if isinstance(item.get("scores"), dict) else {},
+            }
+        )
+    return candidates
+
+
 def _cited_chunk_ids(cited_ids: list[str], evidence: list[Any]) -> list[str]:
     by_id = {str(item.get("evidence_id")): str(item.get("chunk_id")) for item in evidence if isinstance(item, dict)}
     return [by_id[item] for item in cited_ids if item in by_id]
@@ -467,6 +755,10 @@ def _cited_chunk_ids(cited_ids: list[str], evidence: list[Any]) -> list[str]:
 def _cited_urls(cited_ids: list[str], evidence: list[Any]) -> list[str]:
     by_id = {str(item.get("evidence_id")): str(item.get("source_url")) for item in evidence if isinstance(item, dict)}
     return [by_id[item] for item in cited_ids if item in by_id and by_id[item]]
+
+
+def _all_urls_ok(client: EvalApiClient, urls: list[str]) -> bool:
+    return all(client.url_ok(url) for url in urls if url)
 
 
 def _eval_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
@@ -493,11 +785,26 @@ def _deep_merge(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def _aggregate_results(results: list[EvalTaskResult], answerable: list[EvalTaskResult]) -> dict[str, float]:
+def _filter_configs(configs: list[EvalConfig], config_ids: set[str] | None) -> list[EvalConfig]:
+    if not config_ids:
+        return configs
+    filtered = [config for config in configs if config.config_id in config_ids]
+    missing = sorted(config_ids - {config.config_id for config in filtered})
+    if missing:
+        raise ValueError(f"unknown eval config IDs: {missing}")
+    return filtered
+
+
+def _aggregate_results(
+    results: list[EvalTaskResult],
+    answerable: list[EvalTaskResult],
+    unanswerable: list[EvalTaskResult],
+) -> dict[str, float]:
     retrieval_base = answerable or results
     scores = [result.scores for result in results if result.scores is not None]
     retrieval_scores = [result.scores for result in retrieval_base if result.scores is not None]
     latencies = [float(result.latency_ms.get("total", 0)) for result in results]
+    unanswerable_scores = [result.scores for result in unanswerable if result.scores is not None]
     metrics = {
         "page_recall_at_1": aggregate(score.page_recall["1"] for score in retrieval_scores),
         "page_recall_at_5": aggregate(score.page_recall["5"] for score in retrieval_scores),
@@ -518,10 +825,10 @@ def _aggregate_results(results: list[EvalTaskResult], answerable: list[EvalTaskR
         ),
         "exact_match": aggregate(score.exact_match for score in scores),
         "token_f1": aggregate(score.token_f1 for score in scores),
-        "unanswerable_accuracy": aggregate(score.unanswerable_accuracy for score in scores),
         "citation_precision": aggregate(score.citation_precision for score in scores),
         "citation_recall": aggregate(score.citation_recall for score in scores),
         "unsupported_claim_rate": aggregate(score.unsupported_claim_rate for score in scores),
+        "cited_hard_negative_rate": aggregate(score.cited_hard_negative_rate for score in scores),
         "kiwix_url_ok": aggregate(score.kiwix_url_ok for score in scores),
         "latency_p50_ms": percentile(latencies, 50),
         "latency_p95_ms": percentile(latencies, 95),
@@ -529,6 +836,11 @@ def _aggregate_results(results: list[EvalTaskResult], answerable: list[EvalTaskR
         "tokens": aggregate(float(result.usage.get("total_tokens", 0)) for result in results),
         "openrouter_cost_usd": aggregate(float(result.usage.get("estimated_cost_usd", 0.0)) for result in results),
     }
+    if unanswerable_scores:
+        metrics["unanswerable_accuracy"] = aggregate(score.unanswerable_accuracy for score in unanswerable_scores)
+        metrics["soft_unanswerable_context_rate"] = aggregate(
+            score.soft_unanswerable_context_rate for score in unanswerable_scores
+        )
     metrics.update(_stage_latency_metrics(results))
     return metrics
 
@@ -538,7 +850,12 @@ def _task_failed_threshold(task: EvalTask | None, scores: TaskScores | None) -> 
         return True
     if task.unanswerable:
         return scores.unanswerable_accuracy < 1.0
-    return scores.page_recall["10"] < 1.0 or scores.chunk_recall["20"] < 1.0 or scores.citation_precision < 1.0
+    return (
+        scores.page_recall["10"] < 1.0
+        or scores.chunk_recall["20"] < 1.0
+        or scores.citation_precision < 1.0
+        or scores.cited_hard_negative_rate > 0.0
+    )
 
 
 def _failed_result(
@@ -547,22 +864,71 @@ def _failed_result(
     manifest: EvalDatasetManifest,
     error: str,
     latency_ms: int,
+    *,
+    eval_run_id: str = "",
+    report_id: str = "",
+    run_started_at: str = "",
+    root_run_contract_id: str = "",
+    payload: dict[str, Any] | None = None,
+    attempt_records: list[dict[str, Any]] | None = None,
+    failure: dict[str, Any] | None = None,
 ) -> EvalTaskResult:
+    payload = dict(payload or {})
+    failure = dict(failure or {})
+    usage_event = dict(payload.get("usage") or {})
+    usage_data = dict(usage_event.get("data") or {})
+    failed_event = dict(payload.get("failed_event") or {})
+    failed_data = dict(failed_event.get("data") or {})
+    retrieval = dict(usage_data.get("retrieval") or failed_data.get("retrieval") or {})
+    prefusion = _candidate_refs_sync(_safe_candidates_from_retrieval(retrieval, "prefusion"), "prefusion")
+    reranked = _candidate_refs_sync(_safe_candidates_from_retrieval(retrieval, "rerank"), "rerank")
+    failure_stage = str(failure.get("stage") or failed_data.get("stage") or "chat")
+    failure_code = str(failure.get("code") or failed_data.get("code") or "chat_failed")
+    last_successful_stage = str(failure.get("last_successful_stage") or failed_data.get("last_successful_stage") or "")
+    attempts = max(
+        int(failure.get("attempt") or failed_data.get("attempt") or 1),
+        len(attempt_records or []),
+    )
     return EvalTaskResult(
         task_id=task.task_id,
         config_id=config.config_id,
         config_hash=config.config_hash,
+        eval_run_id=eval_run_id,
+        report_id=report_id,
+        run_started_at=run_started_at,
+        dataset_hash=manifest.dataset_hash,
         status="failed",
         question=task.question,
+        retrieved_candidates=prefusion,
+        reranked_candidates=reranked,
+        mode_selected="harness" if _used_harness(retrieval) else "normal",
+        run_contract_id=root_run_contract_id,
+        execution_path=_execution_path(retrieval),
+        path_selection_reason=_path_selection_reason(config, retrieval),
+        retrieval_contract_ids=_retrieval_contract_ids_from_payload(retrieval),
+        tool_contract_ids=_tool_contract_ids_from_payload(retrieval),
+        step_events=_step_events_from_payload(payload, config=config, attempt=attempts, failure=failure),
+        failure_stage=failure_stage,
+        failure_code=failure_code,
+        failure_retryable=bool(
+            failure.get("retryable") if "retryable" in failure else failed_data.get("retryable", True)
+        ),
+        attempts=attempts,
+        last_successful_stage=last_successful_stage,
         latency_ms={"total": latency_ms},
+        usage={"attempts": attempts, "attempt_records": attempt_records or []},
         errors=[error],
+        query_run_id=str(payload.get("query_run_id")) if payload.get("query_run_id") else None,
+        trace_id=str(payload.get("trace_id") or failed_data.get("trace_id"))
+        if payload.get("trace_id") or failed_data.get("trace_id")
+        else None,
         corpus={
             "snapshot_id": manifest.snapshot_id,
             "index_version": manifest.index_version,
             "zim_checksum": manifest.zim_checksum,
         },
         model_aliases=config.model_aliases,
-        contract_ids={},
+        contract_ids={"run_contract_id": root_run_contract_id} if root_run_contract_id else {},
     )
 
 
@@ -603,12 +969,226 @@ def _safe_timing_dict(payload: dict[Any, Any]) -> dict[str, int]:
     }
 
 
+def _step_events_from_payload(
+    payload: dict[str, Any],
+    *,
+    config: EvalConfig,
+    attempt: int,
+    failure: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    usage_event = dict(payload.get("usage") or {})
+    usage_data = dict(usage_event.get("data") or {})
+    failed_event = dict(payload.get("failed_event") or {})
+    failed_data = dict(failed_event.get("data") or {})
+    retrieval = dict(usage_data.get("retrieval") or failed_data.get("retrieval") or {})
+    events = list(retrieval.get("events") or [])
+    output: list[dict[str, Any]] = [
+        {
+            "name": "question_received",
+            "status": "completed",
+            "attempt": attempt,
+            "reason": "eval_task",
+        },
+        {
+            "name": "path_selected",
+            "status": "completed",
+            "attempt": attempt,
+            "reason": _path_selection_reason(config, retrieval),
+            "execution_path": _execution_path(retrieval),
+        },
+    ]
+    seen: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        stage = str(event.get("stage") or "")
+        step = _step_name_for_stage(stage)
+        if not step:
+            continue
+        seen.add(step)
+        output.append(_step_event_from_retrieval_event(step, event, attempt=attempt))
+    if "extended_completed" not in seen:
+        output.append(
+            {
+                "name": "extended_skipped",
+                "status": "skipped",
+                "attempt": attempt,
+                "reason": "execution_path_not_harness",
+            }
+        )
+    if failure:
+        output.append(
+            {
+                "name": f"{str(failure.get('stage') or 'task')}_failed",
+                "status": "failed",
+                "attempt": attempt,
+                "code": str(failure.get("code") or "unknown"),
+                "safe_message": str(failure.get("safe_message") or ""),
+                "retryable": bool(failure.get("retryable", True)),
+                "last_successful_stage": str(failure.get("last_successful_stage") or ""),
+            }
+        )
+        output.append({"name": "task_failed", "status": "failed", "attempt": attempt})
+    else:
+        output.append({"name": "answer_generation_completed", "status": "completed", "attempt": attempt})
+        output.append({"name": "citation_check_completed", "status": "completed", "attempt": attempt})
+        output.append({"name": "task_completed", "status": "completed", "attempt": attempt})
+    return output
+
+
+def _step_name_for_stage(stage: str) -> str:
+    return {
+        "bm25": "bm25_completed",
+        "dense": "dense_completed",
+        "rrf": "fusion_completed",
+        "rerank": "rerank_completed",
+        "context": "context_selected",
+        "answerability": "answerability_checked",
+        "harness_tool": "extended_tool_search_completed",
+        "harness": "extended_completed",
+    }.get(stage, "")
+
+
+def _step_event_from_retrieval_event(name: str, event: dict[str, Any], *, attempt: int) -> dict[str, Any]:
+    candidates = list(event.get("candidates") or [])
+    chunk_ids = [str(item.get("chunk_id")) for item in candidates if isinstance(item, dict) and item.get("chunk_id")]
+    payload: dict[str, Any] = {
+        "name": name,
+        "status": "completed",
+        "attempt": attempt,
+        "latency_ms": int(event.get("latency_ms") or event.get("stage_latency_ms") or 0),
+        "candidate_count": int(event.get("count") or len(candidates)),
+        "chunk_ids": chunk_ids[:20],
+    }
+    if event.get("run_contract_id"):
+        payload["retrieval_contract_id"] = str(event["run_contract_id"])
+    if event.get("stop_reason"):
+        payload["reason"] = str(event["stop_reason"])
+    if event.get("decision"):
+        payload["decision"] = event["decision"]
+    return payload
+
+
+def _failure_from_exception(exc: Exception, *, attempt: int) -> dict[str, Any]:
+    return {
+        "stage": "api_request",
+        "code": type(exc).__name__,
+        "retryable": True,
+        "attempt": attempt,
+        "last_successful_stage": "",
+        "safe_message": type(exc).__name__,
+    }
+
+
+def _failure_from_payload(payload: dict[str, Any], *, attempt: int) -> dict[str, Any]:
+    failed_event = dict(payload.get("failed_event") or {})
+    data = dict(failed_event.get("data") or {})
+    return {
+        "stage": str(data.get("stage") or "chat"),
+        "code": str(data.get("code") or payload.get("error") or "run_failed"),
+        "retryable": bool(data.get("retryable", True)),
+        "attempt": int(data.get("attempt") or attempt),
+        "last_successful_stage": str(data.get("last_successful_stage") or ""),
+        "safe_message": str(data.get("safe_message") or data.get("error") or payload.get("error") or "run failed"),
+    }
+
+
+def _failure_message(failure: dict[str, Any], attempts: int) -> str:
+    stage = str(failure.get("stage") or "chat")
+    code = str(failure.get("code") or "run_failed")
+    return f"{stage}:{code} after {attempts} attempts"
+
+
+def _execution_path(retrieval: dict[str, Any]) -> str:
+    return "harness" if _used_harness(retrieval) else "normal"
+
+
+def _path_selection_reason(config: EvalConfig, retrieval: dict[str, Any]) -> str:
+    if config.mode == "extended":
+        return "user_selected"
+    if _used_harness(retrieval):
+        return "auto_question_type"
+    return "config_default"
+
+
+def _safe_candidates_from_retrieval(retrieval: dict[str, Any], stage: str) -> list[dict[str, Any]]:
+    if not retrieval:
+        return []
+    if stage == "rerank":
+        candidates = _stage_candidates(list(retrieval.get("events") or []), "rerank")
+        return candidates or _evidence_candidates(retrieval)
+    return _stage_candidates(list(retrieval.get("events") or []), "rrf") or _evidence_candidates(retrieval)
+
+
+def _candidate_refs_sync(candidates: list[dict[str, Any]], stage: str) -> list[CandidateRef]:
+    refs: list[CandidateRef] = []
+    for rank, item in enumerate(candidates[:20], start=1):
+        if not isinstance(item, dict) or not item.get("chunk_id"):
+            continue
+        refs.append(
+            CandidateRef(
+                chunk_id=str(item.get("chunk_id") or ""),
+                document_id=str(item.get("document_id") or ""),
+                section_id=str(item.get("section_id") or ""),
+                title=str(item.get("title") or ""),
+                source_url=str(item.get("source_url") or ""),
+                rank=int(item.get("rank") or rank),
+                stage=stage,
+                scores={
+                    str(key): float(value)
+                    for key, value in dict(item.get("scores") or {}).items()
+                    if isinstance(value, int | float)
+                },
+            )
+        )
+    return refs
+
+
 def _contract_ids_from_payload(payload: dict[str, Any]) -> dict[str, str]:
     return {
         key: str(payload[key])
         for key in ("index_contract_id", "run_contract_id")
         if isinstance(payload.get(key), str) and payload.get(key)
     }
+
+
+def _eval_root_run_contract_id(manifest: EvalDatasetManifest, config: EvalConfig) -> str:
+    return "sha256:" + stable_json_hash(
+        {
+            "schema": "eval_answer_run_contract_v1",
+            "semantics_version": EVAL_SEMANTICS_VERSION,
+            "dataset_hash": manifest.dataset_hash,
+            "config_id": config.config_id,
+            "config_hash": config.config_hash,
+            "retrieval_profile": config.retrieval_profile,
+            "retrieval_overrides": config.retrieval_overrides,
+            "mode": config.mode,
+            "model_aliases": config.model_aliases,
+        }
+    )
+
+
+def _retrieval_contract_ids_from_payload(payload: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    direct = payload.get("run_contract_id")
+    if isinstance(direct, str) and direct:
+        ids.append(direct)
+    for event in payload.get("events", []):
+        if isinstance(event, dict):
+            value = event.get("run_contract_id")
+            if isinstance(value, str) and value:
+                ids.append(value)
+    return sorted(set(ids))
+
+
+def _tool_contract_ids_from_payload(payload: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for event in payload.get("events", []):
+        if isinstance(event, dict) and event.get("stage") == "harness_tool":
+            value = event.get("run_contract_id")
+            if isinstance(value, str) and value:
+                ids.append(value)
+    return sorted(set(ids))
 
 
 def _summary_contract_ids(results: list[EvalTaskResult]) -> dict[str, list[str]]:
@@ -653,21 +1233,25 @@ def _initial_status(
     manifest: EvalDatasetManifest,
     *,
     run_id: str,
+    report_id: str,
     run_dir: Path,
     configs: list[EvalConfig],
     started_at: str,
+    batch_size: int,
     processed_task_runs: int = 0,
     completed_task_runs: int = 0,
     failed_task_runs: int = 0,
 ) -> EvalRunStatus:
     return EvalRunStatus(
         run_id=run_id,
+        report_id=report_id,
         state="running",
         phase="preparing",
         suite=manifest.dataset_name,
         dataset_hash=manifest.dataset_hash,
         dataset_path=manifest.jsonl_path,
         run_dir=str(run_dir),
+        batch_size=batch_size,
         total_configs=len(configs),
         total_tasks=manifest.task_count,
         total_task_runs=manifest.task_count * len(configs),
@@ -686,11 +1270,12 @@ def _advance_status(
     current_task_id: str,
     current_task_index: int,
     processed_task_runs: int,
+    count_eval_run_id: str | None = None,
     last_latency_ms: int | None = None,
 ) -> EvalRunStatus:
     elapsed = max(0.0, time.perf_counter() - started)
-    completed = _completed_count(Path(status.run_dir))
-    failed = _failed_count(Path(status.run_dir))
+    completed = _completed_count(Path(status.run_dir), eval_run_id=count_eval_run_id)
+    failed = _failed_count(Path(status.run_dir), eval_run_id=count_eval_run_id)
     avg = elapsed / processed_task_runs if processed_task_runs else 0.0
     remaining = max(0, status.total_task_runs - processed_task_runs)
     return status.model_copy(
@@ -709,29 +1294,41 @@ def _advance_status(
     )
 
 
-def _processed_count(run_dir: Path, configs: list[EvalConfig]) -> int:
-    return sum(len(_latest_results(_results_path(run_dir, config))) for config in configs)
+def _processed_count(run_dir: Path, configs: list[EvalConfig], *, eval_run_id: str | None = None) -> int:
+    return sum(len(_latest_results(_results_path(run_dir, config), eval_run_id=eval_run_id)) for config in configs)
 
 
-def _completed_count(run_dir: Path) -> int:
-    return _status_count(run_dir, {"completed", "reused"})
+def _completed_count(run_dir: Path, *, eval_run_id: str | None = None) -> int:
+    return _status_count(run_dir, {"completed", "reused"}, eval_run_id=eval_run_id)
 
 
-def _failed_count(run_dir: Path) -> int:
-    return _status_count(run_dir, {"failed"})
+def _failed_count(run_dir: Path, *, eval_run_id: str | None = None) -> int:
+    return _status_count(run_dir, {"failed"}, eval_run_id=eval_run_id)
 
 
-def _status_count(run_dir: Path, statuses: set[str]) -> int:
+def _status_count(run_dir: Path, statuses: set[str], *, eval_run_id: str | None = None) -> int:
     return sum(
         1
         for path in (run_dir / "results").glob("*.jsonl")
-        for result in _latest_results(path).values()
+        for result in _latest_results(path, eval_run_id=eval_run_id).values()
         if result.status in statuses
     )
 
 
-def _latest_results(path: Path) -> dict[str, EvalTaskResult]:
+def _latest_results(
+    path: Path,
+    *,
+    eval_run_id: str | None = None,
+    dataset_hash: str | None = None,
+    config_hash: str | None = None,
+) -> dict[str, EvalTaskResult]:
     rows = read_jsonl(path, EvalTaskResult)
+    if eval_run_id is not None:
+        rows = [row for row in rows if row.eval_run_id == eval_run_id]
+    if dataset_hash is not None:
+        rows = [row for row in rows if row.dataset_hash == dataset_hash]
+    if config_hash is not None:
+        rows = [row for row in rows if row.config_hash == config_hash]
     return {row.task_id: row for row in rows}
 
 
@@ -809,7 +1406,8 @@ def _estimate_model_calls(config: EvalConfig, retrieval: dict[str, Any]) -> int:
         retrieval_calls += max(1, search_calls)
     if profile.retrieval.rerank:
         retrieval_calls += max(1, search_calls)
-    return 1 + retrieval_calls
+    verifier_calls = 1 if profile.answer.verification.claim_verification_uses_llm else 0
+    return 1 + retrieval_calls + verifier_calls
 
 
 def _usage_int(usage: Any, key: str) -> int:

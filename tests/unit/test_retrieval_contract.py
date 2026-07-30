@@ -56,6 +56,37 @@ def test_run_contract_hash_changes_with_overrides() -> None:
     assert first.contract_id != changed.contract_id
 
 
+def test_run_contract_hash_changes_with_verification_policy() -> None:
+    index = _index_contract()
+    base = _profile()
+    verified = get_retrieval_profile(
+        "test_mock",
+        Settings(),
+        overrides={"answer": {"verification": {"claim_verification": "deterministic_strict"}}},
+    )
+
+    first = build_run_contract(index_contract_id=index.contract_id, profile=base, settings=Settings())
+    changed = build_run_contract(index_contract_id=index.contract_id, profile=verified, settings=Settings())
+
+    assert first.verification_policy["claim_verification"] == "off"
+    assert changed.verification_policy["claim_verification"] == "deterministic_strict"
+    assert first.contract_id != changed.contract_id
+
+
+def test_run_contract_hash_changes_with_policy_versions() -> None:
+    index = _index_contract()
+    contract = build_run_contract(index_contract_id=index.contract_id, profile=_profile(), settings=Settings())
+    changed_answerability = contract.model_copy(update={"answerability_gate_version": "answerability_gate_v5"})
+    changed_negative_policy = contract.model_copy(
+        update={"negative_evidence_policy_version": "explicit_negative_title_v2"}
+    )
+
+    assert contract.answerability_gate_version == "answerability_gate_v4"
+    assert contract.negative_evidence_policy_version == "explicit_negative_title_v1"
+    assert contract.contract_id != changed_answerability.contract_id
+    assert contract.contract_id != changed_negative_policy.contract_id
+
+
 def test_index_version_validation_rejects_incompatible_source() -> None:
     index = _index_contract()
     metadata = index_contract_metadata(index)

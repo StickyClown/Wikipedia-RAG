@@ -9,7 +9,28 @@ from wikipediarag.eval.schemas import CandidateRef, EvalTask, RetrievalTaskScore
 
 TOKEN_RE = re.compile(r"[\wА-Яа-яЁё]+", re.UNICODE)
 CITATION_RE = re.compile(r"\[(S\d+)\]")
-NO_ANSWER_MARKERS = ("недостаточно", "нет доказательств", "не найден", "insufficient", "cannot answer")
+NO_ANSWER_MARKERS = (
+    "недостаточно",
+    "нет доказательств",
+    "не найден",
+    "не найдена",
+    "не найдено",
+    "отсутствует информация",
+    "информация отсутствует",
+    "отсутствуют сведения",
+    "нет сведений",
+    "нет информации",
+    "не указано",
+    "не содержит информации",
+    "не удалось определить",
+    "невозможно определить",
+    "cannot answer",
+    "cannot determine",
+    "insufficient",
+    "not specified",
+    "no information",
+    "does not contain information",
+)
 
 
 def normalize_answer(value: str) -> str:
@@ -42,7 +63,15 @@ def token_f1(answer: str, accepted_answers: list[str]) -> float:
 
 def is_no_answer(answer: str) -> bool:
     normalized = answer.casefold()
-    return any(marker in normalized for marker in NO_ANSWER_MARKERS)
+    if any(marker in normalized for marker in NO_ANSWER_MARKERS):
+        return True
+    absence_patterns = (
+        r"информац\w*.{0,160}отсутств",
+        r"сведен\w*.{0,160}отсутств",
+        r"источник\w*.{0,160}не\s+содерж",
+        r"source\w*.{0,160}(?:does not contain|do not contain)",
+    )
+    return any(re.search(pattern, normalized, flags=re.S) for pattern in absence_patterns)
 
 
 def recall_at(candidates: list[str], gold: set[str], k: int) -> float:
@@ -106,13 +135,19 @@ def citation_scores(
     gold_chunk_ids: set[str],
     *,
     unanswerable: bool,
+    no_answer: bool = False,
+    allow_context_citations: bool = False,
 ) -> tuple[float, float, float]:
     if unanswerable:
+        if no_answer:
+            return 1.0, 1.0, 0.0
         return (1.0 if not cited_chunk_ids else 0.0, 1.0, float(bool(cited_chunk_ids)))
     if not cited_chunk_ids:
         return 0.0, 0.0, 1.0
     cited = set(cited_chunk_ids)
     supported = cited & gold_chunk_ids
+    if allow_context_citations and gold_chunk_ids and supported >= gold_chunk_ids:
+        return 1.0, 1.0, 0.0
     precision = len(supported) / len(cited)
     recall = len(supported) / len(gold_chunk_ids) if gold_chunk_ids else 0.0
     unsupported = 1.0 - precision
@@ -135,10 +170,22 @@ def score_task(
     gold_pages = set(task.gold_page_ids)
     gold_sections = set(task.gold_section_ids)
     gold_chunks = set(task.gold_chunk_ids)
+    no_answer = is_no_answer(answer)
+    cited_hard_negative = (
+        0.0
+        if task.unanswerable and no_answer
+        else _cited_hard_negative_rate(
+            task,
+            cited_chunk_ids=cited_chunk_ids,
+            candidates=[*reranked, *prefusion],
+        )
+    )
     citation_precision, citation_recall, unsupported = citation_scores(
         cited_chunk_ids,
         gold_chunks,
         unanswerable=task.unanswerable,
+        no_answer=no_answer,
+        allow_context_citations=cited_hard_negative == 0.0,
     )
     return TaskScores(
         page_recall={str(k): recall_at(pages, gold_pages, k) for k in (1, 5, 10, 20)},
@@ -151,10 +198,12 @@ def score_task(
         reranker_gold_delta=rank_delta(prefusion_chunks, chunks, gold_chunks, 20),
         exact_match=0.0 if task.unanswerable else exact_match(answer, [task.reference_answer, *task.accepted_answers]),
         token_f1=0.0 if task.unanswerable else token_f1(answer, [task.reference_answer, *task.accepted_answers]),
-        unanswerable_accuracy=float(is_no_answer(answer)) if task.unanswerable else 0.0,
+        unanswerable_accuracy=float(no_answer) if task.unanswerable else 0.0,
+        soft_unanswerable_context_rate=float(task.unanswerable and no_answer and bool(cited_chunk_ids)),
         citation_precision=citation_precision,
         citation_recall=citation_recall,
         unsupported_claim_rate=unsupported,
+        cited_hard_negative_rate=cited_hard_negative,
         kiwix_url_ok=float(kiwix_url_ok),
     )
 
@@ -186,6 +235,13 @@ def score_retrieval_task(
         reranker_gold_delta=rank_delta(prefusion_chunks, reranked_chunks, gold_chunks, 20),
         retrieved_gold_leak_rate=_gold_leak_rate(chunks, gold_chunks, task.unanswerable),
         false_positive_evidence_rate=_false_positive_rate(pages, hard_negative_pages, 20),
+        dangerous_false_positive_evidence_rate=_dangerous_false_positive_rate(
+            task,
+            final=final,
+            gold_pages=gold_pages,
+            hard_negative_pages=hard_negative_pages,
+            k=20,
+        ),
         hard_negative_page_hit_at_10=recall_at(pages, hard_negative_pages, 10),
         hard_negative_page_hit_at_20=recall_at(pages, hard_negative_pages, 20),
         gold_vs_hard_negative_rank_margin=_rank_margin(pages, gold_pages, hard_negative_pages, 20),
@@ -227,6 +283,62 @@ def _false_positive_rate(candidates: list[str], negative_pages: set[str], k: int
     if not top:
         return 0.0
     return sum(1 for item in top if item in negative_pages) / len(top)
+
+
+def _cited_hard_negative_rate(
+    task: EvalTask,
+    *,
+    cited_chunk_ids: list[str],
+    candidates: list[CandidateRef],
+) -> float:
+    hard_negative_pages = set(task.hard_negative_page_ids)
+    if not hard_negative_pages or not cited_chunk_ids:
+        return 0.0
+    page_by_chunk = {candidate.chunk_id: candidate.document_id for candidate in candidates if candidate.chunk_id}
+    return float(any(page_by_chunk.get(chunk_id) in hard_negative_pages for chunk_id in set(cited_chunk_ids)))
+
+
+def _dangerous_false_positive_rate(
+    task: EvalTask,
+    *,
+    final: list[CandidateRef],
+    gold_pages: set[str],
+    hard_negative_pages: set[str],
+    k: int,
+) -> float:
+    if task.unanswerable or not hard_negative_pages:
+        return 0.0
+    top = final[:k]
+    if not top:
+        return 0.0
+    pages = [item.document_id for item in top]
+    gold_rank = _first_rank(pages, gold_pages, k)
+    best_gold_score = _best_candidate_score(item for item in top if item.document_id in gold_pages)
+    dangerous = 0
+    for rank, candidate in enumerate(top, start=1):
+        if candidate.document_id not in hard_negative_pages:
+            continue
+        score = _candidate_score(candidate)
+        rank_risk = rank <= 3 or (gold_rank is not None and rank < gold_rank)
+        score_risk = score is not None and (
+            score >= 0.5 or (best_gold_score is not None and score >= best_gold_score * 0.6)
+        )
+        if rank_risk or score_risk:
+            dangerous += 1
+    return dangerous / len(top)
+
+
+def _best_candidate_score(candidates: Iterable[CandidateRef]) -> float | None:
+    scores = [score for candidate in candidates if (score := _candidate_score(candidate)) is not None]
+    return max(scores) if scores else None
+
+
+def _candidate_score(candidate: CandidateRef) -> float | None:
+    for key in ("rerank", "relevance_score", "rrf_total", "dense", "bm25"):
+        value = candidate.scores.get(key)
+        if isinstance(value, int | float):
+            return float(value)
+    return None
 
 
 def _rank_margin(

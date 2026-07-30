@@ -213,9 +213,11 @@ class TaskScores(BaseModel):
     exact_match: float
     token_f1: float
     unanswerable_accuracy: float
+    soft_unanswerable_context_rate: float = 0.0
     citation_precision: float
     citation_recall: float
     unsupported_claim_rate: float
+    cited_hard_negative_rate: float = 0.0
     kiwix_url_ok: float
 
 
@@ -223,6 +225,10 @@ class EvalTaskResult(BaseModel):
     task_id: str
     config_id: str
     config_hash: str
+    eval_run_id: str = ""
+    report_id: str = ""
+    run_started_at: str = ""
+    dataset_hash: str = ""
     status: Literal["completed", "failed", "reused"]
     question: str
     answer: str = ""
@@ -231,6 +237,17 @@ class EvalTaskResult(BaseModel):
     retrieved_candidates: list[CandidateRef] = Field(default_factory=list)
     reranked_candidates: list[CandidateRef] = Field(default_factory=list)
     mode_selected: Literal["normal", "harness"] = "normal"
+    run_contract_id: str = ""
+    execution_path: str = ""
+    path_selection_reason: str = ""
+    retrieval_contract_ids: list[str] = Field(default_factory=list)
+    tool_contract_ids: list[str] = Field(default_factory=list)
+    step_events: list[dict[str, Any]] = Field(default_factory=list)
+    failure_stage: str = ""
+    failure_code: str = ""
+    failure_retryable: bool | None = None
+    attempts: int = Field(default=0, ge=0)
+    last_successful_stage: str = ""
     latency_ms: dict[str, int] = Field(default_factory=dict)
     usage: dict[str, Any] = Field(default_factory=dict)
     scores: TaskScores | None = None
@@ -255,22 +272,26 @@ class ConfigSummary(BaseModel):
 
 class EvalRunManifest(BaseModel):
     run_id: str
+    report_id: str = ""
     suite: str
     dataset_hash: str
     dataset_path: str
     created_at: str
+    batch_size: int = Field(default=1, ge=1)
     config_summaries: list[ConfigSummary]
     run_dir: str
 
 
 class EvalRunStatus(BaseModel):
     run_id: str
+    report_id: str = ""
     state: EvalRunState
     phase: EvalRunPhase
     suite: str
     dataset_hash: str
     dataset_path: str
     run_dir: str
+    batch_size: int = Field(default=1, ge=1)
     total_configs: int = Field(ge=0)
     total_tasks: int = Field(ge=0)
     total_task_runs: int = Field(ge=0)
@@ -301,6 +322,7 @@ class RetrievalTaskScores(BaseModel):
     reranker_gold_delta: float | None = None
     retrieved_gold_leak_rate: float = 0.0
     false_positive_evidence_rate: float = 0.0
+    dangerous_false_positive_evidence_rate: float = 0.0
     hard_negative_page_hit_at_10: float = 0.0
     hard_negative_page_hit_at_20: float = 0.0
     gold_vs_hard_negative_rank_margin: float | None = None
@@ -384,11 +406,17 @@ class RetrievalRunManifest(BaseModel):
 
 class ReleaseGateStatus(BaseModel):
     run_id: str
+    report_id: str = ""
+    latest_report_id: str = ""
     state: ReleaseGateState
     phase: ReleaseGatePhase
     suite: str
     api: str
     run_dir: str
+    report_path: str = ""
+    stage_report_paths: dict[str, str] = Field(default_factory=dict)
+    config_snapshot: dict[str, Any] = Field(default_factory=dict)
+    blocker_details: list[dict[str, Any]] = Field(default_factory=list)
     total_stages: int = Field(ge=0)
     stage_index: int = Field(default=0, ge=0)
     current_stage: str = ""

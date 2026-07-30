@@ -1,108 +1,125 @@
 # WikipediaRag
 
-Local Docker-first RAG MVP for Russian Wikipedia. The current real demo path uses one local Russian Wikipedia ZIM file: Kiwix serves the full archive, while the worker indexes a bounded canonical article subset through `python-libzim`. Wikimedia XML `pages-articles` multistream remains a supported regression/local fallback.
+WikipediaRag is a Docker-first local RAG platform for Russian Wikipedia and default-tenant document knowledge bases. It is currently a local MVP, not a production multi-tenant release.
 
-For Codex and engineer handoff, use this repository-level source set:
+First-read source of truth for an LLM or engineer:
 
-- `AGENTS.md` - working protocol, scope control and safety rules.
-- `README.md` - current runbook and project handoff.
-- `docs/architecture.md` - compact architecture, contracts, invariants and decisions.
-- `docs/STATUS.md` - current state, latest validation evidence and blockers.
+- `AGENTS.md` - work protocol, safety rules and implementation constraints.
+- `README.md` - project map, runbook and current capabilities.
+- `docs/architecture.md` - architecture contracts, service boundaries and invariants.
+- `docs/STATUS.md` - latest milestone, validation evidence, blockers and next work.
 
 ## Current State
 
-Active milestone: ExecPlan 22 behavior is implemented and deterministic validation passed. Provider-backed reviewed release-gate execution is blocked because OpenRouter access currently returns `403 Forbidden`; the latest reviewed gate status remains completed but failed on quality metrics from the prior run.
+Active milestone: ExecPlan 25.1+25.2 is implemented for local async document ingestion on the seeded `default_tenant_id/default_kb_id` model. ExecPlan 21 remains complete for the reviewed Wikipedia smoke gate; the latest provider-backed reviewed gate is `completed`, `passed=true`, `blocking_failures=0`.
 
-Implemented local MVP capabilities:
+Implemented MVP capabilities:
 
-- FastAPI API, worker and Model Gateway on Python 3.12.
+- FastAPI API, background worker and Model Gateway on Python 3.12.
 - React + Vite + TypeScript UI.
-- PostgreSQL, OpenSearch, MinIO, Redis/Valkey, Kiwix and OpenTelemetry Collector via Docker Compose.
-- Model Gateway aliases for OpenRouter-backed `sota_mvp`; mock aliases are explicit and only for tests/local demo.
-- ZIM/libzim ingestion with checkpoints, redirects as provenance, deterministic chunks and Kiwix source URLs.
-- XML multistream fallback ingestion for regression/development.
-- Hybrid retrieval: BM25, dense search, service-side RRF, rerank, dedup/page quota, parent expansion and token-budget context packing.
-- Chat SSE with evidence IDs, source links, retrieval trace, answerability gate, citation validation and safe timings.
-- Retrieval debugger via `POST /api/v1/search:debug`.
-- Bounded Extended Search MVP with multi-query search and tenant-scoped neighbor expansion.
-- Local JSONL evaluation, trusted dataset generation, reviewed freeze workflow and release-gate runner.
+- PostgreSQL control plane, OpenSearch search representation, MinIO artifacts, Redis/Valkey jobs/cache, Kiwix ZIM viewing and OpenTelemetry.
+- Model Gateway aliases for chat, embeddings and rerank; business code does not call OpenRouter or `llama-server` directly.
+- ZIM/libzim Wikipedia ingestion with Kiwix source URLs, checkpoints, redirects as provenance and deterministic chunks.
+- XML multistream Wikipedia fallback for regression/local development.
+- Async document upload sessions with presigned MinIO upload, completion, background validation/parsing/chunking/embedding and published-only retrieval.
+- Isolated parser containers: Xberg default parser, Docling Serve CPU fallback/high-quality parser and local metadata-service for fast language/date extraction.
+- Universal document metadata: upload/system timestamps, document-date candidates, language/confidence, MIME/signature facts, parser route/report, hashes, warnings and safe public metadata.
+- Hybrid retrieval: BM25, dense vectors, RRF, rerank, dedup/page quota, parent expansion, answerability and citation validation.
+- Bounded Extended Search MVP for multi-query follow-up retrieval when evidence is partial or insufficient.
+- Local evaluation, trusted/reviewed dataset workflow and dated release-gate reports with root run contracts and step events.
+- Document corpus verification with generated fixtures plus optional pinned URL/SHA external samples.
 
-## Requirements
+## Runtime
+
+Requirements:
 
 - Docker Desktop or compatible Docker Compose runtime.
 - Python 3.12 and `uv`.
 - Node.js 22.14+ and `pnpm`.
-- GNU Make when available. In this Windows Codex environment `make` may be absent, so equivalent `uv`/`pnpm` commands are acceptable and must be recorded exactly.
+- GNU Make when available; this Windows host may require direct `uv`, `pnpm` or `docker compose` equivalents.
 
-Do not commit `.env`, API keys, ZIM snapshots, model files, generated indices, uploads or evaluation artifacts.
+Local URLs:
 
-## Data
+- UI: `http://localhost:5173`
+- API health/readiness: `http://localhost:8000/health`, `http://localhost:8000/ready`
+- Model Gateway: `http://localhost:8081`
+- Mock provider: `http://localhost:8082`
+- Kiwix: `http://localhost:8083`
+- Metadata service: `http://localhost:8090`
+- Xberg: `http://localhost:8091`
+- Docling: `http://localhost:8092`
+- MinIO console: `http://localhost:9001`
+- OpenSearch: `http://localhost:9200`
 
-Place one real Russian Wikipedia ZIM file under:
-
-```text
-zim/*.zim
-```
-
-The same directory is mounted read-only into:
-
-- Kiwix as `/data`;
-- API/worker as `/zim`.
-
-Kiwix serves the full archive on `http://localhost:8083`. The RAG import indexes only the requested number of canonical non-redirect article pages. Redirects are persisted as provenance/aliases and do not count toward `WIKI_LIMIT`.
-
-Optional XML fallback data is local-only and ignored by Git:
-
-```text
-zip/ruwiki-20260701-pages-articles-multistream.xml.bz2
-zip/ruwiki-20260701-pages-articles-multistream-index.txt.bz2
-```
-
-## Run
+Start:
 
 ```bash
 cp .env.example .env
 make up
 ```
 
-Useful local URLs:
+If `make` is unavailable, inspect `Makefile` and run the equivalent command directly.
 
-- Web UI: `http://localhost:5173`
-- API health: `http://localhost:8000/health`
-- API readiness: `http://localhost:8000/ready`
-- Model Gateway: `http://localhost:8081`
-- Mock provider: `http://localhost:8082`
-- Kiwix: `http://localhost:8083`
-- MinIO console: `http://localhost:9001`
-- OpenSearch: `http://localhost:9200`
+## Data And Ingestion
 
-If GNU Make is unavailable, inspect `Makefile` and run the equivalent `uv` or `docker compose` command directly.
+Place one real Russian Wikipedia ZIM file under ignored `zim/*.zim`. Kiwix serves the full archive; the worker imports a bounded canonical subset from the same file. Optional XML fallback dumps live under ignored `zip/`.
 
-## Import
-
-Small ZIM demo import:
+Small ZIM import:
 
 ```bash
 make import-zim-small WIKI_LIMIT=10000
 ```
 
-XML fallback import:
+Document upload is asynchronous and default-tenant scoped:
 
-```bash
-make import-wiki-small WIKI_LIMIT=10000
+```text
+POST /api/v1/uploads/sessions
+PUT  <upload_url>
+POST /api/v1/uploads/sessions/{upload_session_id}:complete
+GET  /api/v1/ingestion-jobs/{job_id}
+GET  /api/v1/documents/{document_id}
+GET  /api/v1/documents/{document_id}/versions
+POST /api/v1/documents/{document_id}:reprocess
 ```
 
-Job status and controls:
+Parser routing:
 
-```bash
-curl http://localhost:8000/api/v1/ingestion-jobs/<job_id>
-curl -X POST http://localhost:8000/api/v1/ingestion-jobs/<job_id>:cancel
-curl -X POST http://localhost:8000/api/v1/ingestion-jobs/<job_id>:resume
+- CSV, TSV, JSON and JSONL use app-owned local streaming adapters.
+- Xberg handles supported document formats first.
+- Docling is used for parser failure, low-quality/empty text, scanned PDF signals, layout/table/formula/read-order warnings or explicit `high_quality`.
+
+Parser containers receive bytes/temp files over HTTP only. They never receive MinIO credentials, raw object keys, arbitrary URLs, tenant authority, prompts or provider payloads.
+
+## Retrieval And Evaluation
+
+Normal answer path:
+
+```text
+query
+-> BM25 + dense
+-> RRF
+-> rerank
+-> dedup/page quota/parent expansion
+-> token-budget context
+-> answerability
+-> grounded answer with citations
 ```
 
-Checkpoints advance only after durable DB/object-storage/OpenSearch writes. Failed jobs must not publish partial content.
+Debug retrieval without generation:
 
-## Validation
+```bash
+curl -X POST http://localhost:8000/api/v1/search:debug
+```
+
+Provider-backed release gates require healthy API readiness and strict OpenRouter smoke. Do not rerun them while `/ready` is degraded.
+
+Release-gate reports are immutable dated directories under:
+
+```text
+artifacts/eval/release-gates/<suite>/<YYYYMMDDTHHMMSSZ-suite-release-gate-short_id>/
+```
+
+## Validation Commands
 
 Preferred stable commands:
 
@@ -116,41 +133,44 @@ make test-e2e
 make smoke
 make eval
 make smoke-models PROVIDER=mock
+make verify-document-upload
+make verify-document-corpus
 ```
 
-Direct Python equivalents commonly used in this environment:
+Windows/direct equivalents:
 
 ```bash
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src tests
-uv run pytest tests/unit tests/integration tests/e2e -q
+uv run pytest tests/unit tests/integration
 uv run python -m wikipediarag.cli smoke-models --provider mock
+uv run python -m wikipediarag.cli verify-document-upload
+uv run python -m wikipediarag.cli verify-document-corpus --fixture-set standard
 ```
 
-UI checks:
+UI:
 
 ```bash
 cd services/ui
 pnpm lint
 pnpm typecheck
-pnpm format:check
 pnpm build
 ```
 
-Provider-backed validation:
+Document corpus verification:
 
 ```bash
-uv run python -m wikipediarag.cli smoke-models --provider openrouter --gateway http://localhost:8081
-uv run python -m wikipediarag.cli eval-release-gate-status --suite reviewed-wikipedia-smoke-v1 --json
-uv run python -m wikipediarag.cli eval-release-gate --suite reviewed-wikipedia-smoke-v1 --api http://localhost:8000
+uv run python -m wikipediarag.cli verify-document-corpus --fixture-set standard
+uv run python -m wikipediarag.cli verify-document-corpus --fixture-set full
+uv run python -m wikipediarag.cli verify-document-corpus --fixture-set smoke --include-external --skip-compose
 ```
 
-Do not start a provider-backed release gate while API readiness is degraded.
+External corpus bytes are downloaded to ignored `artifacts/corpora/document-corpus/`. Only URL, SHA256, license and expected assertions are tracked.
 
-## OpenRouter
+## Configuration Notes
 
-For real `sota_mvp` runs, configure only local `.env`:
+Real OpenRouter runs use local `.env` only:
 
 ```env
 MODEL_PROVIDER=openrouter
@@ -160,33 +180,21 @@ ZIM_DIR=/zim
 KIWIX_PUBLIC_BASE_URL=http://localhost:8083
 ```
 
-`sota_mvp` must not silently fall back to mock aliases or hash embeddings. Model Gateway `/health` is liveness only; `/ready` reports provider/capability degradation. In local `warn` smoke mode, a failed OpenRouter startup smoke keeps the gateway inspectable but unhealthy for OpenRouter aliases.
+`sota_mvp` must not silently fall back to mock aliases or hash embeddings. Model Gateway `/health` is liveness after startup; `/ready` reports dependency degradation. During slow startup smoke, both endpoints may be temporarily unreachable until application startup completes.
 
-## llama.cpp
-
-The local model target is three internal `llama-server` roles behind Model Gateway: chat, embeddings and rerank. The optional compose profile exists, but real use requires owner decisions on hardware, VRAM, model licenses, checksums and quality gates.
+Local `llama.cpp` remains an optional future target behind Model Gateway aliases:
 
 ```bash
 docker compose -f compose.yaml -f compose.llamacpp.yaml --profile llamacpp up -d
 make smoke-models PROVIDER=llamacpp
 ```
 
-Application code must use Model Gateway aliases and must not call OpenRouter or `llama-server` directly.
+## Main Risks And Next Work
 
-## Demo
-
-After import, open `http://localhost:5173` and ask:
-
-```text
-Что такое Россия?
-```
-
-Expected behavior: Russian answer with citation IDs such as `[S1]`, clickable Kiwix source links and retrieval debugger stages for profile/query, BM25, dense, RRF, rerank, policy/context and optional Extended Search.
-
-## Main Risks
-
-- OpenRouter access, model churn, external provider exposure and cost.
-- Current local MVP uses a seeded/default tenant; production auth/tenancy remains future work.
-- Universal PDF/Office/image ingestion is not production-ready.
-- Warm retrieval p95 in real eval has exceeded the target SLO and needs profiling.
-- Reviewed release gate is blocked until OpenRouter access and remaining quality findings are resolved.
+- Production auth, tenant onboarding, role model and cross-tenant acceptance are not implemented.
+- Document ingestion is local/default-tenant only and still needs malware scanning, retention/deletion policy, ACL mirroring, parser autoscaling and external deployment hardening.
+- Public multi-file batch creation is not exposed yet; the DB/job framework already supports independent job items.
+- Fast language/date extraction is deterministic and local but heuristic.
+- Warm retrieval p95 needs profiling and SLO work.
+- OpenRouter-backed gates depend on provider quota, credits, latency and model behavior.
+- Large/legal corpus expansion should stay manifest-driven and run outside ordinary CI unless explicitly approved.

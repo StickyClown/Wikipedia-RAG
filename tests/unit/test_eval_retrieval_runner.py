@@ -74,7 +74,14 @@ def _task(task_id: str = "t1", *, hard_negative_page_ids: list[str] | None = Non
     )
 
 
-def _candidate(chunk_id: str, document_id: str, section_id: str, rank: int) -> CandidateRef:
+def _candidate(
+    chunk_id: str,
+    document_id: str,
+    section_id: str,
+    rank: int,
+    *,
+    scores: dict[str, float] | None = None,
+) -> CandidateRef:
     return CandidateRef(
         chunk_id=chunk_id,
         document_id=document_id,
@@ -83,6 +90,7 @@ def _candidate(chunk_id: str, document_id: str, section_id: str, rank: int) -> C
         source_url=f"http://localhost/{chunk_id}",
         rank=rank,
         stage="context",
+        scores=scores or {},
     )
 
 
@@ -121,8 +129,30 @@ def test_hard_negative_metrics_track_rank_margin() -> None:
 
     assert scores.hard_negative_page_hit_at_10 == 1.0
     assert scores.false_positive_evidence_rate == 0.5
+    assert scores.dangerous_false_positive_evidence_rate == 0.5
     assert scores.gold_vs_hard_negative_rank_margin == -1.0
     assert scores.reranker_gold_delta == -1.0
+
+
+def test_low_score_rank4_hard_negative_is_diagnostic_only() -> None:
+    task = _task(hard_negative_page_ids=["p2"])
+    scores = score_retrieval_task(
+        task,
+        final=[
+            _candidate("c1", "p1", "s1", 1, scores={"rerank": 0.866}),
+            _candidate("c3", "p3", "s3", 2, scores={"rerank": 0.4}),
+            _candidate("c4", "p4", "s4", 3, scores={"rerank": 0.3}),
+            _candidate("c2", "p2", "s2", 4, scores={"rerank": 0.177}),
+        ],
+        reranked=[
+            _candidate("c1", "p1", "s1", 1, scores={"rerank": 0.866}),
+            _candidate("c2", "p2", "s2", 4, scores={"rerank": 0.177}),
+        ],
+        prefusion=[_candidate("c1", "p1", "s1", 1), _candidate("c2", "p2", "s2", 2)],
+    )
+
+    assert scores.false_positive_evidence_rate == 0.25
+    assert scores.dangerous_false_positive_evidence_rate == 0.0
 
 
 def test_retrieval_summary_excludes_answer_citation_token_metrics() -> None:

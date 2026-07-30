@@ -18,6 +18,17 @@ def test_sota_mvp_profile_matches_required_defaults() -> None:
     assert profile.postprocess.page_quota == 2
     assert profile.postprocess.parent_expansion == "selective"
     assert profile.model_aliases.generator_main == "generator_main"
+    assert profile.answer.verification.citation_validation == "strict"
+    assert profile.answer.verification.claim_verification == "off"
+
+
+def test_verified_profile_enables_claim_verifier_without_changing_base() -> None:
+    base = get_retrieval_profile("sota_mvp")
+    verified = get_retrieval_profile("sota_mvp_verified")
+
+    assert base.answer.verification.claim_verification == "off"
+    assert verified.answer.verification.citation_validation == "strict"
+    assert verified.answer.verification.claim_verification == "llm_strict"
 
 
 def test_profile_rejects_disabling_bm25_and_dense() -> None:
@@ -47,6 +58,16 @@ def test_profile_overrides_are_validated_on_same_shape() -> None:
         get_retrieval_profile("sota_mvp", overrides={"retrieval": {"bm25": False, "dense": False}})
 
 
+def test_legacy_citation_bool_maps_to_typed_policy() -> None:
+    profile = get_retrieval_profile(
+        "test_mock",
+        overrides={"answer": {"deterministic_citation_validation": False}},
+    )
+
+    assert profile.answer.verification.citation_validation == "off"
+    assert profile.answer.deterministic_citation_validation is False
+
+
 def test_ablation_profiles_reuse_same_profile_shape() -> None:
     bm25_only = get_retrieval_profile("bm25_only")
     rewrite_off = get_retrieval_profile("rewrite_off")
@@ -56,3 +77,14 @@ def test_ablation_profiles_reuse_same_profile_shape() -> None:
     assert bm25_only.retrieval.dense is False
     assert rewrite_off.retrieval.query_rewrite == "off"
     assert parent_off.postprocess.parent_expansion == "off"
+
+
+def test_upload_profiles_keep_embedding_dimension_contract() -> None:
+    upload_mock = get_retrieval_profile("upload_mock")
+    upload_sota = get_retrieval_profile("upload_sota_mvp")
+
+    assert upload_mock.source == "upload"
+    assert upload_mock.embedding_dimensions(64) == 64
+    assert upload_sota.source == "upload"
+    assert upload_sota.model_aliases.embed == "embed_default"
+    assert upload_sota.embedding_dimensions(64) == 1024

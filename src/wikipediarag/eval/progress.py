@@ -26,7 +26,10 @@ class EvalGenerateCliReporter:
         self._stream = stream or sys.stdout
 
     def __call__(self, event: EvalGenerateProgressEvent) -> None:
-        print(format_progress_event(event), file=self._stream, flush=True)
+        try:
+            print(format_progress_event(event), file=self._stream, flush=True)
+        except OSError:
+            return
 
 
 def format_progress_event(event: EvalGenerateProgressEvent) -> str:

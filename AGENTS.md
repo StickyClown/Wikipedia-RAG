@@ -9,6 +9,8 @@ Implement the Production RAG Platform incrementally, with one narrow approved ta
 3. `docs/architecture.md`
 4. `docs/STATUS.md`
 
+These four files are the first-read handoff for a new LLM/engineer. Keep them current and compact enough to understand the project without reading code first; move historical detail into `docs/exec-plans/` or generated artifacts.
+
 Before implementation, briefly state which of these files were read and the current milestone from `docs/STATUS.md`.
 
 ## Current milestone rule
@@ -73,6 +75,8 @@ make test-integration
 make test-e2e
 make smoke
 make eval
+make verify-document-upload
+make verify-document-corpus
 ```
 
 If `make` is unavailable on the host, run equivalent `uv`, `pnpm` or `docker compose` commands and record the exact commands and exit codes.
@@ -81,6 +85,7 @@ If `make` is unavailable on the host, run equivalent `uv`, `pnpm` or `docker com
 
 - Do not run long eval, ingestion, release-gate, provider generation or benchmark commands silently.
 - Commands expected to take more than a few minutes must expose live progress, status polling or append-only logs with stage, processed/total, last update and failure state.
+- Use bounded backfill concurrency for eval, generation, retrieval and release-gate commands when the command supports `--batch-size` or `--concurrency`; avoid sequential long-running eval paths when a bounded mode exists.
 - If interrupted or timed out, inspect remaining processes and artifact state before continuing.
 
 ## Definition of done

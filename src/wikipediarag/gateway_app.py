@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -16,19 +17,74 @@ from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profi
 app = FastAPI(title="WikipediaRag Model Gateway")
 
 
+@dataclass
+class ReadinessCheck:
+    component: str
+    status: str
+    reason: str
+
+
+@dataclass
+class GatewayReadinessState:
+    status: str = "ok"
+    checks: list[ReadinessCheck] = field(default_factory=list)
+
+
+_readiness_state = GatewayReadinessState()
+
+
 @app.on_event("startup")
 async def startup_smoke() -> None:
+    global _readiness_state
+
     settings = get_settings()
     profile = get_retrieval_profile(settings=settings)
+    _readiness_state = GatewayReadinessState()
+    smoke_mode = settings.model_gateway_startup_smoke
+    if smoke_mode == "off":
+        return
     if profile.requires_real_provider and not settings.openrouter_api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is required for sota_mvp")
+        failure = ReadinessCheck(
+            component="openrouter.startup_smoke",
+            status="failed",
+            reason="openrouter_api_key_missing",
+        )
+        _readiness_state = GatewayReadinessState(status="degraded", checks=[failure])
+        if smoke_mode == "required":
+            raise RuntimeError("OPENROUTER_API_KEY is required for sota_mvp")
+        return
     if profile.requires_real_provider:
-        await _openrouter_startup_smoke(settings, profile)
+        try:
+            await _openrouter_startup_smoke(settings, profile)
+        except Exception as exc:
+            failure = ReadinessCheck(
+                component="openrouter.startup_smoke",
+                status="failed",
+                reason=_safe_smoke_failure_reason(exc),
+            )
+            _readiness_state = GatewayReadinessState(status="degraded", checks=[failure])
+            if smoke_mode == "required":
+                raise
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready() -> dict[str, Any]:
+    return {
+        "status": _readiness_state.status,
+        "checks": [
+            {
+                "component": check.component,
+                "status": check.status,
+                "reason": check.reason,
+            }
+            for check in _readiness_state.checks
+        ],
+    }
 
 
 @app.get("/v1/models")
@@ -142,8 +198,32 @@ def _alias_available(alias: ModelAlias) -> bool:
     if alias.provider == "mock":
         return True
     if alias.provider == "openrouter":
-        return bool(settings.openrouter_api_key)
+        return bool(settings.openrouter_api_key) and not _provider_degraded("openrouter")
     return False
+
+
+def _provider_degraded(provider: str) -> bool:
+    prefix = f"{provider}."
+    return any(check.component.startswith(prefix) and check.status != "ok" for check in _readiness_state.checks)
+
+
+def _safe_smoke_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"provider_http_{exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "provider_timeout"
+    if isinstance(exc, httpx.NetworkError):
+        return "provider_network_error"
+    message = str(exc)
+    if message.startswith("OpenRouter catalog does not list required models"):
+        return "catalog_missing_required_models"
+    if "embedding returned" in message:
+        return "embedding_dimensions_mismatch"
+    if "chat streaming returned" in message:
+        return "chat_streaming_smoke_failed"
+    if "rerank did not return ordered results" in message:
+        return "rerank_ordering_smoke_failed"
+    return "provider_smoke_failed"
 
 
 async def _openrouter_startup_smoke(settings: Settings, profile: RetrievalProfile) -> None:

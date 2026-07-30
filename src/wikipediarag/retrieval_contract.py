@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from wikipediarag.answerability import GATE_VERSION as ANSWERABILITY_GATE_VERSION
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.model_registry import ModelOperation, get_model_registry
 from wikipediarag.repository import get_knowledge_base, load_index_version_by_read_alias
@@ -15,7 +16,8 @@ from wikipediarag.retrieval_profile import RetrievalProfile
 INDEX_CONTRACT_SCHEMA_VERSION = 1
 RUN_CONTRACT_SCHEMA_VERSION = 1
 VECTOR_FIELD = "embedding"
-ANSWERABILITY_GATE_VERSION = "none"
+CLAIM_VERIFIER_VERSION = "claim_verifier_v1"
+NEGATIVE_EVIDENCE_POLICY_VERSION = "explicit_negative_title_v1"
 
 
 class KnowledgeBaseNotReady(RuntimeError):
@@ -61,6 +63,9 @@ class RunContract(BaseModel):
     retrieval_overrides_hash: str
     model_aliases: dict[str, ModelRef]
     answerability_gate_version: str = ANSWERABILITY_GATE_VERSION
+    negative_evidence_policy_version: str = NEGATIVE_EVIDENCE_POLICY_VERSION
+    verification_policy: dict[str, Any]
+    claim_verifier_version: str = CLAIM_VERIFIER_VERSION
 
     @property
     def contract_id(self) -> str:
@@ -156,6 +161,7 @@ def build_run_contract(
             "verifier": model_ref(aliases.verifier, "chat", settings),
             "rerank": model_ref(aliases.rerank, "rerank", settings),
         },
+        verification_policy=profile.answer.verification.model_dump(mode="json"),
     )
 
 

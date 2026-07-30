@@ -19,7 +19,17 @@ type Job = {
     pages_imported?: number;
     chunks_indexed?: number;
     pages_seen?: number;
+    stage?: string;
+    bytes_received?: number;
+    documents_total?: number;
+    documents_completed?: number;
+    documents_failed?: number;
+    parser_route?: string;
+    chunks_staged?: number;
+    chunks_published?: number;
+    timings_ms?: Record<string, number>;
   };
+  error_code?: string | null;
   error_message?: string | null;
 };
 
@@ -55,6 +65,37 @@ type RetrievalOverrideState = {
   topK: number;
 };
 
+type UploadSessionAccepted = {
+  upload_session_id: string;
+  upload_url: string;
+  expires_at: string;
+  required_headers: Record<string, string>;
+};
+
+type UploadCompleteResponse = {
+  document_id: string;
+  document_version_id: string;
+  job_id: string;
+  status: string;
+};
+
+type DocumentPublicMetadata = {
+  id: string;
+  title: string;
+  filename?: string;
+  status?: string;
+  parser_route?: string | null;
+  parser_name?: string | null;
+  parser_version?: string | null;
+  content_hash?: string | null;
+  normalized_hash?: string | null;
+  uploaded_at?: string | null;
+  upload_completed_at?: string | null;
+  ingested_at?: string | null;
+  published_at?: string | null;
+  public_metadata?: Record<string, unknown>;
+};
+
 export function App() {
   const [ready, setReady] = useState("checking");
   const [limit, setLimit] = useState(1000);
@@ -78,6 +119,11 @@ export function App() {
   const [queryRunId, setQueryRunId] = useState("");
   const [events, setEvents] = useState<RetrievalEvent[]>([]);
   const [uploadStatus, setUploadStatus] = useState("");
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadJob, setUploadJob] = useState<Job | null>(null);
+  const [uploadDocument, setUploadDocument] =
+    useState<DocumentPublicMetadata | null>(null);
+  const [uploadError, setUploadError] = useState("");
 
   useEffect(() => {
     fetch(`${API_BASE}/ready`)
@@ -166,16 +212,87 @@ export function App() {
   }
 
   async function uploadFile(event: React.ChangeEvent<HTMLInputElement>) {
-    const file = event.currentTarget.files?.[0];
+    const input = event.currentTarget;
+    const file = input.files?.[0];
     if (!file) return;
-    const form = new FormData();
-    form.append("file", file);
-    const response = await fetch(`${API_BASE}/api/v1/uploads`, {
-      method: "POST",
-      body: form,
-    });
-    const data = await response.json();
-    setUploadStatus(`Indexed ${data.chunks_indexed} chunks from ${file.name}`);
+    setUploadBusy(true);
+    setUploadError("");
+    setUploadJob(null);
+    setUploadDocument(null);
+    setUploadStatus(`Preparing ${file.name}`);
+    try {
+      const checksum = await sha256Hex(file);
+      const sessionResponse = await fetch(
+        `${API_BASE}/api/v1/uploads/sessions`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filename: file.name,
+            content_type: file.type || "application/octet-stream",
+            size_bytes: file.size,
+            checksum_sha256: checksum,
+            parser_profile: "standard",
+          }),
+        },
+      );
+      if (!sessionResponse.ok) throw new Error(await sessionResponse.text());
+      const session = (await sessionResponse.json()) as UploadSessionAccepted;
+      setUploadStatus("Uploading to object storage");
+      const putResponse = await fetch(session.upload_url, {
+        method: "PUT",
+        headers: session.required_headers,
+        body: file,
+      });
+      if (!putResponse.ok) throw new Error(await putResponse.text());
+      setUploadStatus("Completing upload session");
+      const completeResponse = await fetch(
+        `${API_BASE}/api/v1/uploads/sessions/${session.upload_session_id}:complete`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ metadata: { ui_upload: true } }),
+        },
+      );
+      if (!completeResponse.ok) throw new Error(await completeResponse.text());
+      const completed =
+        (await completeResponse.json()) as UploadCompleteResponse;
+      setUploadStatus(`Queued ${file.name}`);
+      void pollUploadJob(completed.job_id, completed.document_id);
+    } catch (error) {
+      setUploadBusy(false);
+      setUploadError(error instanceof Error ? error.message : String(error));
+      setUploadStatus("");
+    } finally {
+      input.value = "";
+    }
+  }
+
+  async function pollUploadJob(jobId: string, documentId: string) {
+    const response = await fetch(`${API_BASE}/api/v1/ingestion-jobs/${jobId}`);
+    const nextJob = (await response.json()) as Job;
+    setUploadJob(nextJob);
+    const stage = nextJob.progress?.stage ?? nextJob.status;
+    setUploadStatus(`Ingestion ${stage}`);
+    if (!["completed", "failed", "cancelled"].includes(nextJob.status)) {
+      window.setTimeout(() => pollUploadJob(jobId, documentId), 1500);
+      return;
+    }
+    setUploadBusy(false);
+    if (nextJob.status === "completed") {
+      const documentResponse = await fetch(
+        `${API_BASE}/api/v1/documents/${encodeURIComponent(documentId)}`,
+      );
+      if (documentResponse.ok) {
+        setUploadDocument(
+          (await documentResponse.json()) as DocumentPublicMetadata,
+        );
+      }
+    } else {
+      setUploadError(
+        nextJob.error_code ?? nextJob.error_message ?? nextJob.status,
+      );
+    }
   }
 
   return (
@@ -221,8 +338,59 @@ export function App() {
           <h2>
             <FileUp size={18} /> Upload
           </h2>
-          <input type="file" accept=".txt,.md,.html" onChange={uploadFile} />
-          {uploadStatus && <p>{uploadStatus}</p>}
+          <input
+            type="file"
+            accept=".txt,.md,.markdown,.html,.htm,.csv,.tsv,.json,.jsonl,.pdf,.docx,.pptx,.xlsx"
+            onChange={uploadFile}
+            disabled={uploadBusy}
+          />
+          {uploadStatus && <p className="upload-status">{uploadStatus}</p>}
+          {uploadJob && (
+            <div className="progress upload-progress">
+              <strong>{uploadJob.status}</strong>
+              <span>{uploadJob.progress?.stage ?? "received"}</span>
+              <span>
+                {uploadJob.progress?.parser_route ?? "parser pending"}
+              </span>
+              <span>{uploadJob.progress?.bytes_received ?? 0} bytes</span>
+              <span>
+                {uploadJob.progress?.chunks_staged ?? 0} staged /{" "}
+                {uploadJob.progress?.chunks_published ?? 0} published
+              </span>
+              {uploadJob.error_code && (
+                <span className="error">{uploadJob.error_code}</span>
+              )}
+            </div>
+          )}
+          {uploadDocument && (
+            <dl className="upload-meta">
+              <div>
+                <dt>Title</dt>
+                <dd>{uploadDocument.title}</dd>
+              </div>
+              <div>
+                <dt>Status</dt>
+                <dd>{uploadDocument.status ?? "published"}</dd>
+              </div>
+              <div>
+                <dt>Language</dt>
+                <dd>{metadataValue(uploadDocument, "detected_language")}</dd>
+              </div>
+              <div>
+                <dt>Document Date</dt>
+                <dd>{metadataValue(uploadDocument, "document_date")}</dd>
+              </div>
+              <div>
+                <dt>Parser</dt>
+                <dd>{uploadDocument.parser_route ?? "unknown"}</dd>
+              </div>
+              <div>
+                <dt>Uploaded</dt>
+                <dd>{formatTimestamp(uploadDocument.uploaded_at)}</dd>
+              </div>
+            </dl>
+          )}
+          {uploadError && <p className="error">{uploadError}</p>}
         </div>
       </section>
 
@@ -401,6 +569,32 @@ function buildRetrievalOverrides(state: RetrievalOverrideState) {
       extended_search: state.extendedSearchMode,
     },
   };
+}
+
+async function sha256Hex(file: File) {
+  const hashBuffer = await crypto.subtle.digest(
+    "SHA-256",
+    await file.arrayBuffer(),
+  );
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function metadataValue(document: DocumentPublicMetadata, key: string) {
+  const value = document.public_metadata?.[key];
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value);
+  }
+  return "";
+}
+
+function formatTimestamp(value?: string | null) {
+  if (!value) return "";
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
 }
 
 function DebugStage({ event }: { event: RetrievalEvent }) {

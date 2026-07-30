@@ -11,16 +11,17 @@ from typing import Any, Literal, TextIO, cast
 from pydantic import BaseModel, Field, ValidationError
 
 from wikipediarag.config import Settings, get_settings
-from wikipediarag.eval.artifacts import ARTIFACT_ROOT, read_json, utc_now_iso, write_json, write_jsonl
+from wikipediarag.eval.artifacts import ARTIFACT_ROOT, read_json, read_jsonl, utc_now_iso, write_json, write_jsonl
 from wikipediarag.eval.hashing import stable_json_hash
 from wikipediarag.eval.retrieval_runner import run_retrieval_suite
-from wikipediarag.eval.runner import run_suite
+from wikipediarag.eval.runner import DEFAULT_ANSWER_EVAL_BATCH_SIZE, eval_configs, run_suite
 from wikipediarag.eval.schemas import (
     ConfigSummary,
     EvalDatasetManifest,
     EvalRunManifest,
     EvalRunStatus,
     EvalTask,
+    EvalTaskResult,
     GoldEvidence,
     ReleaseGateStatus,
     RetrievalConfigSummary,
@@ -50,7 +51,10 @@ class ReleaseGateCliReporter:
         self._stream = stream or sys.stdout
 
     def __call__(self, status: ReleaseGateStatus, event: str) -> None:
-        print(format_release_gate_progress(status, event), file=self._stream, flush=True)
+        try:
+            print(format_release_gate_progress(status, event), file=self._stream, flush=True)
+        except OSError:
+            return
 
 
 def format_release_gate_progress(status: ReleaseGateStatus, event: str) -> str:
@@ -75,6 +79,7 @@ def format_release_gate_progress(status: ReleaseGateStatus, event: str) -> str:
 def format_release_gate_status(status: ReleaseGateStatus) -> str:
     lines = [
         f"run_id={status.run_id} state={status.state} phase={status.phase}",
+        f"report_id={status.report_id or status.latest_report_id or '-'}",
         f"updated_at={status.updated_at}",
         f"suite={status.suite} api={status.api}",
         (
@@ -89,6 +94,7 @@ def format_release_gate_status(status: ReleaseGateStatus) -> str:
         ),
         f"timings_ms={_format_stage_timings(status.timings_ms)}",
         f"run_dir={status.run_dir}",
+        f"report_path={status.report_path or '-'}",
     ]
     if status.passed is not None:
         lines.append(f"passed={status.passed} blocking_failures={status.blocking_failures}")
@@ -236,17 +242,29 @@ async def eval_release_gate(
     baseline = dict(dev_payload.get("baseline") or dev_payload.get("release_gate_baseline") or {})
     dev_tasks = load_locked_split_tasks(dev_manifest, "dev")
     test_tasks = load_locked_split_tasks(test_manifest, "test")
-    run_id = f"{suite}-release-gate"
-    run_dir = _release_gate_run_dir(suite, run_id)
     started_at = utc_now_iso()
+    report_id = _dated_report_id(suite, "release-gate", started_at=started_at)
+    run_id = report_id
+    run_dir = _release_gate_run_dir(suite, run_id)
     started = time.perf_counter()
+    config_snapshot = _release_gate_config_snapshot(
+        suite=suite,
+        api=api,
+        settings=resolved,
+        dev_manifest=dev_manifest,
+        test_manifest=test_manifest,
+    )
     status = ReleaseGateStatus(
         run_id=run_id,
+        report_id=report_id,
+        latest_report_id=report_id,
         state="running",
         phase="preparing",
         suite=suite,
         api=api,
         run_dir=str(run_dir),
+        report_path=str(run_dir / "report.json"),
+        config_snapshot=config_snapshot,
         total_stages=len(RELEASE_GATE_STAGES),
         started_at=started_at,
         updated_at=started_at,
@@ -266,7 +284,12 @@ async def eval_release_gate(
                 dev_manifest,
                 dev_tasks,
                 api=api,
+                batch_size=DEFAULT_ANSWER_EVAL_BATCH_SIZE,
                 settings=resolved,
+                config_ids={RELEASE_GATE_CONFIG_ID},
+                run_id=_dated_report_id(suite, "dev-answer", started_at=started_at),
+                report_id=report_id,
+                reuse_completed=False,
                 progress_callback=callback,
             ),
         )
@@ -281,8 +304,9 @@ async def eval_release_gate(
                 dev_tasks,
                 api=api,
                 batch_size=10,
-                run_id=f"{suite}-dev-release-gate",
+                run_id=_dated_report_id(suite, "dev-retrieval", started_at=started_at),
                 settings=resolved,
+                config_ids={RELEASE_GATE_CONFIG_ID},
                 progress_callback=callback,
             ),
         )
@@ -296,7 +320,12 @@ async def eval_release_gate(
                 test_manifest,
                 test_tasks,
                 api=api,
+                batch_size=DEFAULT_ANSWER_EVAL_BATCH_SIZE,
                 settings=resolved,
+                config_ids={RELEASE_GATE_CONFIG_ID},
+                run_id=_dated_report_id(suite, "test-answer", started_at=started_at),
+                report_id=report_id,
+                reuse_completed=False,
                 progress_callback=callback,
             ),
         )
@@ -311,8 +340,9 @@ async def eval_release_gate(
                 test_tasks,
                 api=api,
                 batch_size=10,
-                run_id=f"{suite}-test-release-gate",
+                run_id=_dated_report_id(suite, "test-retrieval", started_at=started_at),
                 settings=resolved,
+                config_ids={RELEASE_GATE_CONFIG_ID},
                 progress_callback=callback,
             ),
         )
@@ -334,9 +364,17 @@ async def eval_release_gate(
         report["timings_ms"] = dict(timings)
         report["release_gate_run"] = {
             "run_id": status.run_id,
+            "report_id": status.report_id,
             "run_dir": status.run_dir,
             "status_path": str(Path(status.run_dir) / "status.json"),
+            "report_path": status.report_path,
         }
+        report["config_snapshot"] = config_snapshot
+        report["blocker_details"] = _release_gate_blocker_details(
+            report,
+            dev_tasks=dev_tasks,
+            test_tasks=test_tasks,
+        )
         status = _advance_release_gate_status(status, started=started, timings=timings).model_copy(
             update={
                 "state": "completed",
@@ -344,10 +382,13 @@ async def eval_release_gate(
                 "current_stage": "",
                 "passed": bool(report.get("passed")),
                 "blocking_failures": len(list(report.get("blocking_failures") or [])),
+                "stage_report_paths": _stage_report_paths(report),
+                "blocker_details": list(report.get("blocker_details") or []),
                 "updated_at": utc_now_iso(),
             }
         )
         _write_release_gate_status(status)
+        write_json(Path(status.report_path), report)
         _log_release_gate_event(run_dir, "run_completed", status=status)
         _emit_release_gate(progress_callback, status, "run_completed")
         return report
@@ -396,6 +437,178 @@ def evaluate_release_gate(
     }
 
 
+def _release_gate_config_snapshot(
+    *,
+    suite: str,
+    api: str,
+    settings: Settings,
+    dev_manifest: EvalDatasetManifest,
+    test_manifest: EvalDatasetManifest,
+) -> dict[str, Any]:
+    configs = {config.config_id: config for config in eval_configs(settings)}
+    config = configs.get(RELEASE_GATE_CONFIG_ID)
+    return {
+        "suite": suite,
+        "api": api,
+        "provider": settings.model_provider,
+        "retrieval_profile": settings.retrieval_profile,
+        "model_gateway_url": settings.model_gateway_url,
+        "models_config_path": str(settings.models_config_path),
+        "retrieval_config_path": str(settings.retrieval_config_path),
+        "config_id": RELEASE_GATE_CONFIG_ID,
+        "config_hash": config.config_hash if config else "",
+        "model_aliases": config.model_aliases if config else {},
+        "dev_dataset": {
+            "name": dev_manifest.dataset_name,
+            "hash": dev_manifest.dataset_hash,
+            "path": dev_manifest.jsonl_path,
+        },
+        "test_dataset": {
+            "name": test_manifest.dataset_name,
+            "hash": test_manifest.dataset_hash,
+            "path": test_manifest.jsonl_path,
+        },
+        "commands": {
+            "release_gate": f"uv run python -m wikipediarag.cli eval-release-gate --suite {suite} --api {api}",
+            "status": f"uv run python -m wikipediarag.cli eval-release-gate-status --suite {suite} --json",
+        },
+    }
+
+
+def _release_gate_blocker_details(
+    report: dict[str, Any],
+    *,
+    dev_tasks: list[EvalTask],
+    test_tasks: list[EvalTask],
+) -> list[dict[str, Any]]:
+    runs = dict(report.get("runs") or {})
+    tasks_by_split = {
+        "dev": {task.task_id: task for task in dev_tasks},
+        "test": {task.task_id: task for task in test_tasks},
+    }
+    details: list[dict[str, Any]] = []
+    for finding in list(report.get("blocking_failures") or []):
+        if not isinstance(finding, dict):
+            continue
+        split = str(finding.get("split") or "")
+        source = str(finding.get("source") or "")
+        config_id = str(finding.get("config_id") or RELEASE_GATE_CONFIG_ID)
+        metric = str(finding.get("metric") or "")
+        run_key = f"{split}_{source}"
+        run_payload = dict(runs.get(run_key) or {})
+        summary = _summary_payload(run_payload, config_id)
+        task_ids = [str(item) for item in summary.get("failed_task_ids") or []]
+        if source == "answer" and not task_ids and _is_artifact_problem(metric, str(finding.get("message") or "")):
+            task_ids = _mixed_contract_task_ids(run_payload, config_id, metric)
+        task_details: list[dict[str, Any]] = []
+        if source == "answer":
+            result_by_task = _answer_results_by_task(run_payload, config_id)
+            for task_id in task_ids[:20]:
+                task = tasks_by_split.get(split, {}).get(task_id)
+                result = result_by_task.get(task_id)
+                if task is not None:
+                    task_details.append(_answer_blocker_task_detail(task, result))
+        details.append(
+            {
+                "category": "report_problem"
+                if _is_artifact_problem(metric, str(finding.get("message") or ""))
+                else ("answer_quality_failure" if source == "answer" else "retrieval_quality_failure"),
+                "finding": finding,
+                "run": {
+                    "run_id": run_payload.get("run_id", ""),
+                    "run_dir": run_payload.get("run_dir", ""),
+                    "dataset_hash": run_payload.get("dataset_hash", ""),
+                    "config_hash": summary.get("config_hash", ""),
+                    "contract_ids": summary.get("contract_ids", {}),
+                    "errors": summary.get("errors", []),
+                },
+                "task_details": task_details,
+            }
+        )
+    return details
+
+
+def _summary_payload(run_payload: dict[str, Any], config_id: str) -> dict[str, Any]:
+    for summary in list(run_payload.get("config_summaries") or []):
+        if isinstance(summary, dict) and summary.get("config_id") == config_id:
+            return summary
+    return {}
+
+
+def _answer_results_by_task(run_payload: dict[str, Any], config_id: str) -> dict[str, EvalTaskResult]:
+    run_dir = Path(str(run_payload.get("run_dir") or ""))
+    config_hash = str(_summary_payload(run_payload, config_id).get("config_hash") or "")
+    if not run_dir or not config_hash:
+        return {}
+    path = run_dir / "results" / f"{config_id}-{config_hash[:12]}.jsonl"
+    return {result.task_id: result for result in read_jsonl(path, EvalTaskResult)}
+
+
+def _mixed_contract_task_ids(run_payload: dict[str, Any], config_id: str, metric: str) -> list[str]:
+    result_by_task = _answer_results_by_task(run_payload, config_id)
+    key = metric if metric.endswith("_contract_id") else "run_contract_id"
+    values = {result.contract_ids.get(key, "") for result in result_by_task.values() if result.contract_ids.get(key)}
+    if len(values) <= 1:
+        return []
+    return sorted(result_by_task)
+
+
+def _answer_blocker_task_detail(task: EvalTask, result: EvalTaskResult | None) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "question": task.question,
+        "reference_answer": task.reference_answer,
+        "accepted_answers": task.accepted_answers,
+        "actual_answer": result.answer if result else "",
+        "status": result.status if result else "missing_result",
+        "execution_path": result.execution_path if result else "",
+        "path_selection_reason": result.path_selection_reason if result else "",
+        "failure": {
+            "stage": result.failure_stage if result else "missing_result",
+            "code": result.failure_code if result else "missing_result",
+            "retryable": result.failure_retryable if result else None,
+            "attempts": result.attempts if result else 0,
+            "last_successful_stage": result.last_successful_stage if result else "",
+        },
+        "algorithm_actions": [
+            "question_sent_to_public_api",
+            "retrieval_candidates_collected",
+            "answer_generated",
+            "citations_scored_against_gold_evidence",
+            "summary_evaluated_against_release_gate_thresholds",
+        ],
+        "contract_ids": result.contract_ids if result else {},
+        "run_contract_id": result.run_contract_id if result else "",
+        "retrieval_contract_ids": result.retrieval_contract_ids if result else [],
+        "tool_contract_ids": result.tool_contract_ids if result else [],
+        "step_events": result.step_events if result else [],
+        "errors": result.errors if result else ["missing_result"],
+        "cited_chunk_ids": result.cited_chunk_ids if result else [],
+        "gold_chunks": [evidence.model_dump(mode="json") for evidence in task.gold_evidence],
+        "retrieved_chunks": [
+            candidate.model_dump(mode="json") for candidate in (result.reranked_candidates if result else [])
+        ],
+    }
+
+
+def _is_artifact_problem(metric: str, message: str) -> bool:
+    return metric in {"contract_ids", "run_contract_id", "index_contract_id"} or "mixed_contract" in message
+
+
+def _stage_report_paths(report: dict[str, Any]) -> dict[str, str]:
+    paths: dict[str, str] = {}
+    for stage, payload in dict(report.get("runs") or {}).items():
+        if isinstance(payload, dict) and payload.get("run_dir"):
+            paths[str(stage)] = str(Path(str(payload["run_dir"])) / "manifest.json")
+    return paths
+
+
+def _dated_report_id(suite: str, stage: str, *, started_at: str) -> str:
+    timestamp = started_at.replace("-", "").replace(":", "")
+    short_id = stable_json_hash([suite, stage, started_at, time.time_ns()], 16)[:8]
+    return f"{timestamp}-{suite}-{stage}-{short_id}"
+
+
 def load_review_pool_manifest(suite: str) -> ReviewPoolManifest:
     latest = ARTIFACT_ROOT / "datasets" / suite / "reviewed-pool.latest.json"
     if not latest.exists():
@@ -403,11 +616,19 @@ def load_review_pool_manifest(suite: str) -> ReviewPoolManifest:
     return ReviewPoolManifest.model_validate(read_json(latest))
 
 
-def load_release_gate_status(suite: str) -> ReleaseGateStatus:
+def load_release_gate_status(suite: str, report_id: str | None = None) -> ReleaseGateStatus:
+    if report_id:
+        path = _release_gate_suite_dir(suite) / report_id / "status.json"
+        if not path.exists():
+            raise FileNotFoundError(f"no release gate status found for suite {suite} report_id {report_id}")
+        return ReleaseGateStatus.model_validate(read_json(path))
     latest = _release_gate_suite_dir(suite) / "latest-status.json"
-    if not latest.exists():
-        raise FileNotFoundError(f"no release gate status found for suite {suite}")
-    return ReleaseGateStatus.model_validate(read_json(latest))
+    if latest.exists():
+        return ReleaseGateStatus.model_validate(read_json(latest))
+    statuses = sorted(_release_gate_suite_dir(suite).glob("*/status.json"))
+    if statuses:
+        return ReleaseGateStatus.model_validate(read_json(statuses[-1]))
+    raise FileNotFoundError(f"no release gate status found for suite {suite}")
 
 
 def load_locked_split_manifest(suite: str, split: Literal["dev", "test"]) -> tuple[EvalDatasetManifest, dict[str, Any]]:
@@ -668,9 +889,25 @@ def _gate_findings_for_split(
             findings.append(
                 _finding(split, source, summary.config_id, "unanswerable_accuracy", "unanswerable_accuracy < 1.0")
             )
-    if source == "retrieval" and metrics.get("false_positive_evidence_rate", 0.0) > 0.0:
+        if metrics.get("cited_hard_negative_rate", 0.0) > 0.0:
+            findings.append(
+                _finding(
+                    split,
+                    source,
+                    summary.config_id,
+                    "cited_hard_negative_rate",
+                    "answer cited hard-negative evidence",
+                )
+            )
+    if source == "retrieval" and metrics.get("dangerous_false_positive_evidence_rate", 0.0) > 0.0:
         findings.append(
-            _finding(split, source, summary.config_id, "false_positive_evidence_rate", "false positive evidence > 0")
+            _finding(
+                split,
+                source,
+                summary.config_id,
+                "dangerous_false_positive_evidence_rate",
+                "dangerous false-positive evidence > 0",
+            )
         )
     findings.extend(_regression_findings(split, source, summary, baseline))
     return findings
@@ -836,6 +1073,9 @@ def _release_gate_status_from_manifest(
 ) -> ReleaseGateStatus:
     total = sum(summary.task_count for summary in child_manifest.config_summaries)
     failed = sum(len(summary.failed_task_ids) for summary in child_manifest.config_summaries)
+    stage_paths = dict(status.stage_report_paths)
+    if status.current_stage:
+        stage_paths[status.current_stage] = str(Path(child_manifest.run_dir) / "manifest.json")
     return _advance_release_gate_status(status, started=started, timings=timings).model_copy(
         update={
             "child_run_id": child_manifest.run_id,
@@ -843,6 +1083,7 @@ def _release_gate_status_from_manifest(
             "child_processed_task_runs": total,
             "child_total_task_runs": total,
             "child_failed_task_runs": failed,
+            "stage_report_paths": stage_paths,
             "updated_at": utc_now_iso(),
         }
     )
@@ -866,6 +1107,7 @@ def _advance_release_gate_status(
 def _write_release_gate_status(status: ReleaseGateStatus) -> None:
     payload = status.model_dump(mode="json")
     write_json(Path(status.run_dir) / "status.json", payload)
+    write_json(_release_gate_suite_dir(status.suite) / "status.json", payload)
     write_json(_release_gate_suite_dir(status.suite) / "latest-status.json", payload)
     write_json(ARTIFACT_ROOT / "release-gates" / "latest-status.json", payload)
 

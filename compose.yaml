@@ -76,6 +76,41 @@ services:
     volumes:
       - ./zim:/data:ro
 
+  xberg:
+    image: ghcr.io/xberg-io/xberg:1.0.3
+    command: serve --host 0.0.0.0 --port 8000
+    environment:
+      XBERG_CORS_ORIGINS: "http://localhost:5173"
+      XBERG_MAX_UPLOAD_SIZE_MB: "100"
+      RUST_LOG: info
+    ports:
+      - "8091:8000"
+    volumes:
+      - xberg-cache:/app/.xberg
+
+  docling:
+    image: quay.io/docling-project/docling-serve-cpu:v1.28.0
+    environment:
+      UVICORN_HOST: 0.0.0.0
+      UVICORN_PORT: "5001"
+      DOCLING_DEVICE: cpu
+      DOCLING_SERVE_ENABLE_UI: "false"
+      DOCLING_SERVE_MAX_FILE_SIZE: "104857600"
+    ports:
+      - "8092:5001"
+    volumes:
+      - docling-cache:/root/.cache
+
+  metadata-service:
+    build:
+      context: .
+      dockerfile: infra/docker/python.Dockerfile
+    command: python -m wikipediarag.metadata_app
+    environment:
+      APP_ENV: development
+    ports:
+      - "8090:8090"
+
   mock-provider:
     build:
       context: .
@@ -93,6 +128,7 @@ services:
     command: python -m wikipediarag.gateway_app
     environment:
       MODEL_PROVIDER: ${MODEL_PROVIDER:-mock}
+      MODEL_GATEWAY_STARTUP_SMOKE: ${MODEL_GATEWAY_STARTUP_SMOKE:-warn}
       RETRIEVAL_PROFILE: ${RETRIEVAL_PROFILE:-test_mock}
       MODELS_CONFIG_PATH: ${MODELS_CONFIG_PATH:-/app/config/models.yaml}
       RETRIEVAL_CONFIG_PATH: ${RETRIEVAL_CONFIG_PATH:-/app/config/retrieval.yaml}
@@ -114,11 +150,17 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://rag:change-me-local-only@postgres:5432/rag}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-local-minio}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-change-me-local-only}
       MINIO_BUCKET: ${MINIO_BUCKET:-rag-artifacts}
       OPENSEARCH_URL: ${OPENSEARCH_URL:-http://opensearch:9200}
       MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL:-http://model-gateway:8080}
+      API_PUBLIC_BASE_URL: ${API_PUBLIC_BASE_URL:-http://localhost:8000}
+      XBERG_URL: ${XBERG_URL:-http://xberg:8000}
+      DOCLING_URL: ${DOCLING_URL:-http://docling:5001}
+      METADATA_SERVICE_URL: ${METADATA_SERVICE_URL:-http://metadata-service:8090}
+      DOCUMENT_PARSER_SERVICES_REQUIRED: ${DOCUMENT_PARSER_SERVICES_REQUIRED:-false}
       RETRIEVAL_PROFILE: ${RETRIEVAL_PROFILE:-test_mock}
       MODELS_CONFIG_PATH: ${MODELS_CONFIG_PATH:-/app/config/models.yaml}
       RETRIEVAL_CONFIG_PATH: ${RETRIEVAL_CONFIG_PATH:-/app/config/retrieval.yaml}
@@ -155,11 +197,17 @@ services:
       APP_ENV: ${APP_ENV:-development}
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://rag:change-me-local-only@postgres:5432/rag}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-local-minio}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-change-me-local-only}
       MINIO_BUCKET: ${MINIO_BUCKET:-rag-artifacts}
       OPENSEARCH_URL: ${OPENSEARCH_URL:-http://opensearch:9200}
       MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL:-http://model-gateway:8080}
+      API_PUBLIC_BASE_URL: ${API_PUBLIC_BASE_URL:-http://localhost:8000}
+      XBERG_URL: ${XBERG_URL:-http://xberg:8000}
+      DOCLING_URL: ${DOCLING_URL:-http://docling:5001}
+      METADATA_SERVICE_URL: ${METADATA_SERVICE_URL:-http://metadata-service:8090}
+      DOCUMENT_PARSER_SERVICES_REQUIRED: ${DOCUMENT_PARSER_SERVICES_REQUIRED:-true}
       RETRIEVAL_PROFILE: ${RETRIEVAL_PROFILE:-test_mock}
       MODELS_CONFIG_PATH: ${MODELS_CONFIG_PATH:-/app/config/models.yaml}
       RETRIEVAL_CONFIG_PATH: ${RETRIEVAL_CONFIG_PATH:-/app/config/retrieval.yaml}
@@ -176,6 +224,12 @@ services:
     depends_on:
       api:
         condition: service_started
+      metadata-service:
+        condition: service_started
+      xberg:
+        condition: service_started
+      docling:
+        condition: service_started
 
   ui:
     build:
@@ -191,3 +245,5 @@ volumes:
   postgres-data:
   minio-data:
   opensearch-data:
+  xberg-cache:
+  docling-cache:

@@ -732,7 +732,10 @@ class TrustedGenerateCliReporter:
         self._stream = stream or sys.stdout
 
     def __call__(self, status: TrustedGenerateRunStatus, event: str, payload: dict[str, Any]) -> None:
-        print(format_trusted_progress_event(status, event, payload), file=self._stream, flush=True)
+        try:
+            print(format_trusted_progress_event(status, event, payload), file=self._stream, flush=True)
+        except OSError:
+            return
 
 
 def format_trusted_progress_event(status: TrustedGenerateRunStatus, event: str, payload: dict[str, Any]) -> str:

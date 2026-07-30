@@ -8,7 +8,7 @@ from wikipediarag.embedding import normalize_for_embedding
 from wikipediarag.retrieval_profile import RetrievalProfile
 from wikipediarag.schemas import AnswerabilityDecision, AnswerabilityStatus, Evidence
 
-GATE_VERSION = "answerability_gate_v1"
+GATE_VERSION = "answerability_gate_v4"
 
 _VALUE_RE = re.compile(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b|\b\d{3,4}\b|\b\d+(?:[,.]\d+)?\b")
 _STOPWORDS = {
@@ -16,14 +16,24 @@ _STOPWORDS = {
     "в",
     "во",
     "где",
+    "год",
     "для",
     "и",
     "или",
     "как",
     "какая",
+    "каком",
+    "какого",
     "какие",
     "какой",
+    "какое",
+    "какую",
     "когда",
+    "которого",
+    "которой",
+    "которое",
+    "который",
+    "которые",
     "кто",
     "на",
     "о",
@@ -32,6 +42,10 @@ _STOPWORDS = {
     "по",
     "почему",
     "при",
+    "произошел",
+    "произошла",
+    "произошли",
+    "произошло",
     "с",
     "со",
     "сравни",
@@ -47,7 +61,51 @@ _STOPWORDS = {
     "where",
     "who",
     "why",
+    "дай",
+    "информация",
+    "информацию",
+    "кратко",
+    "локальном",
+    "локальный",
+    "опиши",
+    "подробно",
+    "расскажи",
+    "сведения",
+    "году",
+    "выпуска",
+    "каждого",
+    "конкретные",
+    "релиз",
+    "релиза",
+    "релизы",
+    "сравните",
+    "тип",
+    "типу",
+    "укажите",
+    "формат",
+    "формата",
+    "значение",
+    "значения",
+    "альбом",
+    "альбома",
 }
+_FACT_REQUIREMENT_MARKERS = (
+    "год",
+    "дата",
+    "дате",
+    "когда",
+    "номер",
+    "серийн",
+    "сколько",
+    "официальн",
+    "snapshot",
+    "снапшот",
+    "указан",
+    "указано",
+    "население",
+    "площад",
+    "столиц",
+)
 _PART_MARKERS = (" и ", " vs ", " versus ", ";")
 _CONFLICT_MARKERS = (
     "конфликт",
@@ -74,7 +132,9 @@ def decide_answerability(
     all_text = _evidence_text(evidence)
     covered_values = [value for value in key_values if value.casefold() in all_text]
     covered_names = [name for name in key_names if normalize_for_embedding(name) in all_text]
+    missing_names = [name for name in key_names if name not in covered_names]
     exact_title_match = _has_exact_or_redirect_title_match(query, evidence)
+    answer_terms, covered_answer_terms, missing_answer_terms = _answer_bearing_terms(query, evidence)
     top_score = _top_relevance_score(evidence)
     page_diversity = _page_diversity(evidence)
     conflicting = _has_explicit_conflict(query, evidence)
@@ -98,6 +158,10 @@ def decide_answerability(
         "covered_values": covered_values,
         "query_names": key_names,
         "covered_names": covered_names,
+        "missing_names": missing_names,
+        "answer_bearing_terms": sorted(answer_terms),
+        "covered_answer_bearing_terms": sorted(covered_answer_terms),
+        "missing_answer_bearing_terms": sorted(missing_answer_terms),
         "final_evidence_min": profile.postprocess.final_evidence_min,
         "evidence_count": len(evidence),
     }
@@ -125,6 +189,17 @@ def decide_answerability(
             missing_parts=required_parts,
             signals=signals,
         )
+    if _has_missing_answer_bearing_requirement(query, answer_terms, covered_answer_terms, missing_answer_terms):
+        return AnswerabilityDecision(
+            version=GATE_VERSION,
+            status=AnswerabilityStatus.partial,
+            confidence=0.55,
+            reason="answer_bearing_terms_missing_partial",
+            required_parts=required_parts,
+            covered_parts=covered_parts,
+            missing_parts=missing_parts or required_parts,
+            signals=signals,
+        )
     if strong_match and coverage_ratio >= 1.0 and values_ok and names_ok and enough_diversity:
         return AnswerabilityDecision(
             version=GATE_VERSION,
@@ -144,7 +219,7 @@ def decide_answerability(
             reason="partial_context_coverage",
             required_parts=required_parts,
             covered_parts=covered_parts,
-            missing_parts=missing_parts,
+            missing_parts=missing_parts or missing_names,
             signals=signals,
         )
     return AnswerabilityDecision(
@@ -173,7 +248,8 @@ def should_try_extended_search(decision: AnswerabilityDecision) -> bool:
 
 def _required_parts(query: str) -> list[str]:
     compact = " ".join(query.split())
-    parts = [part.strip(" ?!.") for part in re.split(r"\?|;|\bи\b|\bvs\b|\bversus\b", compact, flags=re.I)]
+    split_pattern = r"\?|;|\bvs\b|\bversus\b"
+    parts = [part.strip(" ?!.") for part in re.split(split_pattern, compact, flags=re.I)]
     meaningful = [part for part in parts if _significant_terms(part)]
     if len(meaningful) <= 1:
         return [compact]
@@ -233,6 +309,42 @@ def _has_exact_or_redirect_title_match(query: str, evidence: Sequence[Evidence])
             ):
                 return True
     return False
+
+
+def _answer_bearing_terms(query: str, evidence: Sequence[Evidence]) -> tuple[set[str], set[str], set[str]]:
+    query_terms = _significant_terms(query)
+    title_terms = _matched_title_terms(query, evidence)
+    answer_terms = {term for term in query_terms if not _terms_overlap({term}, title_terms)}
+    evidence_terms = set(_evidence_text(evidence).split())
+    covered = {term for term in answer_terms if _terms_overlap({term}, evidence_terms)}
+    missing = answer_terms - covered
+    return answer_terms, covered, missing
+
+
+def _matched_title_terms(query: str, evidence: Sequence[Evidence]) -> set[str]:
+    query_terms = set(normalize_for_embedding(query).split())
+    matched: set[str] = set()
+    for item in evidence:
+        for title in _candidate_titles(item).split("\n"):
+            title_terms = set(normalize_for_embedding(title).split())
+            if title_terms and any(_terms_overlap({term}, query_terms) for term in title_terms):
+                matched.update(title_terms)
+    return matched
+
+
+def _has_missing_answer_bearing_requirement(
+    query: str,
+    answer_terms: set[str],
+    covered_terms: set[str],
+    missing_terms: set[str],
+) -> bool:
+    if len(answer_terms) < 2 or len(missing_terms) < 2:
+        return False
+    normalized_query = normalize_for_embedding(query)
+    if not any(marker in normalized_query for marker in _FACT_REQUIREMENT_MARKERS):
+        return False
+    coverage_ratio = len(covered_terms) / max(len(answer_terms), 1)
+    return coverage_ratio < 0.5
 
 
 def _candidate_titles(evidence: Evidence) -> str:

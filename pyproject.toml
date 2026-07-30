@@ -34,6 +34,7 @@ dev = [
 [project.scripts]
 wikipediarag-api = "wikipediarag.api_app:main"
 wikipediarag-gateway = "wikipediarag.gateway_app:main"
+wikipediarag-metadata = "wikipediarag.metadata_app:main"
 wikipediarag-mock-provider = "wikipediarag.mock_provider_app:main"
 wikipediarag-worker = "wikipediarag.worker:main"
 wikipediarag = "wikipediarag.cli:main"

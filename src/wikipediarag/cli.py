@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape
 
 import httpx
 
+from wikipediarag.document_corpus import (
+    DocumentCorpusItem,
+    corpus_summary,
+    load_manifest_corpus,
+    materialize_corpus_item,
+    synthetic_document_corpus,
+)
 from wikipediarag.eval.schemas import TaskFamily
 
 
@@ -54,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_run_parser = subparsers.add_parser("eval-run")
     eval_run_parser.add_argument("--suite", default="generated-wikipedia-v1")
     eval_run_parser.add_argument("--api", default="http://localhost:8000")
+    eval_run_parser.add_argument("--batch-size", type=int, default=6)
 
     eval_report_parser = subparsers.add_parser("eval-report")
     eval_report_parser.add_argument("--latest", action="store_true")
@@ -128,7 +140,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     eval_release_gate_status_parser = subparsers.add_parser("eval-release-gate-status")
     eval_release_gate_status_parser.add_argument("--suite", required=True)
+    eval_release_gate_status_parser.add_argument("--report-id", default=None)
     eval_release_gate_status_parser.add_argument("--json", action="store_true")
+
+    eval_task_diagnostics_parser = subparsers.add_parser("eval-task-diagnostics")
+    eval_task_diagnostics_parser.add_argument("--suite", required=True)
+    eval_task_diagnostics_parser.add_argument("--split", choices=["dev", "test"], default="test")
+    eval_task_diagnostics_parser.add_argument("--config-id", default="sota_mvp_normal")
+    eval_task_diagnostics_parser.add_argument("--task-id", action="append", required=True)
+    eval_task_diagnostics_parser.add_argument("--json", action="store_true")
+
+    eval_reviewed_short_parser = subparsers.add_parser("eval-reviewed-short")
+    eval_reviewed_short_parser.add_argument("--suite", required=True)
+    eval_reviewed_short_parser.add_argument("--split", choices=["dev", "test"], default="test")
+    eval_reviewed_short_parser.add_argument("--api", default="http://localhost:8000")
+    eval_reviewed_short_parser.add_argument("--config-id", default="sota_mvp_normal")
+    eval_reviewed_short_parser.add_argument("--task-id", action="append", required=True)
+    eval_reviewed_short_parser.add_argument("--batch-size", type=int, default=6)
+    eval_reviewed_short_parser.add_argument("--retrieval-batch-size", type=int, default=10)
+    eval_reviewed_short_parser.add_argument("--skip-answer", action="store_true")
+    eval_reviewed_short_parser.add_argument("--skip-retrieval", action="store_true")
 
     eval_full_parser = subparsers.add_parser("eval-full")
     eval_full_parser.add_argument("--count", type=int, default=None)
@@ -149,10 +180,46 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("ZIM_IMPORT_JOB_ID"),
         help="validate an existing completed ZIM import instead of creating another one",
     )
+
+    verify_upload_parser = subparsers.add_parser("verify-document-upload")
+    verify_upload_parser.add_argument("--api", default="http://localhost:8000")
+    verify_upload_parser.add_argument("--xberg", default=os.environ.get("XBERG_PUBLIC_URL", "http://localhost:8091"))
+    verify_upload_parser.add_argument(
+        "--docling",
+        default=os.environ.get("DOCLING_PUBLIC_URL", "http://localhost:8092"),
+    )
+    verify_upload_parser.add_argument(
+        "--metadata-service",
+        default=os.environ.get("METADATA_SERVICE_PUBLIC_URL", "http://localhost:8090"),
+    )
+    verify_upload_parser.add_argument("--skip-compose", action="store_true")
+    verify_upload_parser.add_argument("--down-after", action="store_true")
+
+    verify_corpus_parser = subparsers.add_parser("verify-document-corpus")
+    verify_corpus_parser.add_argument("--api", default="http://localhost:8000")
+    verify_corpus_parser.add_argument("--xberg", default=os.environ.get("XBERG_PUBLIC_URL", "http://localhost:8091"))
+    verify_corpus_parser.add_argument(
+        "--docling",
+        default=os.environ.get("DOCLING_PUBLIC_URL", "http://localhost:8092"),
+    )
+    verify_corpus_parser.add_argument(
+        "--metadata-service",
+        default=os.environ.get("METADATA_SERVICE_PUBLIC_URL", "http://localhost:8090"),
+    )
+    verify_corpus_parser.add_argument("--fixture-set", choices=["smoke", "standard", "full"], default="standard")
+    verify_corpus_parser.add_argument("--skip-negative", action="store_true")
+    verify_corpus_parser.add_argument("--include-external", action="store_true")
+    verify_corpus_parser.add_argument("--include-disabled-external", action="store_true")
+    verify_corpus_parser.add_argument("--manifest", default="config/document_corpus_manifest.json")
+    verify_corpus_parser.add_argument("--cache-dir", default="artifacts/corpora/document-corpus")
+    verify_corpus_parser.add_argument("--max-documents", type=int, default=None)
+    verify_corpus_parser.add_argument("--skip-compose", action="store_true")
+    verify_corpus_parser.add_argument("--down-after", action="store_true")
     return parser
 
 
 def main() -> None:
+    _configure_stdio()
     parser = build_parser()
     args = parser.parse_args()
     if args.command == "import-wiki":
@@ -170,7 +237,7 @@ def main() -> None:
     elif args.command == "eval-generate-status":
         run_eval_generate_status(args.run_id, args.latest, args.json)
     elif args.command == "eval-run":
-        run_eval_run(args.suite, args.api)
+        run_eval_run(args.suite, args.api, args.batch_size)
     elif args.command == "eval-report":
         run_eval_report(args.latest)
     elif args.command == "eval-retrieval-run":
@@ -198,7 +265,11 @@ def main() -> None:
     elif args.command == "eval-release-gate":
         run_eval_release_gate(args.suite, args.api)
     elif args.command == "eval-release-gate-status":
-        run_eval_release_gate_status(args.suite, args.json)
+        run_eval_release_gate_status(args.suite, args.report_id, args.json)
+    elif args.command == "eval-task-diagnostics":
+        run_eval_task_diagnostics(args.suite, args.split, args.config_id, list(args.task_id), args.json)
+    elif args.command == "eval-reviewed-short":
+        run_eval_reviewed_short(args)
     elif args.command == "eval-full":
         run_eval_full(args)
     elif args.command == "smoke-models":
@@ -208,6 +279,10 @@ def main() -> None:
         print("release gate passed")
     elif args.command == "demo-release-gate":
         demo_release_gate(args.api, args.job_id)
+    elif args.command == "verify-document-upload":
+        verify_document_upload(args)
+    elif args.command == "verify-document-corpus":
+        verify_document_corpus(args)
 
 
 def _add_eval_generate_arguments(parser: argparse.ArgumentParser) -> None:
@@ -222,6 +297,13 @@ def _add_eval_generate_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--resume-run-id", default=None)
+
+
+def _configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
 
 
 def _parse_family_weight_specs(specs: list[str]) -> dict[TaskFamily, float] | None:
@@ -375,11 +457,11 @@ def run_eval_generate_status(run_id: str | None, latest: bool, json_mode: bool) 
     print(format_generate_status(status))
 
 
-def run_eval_run(suite: str, api: str) -> None:
+def run_eval_run(suite: str, api: str, batch_size: int) -> None:
     from wikipediarag.eval.commands import eval_run
     from wikipediarag.eval.runner import EvalRunCliReporter
 
-    report = asyncio.run(eval_run(suite=suite, api=api, progress_callback=EvalRunCliReporter()))
+    report = asyncio.run(eval_run(suite=suite, api=api, batch_size=batch_size, progress_callback=EvalRunCliReporter()))
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
@@ -520,21 +602,58 @@ def run_eval_release_gate(suite: str, api: str) -> None:
     from wikipediarag.eval.commands import eval_release_gate
     from wikipediarag.eval.review import ReleaseGateCliReporter
 
+    _require_api_ready(api)
     report = asyncio.run(eval_release_gate(suite=suite, api=api, progress_callback=ReleaseGateCliReporter()))
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if not report.get("passed"):
         raise SystemExit("eval-release-gate failed")
 
 
-def run_eval_release_gate_status(suite: str, json_mode: bool) -> None:
+def run_eval_release_gate_status(suite: str, report_id: str | None, json_mode: bool) -> None:
     from wikipediarag.eval.commands import eval_release_gate_status
     from wikipediarag.eval.review import format_release_gate_status
 
-    status = eval_release_gate_status(suite=suite)
+    status = eval_release_gate_status(suite=suite, report_id=report_id)
     if json_mode:
         print(json.dumps(status.model_dump(mode="json"), ensure_ascii=False, indent=2))
         return
     print(format_release_gate_status(status))
+
+
+def run_eval_task_diagnostics(
+    suite: str,
+    split: str,
+    config_id: str,
+    task_ids: list[str],
+    json_mode: bool,
+) -> None:
+    from wikipediarag.eval.commands import eval_task_diagnostics
+
+    report = eval_task_diagnostics(suite=suite, split=split, task_ids=task_ids, config_id=config_id)
+    if json_mode:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_reviewed_short(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_reviewed_short
+
+    _require_api_ready(args.api)
+    report = asyncio.run(
+        eval_reviewed_short(
+            suite=args.suite,
+            split=args.split,
+            task_ids=list(args.task_id),
+            api=args.api,
+            config_id=args.config_id,
+            batch_size=args.batch_size,
+            retrieval_batch_size=args.retrieval_batch_size,
+            run_answer=not args.skip_answer,
+            run_retrieval=not args.skip_retrieval,
+        )
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 def run_eval_full(args: argparse.Namespace) -> None:
@@ -590,6 +709,10 @@ def smoke_models(gateway: str, provider: str) -> None:
         missing = sorted(required - available)
         if missing:
             raise SystemExit(f"missing model aliases: {missing}")
+        healthy = {item["id"] for item in model_payload.get("data", []) if item.get("healthy")}
+        unhealthy = sorted(required - healthy)
+        if unhealthy:
+            raise SystemExit(f"model gateway aliases are unhealthy: {unhealthy}")
         embedding = client.post(
             f"{gateway}/v1/embeddings",
             json={"model": aliases["embed"], "input": ["Россия - государство"], "dimensions": dimensions},
@@ -650,10 +773,7 @@ def demo_release_gate(api: str, job_id: str | None = None) -> None:
     kiwix_probe_url = os.environ.get("KIWIX_INTERNAL_BASE_URL", kiwix_base_url).rstrip("/")
     gateway_url = os.environ.get("MODEL_GATEWAY_URL", "http://model-gateway:8080").rstrip("/")
     with httpx.Client(timeout=120) as client:
-        ready = client.get(f"{api}/ready")
-        ready.raise_for_status()
-        if ready.json().get("status") != "ok":
-            raise SystemExit(f"API is not ready: {ready.text}")
+        ready = _require_api_ready(api, client=client)
         models = client.get(f"{gateway_url}/v1/models")
         models.raise_for_status()
         required_aliases = {"embed_default", "generator_fast", "generator_main", "verifier", "rerank_default"}
@@ -696,6 +816,792 @@ def demo_release_gate(api: str, job_id: str | None = None) -> None:
                 indent=2,
             )
         )
+
+
+def verify_document_upload(args: argparse.Namespace) -> None:
+    api = str(args.api).rstrip("/")
+    xberg = str(args.xberg).rstrip("/")
+    docling = str(args.docling).rstrip("/")
+    metadata_service = str(args.metadata_service).rstrip("/")
+    report_dir = Path("artifacts/validation/document-upload") / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {
+        "passed": False,
+        "api": api,
+        "xberg": xberg,
+        "docling": docling,
+        "metadata_service": metadata_service,
+        "report_dir": str(report_dir),
+        "checks": [],
+        "uploads": [],
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    exit_code = 0
+    try:
+        if not args.skip_compose:
+            _compose_up_document_upload_stack()
+            _record_check(report, "compose_up", True)
+        with httpx.Client(timeout=180) as client:
+            _wait_json_ready(client, f"{metadata_service}/health", "metadata-service")
+            _record_check(report, "metadata_service_health", True)
+            _smoke_metadata_service(client, metadata_service)
+            _record_check(report, "metadata_service_extract", True)
+            _wait_json_ready(client, f"{xberg}/health", "xberg")
+            _record_check(report, "xberg_health", True)
+            _smoke_xberg(client, xberg)
+            _record_check(report, "xberg_extract", True)
+            _wait_json_ready(client, f"{docling}/health", "docling")
+            _record_check(report, "docling_health", True)
+            _smoke_docling(client, docling)
+            _record_check(report, "docling_convert", True)
+            _wait_json_ready(client, f"{api}/ready", "api", require_ok=True)
+            _record_check(report, "api_ready", True)
+            kb_id = _create_verify_knowledge_base(client, api)
+            report["knowledge_base_id"] = kb_id
+            for fixture in _document_upload_fixtures():
+                upload_result = _upload_verify_fixture(client, api, kb_id, fixture)
+                job_payload = _wait_job_terminal(client, api, str(upload_result["job_id"]))
+                if job_payload.get("status") != "completed":
+                    raise RuntimeError(f"upload job did not complete: {job_payload}")
+                document = _get_json(client, f"{api}/api/v1/documents/{upload_result['document_id']}")
+                versions = _get_json(client, f"{api}/api/v1/documents/{upload_result['document_id']}/versions")
+                _assert_public_payload_is_safe(document)
+                _assert_public_payload_is_safe(versions)
+                public_metadata = document.get("public_metadata") if isinstance(document, dict) else {}
+                if not isinstance(public_metadata, dict) or not public_metadata.get("detected_language"):
+                    raise RuntimeError(f"document metadata is missing detected language: {document}")
+                report["uploads"].append(
+                    {
+                        "filename": fixture["filename"],
+                        "document_id": upload_result["document_id"],
+                        "document_version_id": upload_result["document_version_id"],
+                        "job": job_payload,
+                        "document": document,
+                        "versions_count": len(versions.get("versions", [])) if isinstance(versions, dict) else 0,
+                    }
+                )
+            _verify_uploaded_retrieval(client, api, kb_id)
+            _record_check(report, "retrieval_published_chunks", True)
+        report["passed"] = True
+    except Exception as exc:
+        exit_code = 1
+        report["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+    finally:
+        report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_document_upload_reports(report_dir, report)
+        if args.down_after:
+            subprocess.run([_docker_executable(), "compose", "down"], check=False)  # noqa: S603
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+def verify_document_corpus(args: argparse.Namespace) -> None:
+    api = str(args.api).rstrip("/")
+    xberg = str(args.xberg).rstrip("/")
+    docling = str(args.docling).rstrip("/")
+    metadata_service = str(args.metadata_service).rstrip("/")
+    report_dir = Path("artifacts/validation/document-corpus") / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    report_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(str(args.cache_dir))
+    manifest_path = Path(str(args.manifest))
+    report: dict[str, Any] = {
+        "passed": False,
+        "api": api,
+        "xberg": xberg,
+        "docling": docling,
+        "metadata_service": metadata_service,
+        "fixture_set": args.fixture_set,
+        "include_external": bool(args.include_external),
+        "manifest": str(manifest_path),
+        "cache_dir": str(cache_dir),
+        "report_dir": str(report_dir),
+        "checks": [],
+        "items": [],
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    exit_code = 0
+    try:
+        items = synthetic_document_corpus(
+            fixture_set=str(args.fixture_set),
+            include_negative=not bool(args.skip_negative),
+        )
+        with httpx.Client(timeout=180, follow_redirects=True) as client:
+            if args.include_external:
+                external_items = load_manifest_corpus(
+                    manifest_path,
+                    include_disabled=bool(args.include_disabled_external),
+                )
+                items.extend(_materialize_external_corpus(client, external_items, cache_dir))
+            if args.max_documents is not None:
+                items = items[: max(0, int(args.max_documents))]
+            report["corpus_summary"] = corpus_summary(items)
+            if not args.skip_compose:
+                _compose_up_document_upload_stack()
+                _record_check(report, "compose_up", True)
+            _wait_json_ready(client, f"{metadata_service}/health", "metadata-service")
+            _record_check(report, "metadata_service_health", True)
+            _smoke_metadata_service(client, metadata_service)
+            _record_check(report, "metadata_service_extract", True)
+            _wait_json_ready(client, f"{xberg}/health", "xberg")
+            _record_check(report, "xberg_health", True)
+            _smoke_xberg(client, xberg)
+            _record_check(report, "xberg_extract", True)
+            _wait_json_ready(client, f"{docling}/health", "docling")
+            _record_check(report, "docling_health", True)
+            _smoke_docling(client, docling)
+            _record_check(report, "docling_convert", True)
+            _wait_json_ready(client, f"{api}/ready", "api", require_ok=True)
+            _record_check(report, "api_ready", True)
+            _verify_corpus_api_controls(client, api)
+            _record_check(report, "upload_api_negative_controls", True)
+            kb_id = _create_verify_knowledge_base(client, api)
+            report["knowledge_base_id"] = kb_id
+            for index, item in enumerate(items, start=1):
+                result = _run_corpus_item(client, api, kb_id, item)
+                _append_report_item(report, result)
+                print(
+                    json.dumps(
+                        {
+                            "corpus_item": item.id,
+                            "processed": index,
+                            "total": len(items),
+                            "passed": result.get("passed"),
+                            "outcome": result.get("outcome"),
+                            "job_status": result.get("job_status"),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            failures = [item for item in report["items"] if isinstance(item, dict) and not item.get("passed")]
+            if failures:
+                raise RuntimeError(f"document corpus verification failed for {len(failures)} item(s)")
+        report["passed"] = True
+    except Exception as exc:
+        exit_code = 1
+        report["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+    finally:
+        report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_document_corpus_reports(report_dir, report)
+        if args.down_after:
+            subprocess.run([_docker_executable(), "compose", "down"], check=False)  # noqa: S603
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+def _materialize_external_corpus(
+    client: httpx.Client,
+    items: list[DocumentCorpusItem],
+    cache_dir: Path,
+) -> list[DocumentCorpusItem]:
+    materialized: list[DocumentCorpusItem] = []
+    headers = {"User-Agent": "WikipediaRag document corpus verification contact local@example.invalid"}
+    for item in items:
+        if not item.url:
+            raise RuntimeError(f"external corpus item {item.id} is missing url")
+        item_dir = cache_dir / item.source_id
+        item_dir.mkdir(parents=True, exist_ok=True)
+        local_path = item_dir / f"{item.id}-{item.filename}"
+        if local_path.exists():
+            data = local_path.read_bytes()
+            materialized.append(materialize_corpus_item(item, data=data))
+            continue
+        response = client.get(item.url, headers=headers, timeout=180)
+        response.raise_for_status()
+        data = response.content
+        materialized_item = materialize_corpus_item(item, data=data)
+        local_path.write_bytes(data)
+        materialized.append(materialized_item)
+    return materialized
+
+
+def _verify_corpus_api_controls(client: httpx.Client, api: str) -> None:
+    checksum = hashlib.sha256(b"control").hexdigest()
+    wrong_kb = client.post(
+        f"{api}/api/v1/uploads/sessions",
+        json={
+            "filename": "wrong-kb.txt",
+            "content_type": "text/plain",
+            "size_bytes": 7,
+            "checksum_sha256": checksum,
+            "knowledge_base_id": "00000000-0000-4000-8000-000000000000",
+        },
+        timeout=30,
+    )
+    if wrong_kb.status_code != 404:
+        raise RuntimeError(f"wrong KB upload session was not rejected: {wrong_kb.status_code} {wrong_kb.text[:300]}")
+    traversal = client.post(
+        f"{api}/api/v1/uploads/sessions",
+        json={
+            "filename": "../secret.txt",
+            "content_type": "text/plain",
+            "size_bytes": 7,
+            "checksum_sha256": checksum,
+        },
+        timeout=30,
+    )
+    if traversal.status_code < 400:
+        raise RuntimeError("path traversal upload filename was not rejected")
+
+
+def _run_corpus_item(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    item: DocumentCorpusItem,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {**item.report_metadata(), "passed": False}
+    try:
+        if item.content is None:
+            raise RuntimeError(f"corpus item {item.id} has no materialized content")
+        upload_result = _upload_corpus_item(client, api, knowledge_base_id, item)
+        result.update(upload_result)
+        _assert_corpus_item_outcome(client, api, knowledge_base_id, item, result)
+        result["passed"] = True
+    except Exception as exc:
+        result["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+    return result
+
+
+def _upload_corpus_item(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    item: DocumentCorpusItem,
+) -> dict[str, Any]:
+    if item.content is None:
+        raise RuntimeError(f"corpus item {item.id} is not materialized")
+    content = item.content
+    metadata = item.metadata or {}
+    actual_checksum = hashlib.sha256(content).hexdigest()
+    declared_checksum = str(metadata.get("declared_sha256") or actual_checksum)
+    declared_size = int(metadata.get("declared_size_bytes") or len(content))
+    session_response = client.post(
+        f"{api}/api/v1/uploads/sessions",
+        json={
+            "filename": item.filename,
+            "content_type": item.content_type,
+            "size_bytes": declared_size,
+            "checksum_sha256": declared_checksum,
+            "knowledge_base_id": knowledge_base_id,
+            "parser_profile": item.parser_profile,
+            "metadata": {
+                "verify_document_corpus": True,
+                "corpus_item_id": item.id,
+                "source_id": item.source_id,
+                "license": item.license,
+            },
+        },
+        timeout=30,
+    )
+    if item.expected_outcome == "session_rejected":
+        return {
+            "outcome": "session_rejected",
+            "session_status_code": session_response.status_code,
+            "session_rejected": session_response.status_code >= 400,
+            "safe_error": session_response.text[:300],
+        }
+    session_response.raise_for_status()
+    session = session_response.json()
+    upload_response = client.put(
+        session["upload_url"],
+        content=content,
+        headers=session.get("required_headers") or {},
+        timeout=120,
+    )
+    upload_response.raise_for_status()
+    complete_response = client.post(
+        f"{api}/api/v1/uploads/sessions/{session['upload_session_id']}:complete",
+        json={"metadata": {"verify_document_corpus_completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}},
+        timeout=30,
+    )
+    if item.expected_outcome == "complete_rejected":
+        return {
+            "outcome": "complete_rejected",
+            "upload_session_id": session["upload_session_id"],
+            "complete_status_code": complete_response.status_code,
+            "complete_rejected": complete_response.status_code >= 400,
+            "safe_error": complete_response.text[:300],
+        }
+    complete_response.raise_for_status()
+    completed = complete_response.json()
+    job_payload = _wait_job_terminal(client, api, str(completed["job_id"]))
+    result = {
+        "outcome": "job_terminal",
+        "upload_session_id": session["upload_session_id"],
+        "document_id": completed["document_id"],
+        "document_version_id": completed["document_version_id"],
+        "job_id": completed["job_id"],
+        "job_status": job_payload.get("status"),
+        "job": job_payload,
+    }
+    if completed.get("document_id"):
+        document = _get_json(client, f"{api}/api/v1/documents/{completed['document_id']}")
+        versions = _get_json(client, f"{api}/api/v1/documents/{completed['document_id']}/versions")
+        result["document"] = document
+        result["versions_count"] = len(versions.get("versions", [])) if isinstance(versions, dict) else 0
+        _assert_public_payload_is_safe(document)
+        _assert_public_payload_is_safe(versions)
+    return result
+
+
+def _assert_corpus_item_outcome(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    item: DocumentCorpusItem,
+    result: dict[str, Any],
+) -> None:
+    if item.expected_outcome == "session_rejected":
+        if not result.get("session_rejected"):
+            raise RuntimeError(f"expected session rejection for {item.id}")
+        return
+    if item.expected_outcome == "complete_rejected":
+        if not result.get("complete_rejected"):
+            raise RuntimeError(f"expected upload completion rejection for {item.id}")
+        _assert_expected_error_text(item, str(result.get("safe_error") or ""))
+        return
+    job = result.get("job")
+    if not isinstance(job, dict):
+        raise RuntimeError(f"missing job payload for {item.id}")
+    if item.expected_outcome == "failed":
+        if job.get("status") != "failed":
+            raise RuntimeError(f"expected failed job for {item.id}: {job}")
+        progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+        safe_error_code = progress.get("safe_error_code") if isinstance(progress, dict) else None
+        if item.expected_error_code and safe_error_code != item.expected_error_code:
+            raise RuntimeError(f"expected error {item.expected_error_code} for {item.id}, got {safe_error_code}: {job}")
+        return
+    if job.get("status") != "completed":
+        raise RuntimeError(f"expected completed job for {item.id}: {job}")
+    document = result.get("document")
+    if not isinstance(document, dict):
+        raise RuntimeError(f"missing document metadata for {item.id}")
+    if document.get("status") != "published":
+        raise RuntimeError(f"document was not published for {item.id}: {document}")
+    raw_public_metadata = document.get("public_metadata")
+    public_metadata = raw_public_metadata if isinstance(raw_public_metadata, dict) else {}
+    if item.expected_language and public_metadata.get("detected_language") != item.expected_language:
+        raise RuntimeError(
+            f"expected language {item.expected_language} for {item.id}, got {public_metadata.get('detected_language')}"
+        )
+    if item.expected_document_date and public_metadata.get("document_date") != item.expected_document_date:
+        raise RuntimeError(
+            f"expected date {item.expected_document_date} for {item.id}, got {public_metadata.get('document_date')}"
+        )
+    if item.expected_parser_route and public_metadata.get("parser_route") != item.expected_parser_route:
+        raise RuntimeError(
+            f"expected parser route {item.expected_parser_route} for {item.id}, "
+            f"got {public_metadata.get('parser_route')}"
+        )
+    if item.content is not None and document.get("content_hash") != hashlib.sha256(item.content).hexdigest():
+        raise RuntimeError(f"document content hash mismatch for {item.id}")
+    _assert_timestamp_order(document, ("uploaded_at", "upload_completed_at", "ingested_at", "published_at"))
+    if item.retrieval_query:
+        _verify_corpus_retrieval(client, api, knowledge_base_id, item, str(result.get("document_version_id")))
+
+
+def _assert_expected_error_text(item: DocumentCorpusItem, value: str) -> None:
+    if item.expected_error_code and item.expected_error_code not in value:
+        raise RuntimeError(f"expected error text {item.expected_error_code} for {item.id}, got {value[:300]}")
+
+
+def _assert_timestamp_order(payload: dict[str, Any], fields: tuple[str, ...]) -> None:
+    values = [str(payload[field]) for field in fields if payload.get(field)]
+    if values != sorted(values):
+        raise RuntimeError(f"document timestamps are not monotonic: {values}")
+
+
+def _verify_corpus_retrieval(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    item: DocumentCorpusItem,
+    document_version_id: str,
+) -> None:
+    response = client.post(
+        f"{api}/api/v1/search:debug",
+        json={
+            "message": item.retrieval_query,
+            "top_k": 5,
+            "knowledge_base_ids": [knowledge_base_id],
+            "retrieval_profile": "upload_mock",
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    evidence = payload.get("evidence") if isinstance(payload, dict) else None
+    if not isinstance(evidence, list) or not evidence:
+        raise RuntimeError(f"corpus item {item.id} is not retrievable: {payload}")
+    matching = []
+    for entry in evidence:
+        if not isinstance(entry, dict):
+            continue
+        metadata = entry.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("document_version_id") == document_version_id:
+            matching.append(entry)
+    if not matching:
+        raise RuntimeError(
+            f"corpus item {item.id} retrieval returned no evidence for version {document_version_id}: {payload}"
+        )
+    metadata = matching[0].get("metadata") if isinstance(matching[0].get("metadata"), dict) else {}
+    if not isinstance(metadata, dict) or not metadata.get("locator"):
+        raise RuntimeError(f"corpus item {item.id} evidence is missing locator metadata: {matching[0]}")
+    if metadata.get("publication_status") != "published":
+        raise RuntimeError(f"corpus item {item.id} retrieval returned non-published evidence: {matching[0]}")
+
+
+def _append_report_item(report: dict[str, Any], item: dict[str, Any]) -> None:
+    items = report.setdefault("items", [])
+    if isinstance(items, list):
+        items.append(item)
+
+
+def _write_document_corpus_reports(report_dir: Path, report: dict[str, Any]) -> None:
+    report_path = report_dir / "document-corpus-report.json"
+    junit_path = report_dir / "document-corpus-junit.xml"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    raw_items = report.get("items")
+    items: list[Any] = raw_items if isinstance(raw_items, list) else []
+    failures = [item for item in items if isinstance(item, dict) and not item.get("passed")]
+    failure_count = len(failures) + (1 if not failures and report.get("error") else 0)
+    testcases: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        failure_xml = ""
+        error = item.get("error")
+        if isinstance(error, dict):
+            failure_xml = (
+                f'<failure type="{escape(str(error.get("code") or "Error"))}">'
+                f"{escape(str(error.get('message') or ''))}</failure>"
+            )
+        testcases.append(
+            f'  <testcase classname="wikipediarag.cli" name="{escape(str(item.get("id") or "item"))}">'
+            f"{failure_xml}</testcase>\n"
+        )
+    if not testcases and report.get("error"):
+        error = report["error"] if isinstance(report["error"], dict) else {}
+        testcases.append(
+            '  <testcase classname="wikipediarag.cli" name="verify_document_corpus">'
+            f'<failure type="{escape(str(error.get("code") or "Error"))}">'
+            f"{escape(str(error.get('message') or ''))}</failure></testcase>\n"
+        )
+    junit = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<testsuite name="verify-document-corpus" tests="{len(testcases)}" failures="{failure_count}">\n'
+        f"{''.join(testcases)}</testsuite>\n"
+    )
+    junit_path.write_text(junit, encoding="utf-8")
+
+
+def _compose_up_document_upload_stack() -> None:
+    env = {
+        **os.environ,
+        "MODEL_PROVIDER": "mock",
+        "RETRIEVAL_PROFILE": "test_mock",
+        "DOCUMENT_PARSER_SERVICES_REQUIRED": "true",
+        "MINIO_PUBLIC_ENDPOINT": os.environ.get("MINIO_PUBLIC_ENDPOINT", "http://localhost:9000"),
+        "API_PUBLIC_BASE_URL": os.environ.get("API_PUBLIC_BASE_URL", "http://localhost:8000"),
+        "XBERG_URL": os.environ.get("XBERG_URL", "http://xberg:8000"),
+        "DOCLING_URL": os.environ.get("DOCLING_URL", "http://docling:5001"),
+        "METADATA_SERVICE_URL": os.environ.get("METADATA_SERVICE_URL", "http://metadata-service:8090"),
+    }
+    services = [
+        "postgres",
+        "redis",
+        "minio",
+        "opensearch",
+        "mock-provider",
+        "model-gateway",
+        "metadata-service",
+        "xberg",
+        "docling",
+        "api",
+        "worker",
+    ]
+    subprocess.run(  # noqa: S603
+        [_docker_executable(), "compose", "up", "-d", "--build", "--force-recreate", *services],
+        check=True,
+        env=env,
+    )
+
+
+def _docker_executable() -> str:
+    return shutil.which("docker") or ("docker.exe" if sys.platform == "win32" else "docker")
+
+
+def _record_check(report: dict[str, Any], name: str, passed: bool, details: dict[str, Any] | None = None) -> None:
+    checks = report.setdefault("checks", [])
+    if isinstance(checks, list):
+        checks.append({"name": name, "passed": passed, "details": details or {}})
+
+
+def _wait_json_ready(
+    client: httpx.Client,
+    url: str,
+    name: str,
+    *,
+    require_ok: bool = False,
+    timeout_seconds: int = 240,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_error = ""
+    while time.monotonic() < deadline:
+        try:
+            response = client.get(url, timeout=10)
+            if response.status_code < 500:
+                payload_json = response.json()
+                payload = dict(payload_json) if isinstance(payload_json, dict) else {}
+                status = payload.get("status")
+                accepted_statuses = {"ok"} if require_ok else {"ok", "healthy", "degraded"}
+                if status in accepted_statuses:
+                    return payload
+                last_error = response.text[:300]
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(3)
+    raise RuntimeError(f"{name} did not become ready at {url}: {last_error}")
+
+
+def _smoke_metadata_service(client: httpx.Client, base_url: str) -> None:
+    response = client.post(
+        f"{base_url}/v1/metadata:extract",
+        json={"filename": "smoke.txt", "text": "Проверочный документ от 29.07.2026."},
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("detected_language") != "ru" or payload.get("document_date") != "2026-07-29":
+        raise RuntimeError(f"metadata service smoke returned unexpected metadata: {payload}")
+
+
+def _smoke_xberg(client: httpx.Client, base_url: str) -> None:
+    response = client.post(
+        f"{base_url}/extract",
+        files={"files": ("smoke.pdf", _verify_pdf_bytes(), "application/pdf")},
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not _payload_contains(payload, "Verify document"):
+        raise RuntimeError("xberg smoke did not return expected fixture text")
+
+
+def _smoke_docling(client: httpx.Client, base_url: str) -> None:
+    response = client.post(
+        f"{base_url}/v1/convert/file",
+        data={"to_formats": "md", "target_type": "inbody", "do_ocr": "false", "table_mode": "fast"},
+        files={"files": ("smoke.pdf", _verify_pdf_bytes(), "application/pdf")},
+        timeout=180,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not _payload_contains(payload, "Verify document"):
+        raise RuntimeError("docling smoke did not return expected fixture text")
+
+
+def _verify_pdf_bytes() -> bytes:
+    objects = [
+        b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n",
+        b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n",
+        (
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 320 144] "
+            b"/Resources <</Font <</F1 5 0 R>>>> /Contents 4 0 R>>\nendobj\n"
+        ),
+        (
+            b"4 0 obj\n<</Length 57>>\nstream\n"
+            b"BT /F1 12 Tf 40 100 Td (Verify document 2026-07-29) Tj ET\nendstream\nendobj\n"
+        ),
+        b"5 0 obj\n<</Type /Font /Subtype /Type1 /BaseFont /Helvetica>>\nendobj\n",
+    ]
+    content = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for item in objects:
+        offsets.append(len(content))
+        content.extend(item)
+    xref_offset = len(content)
+    content.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    content.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        content.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    content.extend(
+        (f"trailer\n<</Size {len(objects) + 1} /Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF\n").encode("ascii")
+    )
+    return bytes(content)
+
+
+def _payload_contains(payload: Any, needle: str) -> bool:
+    if isinstance(payload, str):
+        return needle in payload
+    if isinstance(payload, dict):
+        return any(_payload_contains(item, needle) for item in payload.values())
+    if isinstance(payload, list):
+        return any(_payload_contains(item, needle) for item in payload)
+    return False
+
+
+def _create_verify_knowledge_base(client: httpx.Client, api: str) -> str:
+    response = client.post(
+        f"{api}/api/v1/knowledge-bases",
+        json={"name": f"Document Upload Verify {time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return str(response.json()["id"])
+
+
+def _document_upload_fixtures() -> list[dict[str, Any]]:
+    csv_content = (
+        "title,document_date,language,note\nПроверочный документ,2026-07-29,ru,локальная таблица для проверки цитат\n"
+    ).encode()
+    return [
+        {
+            "filename": "verify-document.pdf",
+            "content": _verify_pdf_bytes(),
+            "content_type": "application/pdf",
+            "parser_profile": "standard",
+        },
+        {
+            "filename": "verify-metadata.csv",
+            "content": csv_content,
+            "content_type": "text/csv",
+            "parser_profile": "standard",
+        },
+    ]
+
+
+def _upload_verify_fixture(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    fixture: dict[str, Any],
+) -> dict[str, Any]:
+    content = bytes(fixture["content"])
+    checksum = hashlib.sha256(content).hexdigest()
+    session_response = client.post(
+        f"{api}/api/v1/uploads/sessions",
+        json={
+            "filename": fixture["filename"],
+            "content_type": fixture["content_type"],
+            "size_bytes": len(content),
+            "checksum_sha256": checksum,
+            "knowledge_base_id": knowledge_base_id,
+            "parser_profile": fixture["parser_profile"],
+            "metadata": {"verify_document_upload": True},
+        },
+        timeout=30,
+    )
+    session_response.raise_for_status()
+    session = session_response.json()
+    upload_response = client.put(
+        session["upload_url"],
+        content=content,
+        headers=session.get("required_headers") or {},
+        timeout=120,
+    )
+    upload_response.raise_for_status()
+    complete_response = client.post(
+        f"{api}/api/v1/uploads/sessions/{session['upload_session_id']}:complete",
+        json={"metadata": {"verify_uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}},
+        timeout=30,
+    )
+    complete_response.raise_for_status()
+    payload = complete_response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("upload complete returned a non-object JSON payload")
+    return dict(payload)
+
+
+def _wait_job_terminal(client: httpx.Client, api: str, job_id: str, *, timeout_seconds: int = 360) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_payload: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        payload = _get_json(client, f"{api}/api/v1/ingestion-jobs/{job_id}")
+        last_payload = payload if isinstance(payload, dict) else {}
+        if last_payload.get("status") in {"completed", "failed", "cancelled"}:
+            return last_payload
+        progress = last_payload.get("progress") if isinstance(last_payload, dict) else {}
+        print(
+            json.dumps(
+                {"job_id": job_id, "status": last_payload.get("status"), "progress": progress},
+                ensure_ascii=False,
+            )
+        )
+        time.sleep(3)
+    raise RuntimeError(f"job did not reach terminal state: {last_payload}")
+
+
+def _get_json(client: httpx.Client, url: str) -> dict[str, Any]:
+    response = client.get(url, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"expected JSON object from {url}")
+    return payload
+
+
+def _assert_public_payload_is_safe(payload: Any) -> None:
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    unsafe_tokens = ("object_key", "original_artifact_key", "normalized_artifact_key", "s3://", "parser_stderr")
+    found = [token for token in unsafe_tokens if token in serialized]
+    if found:
+        raise RuntimeError(f"public metadata leaks private storage or parser fields: {found}")
+
+
+def _verify_uploaded_retrieval(client: httpx.Client, api: str, knowledge_base_id: str) -> None:
+    response = client.post(
+        f"{api}/api/v1/search:debug",
+        json={
+            "message": "Проверочный документ 2026-07-29",
+            "top_k": 5,
+            "knowledge_base_ids": [knowledge_base_id],
+            "retrieval_profile": "upload_mock",
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    evidence = payload.get("evidence") if isinstance(payload, dict) else None
+    if not isinstance(evidence, list) or not evidence:
+        raise RuntimeError(f"uploaded chunks are not retrievable: {payload}")
+    first = evidence[0]
+    metadata = first.get("metadata") if isinstance(first, dict) else {}
+    if not isinstance(metadata, dict) or not metadata.get("locator"):
+        raise RuntimeError(f"retrieved evidence is missing locator metadata: {first}")
+
+
+def _write_document_upload_reports(report_dir: Path, report: dict[str, Any]) -> None:
+    report_path = report_dir / "document-upload-report.json"
+    junit_path = report_dir / "document-upload-junit.xml"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    failure = report.get("error") if not report.get("passed") else None
+    failure_xml = ""
+    if isinstance(failure, dict):
+        failure_xml = (
+            f'<failure type="{escape(str(failure.get("code") or "Error"))}">'
+            f"{escape(str(failure.get('message') or ''))}</failure>"
+        )
+    junit = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<testsuite name="verify-document-upload" tests="1" failures="{0 if report.get("passed") else 1}">\n'
+        f'  <testcase classname="wikipediarag.cli" name="verify_document_upload">{failure_xml}</testcase>\n'
+        "</testsuite>\n"
+    )
+    junit_path.write_text(junit, encoding="utf-8")
+
+
+def _require_api_ready(api: str, *, client: httpx.Client | None = None) -> httpx.Response:
+    if client is None:
+        with httpx.Client(timeout=30) as owned_client:
+            return _require_api_ready(api, client=owned_client)
+    ready = client.get(f"{api}/ready")
+    ready.raise_for_status()
+    if ready.json().get("status") != "ok":
+        raise SystemExit(f"API is not ready: {ready.text}")
+    return ready
 
 
 def _iter_sse(lines: Any) -> list[dict[str, Any]]:

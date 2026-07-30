@@ -1,109 +1,83 @@
 # WikipediaRag Architecture
 
 Status: compact implementation authority
-Last compacted: 2026-07-28
+Last compacted: 2026-07-30
 
 ## Current Snapshot
 
-WikipediaRag is a Docker-first local RAG platform for Russian Wikipedia and future user knowledge bases. The current real demo source is ZIM/libzim + Kiwix. Wikimedia XML `pages-articles` multistream remains a supported regression/local fallback.
+WikipediaRag is a Docker-first local RAG platform for Russian Wikipedia plus default-tenant uploaded documents. The system is built around asynchronous ingestion, tenant-scoped retrieval, reproducible artifacts and a Model Gateway boundary for all model calls. XML multistream fallback remains supported for regression/local imports.
 
-Active milestone state is in `docs/STATUS.md`: ExecPlan 22 deterministic implementation passed validation, but provider-backed reviewed release-gate execution is blocked by OpenRouter `403 Forbidden`.
+Current milestone is in `docs/STATUS.md`: ExecPlan 25.1+25.2 local async document ingestion is implemented without ExecPlan 24 production auth/onboarding. ExecPlan 21 reviewed Wikipedia gate remains complete; latest provider-backed gate is `passed=true`, `blocking_failures=0`.
 
-Runtime stack:
+Runtime services:
 
-- FastAPI API, worker and Model Gateway on Python 3.12.
-- React + Vite + TypeScript UI.
-- PostgreSQL for control-plane state.
-- OpenSearch for online BM25/vector search representation.
-- MinIO/S3 contour for original/normalized artifacts.
-- Redis/Valkey for queue/cache primitives.
-- Kiwix for local ZIM article viewing.
-- OpenTelemetry and structured retrieval events.
+- API and worker: FastAPI/Python 3.12.
+- UI: React + Vite + TypeScript.
+- Control plane: PostgreSQL.
+- Search representation: OpenSearch BM25 + vector fields.
+- Artifacts: MinIO/S3-compatible storage.
+- Jobs/cache: Redis/Valkey.
+- Wikipedia source viewing: Kiwix serving local ZIM.
+- Model access: Model Gateway for chat, embeddings and rerank aliases.
+- Parser services: Xberg, Docling Serve CPU and metadata-service over HTTP.
+- Observability: OpenTelemetry plus structured retrieval/eval events.
 
-## Product Goals
+## Core Invariants
 
-- Answer questions using local Wikipedia and future uploaded documents.
-- Attach verifiable citations to supplied evidence.
-- Preserve retrieval trace and timing data for debugging and evaluation.
-- Keep ingestion asynchronous, resumable and safe.
-- Keep model access behind Model Gateway aliases so OpenRouter can later be replaced by local `llama.cpp` servers without business-code changes.
-
-Explicit non-goals before measured evidence: full GraphRAG, multi-agent swarm, always-on query rewrite, learned sparse as mandatory index, ColBERT, proposition-level chunking for all documents and synchronous large-file indexing in HTTP requests.
+- API and workers are stateless where practical.
+- Client input never directly controls `tenant_id`; tenant and KB scope are injected server-side.
+- Every persistent entity and search document carries tenant scope where applicable.
+- Original files, normalized documents and parser reports live in object storage; OpenSearch is rebuildable and is not source of truth.
+- Ingestion and release-gate reports are idempotent, resumable and timestamped in UTC.
+- Failed or cancelled ingestion jobs do not publish searchable chunks.
+- Business code must call Model Gateway aliases only; it must not call OpenRouter or `llama-server` directly.
+- Normal logs/reports must redact secrets, prompts, provider payloads, raw document text, parser stderr and storage object keys.
 
 ## Service Contours
 
-Application/API contour:
+API contour:
 
-- owns chat, SSE, search debug, ingestion job APIs, readiness and future auth/tenant workflows;
-- does not trust client-supplied tenant filters;
-- persists `query_runs`, usage summaries and safe error metadata.
+- owns chat/SSE, readiness, search debug, upload sessions, document metadata and ingestion job control;
+- returns safe errors and safe public metadata only;
+- persists query runs, retrieval events, usage summaries and safe failure metadata.
 
-Ingestion contour:
+Worker contour:
 
-- reads ZIM through libzim or XML multistream fallback;
-- skips assets/service entries and stores redirects as provenance;
-- chunks canonical articles deterministically;
-- writes DB/object-storage/search state durably before checkpoints advance;
-- publishes versioned OpenSearch indices through aliases only after validation.
+- imports ZIM/XML Wikipedia sources with checkpoints;
+- processes upload job items independently with bounded claiming;
+- validates uploaded bytes before parser routing;
+- stages chunks before OpenSearch writes and publishes only after validation succeeds.
 
-Retrieval contour:
+Model Gateway contour:
 
-- applies server-owned tenant and knowledge-base filters to BM25 and vector queries;
-- runs BM25 + dense retrieval, RRF, optional rerank, dedup/page quota, selective parent expansion and token-budget context packing;
-- validates active knowledge-base aliases against compatible `index_versions` before search;
-- fails safely with `KB_NOT_READY` instead of using silent fallback retrieval.
+- exposes `GET /health`, `GET /ready`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/embeddings`, `POST /v1/rerank`;
+- normalizes provider errors, timeouts, usage and readiness;
+- supports OpenRouter now and local `llama.cpp` later through the same alias contract.
 
-Model contour:
+Parser contour:
 
-- exposes logical aliases for chat, embeddings and rerank;
-- supports OpenRouter now and `llama-server` targets later;
-- normalizes provider errors, timeout/retry policy, usage, readiness and telemetry.
-
-## Model Gateway Contract
-
-Business code must call only Model Gateway aliases. It must not import OpenRouter SDKs or call `llama-server` directly.
-
-Gateway endpoints:
-
-```text
-GET  /health
-GET  /ready
-GET  /v1/models
-POST /v1/chat/completions
-POST /v1/embeddings
-POST /v1/rerank
-```
-
-`/health` is liveness only. `/ready` reports `ok|degraded` and safe provider/capability checks. Provider diagnostics must not include API keys, prompts, document contents, raw provider bodies or stack traces.
-
-`MODEL_GATEWAY_STARTUP_SMOKE` modes:
-
-- `required`: startup smoke failure is fatal.
-- `warn`: process stays inspectable, `/ready` is degraded and affected aliases are unhealthy.
-- `off`: explicit mock/local debug only; not valid release-gate proof.
-
-`sota_mvp` cannot silently fall back to mock aliases or hash embeddings. Mock aliases are explicit and restricted to tests/local demo profiles.
+- Xberg is the fast/default parser for supported document formats.
+- Docling is the high-quality fallback for low-quality, empty, scanned or layout-sensitive cases.
+- metadata-service performs fast local language/date extraction.
+- Parser services receive bytes/temp files over HTTP only, never MinIO credentials, raw object keys, arbitrary URLs, tenant authority, prompts or provider payloads.
 
 ## Data Contracts
 
-PostgreSQL is the control-plane source of truth. Key MVP tables include tenants, users, memberships, knowledge bases, model aliases, query runs, index versions, documents, ingestion jobs, chunks, retrieval events and agent runs.
+PostgreSQL is the control-plane source of truth. Key tables include tenants, users, memberships, knowledge bases, knowledge sources, upload batches, upload sessions, document versions, document artifacts, ingestion jobs, ingestion job items, index versions, documents, chunks, query runs, retrieval events and agent runs.
 
-Core requirements:
+Important contracts:
 
-- tenant-scoped tables need tenant-aware access paths;
-- IDs are opaque UUIDs or deterministic content/version IDs as appropriate;
-- timestamps are UTC;
-- migrations are forward-only after commit;
-- destructive schema changes use expand/migrate/contract stages;
-- embedding alias or dimensions changes create a new index version and require reindex.
+- `index_versions.metadata.index_contract_id` binds source snapshot, aliases, embedding provider/model/dimensions, vector field, chunking and retrieval-profile compatibility.
+- Answer/eval rows use one root `run_contract_id` for the configured run and child retrieval/tool contract IDs for diagnostic substeps.
+- `execution_path` and `path_selection_reason` record whether the row used normal, harness, retrieval-only, extended or fallback behavior.
+- Uploaded documents use an app-owned `NormalizedDocument` schema with stable text/table blocks, source locators, hashes, parser report metadata, warnings and provenance at page/slide/sheet/cell/row/JSON Pointer granularity.
+- `document_versions` carries universal metadata: upload/system timestamps, source dates, document-date candidates/source/confidence, detected language/confidence/alternatives, MIME/signature facts, parser route/version/options, hashes, warnings and safe public metadata.
 
-`index_versions.metadata.index_contract_id` and `metadata.index_contract` bind source snapshot, physical/read alias, embedding alias/provider/model/dimensions, vector field, chunking and retrieval profile compatibility. Online search and evaluation results preserve `index_contract_id` and `run_contract_id`.
+Forward-only schema changes are made through `ensure_schema` for this MVP. After a migration is committed, destructive schema changes require expand/migrate/contract planning.
 
-OpenSearch stores online search representation only. It is rebuildable from persisted artifacts and metadata, not the source of truth.
+## Public API Contracts
 
-## API Contract
-
-Common API errors use a safe envelope:
+Common public error shape:
 
 ```json
 {
@@ -116,131 +90,152 @@ Common API errors use a safe envelope:
 }
 ```
 
-Public errors must not include provider payloads, stack traces, secrets or document content.
-
 Important endpoints:
 
-- `GET /health` - liveness only.
-- `GET /ready` - dependency readiness; API uses Model Gateway `/ready`.
-- `POST /api/v1/wikipedia/zim-imports` - asynchronous ZIM import.
-- `POST /api/v1/wikipedia/imports` - asynchronous XML fallback import.
-- `GET /api/v1/ingestion-jobs/{job_id}` and job event/control endpoints.
-- `POST /api/v1/chat` - SSE chat path.
+- `GET /health` - liveness only after app startup.
+- `GET /ready` - dependency readiness; API depends on Model Gateway `/ready`.
+- `POST /api/v1/wikipedia/zim-imports` - async ZIM import.
+- `POST /api/v1/wikipedia/imports` - async XML fallback import.
+- `POST /api/v1/uploads/sessions` - create upload session and presigned object URL.
+- `POST /api/v1/uploads/sessions/{id}:complete` - create document/version/job records after object durability.
+- `GET /api/v1/documents/{document_id}` - safe document metadata.
+- `GET /api/v1/documents/{document_id}/versions` - safe version metadata.
+- `POST /api/v1/documents/{document_id}:reprocess` - enqueue reprocess for current version.
+- `GET /api/v1/ingestion-jobs/{job_id}` and job control endpoints.
 - `POST /api/v1/search:debug` - retrieval-only debug path.
+- `POST /api/v1/chat` - SSE answer path.
 
-Required chat SSE event types:
+Upload session response:
 
-```text
-run.started
-message.delta
-usage.updated
-run.completed
-run.failed
+```json
+{"upload_session_id": "...", "upload_url": "...", "expires_at": "...", "required_headers": {}}
 ```
 
-Every SSE event includes request/run identity, sequence and timestamp. `usage.updated` carries evidence, retrieval events, answerability, citation/claim verification state, provider usage and safe `timings_ms`.
+Upload complete response:
 
-Answerability statuses are `ANSWERABLE`, `PARTIAL`, `UNANSWERABLE` and `CONFLICTING`. `UNANSWERABLE` and `CONFLICTING` produce local refusal/caveat behavior when Extended Search cannot improve coverage. Citation validation is strict by default; `warn` and `off` are explicit policy states and visible in telemetry.
+```json
+{"document_id": "...", "document_version_id": "...", "job_id": "...", "status": "received"}
+```
 
-## Retrieval and Answering
+Job progress exposes safe counters only: stage, bytes received, document totals, parser route, staged/published chunks, timings, terminal state and safe error code.
+
+Chat SSE event types are `run.started`, `message.delta`, `usage.updated`, `run.completed` and `run.failed`. `run.failed` carries safe stage/code/retryability/attempt/trace metadata, and may include safe retrieval snapshots without document text.
+
+## Ingestion Flows
+
+Wikipedia ZIM flow:
+
+ZIM/libzim + Kiwix is the primary local Wikipedia path.
+
+```text
+Kiwix serves full local ZIM
+-> worker reads canonical non-redirect pages with libzim
+-> redirects stored as provenance
+-> chunks generated deterministically
+-> OpenSearch index version written
+-> alias published after validation
+```
+
+Document upload flow:
+
+```text
+create upload session
+-> client PUT to MinIO presigned URL
+-> complete session
+-> worker validates bytes/signatures/safety
+-> metadata-service extracts language/date from available text
+-> route to local adapter, Xberg or Docling
+-> normalize to app-owned contract
+-> chunk with locators
+-> embed
+-> stage chunks
+-> write OpenSearch
+-> publish DB chunks and document version
+```
+
+Upload validation rejects zero-byte files, oversized objects, archives, renamed executables, extension/signature mismatches, encrypted PDF/Office, macro-enabled Office, deeply nested JSON and remote-resource HTML.
+
+CSV, TSV, JSON and JSONL stay in local streaming adapters. XLSX/PDF/DOCX/PPTX use Xberg first unless the quality route requires Docling.
+
+XML multistream fallback validates UTF-8 index rows and monotonic non-decreasing offsets without loading full multi-gigabyte dumps into memory.
+
+## Retrieval And Answering
 
 Normal retrieval:
 
 ```text
 query normalization
--> BM25 and dense search in parallel
--> RRF fusion
--> cross-encoder rerank
+-> BM25 and dense search
+-> RRF
+-> rerank
 -> dedup/page quota/parent expansion
 -> token-budget context
--> answerability gate
--> grounded answer with citation validation
+-> answerability
+-> grounded generation
+-> citation validation
 ```
 
-`POST /api/v1/search:debug` runs retrieval without generation and is used for candidate/rank/timing analysis. Conditional Extended Search starts only from `PARTIAL` or `UNANSWERABLE` answerability when enabled by profile. It may issue bounded multi-query searches and tenant-scoped neighbor lookups; final answer generation receives only the final evidence bundle.
+Server-owned tenant/KB filters are applied to all BM25, vector, neighbor, debug and export paths. If an active KB has no compatible published index, search fails safely with `KB_NOT_READY`.
 
-Negative-title suppression may remove candidates only from final context, only when the query marks a quoted title as negative/distractor evidence. Raw retrieval events may still show candidates for debugging.
+Extended Search is bounded and conditional. It starts only when profile policy allows it and answerability is `PARTIAL` or `UNANSWERABLE`.
 
-## Ingestion
+## Evaluation And Release Gates
 
-ZIM/libzim + Kiwix is the primary local Wikipedia path:
-
-- Kiwix serves the full ZIM mounted read-only from `./zim`;
-- worker imports a bounded canonical article subset from the same archive;
-- redirects do not count toward `WIKI_LIMIT` and are not chunked;
-- source URLs are built from `KIWIX_PUBLIC_BASE_URL`, the Kiwix book identifier and exact `zim_entry_path`;
-- checkpoints advance only after durable DB/object-storage/OpenSearch writes.
-
-XML multistream fallback remains supported. It validates bzip2 signatures, UTF-8 index rows, `offset:page_id:title` format and monotonic non-decreasing offsets. Workers must not load full multi-gigabyte dumps into memory.
-
-Failed jobs must not publish partial content. Reprocessing from saved canonical artifacts should not repeat expensive parsing/OCR unless explicitly requested.
-
-## Evaluation and Release Gates
-
-Evaluation is CLI-first and stores artifacts under ignored `artifacts/eval/`. PostgreSQL may be read for corpus/gold construction and enrichment; evaluated answer paths use the public API boundary.
+Evaluation is CLI-first and writes ignored artifacts under `artifacts/eval/`. Release gates run only against locked reviewed dev/test rows.
 
 Important commands:
 
 ```bash
 python -m wikipediarag.cli eval-smoke --count 10
 python -m wikipediarag.cli eval-generate --count 150
+python -m wikipediarag.cli eval-run --suite generated-wikipedia-v1 --batch-size 6
 python -m wikipediarag.cli eval-retrieval-run --suite generated-wikipedia-v1 --batch-size 10
-python -m wikipediarag.cli eval-trusted-catalog
-python -m wikipediarag.cli eval-trusted-generate --count 300 --rejection-budget 30
-python -m wikipediarag.cli eval-review-candidates --input <candidate_jsonl> --output-suite <suite>
-python -m wikipediarag.cli eval-freeze-reviewed --suite <suite> --dev-count 20 --test-count 20
-python -m wikipediarag.cli eval-release-gate --suite <suite> --api http://localhost:8000
-python -m wikipediarag.cli eval-release-gate-status --suite <suite> --json
+python -m wikipediarag.cli eval-release-gate --suite reviewed-wikipedia-smoke-v1 --api http://localhost:8000
+python -m wikipediarag.cli eval-release-gate-status --suite reviewed-wikipedia-smoke-v1 --json
+python -m wikipediarag.cli verify-document-upload
+python -m wikipediarag.cli verify-document-corpus --fixture-set standard
 ```
 
-Long-running eval/generation/release-gate commands must expose live progress or inspectable status artifacts. Progress must use safe task IDs and counters, not full prompts, provider bodies or raw evidence packets.
+Long-running eval/generation/release-gate commands must expose live progress or inspectable status artifacts. When supported, use bounded `--batch-size` or `--concurrency`.
 
-Reviewed release gates run answer and retrieval evaluation only on locked reviewed dev/test rows. Test findings are blocking; dev findings are diagnostic. Gates must fail on mixed contract IDs, citation precision below threshold, unsupported claims, no-answer failures, retrieval false-positive evidence, material retrieval regressions and material p95 latency regressions.
+Release-gate report directories are immutable and dated:
 
-Do not rerun provider-backed release gates while API readiness is degraded or strict OpenRouter smoke fails.
+```text
+YYYYMMDDTHHMMSSZ-<suite>-release-gate-<short_id>
+```
 
-## Security and Tenancy
+The gate blocks on mixed root contract IDs, test citation precision below threshold, unsupported claims, no-answer failures, false-positive evidence, material retrieval regressions and material p95 latency regressions. Dev findings are diagnostic unless explicitly promoted.
 
-- Client input never directly selects `tenant_id` for authorization.
-- BM25, vector search, neighbor expansion, traces, reports and caches must include server-owned tenant/access scope.
-- Query/debug/export paths must not expose other tenants.
-- Prompts, document text, provider bodies and secrets are redacted from normal logs.
-- Uploaded files require content-based MIME detection, size/nesting/path traversal limits and isolated parsers before production use.
-- Production infrastructure must not expose PostgreSQL, OpenSearch, MinIO, Redis or model servers publicly.
-- Lockfiles are committed; production Docker images are pinned; model/parser artifact licenses and checksums are recorded.
-- Extended Search has server-side step, wall-time, subquery and cost budgets.
+## Corpus Verification
 
-## Baseline Decisions
+`verify-document-corpus` is the ingestion-quality gate for varied data:
 
-- Backend: Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2, asyncpg, `uv`.
-- UI: React + Vite + TypeScript, `pnpm`.
-- Search: OpenSearch BM25 + HNSW vectors, service-side RRF and cross-encoder rerank.
-- Jobs: Redis/Valkey-backed worker model for MVP.
-- Models: OpenRouter now, local `llama.cpp` target through Model Gateway aliases.
-- Wikipedia: ZIM/libzim + Kiwix primary demo source; XML multistream fallback retained.
-- Agents: bounded Extended Search only, not a default multi-agent system.
-- Observability: retrieval-specific events plus OpenTelemetry.
+- `smoke`: small CSV/PDF plus one negative HTML case.
+- `standard`: generated TXT/MD/HTML/CSV/TSV/JSON/JSONL/PDF plus unsafe negative fixtures.
+- `full`: standard plus generated DOCX/PPTX/XLSX.
+- `--include-external`: downloads pinned manifest entries into ignored `artifacts/corpora/document-corpus/`.
 
-## Open Owner Decisions
+Tracked external corpus manifests contain URL, SHA256, license, source and expected assertions only. Large archives and raw external documents are not committed.
+
+## Open Decisions
 
 Before external deployment:
 
-- deployment target, domain/TLS and reverse proxy;
-- authentication provider, tenant onboarding and role matrix;
-- data retention, deletion and backup requirements;
-- whether user document contents may be sent to OpenRouter;
-- region/residency and compliance requirements.
+- auth provider, tenant onboarding, roles and ACL mirroring;
+- retention, deletion, backup and restore policy;
+- malware scanning policy and parser sandbox hardening;
+- whether user document contents may be sent to external model providers;
+- domain/TLS/reverse proxy and environment isolation;
+- observability retention and on-call ownership.
 
-Before local llama.cpp:
+Before local `llama.cpp`:
 
-- OS/container runtime, GPU model/count/VRAM, RAM/CPU;
-- model disk footprint, licenses, checksums and quality thresholds;
-- target concurrent users and query rate.
+- GPU/CPU/RAM sizing and concurrency targets;
+- model choices, licenses, checksums and quality thresholds;
+- release-gate acceptance criteria for local aliases.
 
-Before production release:
+Before larger corpus expansion:
 
-- RPO/RTO and restore drill requirements;
-- malware scanning policy;
-- observability retention/access;
-- human review ownership for evaluation and citation failures;
-- error budget and on-call ownership.
+- legal corpus cadence and storage budget;
+- which external corpora are CI, nightly or manual only;
+- expected metadata/citation assertions per source family.
