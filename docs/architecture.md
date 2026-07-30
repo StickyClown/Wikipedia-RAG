@@ -7,7 +7,7 @@ Last compacted: 2026-07-30
 
 WikipediaRag is a Docker-first local RAG platform for Russian Wikipedia plus default-tenant uploaded documents. The system is built around asynchronous ingestion, tenant-scoped retrieval, reproducible artifacts and a Model Gateway boundary for all model calls. XML multistream fallback remains supported for regression/local imports.
 
-Current milestone is in `docs/STATUS.md`: ExecPlan 24 Slice 1-6 are implemented as a production-shaped MVP. ExecPlan 25.1+25.2 local async document ingestion remains implemented. ExecPlan 21 reviewed Wikipedia gate remains complete; latest provider-backed gate is `passed=true`, `blocking_failures=0`.
+Current milestone is in `docs/STATUS.md`: ExecPlan 24 Slice 1-6 are implemented as a production-shaped MVP. ExecPlan 25.1+25.2 local async document ingestion remains implemented. ExecPlan 26 eval root-cause diagnostics is complete. ExecPlan 21 reviewed Wikipedia gate remains complete; latest provider-backed gate is `passed=true`, `blocking_failures=0`.
 
 Runtime services:
 
@@ -74,7 +74,7 @@ Important contracts:
 - Keycloak/OIDC login uses Authorization Code Flow with PKCE S256. The browser receives only the opaque app session cookie; provider access/refresh tokens are encrypted server-side in `auth_sessions.server_side_tokens`.
 - Knowledge-base access is computed as the highest role from platform administration, tenant administration, direct user grants, local groups and OIDC groups. Explicit deny rules are out of scope.
 - `index_versions.metadata.index_contract_id` binds source snapshot, aliases, embedding provider/model/dimensions, vector field, chunking and retrieval-profile compatibility.
-- Answer/eval rows use one root `run_contract_id` for the configured run and child retrieval/tool contract IDs for diagnostic substeps.
+- Answer/eval rows use one root `run_contract_id` for the configured run, child retrieval/tool contract IDs for diagnostic substeps and deterministic eval-only `diagnosis` payloads for root-cause reporting.
 - `execution_path` and `path_selection_reason` record whether the row used normal, harness, retrieval-only, extended or fallback behavior.
 - Uploaded documents use an app-owned `NormalizedDocument` schema with stable text/table blocks, source locators, hashes, parser report metadata, warnings and provenance at page/slide/sheet/cell/row/JSON Pointer granularity.
 - `document_versions` carries universal metadata: upload/system timestamps, source dates, document-date candidates/source/confidence, detected language/confidence/alternatives, MIME/signature facts, parser route/version/options, hashes, warnings and safe public metadata.
@@ -222,6 +222,8 @@ YYYYMMDDTHHMMSSZ-<suite>-release-gate-<short_id>
 ```
 
 The gate blocks on mixed root contract IDs, test citation precision below threshold, unsupported claims, no-answer failures, false-positive evidence, material retrieval regressions and material p95 latency regressions. Dev findings are diagnostic unless explicitly promoted.
+Eval diagnostics classify answer and retrieval task rows as `passed`, `retrieval_error`, `hallucination_or_unsupported`, `reasoning_error`, `hard_negative_attribution`, `unanswerable_false_positive`, `execution_error` or `not_evaluated`. The classifier is deterministic and uses existing recall, citation, unsupported-claim, unanswerable, hard-negative and exact-match/token-F1 signals only.
+
 
 ## Corpus Verification
 

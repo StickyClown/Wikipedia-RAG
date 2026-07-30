@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.eval.artifacts import ARTIFACT_ROOT, read_json, read_jsonl, utc_now_iso, write_json, write_jsonl
+from wikipediarag.eval.diagnostics import answer_result_diagnosis, retrieval_result_diagnosis
 from wikipediarag.eval.hashing import stable_json_hash
 from wikipediarag.eval.retrieval_runner import run_retrieval_suite
 from wikipediarag.eval.runner import DEFAULT_ANSWER_EVAL_BATCH_SIZE, eval_configs, run_suite
@@ -27,6 +28,7 @@ from wikipediarag.eval.schemas import (
     RetrievalConfigSummary,
     RetrievalEvalStatus,
     RetrievalRunManifest,
+    RetrievalTaskResult,
 )
 from wikipediarag.eval.settings import adapt_eval_settings
 
@@ -502,12 +504,27 @@ def _release_gate_blocker_details(
             task_ids = _mixed_contract_task_ids(run_payload, config_id, metric)
         task_details: list[dict[str, Any]] = []
         if source == "answer":
-            result_by_task = _answer_results_by_task(run_payload, config_id)
+            answer_result_by_task = _answer_results_by_task(run_payload, config_id)
+            if not task_ids:
+                task_ids = _answer_quality_task_ids(
+                    tasks_by_split.get(split, {}),
+                    answer_result_by_task,
+                    metric,
+                )
             for task_id in task_ids[:20]:
                 task = tasks_by_split.get(split, {}).get(task_id)
-                result = result_by_task.get(task_id)
+                answer_result = answer_result_by_task.get(task_id)
                 if task is not None:
-                    task_details.append(_answer_blocker_task_detail(task, result))
+                    task_details.append(_answer_blocker_task_detail(task, answer_result))
+        if source == "retrieval":
+            retrieval_result_by_task = _retrieval_results_by_task(run_payload, config_id)
+            if not task_ids:
+                task_ids = _retrieval_quality_task_ids(retrieval_result_by_task, metric)
+            for task_id in task_ids[:20]:
+                task = tasks_by_split.get(split, {}).get(task_id)
+                retrieval_result = retrieval_result_by_task.get(task_id)
+                if task is not None:
+                    task_details.append(_retrieval_blocker_task_detail(task, retrieval_result))
         details.append(
             {
                 "category": "report_problem"
@@ -544,6 +561,15 @@ def _answer_results_by_task(run_payload: dict[str, Any], config_id: str) -> dict
     return {result.task_id: result for result in read_jsonl(path, EvalTaskResult)}
 
 
+def _retrieval_results_by_task(run_payload: dict[str, Any], config_id: str) -> dict[str, RetrievalTaskResult]:
+    run_dir = Path(str(run_payload.get("run_dir") or ""))
+    config_hash = str(_summary_payload(run_payload, config_id).get("config_hash") or "")
+    if not run_dir or not config_hash:
+        return {}
+    path = run_dir / "results" / f"{config_id}-{config_hash[:12]}.jsonl"
+    return {result.task_id: result for result in read_jsonl(path, RetrievalTaskResult)}
+
+
 def _mixed_contract_task_ids(run_payload: dict[str, Any], config_id: str, metric: str) -> list[str]:
     result_by_task = _answer_results_by_task(run_payload, config_id)
     key = metric if metric.endswith("_contract_id") else "run_contract_id"
@@ -551,6 +577,39 @@ def _mixed_contract_task_ids(run_payload: dict[str, Any], config_id: str, metric
     if len(values) <= 1:
         return []
     return sorted(result_by_task)
+
+
+def _answer_quality_task_ids(
+    tasks_by_id: dict[str, EvalTask],
+    result_by_task: dict[str, EvalTaskResult],
+    metric: str,
+) -> list[str]:
+    task_ids: list[str] = []
+    for task_id, result in result_by_task.items():
+        task = tasks_by_id.get(task_id)
+        scores = result.scores
+        if task is None or scores is None:
+            continue
+        if metric == "citation_precision" and scores.citation_precision < 1.0:
+            task_ids.append(task_id)
+        elif metric == "unsupported_claim_rate" and scores.unsupported_claim_rate > 0.0:
+            task_ids.append(task_id)
+        elif metric == "unanswerable_accuracy" and task.unanswerable and scores.unanswerable_accuracy < 1.0:
+            task_ids.append(task_id)
+        elif metric == "cited_hard_negative_rate" and scores.cited_hard_negative_rate > 0.0:
+            task_ids.append(task_id)
+    return sorted(task_ids)
+
+
+def _retrieval_quality_task_ids(result_by_task: dict[str, RetrievalTaskResult], metric: str) -> list[str]:
+    task_ids: list[str] = []
+    for task_id, result in result_by_task.items():
+        scores = result.scores
+        if scores is None:
+            continue
+        if metric == "dangerous_false_positive_evidence_rate" and scores.dangerous_false_positive_evidence_rate > 0.0:
+            task_ids.append(task_id)
+    return sorted(task_ids)
 
 
 def _answer_blocker_task_detail(task: EvalTask, result: EvalTaskResult | None) -> dict[str, Any]:
@@ -561,6 +620,7 @@ def _answer_blocker_task_detail(task: EvalTask, result: EvalTaskResult | None) -
         "accepted_answers": task.accepted_answers,
         "actual_answer": result.answer if result else "",
         "status": result.status if result else "missing_result",
+        "diagnosis": answer_result_diagnosis(task, result),
         "execution_path": result.execution_path if result else "",
         "path_selection_reason": result.path_selection_reason if result else "",
         "failure": {
@@ -587,6 +647,22 @@ def _answer_blocker_task_detail(task: EvalTask, result: EvalTaskResult | None) -
         "gold_chunks": [evidence.model_dump(mode="json") for evidence in task.gold_evidence],
         "retrieved_chunks": [
             candidate.model_dump(mode="json") for candidate in (result.reranked_candidates if result else [])
+        ],
+    }
+
+
+def _retrieval_blocker_task_detail(task: EvalTask, result: RetrievalTaskResult | None) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "question": task.question,
+        "reference_answer": task.reference_answer,
+        "accepted_answers": task.accepted_answers,
+        "status": result.status if result else "missing_result",
+        "diagnosis": retrieval_result_diagnosis(task, result),
+        "errors": result.errors if result else ["missing_result"],
+        "gold_chunks": [evidence.model_dump(mode="json") for evidence in task.gold_evidence],
+        "retrieved_chunks": [
+            candidate.model_dump(mode="json") for candidate in (result.final_candidates if result else [])
         ],
     }
 

@@ -190,6 +190,8 @@ def test_retrieval_summary_excludes_answer_citation_token_metrics() -> None:
     assert "citation_precision" not in summary.metrics
     assert "tokens" not in summary.metrics
     assert "exact_match" not in summary.metrics
+    assert summary.metrics["root_cause_passed_count"] == 1.0
+    assert summary.by_family["single_hop_factual"]["root_cause_passed_count"] == 1.0
     assert summary.metrics["stage_latency_bm25_p95_ms"] == 2.0
     assert summary.metrics["stage_latency_rerank_p50_ms"] == 4.0
 

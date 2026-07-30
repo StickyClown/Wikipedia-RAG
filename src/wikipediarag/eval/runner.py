@@ -12,6 +12,7 @@ from wikipediarag.config import Settings, get_settings
 from wikipediarag.eval.api_client import EvalApiClient, HttpEvalApiClient
 from wikipediarag.eval.artifacts import ARTIFACT_ROOT, append_jsonl, read_json, read_jsonl, utc_now_iso, write_json
 from wikipediarag.eval.corpus import load_chunk_refs
+from wikipediarag.eval.diagnostics import answer_result_diagnosis, diagnose_answer_task, root_cause_count_metrics
 from wikipediarag.eval.hashing import stable_json_hash
 from wikipediarag.eval.metrics import aggregate, percentile, score_task
 from wikipediarag.eval.schemas import (
@@ -448,6 +449,7 @@ async def run_task(
             cited_chunk_ids=cited_chunk_ids,
             kiwix_url_ok=kiwix_ok,
         )
+        diagnosis = diagnose_answer_task(task, status="completed", scores=scores)
         retrieval_latency = _retrieval_latency_ms(retrieval)
         timings_ms = _combined_timings_ms(usage_data, retrieval, validation)
         model_calls = _estimate_model_calls(config, retrieval)
@@ -491,6 +493,7 @@ async def run_task(
             latency_ms={"total": total_ms, "retrieval": retrieval_latency, **timings_ms},
             usage=usage,
             scores=scores,
+            diagnosis=diagnosis,
             errors=[],
             query_run_id=str(payload.get("query_run_id")) if payload.get("query_run_id") else None,
             trace_id=str(payload.get("trace_id")) if payload.get("trace_id") else None,
@@ -639,8 +642,16 @@ def summarize_config(config: EvalConfig, tasks: list[EvalTask], results: list[Ev
         result for result in completed if (task := task_by_id.get(result.task_id)) is not None and task.unanswerable
     ]
     metrics = _aggregate_results(completed, answerable, unanswerable)
+    metrics.update(
+        root_cause_count_metrics(answer_result_diagnosis(task_by_id.get(result.task_id), result) for result in latest)
+    )
     by_family: dict[str, dict[str, float]] = {}
     for family in sorted({task.task_family for task in tasks}):
+        family_latest = [
+            result
+            for result in latest
+            if (task := task_by_id.get(result.task_id)) is not None and task.task_family == family
+        ]
         family_results = [
             result
             for result in completed
@@ -656,7 +667,13 @@ def summarize_config(config: EvalConfig, tasks: list[EvalTask], results: list[Ev
             for result in family_results
             if (task := task_by_id.get(result.task_id)) is not None and task.unanswerable
         ]
-        by_family[str(family)] = _aggregate_results(family_results, family_answerable, family_unanswerable)
+        family_metrics = _aggregate_results(family_results, family_answerable, family_unanswerable)
+        family_metrics.update(
+            root_cause_count_metrics(
+                answer_result_diagnosis(task_by_id.get(result.task_id), result) for result in family_latest
+            )
+        )
+        by_family[str(family)] = family_metrics
     failed = [
         result.task_id
         for result in latest
@@ -917,6 +934,7 @@ def _failed_result(
         last_successful_stage=last_successful_stage,
         latency_ms={"total": latency_ms},
         usage={"attempts": attempts, "attempt_records": attempt_records or []},
+        diagnosis=diagnose_answer_task(task, status="failed", scores=None),
         errors=[error],
         query_run_id=str(payload.get("query_run_id")) if payload.get("query_run_id") else None,
         trace_id=str(payload.get("trace_id") or failed_data.get("trace_id"))

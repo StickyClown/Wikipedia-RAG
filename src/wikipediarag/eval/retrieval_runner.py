@@ -12,6 +12,7 @@ from wikipediarag.config import Settings, get_settings
 from wikipediarag.eval.api_client import HttpEvalApiClient, RetrievalEvalApiClient
 from wikipediarag.eval.artifacts import ARTIFACT_ROOT, append_jsonl, read_json, read_jsonl, utc_now_iso, write_json
 from wikipediarag.eval.corpus import load_chunk_refs
+from wikipediarag.eval.diagnostics import diagnose_retrieval_task, retrieval_result_diagnosis, root_cause_count_metrics
 from wikipediarag.eval.metrics import aggregate, percentile, score_retrieval_task
 from wikipediarag.eval.runner import eval_configs
 from wikipediarag.eval.schemas import (
@@ -247,6 +248,7 @@ async def run_retrieval_task(
         total_ms = int((time.perf_counter() - started) * 1000)
         prefusion, reranked, final = await extract_search_debug_candidates(payload, settings=settings)
         scores = score_retrieval_task(task, final=final, reranked=reranked, prefusion=prefusion)
+        diagnosis = diagnose_retrieval_task(task, status="completed", scores=scores)
         timings_ms = _search_debug_timings_ms(payload)
         contract_ids = _contract_ids_from_payload(payload)
         return RetrievalTaskResult(
@@ -264,6 +266,7 @@ async def run_retrieval_task(
             final_candidates=final,
             latency_ms={"total": total_ms, "retrieval": _retrieval_latency_ms(payload), **timings_ms},
             scores=scores,
+            diagnosis=diagnosis,
             errors=[],
             trace_id=str(payload.get("trace_id")) if payload.get("trace_id") else None,
             corpus={
@@ -287,6 +290,7 @@ async def run_retrieval_task(
             batch_index=batch_index,
             task_index=task_index,
             latency_ms={"total": total_ms},
+            diagnosis=diagnose_retrieval_task(task, status="failed", scores=None),
             errors=[type(exc).__name__ + ": " + str(exc)],
             corpus={
                 "snapshot_id": manifest.snapshot_id,
@@ -325,11 +329,24 @@ def summarize_retrieval_config(
     latest = list({result.task_id: result for result in results}.values())
     completed = [result for result in latest if result.scores is not None]
     answerable = [result for result in completed if not task_by_id[result.task_id].unanswerable]
+    metrics = _aggregate_retrieval_results(completed, answerable)
+    metrics.update(
+        root_cause_count_metrics(
+            retrieval_result_diagnosis(task_by_id.get(result.task_id), result) for result in latest
+        )
+    )
     by_family: dict[str, dict[str, float]] = {}
     for family in sorted({task.task_family for task in tasks}):
+        family_latest = [result for result in latest if task_by_id[result.task_id].task_family == family]
         family_results = [result for result in completed if task_by_id[result.task_id].task_family == family]
         family_answerable = [result for result in family_results if not task_by_id[result.task_id].unanswerable]
-        by_family[str(family)] = _aggregate_retrieval_results(family_results, family_answerable)
+        family_metrics = _aggregate_retrieval_results(family_results, family_answerable)
+        family_metrics.update(
+            root_cause_count_metrics(
+                retrieval_result_diagnosis(task_by_id.get(result.task_id), result) for result in family_latest
+            )
+        )
+        by_family[str(family)] = family_metrics
     failed = [
         result.task_id
         for result in latest
@@ -343,7 +360,7 @@ def summarize_retrieval_config(
         config_hash=config.config_hash,
         status="completed",
         task_count=len(latest),
-        metrics=_aggregate_retrieval_results(completed, answerable),
+        metrics=metrics,
         by_family=by_family,
         failed_task_ids=sorted(set(failed)),
         errors=[error for result in latest for error in result.errors] + _contract_mix_errors(contract_ids),

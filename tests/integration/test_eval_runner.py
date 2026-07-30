@@ -312,6 +312,9 @@ def test_summary_uses_latest_result_per_task_id() -> None:
     assert summary.task_count == 1
     assert summary.failed_task_ids == []
     assert summary.errors == []
+    assert summary.metrics["root_cause_passed_count"] == 1.0
+    assert summary.metrics["root_cause_execution_error_count"] == 0.0
+    assert summary.by_family["single_hop_factual"]["root_cause_passed_count"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -789,6 +792,8 @@ async def test_runner_failed_row_preserves_safe_failure_stage_and_retrieved_chun
     assert result.trace_id == "trace-failed"
     assert [candidate.chunk_id for candidate in result.reranked_candidates] == ["c1"]
     assert result.retrieval_contract_ids == ["sha256:retrieval-child"]
+    assert result.diagnosis["root_cause"] == "execution_error"
+    assert summary.metrics["root_cause_execution_error_count"] == 1.0
     assert any(event["name"] == "answer_generation_failed" for event in result.step_events)
 
 

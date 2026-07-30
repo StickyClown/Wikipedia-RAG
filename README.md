@@ -11,7 +11,7 @@ First-read source of truth for an LLM or engineer:
 
 ## Current State
 
-Active milestone: ExecPlan 24 Slice 1-6 are implemented as a production-shaped MVP. ExecPlan 25.1+25.2 remains implemented for local async document ingestion on the seeded default KB compatibility path. ExecPlan 21 remains complete for the reviewed Wikipedia smoke gate; the latest provider-backed reviewed gate is `completed`, `passed=true`, `blocking_failures=0`.
+Active milestone: ExecPlan 24 Slice 1-6 are implemented as a production-shaped MVP. ExecPlan 25.1+25.2 remains implemented for local async document ingestion on the seeded default KB compatibility path. ExecPlan 26 is complete for eval root-cause diagnostics. ExecPlan 21 remains complete for the reviewed Wikipedia smoke gate; the latest provider-backed reviewed gate is `completed`, `passed=true`, `blocking_failures=0`.
 
 Implemented MVP capabilities:
 
@@ -31,7 +31,7 @@ Implemented MVP capabilities:
 - Universal document metadata: upload/system timestamps, document-date candidates, language/confidence, MIME/signature facts, parser route/report, hashes, warnings and safe public metadata.
 - Hybrid retrieval: BM25, dense vectors, RRF, rerank, dedup/page quota, parent expansion, answerability and citation validation.
 - Bounded Extended Search MVP for multi-query follow-up retrieval when evidence is partial or insufficient.
-- Local evaluation, trusted/reviewed dataset workflow and dated release-gate reports with root run contracts and step events.
+- Local evaluation, trusted/reviewed dataset workflow, deterministic root-cause diagnostics and dated release-gate reports with root run contracts and step events.
 - Document corpus verification with generated fixtures plus optional pinned URL/SHA external samples.
 
 ## Runtime
@@ -117,6 +117,11 @@ curl -X POST http://localhost:8000/api/v1/search:debug
 ```
 
 Provider-backed release gates require healthy API readiness and strict OpenRouter smoke. Do not rerun them while `/ready` is degraded.
+
+Eval answer/retrieval JSONL rows include deterministic `diagnosis` payloads and
+summaries include `root_cause_*_count` metrics. `eval-task-diagnostics --json`
+backfills the same diagnosis for older local artifacts when scores are present.
+
 
 Release-gate reports are immutable dated directories under:
 

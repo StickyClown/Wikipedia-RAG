@@ -8,6 +8,8 @@ ExecPlan 24 Slice 1-6 are implemented as a production-shaped MVP. The platform n
 
 ExecPlan 25.1+25.2 remains implemented for the local default-tenant RAG platform with Russian Wikipedia ingestion plus async document uploads, universal metadata, isolated parser services and corpus verification.
 
+ExecPlan 26 is completed and closed. It adds deterministic Legal RAG Bench-style root-cause diagnostics to answer/retrieval eval artifacts and summaries. It does not add LLM judging and does not change `/api/v1/chat`, retrieval runtime, Model Gateway, ingestion or database schema.
+
 Latest reviewed Wikipedia provider gate remains:
 
 - state: `completed`
@@ -23,6 +25,7 @@ Latest reviewed Wikipedia provider gate remains:
 - Hybrid retrieval with BM25, dense vectors, RRF, rerank, dedup/page quota, parent expansion, answerability and citation validation.
 - Bounded Extended Search MVP for controlled multi-query evidence expansion.
 - Dated release-gate reports with configuration snapshots, one root run contract, execution path, child retrieval/tool contracts, safe failure fields and per-question step events.
+- Eval/reporting diagnostics classify answer and retrieval task results as `passed`, `retrieval_error`, `hallucination_or_unsupported`, `reasoning_error`, `hard_negative_attribution`, `unanswerable_false_positive`, `execution_error` or `not_evaluated`; JSONL task results, short eval payloads, task diagnostics, summaries and release-gate blocker details expose the diagnosis where available.
 - Async upload sessions: presigned MinIO upload first, completion second, background ingestion job after durable object visibility.
 - Forward-only `ensure_schema` expansion for knowledge sources, upload batches/sessions, document versions/artifacts, ingestion job items and chunk locator/publication metadata.
 - Universal document metadata on versions: upload/system timestamps, source/document dates, date candidates/source/confidence, detected language/confidence/alternatives, MIME/signature facts, parser route/version/options, hashes, warnings and safe public metadata.
@@ -43,6 +46,69 @@ Latest reviewed Wikipedia provider gate remains:
 - Approved auth dependencies are locked and in use: `argon2-cffi` for Argon2id password hashes and `PyJWT[crypto]` for OIDC/JWKS validation.
 
 ## Validation Evidence
+
+Latest local validation after completing ExecPlan 26 Legal RAG Bench-style eval diagnostics:
+
+```text
+uv run ruff check src\wikipediarag\eval\diagnostics.py src\wikipediarag\eval\schemas.py src\wikipediarag\eval\runner.py src\wikipediarag\eval\retrieval_runner.py src\wikipediarag\eval\commands.py src\wikipediarag\eval\review.py tests\unit\test_eval_diagnostics.py tests\integration\test_eval_runner.py tests\unit\test_eval_retrieval_runner.py
+-> exit 0, All checks passed!
+
+uv run pytest tests\unit\test_eval_diagnostics.py -q
+-> exit 0, 9 passed
+
+uv run mypy src\wikipediarag\eval\diagnostics.py src\wikipediarag\eval\schemas.py src\wikipediarag\eval\runner.py src\wikipediarag\eval\retrieval_runner.py src\wikipediarag\eval\commands.py src\wikipediarag\eval\review.py tests\unit\test_eval_diagnostics.py
+-> exit 0, Success: no issues found in 7 source files
+
+uv run pytest tests\unit\test_eval_diagnostics.py tests\unit\test_eval_metrics.py tests\integration\test_eval_runner.py tests\unit\test_eval_review.py -q
+-> first run exit 1: timing-sensitive test_eval_runner.py::test_runner_batch_size_is_bounded_in_flight_backfill_scheduler failed; immediate targeted rerun passed
+-> rerun exit 0, 31 passed
+
+uv run pytest tests\unit\test_eval_retrieval_runner.py -q
+-> exit 0, 6 passed
+
+git diff --check
+-> exit 0, CRLF normalization warnings only
+
+try { Invoke-RestMethod -Uri http://localhost:8000/ready -TimeoutSec 5 | ConvertTo-Json -Depth 8 } catch { "READY_CHECK_FAILED: $($_.Exception.Message)" }
+-> initial exit 0, status=degraded, postgres=ok, model_gateway=failed
+
+uv run python -m wikipediarag.cli smoke-models --provider openrouter
+-> initial exit 1, aliases unhealthy while gateway readiness was degraded
+
+docker compose restart model-gateway
+-> exit 0
+
+Start-Sleep -Seconds 20; Invoke-RestMethod http://localhost:8081/ready; Invoke-RestMethod http://localhost:8000/ready
+-> exit 0, gateway status=ok, API status=ok
+
+uv run python -m wikipediarag.cli smoke-models --provider openrouter
+-> exit 0, embedding_dimensions=1024, typed_json ok, rerank ordered
+
+uv run python -m wikipediarag.cli eval-reviewed-short --suite reviewed-wikipedia-smoke-v1 --split dev --config-id sota_mvp_normal --task-id trusted-wiki-000018 --task-id trusted-wiki-000217 --task-id trusted-wiki-000251 --task-id trusted-wiki-000295 --batch-size 2 --retrieval-batch-size 2 --api http://localhost:8000
+-> first live attempt exit 0 but every task failed with auth errors because API was in normal AUTH_DISABLED=false mode and the eval HTTP client has no local-auth session
+
+$env:AUTH_DISABLED='true'; docker compose up -d --no-deps --force-recreate api; Remove-Item Env:AUTH_DISABLED
+-> exit 0, API recreated for local/demo eval bypass
+
+Invoke-RestMethod http://localhost:8000/ready; Invoke-RestMethod http://localhost:8000/api/v1/auth/session
+-> exit 0, API status=ok, auth-disabled session authenticated=true
+
+uv run python -m wikipediarag.cli eval-reviewed-short --suite reviewed-wikipedia-smoke-v1 --split dev --config-id sota_mvp_normal --task-id trusted-wiki-000018 --task-id trusted-wiki-000217 --task-id trusted-wiki-000251 --task-id trusted-wiki-000295 --batch-size 2 --retrieval-batch-size 2 --api http://localhost:8000
+-> exit 0, all 4 answer tasks and all 4 retrieval tasks completed
+
+uv run python -m wikipediarag.cli eval-task-diagnostics --suite reviewed-wikipedia-smoke-v1 --split dev --config-id sota_mvp_normal --task-id trusted-wiki-000018 --task-id trusted-wiki-000217 --task-id trusted-wiki-000251 --task-id trusted-wiki-000295 --json
+-> exit 0, missing_task_ids=[]
+-> trusted-wiki-000018 answer=passed retrieval=passed
+-> trusted-wiki-000217 answer=passed retrieval=passed
+-> trusted-wiki-000251 answer=passed retrieval=retrieval_error
+-> trusted-wiki-000295 answer=reasoning_error retrieval=passed
+
+$env:AUTH_DISABLED='false'; docker compose up -d --no-deps --force-recreate api; Remove-Item Env:AUTH_DISABLED
+-> exit 0, API restored to normal auth mode
+
+Invoke-RestMethod http://localhost:8000/ready; Invoke-RestMethod http://localhost:8000/api/v1/auth/session
+-> exit 0, API status=ok, anonymous session authenticated=false
+```
 
 Latest local validation after completing ExecPlan 24:
 
@@ -162,6 +228,7 @@ No additional `.gitignore` change is required for the current commit. `config/do
 
 - ExecPlan 24 is implemented as an MVP, and the live Keycloak container plus host-side code-flow smoke pass. Full browser UI OIDC through the Dockerized API was not run in this turn.
 - Retrieval remains single-KB only; requests with more than one KB fail safely with `MULTI_KB_UNSUPPORTED`.
+- Eval HTTP client does not yet create a local-auth session; live local provider-backed evals currently use the documented `AUTH_DISABLED=true` bypass and must restore normal auth mode afterwards.
 - Data-path enforcement is route-level plus original retrieval query scoping for existing API paths; a deeper worker/cache/object-key audit should remain part of hardening before external deployment.
 - Document ingestion is local/default-tenant only and is not production-hardened for malware scanning, retention/deletion, ACL mirroring, parser autoscaling or external deployment.
 - Public multi-file batch creation is not exposed yet; the DB/job framework supports independent job items and bounded worker claiming.

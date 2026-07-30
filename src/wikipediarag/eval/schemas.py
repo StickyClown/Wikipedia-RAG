@@ -251,6 +251,7 @@ class EvalTaskResult(BaseModel):
     latency_ms: dict[str, int] = Field(default_factory=dict)
     usage: dict[str, Any] = Field(default_factory=dict)
     scores: TaskScores | None = None
+    diagnosis: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     query_run_id: str | None = None
     trace_id: str | None = None
@@ -343,6 +344,7 @@ class RetrievalTaskResult(BaseModel):
     final_candidates: list[CandidateRef] = Field(default_factory=list)
     latency_ms: dict[str, int] = Field(default_factory=dict)
     scores: RetrievalTaskScores | None = None
+    diagnosis: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     trace_id: str | None = None
     corpus: dict[str, str] = Field(default_factory=dict)

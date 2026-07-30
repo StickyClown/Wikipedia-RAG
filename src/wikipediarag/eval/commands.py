@@ -17,6 +17,7 @@ from wikipediarag.eval.artifacts import (
     write_jsonl,
 )
 from wikipediarag.eval.corpus import load_candidate_chunks, load_corpus_snapshot
+from wikipediarag.eval.diagnostics import answer_result_diagnosis, retrieval_result_diagnosis
 from wikipediarag.eval.external import transfer_miracl_ru
 from wikipediarag.eval.generate_runs import load_generate_status, load_latest_generate_status
 from wikipediarag.eval.generator import SMOKE_MARKER, build_smoke_tasks, generate_dataset
@@ -524,6 +525,7 @@ def _short_answer_payload(result: EvalTaskResult) -> dict[str, Any]:
         "answerability_status": result.usage.get("answerability_status"),
         "insufficient_evidence": result.usage.get("insufficient_evidence"),
         "scores": result.scores.model_dump(mode="json") if result.scores else None,
+        "diagnosis": result.diagnosis,
         "timings_ms": result.latency_ms,
         "query_run_id": result.query_run_id,
         "trace_id": result.trace_id,
@@ -536,6 +538,7 @@ def _short_retrieval_payload(result: RetrievalTaskResult) -> dict[str, Any]:
         "task_id": result.task_id,
         "status": result.status,
         "scores": result.scores.model_dump(mode="json") if result.scores else None,
+        "diagnosis": result.diagnosis,
         "timings_ms": result.latency_ms,
         "trace_id": result.trace_id,
         "top_candidates": [
@@ -618,11 +621,19 @@ def _diagnostic_task_payload(
 ) -> dict[str, Any]:
     cited_chunks = set(answer.cited_chunk_ids if answer else [])
     hard_negative_pages = set(task.hard_negative_page_ids)
+    answer_diagnosis = answer_result_diagnosis(task, answer)
+    retrieval_diagnosis = retrieval_result_diagnosis(task, retrieval)
+    primary_diagnosis = answer_diagnosis if answer is not None else retrieval_diagnosis
     return {
         "task_id": task.task_id,
         "task_family": task.task_family,
         "unanswerable": task.unanswerable,
         "question": task.question,
+        "diagnosis": {
+            "root_cause": primary_diagnosis.get("root_cause", "not_evaluated"),
+            "answer": answer_diagnosis,
+            "retrieval": retrieval_diagnosis,
+        },
         "expected": {
             "reference_answer": task.reference_answer,
             "accepted_answers": task.accepted_answers,
@@ -640,6 +651,7 @@ def _diagnostic_task_payload(
             "answerability_status": answer.usage.get("answerability_status"),
             "insufficient_evidence": answer.usage.get("insufficient_evidence"),
             "scores": answer.scores.model_dump(mode="json") if answer.scores else None,
+            "diagnosis": answer_diagnosis,
             "timings_ms": answer.latency_ms,
             "query_run_id": answer.query_run_id,
             "trace_id": answer.trace_id,
@@ -654,6 +666,7 @@ def _diagnostic_task_payload(
         else {
             "status": retrieval.status,
             "scores": retrieval.scores.model_dump(mode="json") if retrieval.scores else None,
+            "diagnosis": retrieval_diagnosis,
             "timings_ms": retrieval.latency_ms,
             "trace_id": retrieval.trace_id,
             "top_candidates": [
