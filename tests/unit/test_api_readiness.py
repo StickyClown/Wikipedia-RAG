@@ -125,3 +125,24 @@ def test_safe_failure_payload_preserves_stage_trace_and_chunk_ids() -> None:
     assert payload["trace_id"] == "trace"
     assert payload["retrieval"]["evidence"][0]["chunk_id"] == "c1"
     assert "content" not in payload["retrieval"]["evidence"][0]
+
+
+def test_safe_validation_errors_do_not_echo_rejected_input() -> None:
+    errors = [
+        {
+            "type": "string_too_short",
+            "loc": ("body", "password"),
+            "msg": "String should have at least 12 characters",
+            "input": "secret",
+        }
+    ]
+
+    safe = api_app._safe_validation_errors(errors)
+
+    assert safe == [
+        {
+            "type": "string_too_short",
+            "loc": ("body", "password"),
+            "msg": "String should have at least 12 characters",
+        }
+    ]

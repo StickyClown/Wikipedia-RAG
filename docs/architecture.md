@@ -7,7 +7,7 @@ Last compacted: 2026-07-30
 
 WikipediaRag is a Docker-first local RAG platform for Russian Wikipedia plus default-tenant uploaded documents. The system is built around asynchronous ingestion, tenant-scoped retrieval, reproducible artifacts and a Model Gateway boundary for all model calls. XML multistream fallback remains supported for regression/local imports.
 
-Current milestone is in `docs/STATUS.md`: ExecPlan 25.1+25.2 local async document ingestion is implemented without ExecPlan 24 production auth/onboarding. ExecPlan 21 reviewed Wikipedia gate remains complete; latest provider-backed gate is `passed=true`, `blocking_failures=0`.
+Current milestone is in `docs/STATUS.md`: ExecPlan 24 Slice 1-6 are implemented as a production-shaped MVP. ExecPlan 25.1+25.2 local async document ingestion remains implemented. ExecPlan 21 reviewed Wikipedia gate remains complete; latest provider-backed gate is `passed=true`, `blocking_failures=0`.
 
 Runtime services:
 
@@ -38,6 +38,8 @@ Runtime services:
 API contour:
 
 - owns chat/SSE, readiness, search debug, upload sessions, document metadata and ingestion job control;
+- owns application auth sessions: local login, OIDC start/callback, password change, logout, session inspection, CSRF issuance and active-tenant selection;
+- owns admin users/tenants, local/OIDC groups, knowledge bases and KB grants;
 - returns safe errors and safe public metadata only;
 - persists query runs, retrieval events, usage summaries and safe failure metadata.
 
@@ -63,17 +65,21 @@ Parser contour:
 
 ## Data Contracts
 
-PostgreSQL is the control-plane source of truth. Key tables include tenants, users, memberships, knowledge bases, knowledge sources, upload batches, upload sessions, document versions, document artifacts, ingestion jobs, ingestion job items, index versions, documents, chunks, query runs, retrieval events and agent runs.
+PostgreSQL is the control-plane source of truth. Key tables include tenants, users, auth identities, auth sessions, groups, group memberships, tenant memberships, knowledge bases, knowledge-base grants, audit events, knowledge sources, upload batches, upload sessions, document versions, document artifacts, ingestion jobs, ingestion job items, index versions, documents, chunks, query runs, retrieval events and agent runs.
 
 Important contracts:
 
+- User identity matching is based on `auth_identities.issuer + subject`; email and username are profile attributes and must not be used for automatic account merging.
+- Local credentials are stored only as Argon2id hashes; browser sessions are opaque HttpOnly cookies, while `auth_sessions` stores only SHA-256 session and CSRF token hashes.
+- Keycloak/OIDC login uses Authorization Code Flow with PKCE S256. The browser receives only the opaque app session cookie; provider access/refresh tokens are encrypted server-side in `auth_sessions.server_side_tokens`.
+- Knowledge-base access is computed as the highest role from platform administration, tenant administration, direct user grants, local groups and OIDC groups. Explicit deny rules are out of scope.
 - `index_versions.metadata.index_contract_id` binds source snapshot, aliases, embedding provider/model/dimensions, vector field, chunking and retrieval-profile compatibility.
 - Answer/eval rows use one root `run_contract_id` for the configured run and child retrieval/tool contract IDs for diagnostic substeps.
 - `execution_path` and `path_selection_reason` record whether the row used normal, harness, retrieval-only, extended or fallback behavior.
 - Uploaded documents use an app-owned `NormalizedDocument` schema with stable text/table blocks, source locators, hashes, parser report metadata, warnings and provenance at page/slide/sheet/cell/row/JSON Pointer granularity.
 - `document_versions` carries universal metadata: upload/system timestamps, source dates, document-date candidates/source/confidence, detected language/confidence/alternatives, MIME/signature facts, parser route/version/options, hashes, warnings and safe public metadata.
 
-Forward-only schema changes are made through `ensure_schema` for this MVP. After a migration is committed, destructive schema changes require expand/migrate/contract planning.
+Forward-only schema changes are made through `ensure_schema` for this MVP. The current auth expansion preserves the seeded default tenant and KB, maps legacy tenant roles to `TENANT_ADMIN`/`MEMBER`, and grants the seeded local user `OWNER` on the default Wikipedia KB without deleting or rebuilding the current index. After a migration is committed, destructive schema changes require expand/migrate/contract planning.
 
 ## Public API Contracts
 
@@ -94,6 +100,15 @@ Important endpoints:
 
 - `GET /health` - liveness only after app startup.
 - `GET /ready` - dependency readiness; API depends on Model Gateway `/ready`.
+- `POST /api/v1/auth/local/login` - local login in `AUTH_MODE=local|hybrid`; disabled in strict `oidc`.
+- `POST /api/v1/auth/local/password` - change local password; requires cookie session and `X-CSRF-Token`.
+- `POST /api/v1/auth/logout` - revoke current app session and clear cookie; requires `X-CSRF-Token`.
+- `GET /api/v1/auth/session` - inspect current app session and issue a fresh CSRF token.
+- `POST /api/v1/auth/session/tenant` - select active tenant and rotate the session token; requires `X-CSRF-Token`.
+- `POST /api/v1/auth/oidc/start` and `GET /api/v1/auth/oidc/callback` - OIDC Authorization Code + PKCE login.
+- `GET/POST/PATCH /api/v1/admin/users` and `/api/v1/admin/tenants` - platform-admin administration.
+- `GET/POST/PATCH/DELETE /api/v1/groups` - active-tenant local/OIDC group metadata and local memberships.
+- `GET/POST/PATCH/DELETE /api/v1/knowledge-bases` and `/api/v1/knowledge-bases/{kb_id}/grants` - active-tenant KB and sharing control.
 - `POST /api/v1/wikipedia/zim-imports` - async ZIM import.
 - `POST /api/v1/wikipedia/imports` - async XML fallback import.
 - `POST /api/v1/uploads/sessions` - create upload session and presigned object URL.
@@ -176,6 +191,8 @@ query normalization
 ```
 
 Server-owned tenant/KB filters are applied to all BM25, vector, neighbor, debug and export paths. If an active KB has no compatible published index, search fails safely with `KB_NOT_READY`.
+
+Multi-KB retrieval remains unsupported in this milestone. Requests with more than one KB fail safely with `MULTI_KB_UNSUPPORTED`.
 
 Extended Search is bounded and conditional. It starts only when profile policy allows it and answerability is `PARTIAL` or `UNANSWERABLE`.
 

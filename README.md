@@ -11,7 +11,7 @@ First-read source of truth for an LLM or engineer:
 
 ## Current State
 
-Active milestone: ExecPlan 25.1+25.2 is implemented for local async document ingestion on the seeded `default_tenant_id/default_kb_id` model. ExecPlan 21 remains complete for the reviewed Wikipedia smoke gate; the latest provider-backed reviewed gate is `completed`, `passed=true`, `blocking_failures=0`.
+Active milestone: ExecPlan 24 Slice 1-6 are implemented as a production-shaped MVP. ExecPlan 25.1+25.2 remains implemented for local async document ingestion on the seeded default KB compatibility path. ExecPlan 21 remains complete for the reviewed Wikipedia smoke gate; the latest provider-backed reviewed gate is `completed`, `passed=true`, `blocking_failures=0`.
 
 Implemented MVP capabilities:
 
@@ -22,6 +22,11 @@ Implemented MVP capabilities:
 - ZIM/libzim Wikipedia ingestion with Kiwix source URLs, checkpoints, redirects as provenance and deterministic chunks.
 - XML multistream Wikipedia fallback for regression/local development.
 - Async document upload sessions with presigned MinIO upload, completion, background validation/parsing/chunking/embedding and published-only retrieval.
+- Auth/tenancy foundation: forward-only schema for identities, sessions, groups, KB grants and audit events; typed `ActorContext`; KB role policy and safe API error envelopes.
+- Local auth foundation: bootstrap admin from `BOOTSTRAP_ADMIN_PASSWORD_FILE` only when no platform admin exists, Argon2id password hashes, opaque HttpOnly app session cookie, server-side session/CSRF hashes, logout revocation and active-tenant selection.
+- OIDC foundation: Authorization Code + PKCE S256, discovery/JWKS ID-token validation, exact issuer/audience/nonce checks, `issuer + sub` identity matching, no email/username auto-merge and encrypted server-side token storage.
+- Local/OIDC groups, KB owner-on-create and KB grant APIs.
+- Route-level tenant/KB enforcement through server-owned `ActorContext`; client-supplied tenant/user/group/filter/object-prefix authority is not accepted by API routes.
 - Isolated parser containers: Xberg default parser, Docling Serve CPU fallback/high-quality parser and local metadata-service for fast language/date extraction.
 - Universal document metadata: upload/system timestamps, document-date candidates, language/confidence, MIME/signature facts, parser route/report, hashes, warnings and safe public metadata.
 - Hybrid retrieval: BM25, dense vectors, RRF, rerank, dedup/page quota, parent expansion, answerability and citation validation.
@@ -170,6 +175,28 @@ External corpus bytes are downloaded to ignored `artifacts/corpora/document-corp
 
 ## Configuration Notes
 
+ExecPlan 24 auth defaults:
+
+```env
+AUTH_MODE=local
+APP_SECRET_FILE=/run/secrets/app_secret
+BOOTSTRAP_ADMIN_USERNAME=admin
+BOOTSTRAP_ADMIN_EMAIL=
+BOOTSTRAP_ADMIN_PASSWORD_FILE=/run/secrets/bootstrap_admin_password
+SESSION_COOKIE_SECURE=true
+OIDC_SCOPE=openid profile email
+```
+
+Local login is enabled in `AUTH_MODE=local` and `AUTH_MODE=hybrid`, and disabled in strict `AUTH_MODE=oidc`. `AUTH_MODE=test` is accepted only when `APP_ENV=test`. If no platform administrator exists and the bootstrap password file is mounted, startup creates the bootstrap admin with `PLATFORM_ADMIN` and `password_change_required=true`; existing admin hashes are never reset. The browser receives only the opaque app session cookie. Use `GET /api/v1/auth/session` to receive the CSRF token required in `X-CSRF-Token` for unsafe cookie-authenticated auth methods.
+
+Keycloak smoke profile:
+
+```bash
+docker compose -f compose.yaml -f compose.keycloak.yaml --profile keycloak-smoke up -d keycloak
+```
+
+The profile uses pinned `quay.io/keycloak/keycloak:26.7.0` and imports `infra/keycloak/wikipediarag-realm.json`. The included smoke credentials and client secret are local deterministic fixtures only; production must mount real secrets. The host-side Authorization Code + PKCE smoke has passed against this profile.
+
 Real OpenRouter runs use local `.env` only:
 
 ```env
@@ -191,7 +218,7 @@ make smoke-models PROVIDER=llamacpp
 
 ## Main Risks And Next Work
 
-- Production auth, tenant onboarding, role model and cross-tenant acceptance are not implemented.
+- ExecPlan 24 auth is implemented as an MVP; remaining hardening is a live browser OIDC pass through the Dockerized API plus a worker/cache/object-storage deletion audit before external deployment.
 - Document ingestion is local/default-tenant only and still needs malware scanning, retention/deletion policy, ACL mirroring, parser autoscaling and external deployment hardening.
 - Public multi-file batch creation is not exposed yet; the DB/job framework already supports independent job items.
 - Fast language/date extraction is deterministic and local but heuristic.

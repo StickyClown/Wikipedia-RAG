@@ -1,0 +1,32 @@
+services:
+  api:
+    environment:
+      AUTH_MODE: hybrid
+      APP_SECRET_FILE: /run/secrets/app_secret
+      OIDC_DISCOVERY_URL: http://keycloak:8080/realms/wikipediarag/.well-known/openid-configuration
+      OIDC_ISSUER: http://keycloak:8080/realms/wikipediarag
+      OIDC_CLIENT_ID: wikipediarag
+      OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      OIDC_REDIRECT_URI: http://localhost:8000/api/v1/auth/oidc/callback
+      OIDC_PLATFORM_ADMIN_ROLES: ""
+      SESSION_COOKIE_SECURE: "false"
+    volumes:
+      - ./infra/keycloak/smoke-secrets/app_secret:/run/secrets/app_secret:ro
+      - ./infra/keycloak/smoke-secrets/oidc_client_secret:/run/secrets/oidc_client_secret:ro
+    depends_on:
+      keycloak:
+        condition: service_started
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HTTP_PORT: "8080"
+    ports:
+      - "8084:8080"
+    volumes:
+      - ./infra/keycloak/wikipediarag-realm.json:/opt/keycloak/data/import/wikipediarag-realm.json:ro
+    profiles:
+      - keycloak-smoke

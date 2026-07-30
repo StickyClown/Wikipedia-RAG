@@ -139,6 +139,28 @@ textarea {
   color: #9d2d24;
 }
 
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.session-pill {
+  max-width: 280px;
+  overflow: hidden;
+  padding: 6px 10px;
+  border: 1px solid #c7d1d6;
+  border-radius: 6px;
+  background: #f8fafb;
+  color: #3d4a51;
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .band {
   padding: 22px clamp(18px, 5vw, 64px);
 }
@@ -150,6 +172,7 @@ textarea {
 }
 
 .panel,
+.auth-panel,
 .answer,
 .debugger,
 .chat {
@@ -157,6 +180,30 @@ textarea {
   border: 1px solid #d9e0e4;
   border-radius: 8px;
   padding: 18px;
+}
+
+.auth-band {
+  display: flex;
+}
+
+.auth-panel {
+  display: grid;
+  width: min(460px, 100%);
+  gap: 12px;
+}
+
+.kb-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: end;
+  justify-content: space-between;
+  border-bottom: 1px solid #d9e0e4;
+  background: #eef3f2;
+}
+
+.kb-toolbar label {
+  min-width: min(420px, 100%);
 }
 
 .row {
@@ -296,6 +343,7 @@ code {
   }
 
   header,
+  .header-actions,
   .grid {
     grid-template-columns: 1fr;
   }
@@ -308,6 +356,11 @@ code {
   button,
   input,
   select {
+    width: 100%;
+  }
+
+  .header-actions,
+  .kb-toolbar {
     width: 100%;
   }
 

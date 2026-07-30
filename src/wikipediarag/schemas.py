@@ -61,6 +61,95 @@ class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
 
 
+class KnowledgeBasePatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=200)
+    email: str | None = Field(default=None, max_length=320)
+    display_name: str | None = Field(default=None, max_length=200)
+    platform_role: str = "USER"
+    is_disabled: bool = False
+
+
+class UserPatch(BaseModel):
+    email: str | None = Field(default=None, max_length=320)
+    display_name: str | None = Field(default=None, max_length=200)
+    platform_role: str | None = None
+    is_disabled: bool | None = None
+
+
+class TenantCreate(BaseModel):
+    slug: str = Field(min_length=1, max_length=120, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    name: str = Field(min_length=1, max_length=200)
+
+
+class TenantPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class GroupCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=240)
+    group_type: str = "LOCAL"
+    external_id: str | None = Field(default=None, max_length=500)
+    member_user_ids: list[str] = Field(default_factory=list, max_length=1000)
+
+
+class GroupPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=240)
+    member_user_ids: list[str] | None = Field(default=None, max_length=1000)
+
+
+class KnowledgeBaseGrantCreate(BaseModel):
+    subject_type: str
+    subject_id: str = Field(min_length=1, max_length=500)
+    role: str
+
+
+class KnowledgeBaseGrantPatch(BaseModel):
+    role: str
+
+
+class LocalLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=1, max_length=1024)
+    remember_me: bool = False
+
+
+class LocalPasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=12, max_length=1024)
+
+
+class TenantSelectionRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=64)
+
+
+class AuthUserResponse(BaseModel):
+    id: str
+    username: str | None = None
+    display_name: str | None = None
+    platform_role: str
+    password_change_required: bool = False
+
+
+class AuthSessionResponse(BaseModel):
+    authenticated: bool
+    user: AuthUserResponse | None = None
+    active_tenant_id: str | None = None
+    tenant_role: str | None = None
+    authentication_method: str | None = None
+    session_id: str | None = None
+    csrf_token: str | None = None
+    expires_at: datetime | None = None
+
+
+class AuthOidcStartResponse(BaseModel):
+    authorization_url: str
+    expires_at: datetime
+
+
 class SseEvent(BaseModel):
     event: str
     request_id: str

@@ -3,24 +3,54 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import text
 
 from wikipediarag.answerability import should_try_extended_search
 from wikipediarag.answering import generate_answer
+from wikipediarag.auth import (
+    ActorContext,
+    AuthenticationMethod,
+    AuthorizationError,
+    GrantSubjectType,
+    GroupType,
+    KnowledgeBaseRole,
+    PlatformRole,
+    require_active_tenant,
+    require_tenant_admin,
+)
+from wikipediarag.auth import require_kb_role as enforce_kb_role
+from wikipediarag.auth_service import (
+    AuthenticationError,
+    authenticate_local_user,
+    change_local_password,
+    create_session,
+    csrf_token_matches,
+    ensure_bootstrap_admin,
+    load_actor_for_session,
+    load_session_user,
+    local_login_enabled,
+    revoke_session,
+    rotate_csrf_token,
+    rotate_session_token,
+    select_active_tenant,
+    test_actor_context,
+)
 from wikipediarag.config import get_settings
 from wikipediarag.db import connect, ensure_schema
 from wikipediarag.document_ingestion import UploadValidationError, safe_upload_filename
 from wikipediarag.extended import run_extended_search, should_start_extended
 from wikipediarag.ids import stable_hash
+from wikipediarag.oidc_service import complete_oidc_callback, oidc_login_enabled, start_oidc_flow
 from wikipediarag.repository import (
     complete_query_run,
     create_document_upload_records,
@@ -32,8 +62,10 @@ from wikipediarag.repository import (
     get_document_public,
     get_knowledge_base,
     get_upload_session,
+    insert_audit_event,
     list_document_versions_public,
     list_knowledge_bases,
+    load_effective_knowledge_base_role,
     load_retrieval_events,
     request_cancel,
     request_resume,
@@ -42,16 +74,31 @@ from wikipediarag.retrieval import retrieve
 from wikipediarag.retrieval_contract import KnowledgeBaseNotReady, validate_active_retrieval_contract
 from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import (
+    AuthOidcStartResponse,
+    AuthSessionResponse,
+    AuthUserResponse,
     ChatRequest,
     DebugSearchRequest,
     DocumentReprocessResponse,
+    GroupCreate,
+    GroupPatch,
     ImportRequest,
     KnowledgeBaseCreate,
+    KnowledgeBaseGrantCreate,
+    KnowledgeBaseGrantPatch,
+    KnowledgeBasePatch,
+    LocalLoginRequest,
+    LocalPasswordChangeRequest,
     SseEvent,
+    TenantCreate,
+    TenantPatch,
+    TenantSelectionRequest,
     UploadCompleteResponse,
     UploadSessionAccepted,
     UploadSessionComplete,
     UploadSessionCreate,
+    UserCreate,
+    UserPatch,
     ZimImportRequest,
 )
 from wikipediarag.storage import create_presigned_put_url, head_object
@@ -59,16 +106,70 @@ from wikipediarag.storage import create_presigned_put_url, head_object
 app = FastAPI(title="WikipediaRag API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    if isinstance(exc.detail, dict) and isinstance(exc.detail.get("error"), dict):
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_payload(
+            code=_http_error_code(exc.status_code),
+            message=str(exc.detail),
+            request_id=_request_id(request),
+        ),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content=_error_payload(
+            code="REQUEST_VALIDATION_FAILED",
+            message="request validation failed",
+            request_id=_request_id(request),
+            details={"errors": _safe_validation_errors(exc.errors())},
+        ),
+    )
+
+
+@app.exception_handler(AuthenticationError)
+async def authentication_exception_handler(request: Request, exc: AuthenticationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_payload(
+            code=exc.code,
+            message=exc.message,
+            request_id=_request_id(request),
+        ),
+    )
+
+
+@app.exception_handler(AuthorizationError)
+async def authorization_exception_handler(request: Request, exc: AuthorizationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_payload(
+            code=exc.code,
+            message=exc.message,
+            request_id=_request_id(request),
+        ),
+    )
+
+
 @app.on_event("startup")
 async def startup() -> None:
     await ensure_schema()
+    settings = get_settings()
+    async with connect() as conn:
+        await ensure_bootstrap_admin(conn, settings)
 
 
 @app.get("/health")
@@ -97,16 +198,479 @@ async def ready() -> dict[str, Any]:
     return {"status": status, "components": components}
 
 
-@app.get("/api/v1/knowledge-bases")
-async def get_knowledge_bases() -> list[dict[str, Any]]:
+@app.post("/api/v1/auth/local/login")
+async def local_login(
+    payload: LocalLoginRequest,
+    request: Request,
+    response: Response,
+) -> AuthSessionResponse:
+    settings = get_settings()
+    if not local_login_enabled(settings):
+        raise AuthenticationError("LOCAL_LOGIN_DISABLED", "local login is disabled", status_code=403)
+    async with connect() as conn:
+        user = await authenticate_local_user(conn, username=payload.username, password=payload.password)
+        active_tenant_id = (
+            None if user.platform_role.value == "PLATFORM_ADMIN" else await _default_active_tenant(conn, user.user_id)
+        )
+        created = await create_session(
+            conn,
+            user_id=user.user_id,
+            authentication_method=AuthenticationMethod.local,
+            settings=settings,
+            remember_me=payload.remember_me,
+            active_tenant_id=active_tenant_id,
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=None,
+            action="auth.local_login",
+            target_type="user",
+            target_id=user.user_id,
+            outcome="success",
+        )
+    max_age = settings.remember_me_max_seconds if payload.remember_me else settings.session_max_seconds
+    _set_session_cookie(response, created.session_token, settings, max_age=max_age)
+    return AuthSessionResponse(
+        authenticated=True,
+        user=_auth_user_response(user),
+        active_tenant_id=active_tenant_id,
+        tenant_role=None,
+        authentication_method=AuthenticationMethod.local.value,
+        session_id=created.session_id,
+        csrf_token=None,
+        expires_at=created.expires_at,
+    )
+
+
+@app.post("/api/v1/auth/oidc/start")
+async def oidc_start() -> AuthOidcStartResponse:
+    settings = get_settings()
+    if not oidc_login_enabled(settings):
+        raise AuthenticationError("OIDC_LOGIN_DISABLED", "OIDC login is disabled", status_code=403)
+    async with connect() as conn:
+        started = await start_oidc_flow(conn, settings=settings)
+    return AuthOidcStartResponse(authorization_url=started.authorization_url, expires_at=started.expires_at)
+
+
+@app.get("/api/v1/auth/oidc/callback")
+async def oidc_callback(
+    code: str,
+    state: str,
+    request: Request,
+    response: Response,
+) -> AuthSessionResponse:
+    settings = get_settings()
+    if not oidc_login_enabled(settings):
+        raise AuthenticationError("OIDC_LOGIN_DISABLED", "OIDC login is disabled", status_code=403)
+    async with connect() as conn:
+        login = await complete_oidc_callback(conn, settings=settings, code=code, state=state)
+        await _audit(
+            conn,
+            request=request,
+            actor=None,
+            action="auth.oidc_login",
+            target_type="user",
+            target_id=login.user_id,
+            outcome="success",
+        )
+    _set_session_cookie(response, login.session_token, settings, max_age=settings.session_max_seconds)
+    return AuthSessionResponse(
+        authenticated=True,
+        user=AuthUserResponse(
+            id=login.user_id,
+            username=login.username,
+            display_name=login.display_name,
+            platform_role=login.platform_role.value,
+            password_change_required=login.password_change_required,
+        ),
+        active_tenant_id=login.active_tenant_id,
+        tenant_role=None,
+        authentication_method=AuthenticationMethod.oidc.value,
+        session_id=login.session_id,
+        csrf_token=None,
+        expires_at=login.expires_at,
+    )
+
+
+@app.post("/api/v1/auth/local/password")
+async def change_password(
+    payload: LocalPasswordChangeRequest,
+    request: Request,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+) -> dict[str, str]:
+    actor = await _require_actor(request)
+    await _require_csrf(actor, x_csrf_token)
+    async with connect() as conn:
+        await change_local_password(
+            conn,
+            user_id=actor.user_id,
+            current_password=payload.current_password,
+            new_password=payload.new_password,
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="auth.local_password_changed",
+            target_type="user",
+            target_id=actor.user_id,
+            outcome="success",
+        )
+    return {"status": "password_changed"}
+
+
+@app.post("/api/v1/auth/logout")
+async def logout(
+    request: Request,
+    response: Response,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+) -> dict[str, str]:
+    actor = await _require_actor(request)
+    await _require_csrf(actor, x_csrf_token)
     settings = get_settings()
     async with connect() as conn:
-        return await list_knowledge_bases(conn, settings.default_tenant_id)
+        await revoke_session(conn, session_id=actor.session_id)
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="auth.logout",
+            target_type="session",
+            target_id=actor.session_id,
+            outcome="success",
+        )
+    _delete_session_cookie(response, settings)
+    return {"status": "logged_out"}
+
+
+@app.get("/api/v1/auth/session")
+async def get_session(request: Request) -> AuthSessionResponse:
+    actor = await _load_actor(request)
+    if actor is None:
+        return AuthSessionResponse(authenticated=False)
+    async with connect() as conn:
+        user = await load_session_user(conn, user_id=actor.user_id)
+        csrf_token = await rotate_csrf_token(conn, session_id=actor.session_id)
+    if user is None:
+        return AuthSessionResponse(authenticated=False)
+    return AuthSessionResponse(
+        authenticated=True,
+        user=_auth_user_response(user),
+        active_tenant_id=actor.active_tenant_id,
+        tenant_role=actor.tenant_role.value if actor.tenant_role is not None else None,
+        authentication_method=actor.authentication_method.value,
+        session_id=actor.session_id,
+        csrf_token=csrf_token,
+        expires_at=None,
+    )
+
+
+@app.post("/api/v1/auth/session/tenant")
+async def select_session_tenant(
+    payload: TenantSelectionRequest,
+    request: Request,
+    response: Response,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+) -> AuthSessionResponse:
+    actor = await _require_actor(request)
+    await _require_csrf(actor, x_csrf_token)
+    settings = get_settings()
+    async with connect() as conn:
+        tenant_role = await select_active_tenant(
+            conn,
+            session_id=actor.session_id,
+            user_id=actor.user_id,
+            platform_role=actor.platform_role,
+            tenant_id=payload.tenant_id,
+        )
+        session_token = await rotate_session_token(conn, session_id=actor.session_id)
+        user = await load_session_user(conn, user_id=actor.user_id)
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="auth.tenant_selected",
+            target_type="tenant",
+            target_id=payload.tenant_id,
+            outcome="success",
+        )
+    _set_session_cookie(response, session_token, settings, max_age=settings.session_max_seconds)
+    return AuthSessionResponse(
+        authenticated=True,
+        user=_auth_user_response(user) if user is not None else None,
+        active_tenant_id=payload.tenant_id,
+        tenant_role=tenant_role.value if tenant_role is not None else None,
+        authentication_method=actor.authentication_method.value,
+        session_id=actor.session_id,
+    )
+
+
+@app.get("/api/v1/admin/users")
+async def admin_list_users(request: Request) -> list[dict[str, Any]]:
+    actor = await _require_actor(request)
+    _require_platform_admin(actor)
+    async with connect() as conn:
+        result = await conn.execute(
+            text(
+                """
+                SELECT id, username, email, display_name, platform_role, is_disabled, created_at, updated_at
+                FROM users
+                ORDER BY created_at DESC
+                """
+            )
+        )
+        return [cast(dict[str, Any], _jsonable(dict(row))) for row in result.mappings()]
+
+
+@app.post("/api/v1/admin/users")
+async def admin_create_user(payload: UserCreate, request: Request) -> dict[str, Any]:
+    actor = await _require_actor(request)
+    _require_platform_admin(actor)
+    platform_role = PlatformRole(payload.platform_role)
+    user_id = str(uuid.uuid4())
+    async with connect() as conn:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO users(id, username, email, display_name, platform_role, is_disabled)
+                VALUES (:id, :username, :email, :display_name, :platform_role, :is_disabled)
+                """
+            ),
+            {
+                "id": user_id,
+                "username": payload.username,
+                "email": payload.email,
+                "display_name": payload.display_name or payload.username,
+                "platform_role": platform_role.value,
+                "is_disabled": payload.is_disabled,
+            },
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="admin.user_created",
+            target_type="user",
+            target_id=user_id,
+            outcome="success",
+        )
+    return {"id": user_id, "username": payload.username, "platform_role": platform_role.value}
+
+
+@app.patch("/api/v1/admin/users/{user_id}")
+async def admin_patch_user(user_id: str, payload: UserPatch, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    _require_platform_admin(actor)
+    assignments = ["updated_at = now()"]
+    params: dict[str, Any] = {"id": user_id}
+    if payload.email is not None:
+        assignments.append("email = :email")
+        params["email"] = payload.email
+    if payload.display_name is not None:
+        assignments.append("display_name = :display_name")
+        params["display_name"] = payload.display_name
+    if payload.platform_role is not None:
+        assignments.append("platform_role = :platform_role")
+        params["platform_role"] = PlatformRole(payload.platform_role).value
+    if payload.is_disabled is not None:
+        assignments.append("is_disabled = :is_disabled")
+        params["is_disabled"] = payload.is_disabled
+    async with connect() as conn:
+        await conn.execute(text(f"UPDATE users SET {', '.join(assignments)} WHERE id = :id"), params)  # noqa: S608
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="admin.user_updated",
+            target_type="user",
+            target_id=user_id,
+            outcome="success",
+        )
+    return {"status": "updated"}
+
+
+@app.get("/api/v1/admin/tenants")
+async def admin_list_tenants(request: Request) -> list[dict[str, Any]]:
+    actor = await _require_actor(request)
+    _require_platform_admin(actor)
+    async with connect() as conn:
+        result = await conn.execute(text("SELECT id, slug, name, created_at, updated_at FROM tenants ORDER BY slug"))
+        return [cast(dict[str, Any], _jsonable(dict(row))) for row in result.mappings()]
+
+
+@app.post("/api/v1/admin/tenants")
+async def admin_create_tenant(payload: TenantCreate, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    _require_platform_admin(actor)
+    tenant_id = str(uuid.uuid4())
+    async with connect() as conn:
+        await conn.execute(
+            text("INSERT INTO tenants(id, slug, name) VALUES (:id, :slug, :name)"),
+            {"id": tenant_id, "slug": payload.slug, "name": payload.name},
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="admin.tenant_created",
+            target_type="tenant",
+            target_id=tenant_id,
+            outcome="success",
+        )
+    return {"id": tenant_id, "slug": payload.slug, "name": payload.name}
+
+
+@app.patch("/api/v1/admin/tenants/{tenant_id}")
+async def admin_patch_tenant(tenant_id: str, payload: TenantPatch, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    _require_platform_admin(actor)
+    if payload.name is None:
+        return {"status": "unchanged"}
+    async with connect() as conn:
+        await conn.execute(
+            text("UPDATE tenants SET name = :name, updated_at = now() WHERE id = :id"),
+            {"id": tenant_id, "name": payload.name},
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="admin.tenant_updated",
+            target_type="tenant",
+            target_id=tenant_id,
+            outcome="success",
+        )
+    return {"status": "updated"}
+
+
+@app.get("/api/v1/groups")
+async def list_groups(request: Request) -> list[dict[str, Any]]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    require_tenant_admin(actor)
+    async with connect() as conn:
+        result = await conn.execute(
+            text(
+                """
+                SELECT g.id, g.name, g.group_type, g.external_id, g.created_at, g.updated_at,
+                       COALESCE(json_agg(gm.user_id) FILTER (WHERE gm.user_id IS NOT NULL), '[]') AS member_user_ids
+                FROM groups g
+                LEFT JOIN group_memberships gm ON gm.group_id = g.id
+                WHERE g.tenant_id = :tenant_id
+                GROUP BY g.id
+                ORDER BY g.name
+                """
+            ),
+            {"tenant_id": tenant_id},
+        )
+        return [cast(dict[str, Any], _jsonable(dict(row))) for row in result.mappings()]
+
+
+@app.post("/api/v1/groups")
+async def create_group(payload: GroupCreate, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    require_tenant_admin(actor)
+    group_type = GroupType(payload.group_type)
+    if group_type == GroupType.oidc and not (payload.external_id or payload.name.startswith("/")):
+        raise HTTPException(status_code=422, detail="OIDC groups require a full external group path")
+    group_id = str(uuid.uuid4())
+    async with connect() as conn:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO groups(id, tenant_id, name, group_type, external_id)
+                VALUES (:id, :tenant_id, :name, :group_type, :external_id)
+                """
+            ),
+            {
+                "id": group_id,
+                "tenant_id": tenant_id,
+                "name": payload.name,
+                "group_type": group_type.value,
+                "external_id": payload.external_id,
+            },
+        )
+        if group_type == GroupType.local:
+            await _replace_local_group_members(conn, group_id=group_id, member_user_ids=payload.member_user_ids)
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="group.created",
+            target_type="group",
+            target_id=group_id,
+            outcome="success",
+        )
+    return {"id": group_id, "name": payload.name}
+
+
+@app.patch("/api/v1/groups/{group_id}")
+async def patch_group(group_id: str, payload: GroupPatch, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    require_tenant_admin(actor)
+    async with connect() as conn:
+        group = await _load_group(conn, tenant_id=tenant_id, group_id=group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail="group not found")
+        if payload.name is not None:
+            await conn.execute(
+                text("UPDATE groups SET name = :name, updated_at = now() WHERE id = :id"),
+                {"id": group_id, "name": payload.name},
+            )
+        if payload.member_user_ids is not None:
+            if GroupType(group["group_type"]) != GroupType.local:
+                raise HTTPException(status_code=409, detail="OIDC group membership is externally managed")
+            await _replace_local_group_members(conn, group_id=group_id, member_user_ids=payload.member_user_ids)
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="group.updated",
+            target_type="group",
+            target_id=group_id,
+            outcome="success",
+        )
+    return {"status": "updated"}
+
+
+@app.delete("/api/v1/groups/{group_id}")
+async def delete_group(group_id: str, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    require_tenant_admin(actor)
+    async with connect() as conn:
+        await conn.execute(text("DELETE FROM group_memberships WHERE group_id = :id"), {"id": group_id})
+        await conn.execute(
+            text("DELETE FROM groups WHERE id = :id AND tenant_id = :tenant_id"),
+            {"id": group_id, "tenant_id": tenant_id},
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="group.deleted",
+            target_type="group",
+            target_id=group_id,
+            outcome="success",
+        )
+    return {"status": "deleted"}
+
+
+@app.get("/api/v1/knowledge-bases")
+async def get_knowledge_bases(request: Request) -> list[dict[str, Any]]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        return await list_knowledge_bases(conn, tenant_id)
 
 
 @app.post("/api/v1/knowledge-bases")
-async def create_knowledge_base(payload: KnowledgeBaseCreate) -> dict[str, str]:
-    settings = get_settings()
+async def create_knowledge_base(payload: KnowledgeBaseCreate, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     kb_id = str(uuid.uuid4())
     async with connect() as conn:
         await conn.execute(
@@ -116,14 +680,231 @@ async def create_knowledge_base(payload: KnowledgeBaseCreate) -> dict[str, str]:
                 VALUES (:id, :tenant_id, :name)
                 """
             ),
-            {"id": kb_id, "tenant_id": settings.default_tenant_id, "name": payload.name},
+            {"id": kb_id, "tenant_id": tenant_id, "name": payload.name},
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO knowledge_base_grants(
+                  id, tenant_id, knowledge_base_id, subject_type, subject_id, role, created_by_user_id
+                )
+                VALUES (:id, :tenant_id, :kb_id, 'USER', :user_id_text, 'OWNER', :user_id)
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "tenant_id": tenant_id,
+                "kb_id": kb_id,
+                "user_id": actor.user_id,
+                "user_id_text": actor.user_id,
+            },
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="knowledge_base.created",
+            target_type="knowledge_base",
+            target_id=kb_id,
+            outcome="success",
         )
     return {"id": kb_id, "name": payload.name}
 
 
+@app.get("/api/v1/knowledge-bases/{kb_id}")
+async def get_knowledge_base_endpoint(kb_id: str, request: Request) -> dict[str, Any]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
+        kb = await get_knowledge_base(conn, tenant_id, kb_id)
+    if kb is None:
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+    return cast(dict[str, Any], _jsonable(kb))
+
+
+@app.patch("/api/v1/knowledge-bases/{kb_id}")
+async def patch_knowledge_base(kb_id: str, payload: KnowledgeBasePatch, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    if payload.name is None:
+        return {"status": "unchanged"}
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
+        await conn.execute(
+            text(
+                """
+                UPDATE knowledge_bases
+                SET name = :name, updated_at = now()
+                WHERE id = :id AND tenant_id = :tenant_id
+                """
+            ),
+            {"id": kb_id, "tenant_id": tenant_id, "name": payload.name},
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="knowledge_base.updated",
+            target_type="knowledge_base",
+            target_id=kb_id,
+            outcome="success",
+        )
+    return {"status": "updated"}
+
+
+@app.delete("/api/v1/knowledge-bases/{kb_id}")
+async def delete_knowledge_base(kb_id: str, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.owner)
+        await conn.execute(
+            text("DELETE FROM knowledge_bases WHERE id = :id AND tenant_id = :tenant_id"),
+            {"id": kb_id, "tenant_id": tenant_id},
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="knowledge_base.deleted",
+            target_type="knowledge_base",
+            target_id=kb_id,
+            outcome="success",
+        )
+    return {"status": "deleted"}
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/grants")
+async def list_kb_grants(kb_id: str, request: Request) -> list[dict[str, Any]]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
+        result = await conn.execute(
+            text(
+                """
+                SELECT id, subject_type, subject_id, role, created_by_user_id, created_at, updated_at
+                FROM knowledge_base_grants
+                WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id
+                ORDER BY created_at DESC
+                """
+            ),
+            {"tenant_id": tenant_id, "kb_id": kb_id},
+        )
+        return [cast(dict[str, Any], _jsonable(dict(row))) for row in result.mappings()]
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/grants")
+async def create_kb_grant(kb_id: str, payload: KnowledgeBaseGrantCreate, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    role = KnowledgeBaseRole(payload.role)
+    subject_type = GrantSubjectType(payload.subject_type)
+    async with connect() as conn:
+        required = KnowledgeBaseRole.owner if role == KnowledgeBaseRole.owner else KnowledgeBaseRole.manager
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=required)
+        grant_id = str(uuid.uuid4())
+        await conn.execute(
+            text(
+                """
+                INSERT INTO knowledge_base_grants(
+                  id, tenant_id, knowledge_base_id, subject_type, subject_id, role, created_by_user_id
+                )
+                VALUES (:id, :tenant_id, :kb_id, :subject_type, :subject_id, :role, :created_by_user_id)
+                ON CONFLICT (tenant_id, knowledge_base_id, subject_type, subject_id)
+                DO UPDATE SET role = EXCLUDED.role, updated_at = now()
+                """
+            ),
+            {
+                "id": grant_id,
+                "tenant_id": tenant_id,
+                "kb_id": kb_id,
+                "subject_type": subject_type.value,
+                "subject_id": payload.subject_id,
+                "role": role.value,
+                "created_by_user_id": actor.user_id,
+            },
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="knowledge_base.grant_created",
+            target_type="knowledge_base",
+            target_id=kb_id,
+            outcome="success",
+        )
+    return {"id": grant_id, "role": role.value}
+
+
+@app.patch("/api/v1/knowledge-bases/{kb_id}/grants/{grant_id}")
+async def patch_kb_grant(
+    kb_id: str,
+    grant_id: str,
+    payload: KnowledgeBaseGrantPatch,
+    request: Request,
+) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    role = KnowledgeBaseRole(payload.role)
+    async with connect() as conn:
+        required = KnowledgeBaseRole.owner if role == KnowledgeBaseRole.owner else KnowledgeBaseRole.manager
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=required)
+        await conn.execute(
+            text(
+                """
+                UPDATE knowledge_base_grants
+                SET role = :role, updated_at = now()
+                WHERE id = :id AND tenant_id = :tenant_id AND knowledge_base_id = :kb_id
+                """
+            ),
+            {"id": grant_id, "tenant_id": tenant_id, "kb_id": kb_id, "role": role.value},
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="knowledge_base.grant_updated",
+            target_type="knowledge_base_grant",
+            target_id=grant_id,
+            outcome="success",
+        )
+    return {"status": "updated"}
+
+
+@app.delete("/api/v1/knowledge-bases/{kb_id}/grants/{grant_id}")
+async def delete_kb_grant(kb_id: str, grant_id: str, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
+        await conn.execute(
+            text(
+                """
+                DELETE FROM knowledge_base_grants
+                WHERE id = :id AND tenant_id = :tenant_id AND knowledge_base_id = :kb_id
+                """
+            ),
+            {"id": grant_id, "tenant_id": tenant_id, "kb_id": kb_id},
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="knowledge_base.grant_deleted",
+            target_type="knowledge_base_grant",
+            target_id=grant_id,
+            outcome="success",
+        )
+    return {"status": "deleted"}
+
+
 @app.post("/api/v1/wikipedia/imports")
-async def create_wikipedia_import(payload: ImportRequest) -> dict[str, str]:
+async def create_wikipedia_import(payload: ImportRequest, request: Request) -> dict[str, str]:
     settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     config = {
         "limit": payload.limit,
         "xml_path": payload.xml_path or str(settings.wiki_xml_path),
@@ -132,9 +913,16 @@ async def create_wikipedia_import(payload: ImportRequest) -> dict[str, str]:
         "retrieval_profile": settings.retrieval_profile,
     }
     async with connect() as conn:
+        await _require_kb_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_id=settings.default_kb_id,
+            role=KnowledgeBaseRole.editor,
+        )
         job_id = await create_ingestion_job(
             conn,
-            settings.default_tenant_id,
+            tenant_id,
             settings.default_kb_id,
             "wikipedia_xml",
             config,
@@ -143,8 +931,10 @@ async def create_wikipedia_import(payload: ImportRequest) -> dict[str, str]:
 
 
 @app.post("/api/v1/wikipedia/zim-imports")
-async def create_zim_import(payload: ZimImportRequest) -> dict[str, str]:
+async def create_zim_import(payload: ZimImportRequest, request: Request) -> dict[str, str]:
     settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     config = {
         "limit": payload.limit or 10000,
         "zim_path": payload.zim_path,
@@ -156,9 +946,16 @@ async def create_zim_import(payload: ZimImportRequest) -> dict[str, str]:
         "retrieval_profile": settings.retrieval_profile,
     }
     async with connect() as conn:
+        await _require_kb_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_id=settings.default_kb_id,
+            role=KnowledgeBaseRole.editor,
+        )
         job_id = await create_ingestion_job(
             conn,
-            settings.default_tenant_id,
+            tenant_id,
             settings.default_kb_id,
             "wikipedia_zim",
             config,
@@ -167,9 +964,14 @@ async def create_zim_import(payload: ZimImportRequest) -> dict[str, str]:
 
 
 @app.get("/api/v1/ingestion-jobs/{job_id}")
-async def get_ingestion_job(job_id: str) -> dict[str, Any]:
+async def get_ingestion_job(job_id: str, request: Request) -> dict[str, Any]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        result = await conn.execute(text("SELECT * FROM ingestion_jobs WHERE id = :id"), {"id": job_id})
+        result = await conn.execute(
+            text("SELECT * FROM ingestion_jobs WHERE id = :id AND tenant_id = :tenant_id"),
+            {"id": job_id, "tenant_id": tenant_id},
+        )
         row = result.mappings().first()
     if row is None:
         raise HTTPException(status_code=404, detail="job not found")
@@ -177,12 +979,12 @@ async def get_ingestion_job(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/v1/ingestion-jobs/{job_id}/events")
-async def ingestion_job_events(job_id: str) -> StreamingResponse:
+async def ingestion_job_events(job_id: str, request: Request) -> StreamingResponse:
     async def event_stream() -> AsyncIterator[str]:
         sequence = 0
         while True:
             sequence += 1
-            job = await get_ingestion_job(job_id)
+            job = await get_ingestion_job(job_id, request)
             yield _sse("job.progress", {"sequence": sequence, "job": job})
             if job["status"] in {"completed", "failed", "cancelled"}:
                 break
@@ -192,39 +994,65 @@ async def ingestion_job_events(job_id: str) -> StreamingResponse:
 
 
 @app.post("/api/v1/ingestion-jobs/{job_id}:cancel")
-async def cancel_ingestion_job(job_id: str) -> dict[str, str]:
+async def cancel_ingestion_job(job_id: str, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
+        job = await _load_job_for_actor(conn, tenant_id=tenant_id, job_id=job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        await _require_kb_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_id=str(job["knowledge_base_id"]),
+            role=KnowledgeBaseRole.editor,
+        )
         await request_cancel(conn, job_id)
     return {"status": "cancel_requested"}
 
 
 @app.post("/api/v1/ingestion-jobs/{job_id}:resume")
-async def resume_ingestion_job(job_id: str) -> dict[str, str]:
+async def resume_ingestion_job(job_id: str, request: Request) -> dict[str, str]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
+        job = await _load_job_for_actor(conn, tenant_id=tenant_id, job_id=job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        await _require_kb_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_id=str(job["knowledge_base_id"]),
+            role=KnowledgeBaseRole.editor,
+        )
         await request_resume(conn, job_id)
     return {"status": "resume_requested"}
 
 
 @app.post("/api/v1/uploads/sessions")
-async def create_upload_session_endpoint(payload: UploadSessionCreate) -> UploadSessionAccepted:
+async def create_upload_session_endpoint(payload: UploadSessionCreate, request: Request) -> UploadSessionAccepted:
     settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     try:
         filename = safe_upload_filename(payload.filename)
     except UploadValidationError as exc:
         raise HTTPException(status_code=422, detail={"error": {"code": exc.code, "message": exc.safe_message}}) from exc
     kb_id = payload.knowledge_base_id or settings.default_kb_id
     async with connect() as conn:
-        kb = await get_knowledge_base(conn, settings.default_tenant_id, kb_id)
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
+        kb = await get_knowledge_base(conn, tenant_id, kb_id)
     if kb is None:
         raise HTTPException(status_code=404, detail="knowledge base not found")
     object_key = (
-        f"uploads/{settings.default_tenant_id}/{stable_hash([filename, payload.checksum_sha256], 16)}/"
-        f"{payload.checksum_sha256}"
+        f"uploads/{tenant_id}/{kb_id}/{stable_hash([filename, payload.checksum_sha256], 16)}/{payload.checksum_sha256}"
     )
     async with connect() as conn:
         session_id, expires_at = await create_upload_session(
             conn,
-            tenant_id=settings.default_tenant_id,
+            tenant_id=tenant_id,
             knowledge_base_id=kb_id,
             filename=filename,
             content_type=payload.content_type,
@@ -253,15 +1081,26 @@ async def create_upload_session_endpoint(payload: UploadSessionCreate) -> Upload
 @app.post("/api/v1/uploads/sessions/{upload_session_id}:complete")
 async def complete_upload_session_endpoint(
     upload_session_id: str,
+    request: Request,
     payload: UploadSessionComplete | None = None,
 ) -> UploadCompleteResponse:
     settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
         session = await get_upload_session(
             conn,
-            tenant_id=settings.default_tenant_id,
+            tenant_id=tenant_id,
             upload_session_id=upload_session_id,
         )
+        if session is not None:
+            await _require_kb_role(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_id=str(session["knowledge_base_id"]),
+                role=KnowledgeBaseRole.editor,
+            )
     if session is None:
         raise HTTPException(status_code=404, detail="upload session not found")
     if str(session["status"]) not in {"created", "uploaded"}:
@@ -277,7 +1116,7 @@ async def complete_upload_session_endpoint(
         raise HTTPException(status_code=409, detail="uploaded object size mismatch")
     document_hash = stable_hash(
         [
-            settings.default_tenant_id,
+            tenant_id,
             str(session["knowledge_base_id"]),
             str(session["checksum_sha256"]),
             str(session["filename"]),
@@ -300,7 +1139,7 @@ async def complete_upload_session_endpoint(
     async with connect() as conn:
         job_id = await create_document_upload_records(
             conn,
-            tenant_id=settings.default_tenant_id,
+            tenant_id=tenant_id,
             knowledge_base_id=str(session["knowledge_base_id"]),
             upload_session={**session, "metadata": session_metadata},
             document_id=document_id,
@@ -317,33 +1156,61 @@ async def complete_upload_session_endpoint(
 
 
 @app.get("/api/v1/documents/{document_id}")
-async def get_document(document_id: str) -> dict[str, Any]:
-    settings = get_settings()
+async def get_document(document_id: str, request: Request) -> dict[str, Any]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        document = await get_document_public(conn, settings.default_tenant_id, document_id)
+        document = await get_document_public(conn, tenant_id, document_id)
+        if document is not None:
+            await _require_kb_role(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_id=str(document["knowledge_base_id"]),
+                role=KnowledgeBaseRole.viewer,
+            )
     if document is None:
         raise HTTPException(status_code=404, detail="document not found")
     return cast(dict[str, Any], _jsonable(document))
 
 
 @app.get("/api/v1/documents/{document_id}/versions")
-async def get_document_versions(document_id: str) -> dict[str, Any]:
-    settings = get_settings()
+async def get_document_versions(document_id: str, request: Request) -> dict[str, Any]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        versions = await list_document_versions_public(conn, settings.default_tenant_id, document_id)
+        document = await get_document_public(conn, tenant_id, document_id)
+        if document is None:
+            raise HTTPException(status_code=404, detail="document not found")
+        await _require_kb_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_id=str(document["knowledge_base_id"]),
+            role=KnowledgeBaseRole.viewer,
+        )
+        versions = await list_document_versions_public(conn, tenant_id, document_id)
     return {"document_id": document_id, "versions": _jsonable(versions)}
 
 
 @app.post("/api/v1/documents/{document_id}:reprocess")
-async def reprocess_document(document_id: str) -> DocumentReprocessResponse:
-    settings = get_settings()
+async def reprocess_document(document_id: str, request: Request) -> DocumentReprocessResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        document = await get_document_public(conn, settings.default_tenant_id, document_id)
+        document = await get_document_public(conn, tenant_id, document_id)
         if document is None or not document.get("current_version_id"):
             raise HTTPException(status_code=404, detail="document not found")
+        await _require_kb_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_id=str(document["knowledge_base_id"]),
+            role=KnowledgeBaseRole.editor,
+        )
         job_id = await create_reprocess_job(
             conn,
-            tenant_id=settings.default_tenant_id,
+            tenant_id=tenant_id,
             knowledge_base_id=str(document["knowledge_base_id"]),
             document_id=document_id,
             document_version_id=str(document["current_version_id"]),
@@ -357,8 +1224,10 @@ async def reprocess_document(document_id: str) -> DocumentReprocessResponse:
 
 
 @app.post("/api/v1/chat")
-async def chat(payload: ChatRequest) -> StreamingResponse:
+async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     request_id = str(uuid.uuid4())
     trace_id = stable_hash([request_id, payload.message], 32)
     active_profile = get_retrieval_profile(
@@ -366,12 +1235,13 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
         settings,
         payload.retrieval_overrides,
     )
-    kb_id = payload.knowledge_base_ids[0] if payload.knowledge_base_ids else settings.default_kb_id
+    kb_id = _single_kb_id(payload.knowledge_base_ids, settings.default_kb_id, request_id=request_id)
     try:
         async with connect() as conn:
+            await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
             await validate_active_retrieval_contract(
                 conn,
-                tenant_id=settings.default_tenant_id,
+                tenant_id=tenant_id,
                 knowledge_base_id=kb_id,
                 profile=active_profile,
                 retrieval_overrides=payload.retrieval_overrides,
@@ -382,8 +1252,9 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
     async with connect() as conn:
         query_run_id = await create_query_run(
             conn,
-            tenant_id=settings.default_tenant_id,
-            user_id=settings.default_user_id,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            user_id=actor.user_id,
             request_id=request_id,
             client_request_id=payload.client_request_id,
             mode=payload.mode.value,
@@ -418,7 +1289,7 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                     retrieval = await run_extended_search(
                         conn,
                         payload.message,
-                        tenant_id=settings.default_tenant_id,
+                        tenant_id=tenant_id,
                         knowledge_base_id=kb_id,
                         query_run_id=str(query_run_id),
                         trace_id=trace_id,
@@ -432,7 +1303,7 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                     retrieval = await retrieve(
                         conn,
                         payload.message,
-                        tenant_id=settings.default_tenant_id,
+                        tenant_id=tenant_id,
                         knowledge_base_id=kb_id,
                         query_run_id=str(query_run_id),
                         trace_id=trace_id,
@@ -453,7 +1324,7 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
                         retrieval = await run_extended_search(
                             conn,
                             payload.message,
-                            tenant_id=settings.default_tenant_id,
+                            tenant_id=tenant_id,
                             knowledge_base_id=kb_id,
                             query_run_id=str(query_run_id),
                             trace_id=trace_id,
@@ -552,25 +1423,39 @@ async def chat(payload: ChatRequest) -> StreamingResponse:
 
 
 @app.get("/api/v1/query-runs/{query_run_id}/retrieval")
-async def query_run_retrieval(query_run_id: str) -> dict[str, Any]:
-    settings = get_settings()
+async def query_run_retrieval(query_run_id: str, request: Request) -> dict[str, Any]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        events = await load_retrieval_events(conn, settings.default_tenant_id, query_run_id)
+        run = await _load_query_run_for_actor(conn, tenant_id=tenant_id, query_run_id=query_run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="query run not found")
+        await _require_kb_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_id=str(run["knowledge_base_id"]),
+            role=KnowledgeBaseRole.editor,
+        )
+        events = await load_retrieval_events(conn, tenant_id, query_run_id)
     return {"query_run_id": query_run_id, "events": _jsonable(events)}
 
 
 @app.post("/api/v1/search:debug")
-async def search_debug(payload: DebugSearchRequest) -> dict[str, Any]:
+async def search_debug(payload: DebugSearchRequest, request: Request) -> dict[str, Any]:
     settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
     trace_id = stable_hash(["debug", payload.message], 32)
     profile = get_retrieval_profile(payload.retrieval_profile, settings, payload.retrieval_overrides)
-    kb_id = payload.knowledge_base_ids[0] if payload.knowledge_base_ids else settings.default_kb_id
+    kb_id = _single_kb_id(payload.knowledge_base_ids, settings.default_kb_id, request_id=trace_id)
     async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
         try:
             result = await retrieve(
                 conn,
                 payload.message,
-                tenant_id=settings.default_tenant_id,
+                tenant_id=tenant_id,
                 knowledge_base_id=kb_id,
                 query_run_id=None,
                 trace_id=trace_id,
@@ -586,6 +1471,208 @@ async def search_debug(payload: DebugSearchRequest) -> dict[str, Any]:
 
 def _event(event: SseEvent) -> str:
     return _sse(event.event, event.model_dump(mode="json"))
+
+
+async def _load_actor(request: Request) -> ActorContext | None:
+    settings = get_settings()
+    request_id = _request_id(request)
+    trace_id = request.headers.get("x-trace-id", request_id)[:128]
+    if settings.auth_mode == "test":
+        return test_actor_context(settings, request_id=request_id, trace_id=trace_id)
+    session_token = request.cookies.get(settings.session_cookie_name)
+    if not session_token:
+        return None
+    async with connect() as conn:
+        return await load_actor_for_session(
+            conn,
+            session_token=session_token,
+            request_id=request_id,
+            trace_id=trace_id,
+        )
+
+
+async def _require_actor(request: Request) -> ActorContext:
+    actor = await _load_actor(request)
+    if actor is None:
+        raise AuthenticationError("UNAUTHENTICATED", "authentication required")
+    if request.method in {"POST", "PATCH", "DELETE"}:
+        await _require_csrf(actor, request.headers.get("X-CSRF-Token"))
+    if request.url.path not in {
+        "/api/v1/auth/local/password",
+        "/api/v1/auth/logout",
+        "/api/v1/auth/session",
+        "/api/v1/auth/session/tenant",
+    }:
+        async with connect() as conn:
+            user = await load_session_user(conn, user_id=actor.user_id)
+        if user is not None and user.password_change_required:
+            raise AuthenticationError("PASSWORD_CHANGE_REQUIRED", "password change is required", status_code=403)
+    return actor
+
+
+def _require_platform_admin(actor: ActorContext) -> None:
+    if actor.platform_role != PlatformRole.platform_admin:
+        raise AuthorizationError("PLATFORM_ADMIN_REQUIRED", "platform administrator access is required")
+
+
+async def _require_kb_role(
+    conn: Any,
+    *,
+    actor: ActorContext,
+    tenant_id: str,
+    kb_id: str,
+    role: KnowledgeBaseRole,
+) -> None:
+    if actor.platform_role == PlatformRole.platform_admin:
+        return
+    actual = await load_effective_knowledge_base_role(
+        conn,
+        user_id=actor.user_id,
+        tenant_id=tenant_id,
+        knowledge_base_id=kb_id,
+    )
+    enforce_kb_role(actual, role)
+
+
+async def _replace_local_group_members(conn: Any, *, group_id: str, member_user_ids: list[str]) -> None:
+    await conn.execute(
+        text("DELETE FROM group_memberships WHERE group_id = :group_id AND membership_type = 'LOCAL'"),
+        {"group_id": group_id},
+    )
+    for user_id in member_user_ids:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO group_memberships(group_id, user_id, membership_type)
+                VALUES (:group_id, :user_id, 'LOCAL')
+                ON CONFLICT (group_id, user_id, membership_type) DO NOTHING
+                """
+            ),
+            {"group_id": group_id, "user_id": user_id},
+        )
+
+
+async def _load_group(conn: Any, *, tenant_id: str, group_id: str) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text("SELECT * FROM groups WHERE id = :id AND tenant_id = :tenant_id"),
+        {"id": group_id, "tenant_id": tenant_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def _load_job_for_actor(conn: Any, *, tenant_id: str, job_id: str) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text("SELECT * FROM ingestion_jobs WHERE id = :id AND tenant_id = :tenant_id"),
+        {"id": job_id, "tenant_id": tenant_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def _load_query_run_for_actor(conn: Any, *, tenant_id: str, query_run_id: str) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text("SELECT * FROM query_runs WHERE id = :id AND tenant_id = :tenant_id"),
+        {"id": query_run_id, "tenant_id": tenant_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+def _single_kb_id(knowledge_base_ids: list[str], default_kb_id: str, *, request_id: str) -> str:
+    if len(knowledge_base_ids) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "code": "MULTI_KB_UNSUPPORTED",
+                    "message": "multi-knowledge-base retrieval is not supported yet",
+                    "request_id": request_id,
+                    "details": {},
+                }
+            },
+        )
+    return knowledge_base_ids[0] if knowledge_base_ids else default_kb_id
+
+
+async def _require_csrf(actor: ActorContext, csrf_token: str | None) -> None:
+    if actor.authentication_method == AuthenticationMethod.test:
+        return
+    if not csrf_token:
+        raise AuthenticationError("CSRF_TOKEN_REQUIRED", "CSRF token is required", status_code=403)
+    async with connect() as conn:
+        if not await csrf_token_matches(conn, session_id=actor.session_id, csrf_token=csrf_token):
+            raise AuthenticationError("CSRF_TOKEN_INVALID", "CSRF token is invalid", status_code=403)
+
+
+async def _default_active_tenant(conn: Any, user_id: str) -> str | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT tenant_id
+            FROM tenant_memberships
+            WHERE user_id = :user_id
+            ORDER BY tenant_id
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id},
+    )
+    row = result.mappings().first()
+    return str(row["tenant_id"]) if row is not None else None
+
+
+def _set_session_cookie(response: Response, session_token: str, settings: Any, *, max_age: int) -> None:
+    response.set_cookie(
+        settings.session_cookie_name,
+        session_token,
+        httponly=True,
+        secure=settings.session_cookie_secure,
+        samesite=settings.session_cookie_samesite,
+        max_age=max_age,
+        path="/",
+    )
+
+
+def _delete_session_cookie(response: Response, settings: Any) -> None:
+    response.delete_cookie(
+        settings.session_cookie_name,
+        path="/",
+        secure=settings.session_cookie_secure,
+        samesite=settings.session_cookie_samesite,
+        httponly=True,
+    )
+
+
+def _auth_user_response(user: Any) -> AuthUserResponse:
+    return AuthUserResponse(
+        id=user.user_id,
+        username=user.username,
+        display_name=user.display_name,
+        platform_role=user.platform_role.value,
+        password_change_required=user.password_change_required,
+    )
+
+
+async def _audit(
+    conn: Any,
+    *,
+    request: Request,
+    actor: ActorContext | None,
+    action: str,
+    target_type: str,
+    target_id: str | None,
+    outcome: str,
+) -> None:
+    await insert_audit_event(
+        conn,
+        actor=actor,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        outcome=outcome,
+        metadata={"request_path": str(request.url.path)},
+    )
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -710,6 +1797,63 @@ def _kb_not_ready_http(exc: KnowledgeBaseNotReady, request_id: str) -> HTTPExcep
             }
         },
     )
+
+
+def _error_payload(
+    *,
+    code: str,
+    message: str,
+    request_id: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": request_id,
+            "details": details or {},
+        }
+    }
+
+
+def _http_error_code(status_code: int) -> str:
+    return {
+        400: "BAD_REQUEST",
+        401: "UNAUTHENTICATED",
+        403: "FORBIDDEN",
+        404: "NOT_FOUND",
+        409: "CONFLICT",
+        422: "REQUEST_VALIDATION_FAILED",
+    }.get(status_code, "HTTP_ERROR")
+
+
+def _request_id(request: Request) -> str:
+    candidate = request.headers.get("x-request-id")
+    if candidate:
+        return candidate[:128]
+    return str(uuid.uuid4())
+
+
+def _safe_validation_errors(errors: Sequence[Any]) -> list[dict[str, Any]]:
+    safe_errors: list[dict[str, Any]] = []
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        safe_errors.append(
+            {
+                key: value
+                for key, value in error.items()
+                if key
+                in {
+                    "type",
+                    "loc",
+                    "msg",
+                    "ctx",
+                    "url",
+                }
+            }
+        )
+    return safe_errors
 
 
 def _jsonable(value: Any) -> Any:

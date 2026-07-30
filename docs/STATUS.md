@@ -4,7 +4,9 @@ Last updated: 2026-07-30
 
 ## Current Phase
 
-ExecPlan 25.1+25.2 is implemented for the local default-tenant RAG platform. The project now supports Russian Wikipedia ingestion plus async document uploads with universal metadata, isolated parser services and corpus verification. ExecPlan 24 production auth/onboarding is not implemented, so this is not a cross-tenant or external deployment readiness claim.
+ExecPlan 24 Slice 1-6 are implemented as a production-shaped MVP. The platform now has auth identities, session/group/grant/audit schema, default-tenant backfill, typed `ActorContext`, KB role policy, safe API error envelopes, bootstrap admin creation from a mounted password file, Argon2id local password verification, opaque server sessions, CSRF issuance from `/api/v1/auth/session`, logout/revocation, tenant selection, OIDC Authorization Code + PKCE S256 foundation, JWKS ID-token validation, server-side encrypted OIDC token storage, local/OIDC groups, admin users/tenants, KB grants, route-level ActorContext enforcement and UI login/session/KB controls. The pinned Keycloak container starts and the host-side Keycloak OIDC code-flow smoke passes.
+
+ExecPlan 25.1+25.2 remains implemented for the local default-tenant RAG platform with Russian Wikipedia ingestion plus async document uploads, universal metadata, isolated parser services and corpus verification.
 
 Latest reviewed Wikipedia provider gate remains:
 
@@ -29,50 +31,81 @@ Latest reviewed Wikipedia provider gate remains:
 - Worker item claiming uses bounded `FOR UPDATE SKIP LOCKED`; failed/cancelled/parser-error jobs do not publish searchable chunks.
 - UI upload panel creates sessions, uploads to presigned URLs, completes sessions, polls async progress and shows parser route, metadata and terminal errors.
 - Document corpus verification uses generated fixtures plus optional pinned URL/SHA/license manifest samples.
+- ExecPlan 24 Slice 1 auth foundation: forward-only `ensure_schema` expansion for `auth_identities`, `auth_sessions`, `auth_oidc_flows`, `groups`, `group_memberships`, `knowledge_base_grants` and `audit_events`; `users.email` is nullable profile metadata; identity matching is represented by `issuer + subject`.
+- ExecPlan 24 Slice 2 local-auth foundation: startup bootstrap admin from `BOOTSTRAP_ADMIN_PASSWORD_FILE` only when no `PLATFORM_ADMIN` exists, Argon2id password hashes, local login in `AUTH_MODE=local|hybrid`, opaque HttpOnly session cookies, SHA-256 session/CSRF hashes in `auth_sessions`, `/auth/session` CSRF issuance, logout revocation and active-tenant selection with session rotation.
+- ExecPlan 24 Slice 3 OIDC foundation: `/api/v1/auth/oidc/start` and callback implement Authorization Code Flow with PKCE S256, OIDC discovery, JWKS signature validation, exact issuer/audience/nonce validation, `issuer + sub` identity matching, no email/username auto-merge and encrypted server-side access/refresh token storage.
+- ExecPlan 24 Slice 4 groups and KB sharing: local/OIDC group CRUD/membership separation, full OIDC group paths, OIDC membership sync that touches only `membership_type='OIDC'`, KB owner-on-create and direct/group KB grants.
+- ExecPlan 24 Slice 5 route enforcement: FastAPI tenant/user scope is resolved from immutable `ActorContext`; route-level default tenant/default user usage was removed from tenant-scoped APIs; chat/query requires `VIEWER`, debug/query-run retrieval/upload/reprocess/import/job control require `EDITOR`, grants/source-style management require `MANAGER`, delete/owner grants require `OWNER` or platform admin.
+- ExecPlan 24 Slice 6 smoke/UI/docs: pinned Keycloak compose profile and deterministic realm import were added; UI now has local/OIDC login, session display, logout, KB list/create/select and cookie/CSRF-aware fetches.
+- Authorization policy foundation: typed platform, tenant and KB role enums; immutable `ActorContext`; highest-role KB policy; tenant-admin/platform-admin helpers; repository helpers for effective KB role resolution and audit insertion.
+- Default tenant backfill maps legacy tenant membership roles to `TENANT_ADMIN`/`MEMBER` and grants the seeded local user `OWNER` on the default Wikipedia KB without deleting or rebuilding the current Wikipedia index.
+- API errors now use the safe error envelope for HTTP and validation failures, with validation input redacted.
+- Approved auth dependencies are locked and in use: `argon2-cffi` for Argon2id password hashes and `PyJWT[crypto]` for OIDC/JWKS validation.
 
 ## Validation Evidence
 
-Latest local validation for the current working tree after the 2026-07-30 docs refresh:
+Latest local validation after completing ExecPlan 24:
 
 ```text
-git status --ignored --short
--> exit 0, generated/secret local state remains ignored: .env, caches, artifacts/, services/ui/dist/, services/ui/node_modules/, zim/, zip/, openrouter_key.txt
-
-git diff --check
--> exit 0, no whitespace errors; Git reported expected LF-to-CRLF working-copy warnings on Windows
-
-rg -n --hidden --glob '!artifacts/**' --glob '!.git/**' --glob '!.venv/**' --glob '!services/ui/node_modules/**' --glob '!zim/**' --glob '!zip/**' --glob '!*.pyc' 'OPENROUTER_API_KEY=sk-|sk-or-v1|BEGIN .*PRIVATE KEY|password\s*=' .
--> exit 1, no matches for real OpenRouter keys, sk-or-v1 keys, private keys or password assignments beyond placeholders
+$env:DATABASE_URL='postgresql+asyncpg://rag:change-me-local-only@localhost:5432/rag'; uv run python -m wikipediarag.migrate
+-> exit 0, database schema is ready
 
 uv run ruff check .
 -> exit 0, All checks passed!
 
 uv run ruff format --check .
--> exit 0, 76 files already formatted
+-> exit 0, 83 files already formatted
 
 uv run mypy src tests
--> exit 0, Success: no issues found in 74 source files
+-> exit 0, Success: no issues found in 81 source files
 
 uv run pytest tests/unit tests/integration
--> exit 1, 2 contract-test failures after compact architecture rewrite; fixed by restoring required XML/ZIM architecture contract phrases
+-> exit 0, 152 passed, 4 warnings
+
+uv run pytest tests\unit\test_oidc_service.py tests\unit\test_auth_service.py
+-> exit 0, 13 passed
+
+$env:DATABASE_URL='postgresql+asyncpg://rag:change-me-local-only@localhost:5432/rag'; uv run python -m wikipediarag.migrate
+-> exit 0, database schema is ready
+
+uv run ruff check .
+-> exit 0, All checks passed!
+
+uv run ruff format --check .
+-> exit 0, 83 files already formatted
+
+uv run mypy src tests
+-> exit 0, Success: no issues found in 81 source files
 
 uv run pytest tests/unit tests/integration
--> exit 1, 1 contract-test failure after first fix; fixed by restoring "monotonic non-decreasing offsets"
-
-uv run pytest tests\integration\test_contracts.py
--> exit 0, 4 passed in 0.06s
-
-uv run pytest tests/unit tests/integration
--> exit 0, 128 passed, 4 warnings in 14.11s
-
-cd services/ui; pnpm lint
--> exit 0
+-> exit 0, 152 passed, 4 warnings in 16.95s
 
 cd services/ui; pnpm typecheck
 -> exit 0
 
+cd services/ui; pnpm lint
+-> exit 0
+
 cd services/ui; pnpm build
 -> exit 0
+
+docker compose -f compose.yaml -f compose.keycloak.yaml --profile keycloak-smoke config
+-> exit 0, merged compose config rendered successfully; raw output not recorded because host .env values are expanded
+
+docker compose -f compose.yaml -f compose.keycloak.yaml --profile keycloak-smoke up -d keycloak
+-> exit 0, after the image was available locally, `wikipediarag-keycloak-1` started
+
+Invoke-RestMethod http://localhost:8084/realms/wikipediarag/.well-known/openid-configuration
+-> exit 0, issuer `http://localhost:8084/realms/wikipediarag`
+
+Host-side Keycloak OIDC Authorization Code + PKCE smoke against compose Postgres
+-> exit 0, code callback completed, platform_role USER, opaque app session created, access/refresh tokens stored encrypted server-side, no access token in app session token
+
+git diff --check
+-> exit 0, no whitespace errors; Git reported expected LF-to-CRLF working-copy warnings on Windows
+
+rg -n --hidden --glob '!.env' --glob '!infra/keycloak/smoke-secrets/**' --glob '!infra/keycloak/wikipediarag-realm.json' --glob '!docs/STATUS.md' --glob '!artifacts/**' --glob '!.git/**' --glob '!.venv/**' --glob '!services/ui/node_modules/**' --glob '!services/ui/dist/**' --glob '!zim/**' --glob '!zip/**' --glob '!*.pyc' 'OPENROUTER_API_KEY=sk-|sk-or-v1|BEGIN .*PRIVATE KEY|change-this-admin-password|new-password-must-not-apply' .
+-> exit 1, no concrete OpenRouter keys, private keys or local-auth smoke password values found outside explicit smoke fixtures
 ```
 
 Latest parser/corpus verification reports retained from the ExecPlan 25.1+25.2 implementation run:
@@ -127,7 +160,9 @@ No additional `.gitignore` change is required for the current commit. `config/do
 
 ## Known Limitations
 
-- Production auth, tenant onboarding, role model and cross-tenant acceptance are not implemented.
+- ExecPlan 24 is implemented as an MVP, and the live Keycloak container plus host-side code-flow smoke pass. Full browser UI OIDC through the Dockerized API was not run in this turn.
+- Retrieval remains single-KB only; requests with more than one KB fail safely with `MULTI_KB_UNSUPPORTED`.
+- Data-path enforcement is route-level plus original retrieval query scoping for existing API paths; a deeper worker/cache/object-key audit should remain part of hardening before external deployment.
 - Document ingestion is local/default-tenant only and is not production-hardened for malware scanning, retention/deletion, ACL mirroring, parser autoscaling or external deployment.
 - Public multi-file batch creation is not exposed yet; the DB/job framework supports independent job items and bounded worker claiming.
 - Language/date metadata is deterministic and local but heuristic; binary/scanned files get final metadata only after parser/OCR text exists.
@@ -137,10 +172,7 @@ No additional `.gitignore` change is required for the current commit. `config/do
 
 ## Next Improvement Plan
 
-Recommended next stage: harden document ingestion for production-adjacent operation without changing tenant/auth scope.
+Recommended next stage: do a focused hardening review of worker/cache/object-storage deletion semantics before external deployment.
 
-- Add cancellation/retry/reprocess coverage for multi-item batches exposed through public API.
-- Add parser timeout/backoff metrics and structured parser quality reports.
-- Add stronger document-date extraction precedence for SEC/contract-style metadata so taxonomy/schema dates do not outrank filing/document dates.
-- Add optional nightly corpus gate for CUAD/CourtListener/SEC/GovInfo/EUR-Lex manifests with strict cache and checksum policy.
-- Profile retrieval p95 and split latency by BM25, dense, rerank, context packing and generation.
+- Add a dedicated cross-tenant runtime smoke that exercises chat, debug, uploads, documents, jobs, query-run retrieval and object keys against two real tenants.
+- Verify browser UI OIDC through the Dockerized API after deciding the internal/public Keycloak URL strategy for containerized local development.

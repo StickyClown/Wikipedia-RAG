@@ -2,6 +2,9 @@ import {
   Bug,
   Database,
   FileUp,
+  KeyRound,
+  LogIn,
+  LogOut,
   MessageSquare,
   Play,
   RotateCw,
@@ -79,6 +82,25 @@ type UploadCompleteResponse = {
   status: string;
 };
 
+type AuthSession = {
+  authenticated: boolean;
+  csrf_token?: string | null;
+  active_tenant_id?: string | null;
+  tenant_role?: string | null;
+  user?: {
+    id: string;
+    username?: string | null;
+    display_name?: string | null;
+    platform_role: string;
+    password_change_required: boolean;
+  } | null;
+};
+
+type KnowledgeBase = {
+  id: string;
+  name: string;
+};
+
 type DocumentPublicMetadata = {
   id: string;
   title: string;
@@ -98,6 +120,15 @@ type DocumentPublicMetadata = {
 
 export function App() {
   const [ready, setReady] = useState("checking");
+  const [session, setSession] = useState<AuthSession>({
+    authenticated: false,
+  });
+  const [authUsername, setAuthUsername] = useState("admin");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
+  const [selectedKnowledgeBaseId, setSelectedKnowledgeBaseId] = useState("");
+  const [newKnowledgeBaseName, setNewKnowledgeBaseName] = useState("");
   const [limit, setLimit] = useState(1000);
   const [job, setJob] = useState<Job | null>(null);
   const [question, setQuestion] = useState("Что такое Россия?");
@@ -132,11 +163,130 @@ export function App() {
       .catch(() => setReady("offline"));
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    async function loadInitialSession() {
+      const response = await fetch(`${API_BASE}/api/v1/auth/session`, {
+        credentials: "include",
+      });
+      if (!response.ok || cancelled) return;
+      const nextSession = (await response.json()) as AuthSession;
+      setSession(nextSession);
+      if (!nextSession.authenticated) return;
+      const kbResponse = await fetch(`${API_BASE}/api/v1/knowledge-bases`, {
+        credentials: "include",
+      });
+      if (!kbResponse.ok || cancelled) return;
+      const items = (await kbResponse.json()) as KnowledgeBase[];
+      setKnowledgeBases(items);
+      if (items[0]) {
+        setSelectedKnowledgeBaseId(items[0].id);
+      }
+    }
+    void loadInitialSession();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const imported = useMemo(() => job?.progress?.pages_imported ?? 0, [job]);
   const chunks = useMemo(() => job?.progress?.chunks_indexed ?? 0, [job]);
 
+  async function apiFetch(path: string, init: RequestInit = {}) {
+    const method = init.method?.toUpperCase() ?? "GET";
+    const headers = new Headers(init.headers);
+    if (method !== "GET" && session.csrf_token) {
+      headers.set("X-CSRF-Token", session.csrf_token);
+    }
+    return fetch(`${API_BASE}${path}`, {
+      ...init,
+      credentials: "include",
+      headers,
+    });
+  }
+
+  async function refreshSession() {
+    const response = await fetch(`${API_BASE}/api/v1/auth/session`, {
+      credentials: "include",
+    });
+    if (response.ok) {
+      const nextSession = (await response.json()) as AuthSession;
+      setSession(nextSession);
+      if (nextSession.authenticated) {
+        await loadKnowledgeBases();
+      }
+    }
+  }
+
+  async function localLogin(event: FormEvent) {
+    event.preventDefault();
+    setAuthError("");
+    const response = await fetch(`${API_BASE}/api/v1/auth/local/login`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: authUsername,
+        password: authPassword,
+      }),
+    });
+    if (!response.ok) {
+      setAuthError(await response.text());
+      return;
+    }
+    setAuthPassword("");
+    await refreshSession();
+  }
+
+  async function oidcLogin() {
+    setAuthError("");
+    const response = await fetch(`${API_BASE}/api/v1/auth/oidc/start`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (!response.ok) {
+      setAuthError(await response.text());
+      return;
+    }
+    const started = (await response.json()) as { authorization_url: string };
+    window.location.assign(started.authorization_url);
+  }
+
+  async function logout() {
+    const response = await apiFetch("/api/v1/auth/logout", { method: "POST" });
+    if (response.ok) {
+      setSession({ authenticated: false });
+      setKnowledgeBases([]);
+      setSelectedKnowledgeBaseId("");
+    }
+  }
+
+  async function loadKnowledgeBases() {
+    const response = await apiFetch("/api/v1/knowledge-bases");
+    if (!response.ok) return;
+    const items = (await response.json()) as KnowledgeBase[];
+    setKnowledgeBases(items);
+    if (!selectedKnowledgeBaseId && items[0]) {
+      setSelectedKnowledgeBaseId(items[0].id);
+    }
+  }
+
+  async function createKnowledgeBase(event: FormEvent) {
+    event.preventDefault();
+    if (!newKnowledgeBaseName.trim()) return;
+    const response = await apiFetch("/api/v1/knowledge-bases", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: newKnowledgeBaseName.trim() }),
+    });
+    if (response.ok) {
+      setNewKnowledgeBaseName("");
+      await loadKnowledgeBases();
+    }
+  }
+
   async function startImport() {
-    const response = await fetch(`${API_BASE}/api/v1/wikipedia/zim-imports`, {
+    const response = await apiFetch("/api/v1/wikipedia/zim-imports", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ limit }),
@@ -146,7 +296,7 @@ export function App() {
   }
 
   async function pollJob(jobId: string) {
-    const response = await fetch(`${API_BASE}/api/v1/ingestion-jobs/${jobId}`);
+    const response = await apiFetch(`/api/v1/ingestion-jobs/${jobId}`);
     const nextJob = await response.json();
     setJob(nextJob);
     if (!["completed", "failed", "cancelled"].includes(nextJob.status)) {
@@ -159,11 +309,14 @@ export function App() {
     setAnswer("");
     setEvidence([]);
     setEvents([]);
-    const response = await fetch(`${API_BASE}/api/v1/chat`, {
+    const response = await apiFetch("/api/v1/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message: question,
+        knowledge_base_ids: selectedKnowledgeBaseId
+          ? [selectedKnowledgeBaseId]
+          : [],
         mode,
         stream: true,
         retrieval_profile: retrievalProfile,
@@ -204,8 +357,8 @@ export function App() {
 
   async function loadDebugger() {
     if (!queryRunId) return;
-    const response = await fetch(
-      `${API_BASE}/api/v1/query-runs/${queryRunId}/retrieval`,
+    const response = await apiFetch(
+      `/api/v1/query-runs/${queryRunId}/retrieval`,
     );
     const data = await response.json();
     setEvents(data.events);
@@ -222,20 +375,18 @@ export function App() {
     setUploadStatus(`Preparing ${file.name}`);
     try {
       const checksum = await sha256Hex(file);
-      const sessionResponse = await fetch(
-        `${API_BASE}/api/v1/uploads/sessions`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            filename: file.name,
-            content_type: file.type || "application/octet-stream",
-            size_bytes: file.size,
-            checksum_sha256: checksum,
-            parser_profile: "standard",
-          }),
-        },
-      );
+      const sessionResponse = await apiFetch("/api/v1/uploads/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: file.name,
+          content_type: file.type || "application/octet-stream",
+          size_bytes: file.size,
+          checksum_sha256: checksum,
+          parser_profile: "standard",
+          knowledge_base_id: selectedKnowledgeBaseId || undefined,
+        }),
+      });
       if (!sessionResponse.ok) throw new Error(await sessionResponse.text());
       const session = (await sessionResponse.json()) as UploadSessionAccepted;
       setUploadStatus("Uploading to object storage");
@@ -246,8 +397,8 @@ export function App() {
       });
       if (!putResponse.ok) throw new Error(await putResponse.text());
       setUploadStatus("Completing upload session");
-      const completeResponse = await fetch(
-        `${API_BASE}/api/v1/uploads/sessions/${session.upload_session_id}:complete`,
+      const completeResponse = await apiFetch(
+        `/api/v1/uploads/sessions/${session.upload_session_id}:complete`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -269,7 +420,7 @@ export function App() {
   }
 
   async function pollUploadJob(jobId: string, documentId: string) {
-    const response = await fetch(`${API_BASE}/api/v1/ingestion-jobs/${jobId}`);
+    const response = await apiFetch(`/api/v1/ingestion-jobs/${jobId}`);
     const nextJob = (await response.json()) as Job;
     setUploadJob(nextJob);
     const stage = nextJob.progress?.stage ?? nextJob.status;
@@ -280,8 +431,8 @@ export function App() {
     }
     setUploadBusy(false);
     if (nextJob.status === "completed") {
-      const documentResponse = await fetch(
-        `${API_BASE}/api/v1/documents/${encodeURIComponent(documentId)}`,
+      const documentResponse = await apiFetch(
+        `/api/v1/documents/${encodeURIComponent(documentId)}`,
       );
       if (documentResponse.ok) {
         setUploadDocument(
@@ -302,10 +453,87 @@ export function App() {
           <h1>WikipediaRag</h1>
           <p>Local Russian Wikipedia RAG MVP</p>
         </div>
-        <span className={`status ${ready}`}>{ready}</span>
+        <div className="header-actions">
+          <span className={`status ${ready}`}>{ready}</span>
+          {session.authenticated ? (
+            <>
+              <span className="session-pill">
+                {session.user?.username ?? session.user?.id}
+                {session.active_tenant_id ? "" : " · no tenant"}
+              </span>
+              <button type="button" onClick={logout}>
+                <LogOut size={16} /> Logout
+              </button>
+            </>
+          ) : null}
+        </div>
       </header>
 
-      <section className="band grid">
+      {!session.authenticated && (
+        <section className="band auth-band">
+          <form className="auth-panel" onSubmit={localLogin}>
+            <h2>
+              <KeyRound size={18} /> Sign in
+            </h2>
+            <input
+              value={authUsername}
+              onChange={(event) => setAuthUsername(event.target.value)}
+              placeholder="Username"
+              autoComplete="username"
+            />
+            <input
+              value={authPassword}
+              onChange={(event) => setAuthPassword(event.target.value)}
+              placeholder="Password"
+              type="password"
+              autoComplete="current-password"
+            />
+            <div className="row">
+              <button type="submit">
+                <LogIn size={16} /> Local
+              </button>
+              <button type="button" onClick={oidcLogin}>
+                <KeyRound size={16} /> OIDC
+              </button>
+            </div>
+            {authError && <p className="error">{authError}</p>}
+          </form>
+        </section>
+      )}
+
+      {session.authenticated && (
+        <section className="band kb-toolbar">
+          <label>
+            Knowledge base
+            <select
+              value={selectedKnowledgeBaseId}
+              onChange={(event) =>
+                setSelectedKnowledgeBaseId(event.target.value)
+              }
+            >
+              {knowledgeBases.map((kb) => (
+                <option key={kb.id} value={kb.id}>
+                  {kb.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <form className="row" onSubmit={createKnowledgeBase}>
+            <input
+              value={newKnowledgeBaseName}
+              onChange={(event) => setNewKnowledgeBaseName(event.target.value)}
+              placeholder="New KB name"
+            />
+            <button type="submit">
+              <Database size={16} /> Create
+            </button>
+          </form>
+        </section>
+      )}
+
+      {session.authenticated && (
+        <>
+          <section className="band grid">
         <div className="panel">
           <h2>
             <Database size={18} /> Wikipedia Import
@@ -392,9 +620,9 @@ export function App() {
           )}
           {uploadError && <p className="error">{uploadError}</p>}
         </div>
-      </section>
+          </section>
 
-      <section className="band">
+          <section className="band">
         <form className="chat" onSubmit={submitChat}>
           <h2>
             <MessageSquare size={18} /> Chat
@@ -550,7 +778,9 @@ export function App() {
             ))}
           </div>
         )}
-      </section>
+          </section>
+        </>
+      )}
     </main>
   );
 }

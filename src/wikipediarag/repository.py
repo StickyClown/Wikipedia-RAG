@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from wikipediarag.auth import ActorContext, KnowledgeBaseRole, PlatformRole, TenantRole, effective_knowledge_base_role
 from wikipediarag.db import json_dumps
 from wikipediarag.ids import new_uuid, stable_uuid
 from wikipediarag.schemas import JobStatus
@@ -1055,6 +1056,7 @@ async def create_query_run(
     conn: AsyncConnection,
     *,
     tenant_id: str,
+    knowledge_base_id: str | None = None,
     user_id: str,
     request_id: str,
     client_request_id: str | None,
@@ -1067,16 +1069,17 @@ async def create_query_run(
         text(
             """
             INSERT INTO query_runs(
-              id, tenant_id, user_id, request_id, client_request_id, mode, status,
+              id, tenant_id, knowledge_base_id, user_id, request_id, client_request_id, mode, status,
               input_text, trace_id, started_at
             )
-            VALUES (:id, :tenant_id, :user_id, :request_id, :client_request_id, :mode,
+            VALUES (:id, :tenant_id, :knowledge_base_id, :user_id, :request_id, :client_request_id, :mode,
                     'running', :input_text, :trace_id, now())
             """
         ),
         {
             "id": str(query_run_id),
             "tenant_id": tenant_id,
+            "knowledge_base_id": knowledge_base_id,
             "user_id": user_id,
             "request_id": request_id,
             "client_request_id": client_request_id,
@@ -1086,6 +1089,176 @@ async def create_query_run(
         },
     )
     return query_run_id
+
+
+async def insert_audit_event(
+    conn: AsyncConnection,
+    *,
+    actor: ActorContext | None,
+    action: str,
+    target_type: str,
+    outcome: str,
+    tenant_id: str | None = None,
+    target_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            INSERT INTO audit_events(
+              id, tenant_id, actor_user_id, actor_session_id, request_id, trace_id,
+              action, target_type, target_id, outcome, metadata
+            )
+            VALUES (
+              :id, :tenant_id, :actor_user_id, :actor_session_id, :request_id, :trace_id,
+              :action, :target_type, :target_id, :outcome, CAST(:metadata AS jsonb)
+            )
+            """
+        ),
+        {
+            "id": str(new_uuid()),
+            "tenant_id": tenant_id if tenant_id is not None else actor.active_tenant_id if actor else None,
+            "actor_user_id": actor.user_id if actor else None,
+            "actor_session_id": actor.session_id if actor else None,
+            "request_id": actor.request_id if actor else str(new_uuid()),
+            "trace_id": actor.trace_id if actor else "",
+            "action": action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "outcome": outcome,
+            "metadata": json_dumps(metadata or {}),
+        },
+    )
+
+
+async def load_effective_knowledge_base_role(
+    conn: AsyncConnection,
+    *,
+    user_id: str,
+    tenant_id: str,
+    knowledge_base_id: str,
+) -> KnowledgeBaseRole | None:
+    platform_role = await load_platform_role(conn, user_id=user_id)
+    if platform_role is None:
+        return None
+    tenant_role = await load_tenant_role(conn, user_id=user_id, tenant_id=tenant_id)
+    direct_user_role = await _load_direct_kb_role(
+        conn,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        subject_type="USER",
+        subject_id=user_id,
+    )
+    local_group_roles = await _load_group_kb_roles(
+        conn,
+        user_id=user_id,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        membership_type="LOCAL",
+    )
+    oidc_group_roles = await _load_group_kb_roles(
+        conn,
+        user_id=user_id,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        membership_type="OIDC",
+    )
+    return effective_knowledge_base_role(
+        platform_role=platform_role,
+        tenant_role=tenant_role,
+        direct_user_role=direct_user_role,
+        local_group_roles=local_group_roles,
+        oidc_group_roles=oidc_group_roles,
+    )
+
+
+async def load_platform_role(conn: AsyncConnection, *, user_id: str) -> PlatformRole | None:
+    result = await conn.execute(
+        text("SELECT platform_role FROM users WHERE id = :user_id AND is_disabled = false"),
+        {"user_id": user_id},
+    )
+    row = result.mappings().first()
+    return PlatformRole(str(row["platform_role"])) if row is not None else None
+
+
+async def load_tenant_role(conn: AsyncConnection, *, user_id: str, tenant_id: str) -> TenantRole | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT role
+            FROM tenant_memberships
+            WHERE tenant_id = :tenant_id AND user_id = :user_id
+            """
+        ),
+        {"tenant_id": tenant_id, "user_id": user_id},
+    )
+    row = result.mappings().first()
+    return TenantRole(str(row["role"])) if row is not None else None
+
+
+async def _load_direct_kb_role(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    subject_type: str,
+    subject_id: str,
+) -> KnowledgeBaseRole | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT role
+            FROM knowledge_base_grants
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND subject_type = :subject_type
+              AND subject_id = :subject_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "subject_type": subject_type,
+            "subject_id": subject_id,
+        },
+    )
+    row = result.mappings().first()
+    return KnowledgeBaseRole(str(row["role"])) if row is not None else None
+
+
+async def _load_group_kb_roles(
+    conn: AsyncConnection,
+    *,
+    user_id: str,
+    tenant_id: str,
+    knowledge_base_id: str,
+    membership_type: str,
+) -> list[KnowledgeBaseRole]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT kbg.role
+            FROM group_memberships gm
+            JOIN knowledge_base_grants kbg
+              ON kbg.subject_type = 'GROUP'
+             AND kbg.subject_id = gm.group_id::text
+            JOIN groups g
+              ON g.id = gm.group_id
+            WHERE gm.user_id = :user_id
+              AND gm.membership_type = :membership_type
+              AND g.tenant_id = :tenant_id
+              AND kbg.tenant_id = :tenant_id
+              AND kbg.knowledge_base_id = :kb_id
+            """
+        ),
+        {
+            "user_id": user_id,
+            "membership_type": membership_type,
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+        },
+    )
+    return [KnowledgeBaseRole(str(row["role"])) for row in result.mappings()]
 
 
 async def complete_query_run(

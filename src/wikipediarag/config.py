@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -55,12 +55,49 @@ class Settings(BaseSettings):
     default_user_id: str = "22222222-2222-4222-8222-222222222222"
     default_kb_id: str = "33333333-3333-4333-8333-333333333333"
 
+    auth_mode: Literal["local", "oidc", "hybrid", "test"] = "local"
+    app_secret_file: Path = Path("/run/secrets/app_secret")
+    bootstrap_admin_username: str = "admin"
+    bootstrap_admin_email: str = ""
+    bootstrap_admin_password_file: Path = Path("/run/secrets/bootstrap_admin_password")
+    session_cookie_name: str = "wikipediarag_session"
+    session_idle_seconds: int = 30 * 24 * 60 * 60
+    session_max_seconds: int = 30 * 24 * 60 * 60
+    remember_me_idle_seconds: int = 30 * 24 * 60 * 60
+    remember_me_max_seconds: int = 90 * 24 * 60 * 60
+    session_cookie_secure: bool = True
+    session_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    oidc_discovery_url: str = ""
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret_file: Path = Path("/run/secrets/oidc_client_secret")
+    oidc_redirect_uri: str = "http://localhost:8000/api/v1/auth/oidc/callback"
+    oidc_scope: str = "openid profile email"
+    oidc_claim_sub: str = "sub"
+    oidc_claim_username: str = "preferred_username"
+    oidc_claim_name: str = "name"
+    oidc_claim_email: str = "email"
+    oidc_claim_email_verified: str = "email_verified"
+    oidc_claim_groups: str = "groups"
+    oidc_claim_realm_roles: str = "realm_access.roles"
+    oidc_auto_provision_domains: str = ""
+    oidc_auto_provision_groups: str = ""
+    oidc_auto_provision_roles: str = ""
+    oidc_platform_admin_roles: str = ""
+    oidc_group_catalog_sync_enabled: bool = False
+
     @field_validator("models_config_path", "retrieval_config_path", mode="after")
     @classmethod
     def resolve_container_config_path_locally(cls, value: Path) -> Path:
         if value.exists() or not value.as_posix().startswith("/app/"):
             return value
         return Path(value.as_posix().removeprefix("/app/"))
+
+    @model_validator(mode="after")
+    def validate_auth_mode(self) -> "Settings":
+        if self.auth_mode == "test" and self.app_env != "test":
+            raise ValueError("AUTH_MODE=test is allowed only when APP_ENV=test")
+        return self
 
     @property
     def is_development(self) -> bool:
