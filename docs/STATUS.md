@@ -4,13 +4,13 @@ Last updated: 2026-08-01
 
 ## Current milestone
 
-Stage 1 Docker runtime validation has been run and recorded. The current focus
-is fixing the blockers found during those smokes before declaring the runtime
-baseline stable.
+Stage 2 ordinary search has been implemented on top of the current runtime
+baseline. The project now has a viewer-safe `POST /api/v1/search` endpoint and
+a separate UI search section independent from chat and `search:debug`.
 
-Completion criterion: document purge completes, the official document-upload
-and cross-tenant smoke commands run under the default Docker auth/profile
-configuration, and the smoke set can be repeated with no blocker entries.
+Completion criterion for the next increment: improve document navigation by
+adding document structure, in-document search and opening a precise document
+location from ordinary search results.
 
 ## Implemented now
 
@@ -23,19 +23,70 @@ configuration, and the smoke set can be repeated with no blocker entries.
 - Parser runtime hardening in Compose: Xberg, Docling and metadata-service with sandbox settings, separate concurrency limiters and safe parser progress metadata.
 - Retrieval: BM25, dense vectors, RRF, rerank, dedup/page quota, parent expansion, answerability, citation validation and experimental safe diagnostics.
 - Direct Multi-KB chat/debug retrieval with all-KB role validation and all-KB readiness preflight. Extended Search remains single-KB.
+- Ordinary user search: viewer-scoped `POST /api/v1/search`, metadata filters,
+  published active-document results only, safe `KB_NOT_READY` handling and a
+  separate React/Vite search section with result list, source open action and
+  uploaded-document locator fallback.
 - Query-run observability V1: chat/debug queries persist protected query runs and retrieval events with stable stage names, query transforms, candidate rank movement, decision reasons, answerability reason codes, Model Gateway safe metadata, feedback/evaluation event endpoints and an updated Retrieval Debugger. PostgreSQL remains the source of truth; OpenTelemetry export is optional/no-op when packages are absent.
 - Retrieval observability now carries explicit per-run `transform_id`/`subquery_id` query context through direct, extended and Multi-KB stage events, candidate debug payloads, extended harness search yield metrics and answer context source summaries.
 - Eval and validation tooling: local-auth eval client, release-gate provider preflight, warm retrieval profiling, MIRACL-RU adapter, document corpus verification and cross-tenant hardening smoke command.
 
 ## In progress
 
-- Stage 1 runtime blockers: deferred document purge failure, auth/profile
-  mismatch in the official smoke commands.
 - Browser UI OIDC through Dockerized API after the public/internal Keycloak URL strategy is decided.
 - External deployment hardening remains planned, not supported production operation.
 
 ## Latest validation
 
+- Stage 2 ordinary search implementation validation on 2026-08-01:
+  `uv run pytest tests\unit\test_auth_service.py tests\unit\test_document_deletion_lifecycle.py tests\unit\test_cli_cross_tenant_hardening.py tests\unit\test_search_endpoint.py tests\unit\test_api_auth_disabled.py tests\unit\test_multi_kb_retrieval.py -q`
+  -> exit 0, 40 passed, 2 warnings;
+  `uv run pytest tests\unit\test_document_deletion_lifecycle.py tests\unit\test_upload_batches.py tests\unit\test_acl_mirroring_metadata.py tests\unit\test_multi_kb_retrieval.py tests\unit\test_cli_cross_tenant_hardening.py -q`
+  -> exit 0, 26 passed, 2 warnings;
+  targeted `uv run mypy` for the changed backend/test files -> exit 0;
+  `uv run ruff check` for changed backend/test files -> exit 0;
+  `uv run ruff format --check` for changed backend/test files -> exit 0;
+  `docker compose config --quiet` -> exit 0;
+  `cd services/ui; pnpm lint` -> exit 0;
+  `cd services/ui; pnpm typecheck` -> exit 0;
+  `cd services/ui; pnpm build` -> exit 0.
+  Full `uv run mypy src tests` was also run at this point and exposed
+  test-only typing issues that were closed in the following validation entry:
+  `tests\unit\test_retrieval_answering.py:148-149` and
+  `tests\unit\test_extended.py:55`.
+  Runtime: `docker compose up -d --build` -> exit 0;
+  `Invoke-RestMethod -Uri http://localhost:8000/ready` -> exit 0 after
+  startup, status ok for PostgreSQL and Model Gateway;
+  `uv run python -m wikipediarag.cli verify-document-upload --skip-compose`
+  -> exit 0, passed=true, report
+  `artifacts/validation/document-upload/20260801T181338Z`;
+  `uv run python -m wikipediarag.cli verify-cross-tenant-hardening --skip-compose`
+  -> exit 0, passed=true, report
+  `artifacts/validation/cross-tenant-hardening/20260801T181428Z`.
+  Ordinary search runtime smoke used local auth + CSRF and KB
+  `eff3437d-f000-45d1-88fb-3a1d78f8ab67`: filtered
+  `POST /api/v1/search` for `verify-metadata` returned HTTP 200 with 1 result,
+  source metadata and locator, artifact
+  `artifacts/validation/runtime-smokes/20260801T212051Z/ordinary-search-title-filtered.json`.
+  Document deletion runtime smoke on `doc:a43385f99cb1eb1a043244a8` returned
+  lifecycle `deleting`, created deferred purge job
+  `cd045ccc-a27b-42ac-861e-44c3f6f5cf55`, and the deleted document was absent
+  from ordinary search after delete; artifacts
+  `artifacts/validation/runtime-smokes/20260801T212106Z/document-delete.json`,
+  `artifacts/validation/runtime-smokes/20260801T212106Z/ordinary-search-after-delete.json`
+  and
+  `artifacts/validation/runtime-smokes/20260801T212117Z/document-purge-job.json`.
+- Full backend typecheck cleanup on 2026-08-01:
+  fixed the remaining test-only typing issues in
+  `tests\unit\test_retrieval_answering.py` and
+  `tests\unit\test_extended.py`;
+  `uv run mypy src tests` -> exit 0, no issues found in 97 source files;
+  `uv run pytest tests\unit\test_retrieval_answering.py tests\unit\test_extended.py -q`
+  -> exit 0, 23 passed;
+  `uv run ruff check tests\unit\test_retrieval_answering.py tests\unit\test_extended.py`
+  -> exit 0;
+  `uv run ruff format --check tests\unit\test_retrieval_answering.py tests\unit\test_extended.py`
+  -> exit 0, 2 files already formatted.
 - Stage 1 Docker runtime validation on 2026-08-01:
   `uv run pytest tests\unit\test_document_deletion_lifecycle.py tests\unit\test_upload_batches.py tests\unit\test_acl_mirroring_metadata.py tests\unit\test_multi_kb_retrieval.py tests\unit\test_cli_cross_tenant_hardening.py -q`
   -> exit 0, 22 passed, 2 warnings;
@@ -182,15 +233,6 @@ configuration, and the smoke set can be repeated with no blocker entries.
 
 ## Active blockers and risks
 
-- Deferred document purge failed in the 2026-08-01 Docker smoke: DELETE/soft
-  removal worked, but immediate-retention purge job ended `failed` with safe
-  error code `ClientError`.
-- Official `verify-document-upload --skip-compose` is not currently usable as a
-  default-auth smoke: it gets HTTP 401 without auth handling; the
-  `AUTH_DISABLED=true` workaround hits the audited-write UUID session-id bug.
-- Official `verify-cross-tenant-hardening --skip-compose` is blocked by
-  retrieval profile/index alias mismatch: `upload_mock` expects
-  `mock_embed_default`, while the uploaded index exposes `embed_default`.
 - Runtime browser/MinIO batch upload smoke has not yet been recorded for the implemented public multi-file UI.
 - Multi-KB direct retrieval is implemented; Multi-KB Extended Search remains future work.
 - API `/ready` currently checks PostgreSQL and Model Gateway readiness; Redis/Valkey, MinIO and OpenSearch are Compose dependencies but are not confirmed readiness checks.
@@ -201,9 +243,9 @@ configuration, and the smoke set can be repeated with no blocker entries.
 
 ## Next approved task
 
-Fix the Stage 1 runtime blockers without broad refactoring: deferred purge
-`ClientError`, official document-upload smoke authentication, and official
-cross-tenant smoke retrieval profile compatibility.
+No new implementation task is approved. The next roadmap item is Stage 3:
+document structure, in-document search and opening precise locations from
+ordinary search results.
 
 ## Related artifacts
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from wikipediarag.config import Settings
@@ -49,7 +51,11 @@ async def test_extended_search_records_tool_and_total_timings(monkeypatch: pytes
         async def execute(self, *_args: object, **_kwargs: object) -> None:
             return None
 
-    async def fake_retrieve(*_args: object, **_kwargs: object) -> RetrievalResult:
+    query_contexts: list[dict[str, object]] = []
+
+    async def fake_retrieve(*_args: object, **kwargs: object) -> RetrievalResult:
+        query_context = dict(cast(dict[str, object], kwargs["query_context"]))
+        query_contexts.append(query_context)
         return RetrievalResult(
             query="subquery",
             trace_id="trace",
@@ -61,9 +67,22 @@ async def test_extended_search_records_tool_and_total_timings(monkeypatch: pytes
                     section_path=["Россия"],
                     content="Россия - государство.",
                     source_url="http://localhost/source",
+                    scores={"bm25": 2.5, "fusion": 0.2},
+                    metadata={
+                        "query_context": query_context,
+                        "subquery_id": query_context["subquery_id"],
+                        "transform_id": query_context["transform_id"],
+                    },
                 )
             ],
-            events=[{"stage": "timings", "timings_ms": {"retrieval_total": 3, "bm25": 1}}],
+            events=[
+                {
+                    "stage": "bm25",
+                    "count": 1,
+                    "candidates": [{"scores": {"bm25": 2.5, "fusion": 0.2}}],
+                },
+                {"stage": "timings", "timings_ms": {"retrieval_total": 3, "bm25": 1}},
+            ],
         )
 
     monkeypatch.setattr("wikipediarag.extended.retrieve", fake_retrieve)
@@ -90,8 +109,17 @@ async def test_extended_search_records_tool_and_total_timings(monkeypatch: pytes
     )
     harness_event = next(event for event in result.events if event["stage"] == "harness")
     assert tool_event["latency_ms"] >= 0
+    assert tool_event["stable_stage"] == "retrieval.extended"
+    assert tool_event["subquery_id"] == "sq.decomposition.1"
+    assert tool_event["transform_id"] == "tr.decomposition.1"
+    assert tool_event["query_hash"]
+    assert tool_event["retrieved_count"] == 1
+    assert tool_event["selected_count"] == 1
+    assert tool_event["max_bm25_score"] == 2.5
+    assert tool_event["max_fusion_score"] == 0.2
     assert tool_event["retrieval_timings_ms"] == {"retrieval_total": 3, "bm25": 1}
     assert harness_event["timings_ms"]["extended_search_total"] >= 0
+    assert query_contexts[0]["subquery_id"] == "sq.decomposition.1"
 
 
 @pytest.mark.asyncio
@@ -149,6 +177,11 @@ async def test_extended_bridge_context_keeps_film_and_series_hops(monkeypatch: p
         profile=profile,
     )
 
+    transform = next(event for event in result.events if event["stage"] == "query_transform")
+    bridge = next(item for item in transform["transforms"] if item["type"] == "bridge_queries")
+    assert bridge["status"] == "performed"
+    assert bridge["query_refs"][0]["subquery_id"] == "sq.bridge.1"
+    assert transform["query_refs"][0]["subquery_id"] == "sq.bridge.1"
     assert [item.title for item in result.evidence[:2]] == ["1040 (фильм)", "104 (серия жилых домов)"]
 
 

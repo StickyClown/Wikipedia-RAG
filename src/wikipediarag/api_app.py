@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 import httpx
@@ -31,12 +31,14 @@ from wikipediarag.auth import (
 from wikipediarag.auth import require_kb_role as enforce_kb_role
 from wikipediarag.auth_service import (
     AuthenticationError,
+    auth_disabled_actor,
     authenticate_local_user,
     change_local_password,
     create_session,
     csrf_token_matches,
     ensure_bootstrap_admin,
     load_actor_for_session,
+    load_bootstrap_admin_user,
     load_session_user,
     local_login_enabled,
     revoke_session,
@@ -47,30 +49,47 @@ from wikipediarag.auth_service import (
 )
 from wikipediarag.config import get_settings
 from wikipediarag.db import connect, ensure_schema
+from wikipediarag.diagnostics import (
+    build_answer_artifact,
+    build_failure_artifact,
+    build_search_plan,
+    initial_route_decision,
+    repair_route_decision,
+)
 from wikipediarag.document_ingestion import UploadValidationError, safe_upload_filename
 from wikipediarag.extended import run_extended_search, should_start_extended
 from wikipediarag.ids import stable_hash
+from wikipediarag.observability import content_policy, safe_error_code, safe_telemetry_payload
 from wikipediarag.oidc_service import complete_oidc_callback, oidc_login_enabled, start_oidc_flow
 from wikipediarag.repository import (
     complete_query_run,
+    create_document_deletion_job,
     create_document_upload_records,
     create_ingestion_job,
     create_query_run,
     create_reprocess_job,
+    create_upload_batch,
     create_upload_session,
     fail_query_run,
+    get_document_lifecycle,
     get_document_public,
     get_knowledge_base,
+    get_upload_batch_status,
     get_upload_session,
     insert_audit_event,
+    insert_retrieval_event,
     list_document_versions_public,
     list_knowledge_bases,
     load_effective_knowledge_base_role,
+    load_index_version_by_read_alias,
     load_retrieval_events,
     request_cancel,
     request_resume,
+    search_public_chunks,
+    soft_delete_document,
+    update_query_run_usage,
 )
-from wikipediarag.retrieval import retrieve
+from wikipediarag.retrieval import retrieve, retrieve_multi
 from wikipediarag.retrieval_contract import KnowledgeBaseNotReady, validate_active_retrieval_contract
 from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import (
@@ -79,6 +98,7 @@ from wikipediarag.schemas import (
     AuthUserResponse,
     ChatRequest,
     DebugSearchRequest,
+    DocumentDeleteResponse,
     DocumentReprocessResponse,
     GroupCreate,
     GroupPatch,
@@ -89,10 +109,20 @@ from wikipediarag.schemas import (
     KnowledgeBasePatch,
     LocalLoginRequest,
     LocalPasswordChangeRequest,
+    QueryRunEvaluationRequest,
+    QueryRunFeedbackRequest,
+    RetrievalResult,
+    SearchRequest,
+    SearchResponse,
+    SearchResult,
     SseEvent,
     TenantCreate,
     TenantPatch,
     TenantSelectionRequest,
+    UploadBatchAccepted,
+    UploadBatchCreate,
+    UploadBatchItemAccepted,
+    UploadBatchStatus,
     UploadCompleteResponse,
     UploadSessionAccepted,
     UploadSessionComplete,
@@ -101,6 +131,7 @@ from wikipediarag.schemas import (
     UserPatch,
     ZimImportRequest,
 )
+from wikipediarag.search_index import READ_ALIAS, delete_document_chunks
 from wikipediarag.storage import create_presigned_put_url, head_object
 
 app = FastAPI(title="WikipediaRag API")
@@ -210,7 +241,9 @@ async def local_login(
     async with connect() as conn:
         user = await authenticate_local_user(conn, username=payload.username, password=payload.password)
         active_tenant_id = (
-            None if user.platform_role.value == "PLATFORM_ADMIN" else await _default_active_tenant(conn, user.user_id)
+            settings.default_tenant_id
+            if user.platform_role == PlatformRole.platform_admin
+            else await _default_active_tenant(conn, user.user_id)
         )
         created = await create_session(
             conn,
@@ -326,9 +359,12 @@ async def logout(
     response: Response,
     x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
 ) -> dict[str, str]:
+    settings = get_settings()
+    if settings.auth_disabled:
+        _delete_session_cookie(response, settings)
+        return {"status": "logged_out"}
     actor = await _require_actor(request)
     await _require_csrf(actor, x_csrf_token)
-    settings = get_settings()
     async with connect() as conn:
         await revoke_session(conn, session_id=actor.session_id)
         await _audit(
@@ -346,9 +382,33 @@ async def logout(
 
 @app.get("/api/v1/auth/session")
 async def get_session(request: Request) -> AuthSessionResponse:
+    settings = get_settings()
     actor = await _load_actor(request)
     if actor is None:
         return AuthSessionResponse(authenticated=False)
+    if settings.auth_disabled:
+        async with connect() as conn:
+            user = await load_bootstrap_admin_user(conn, settings)
+        return AuthSessionResponse(
+            authenticated=True,
+            user=(
+                _auth_user_response(user)
+                if user is not None
+                else AuthUserResponse(
+                    id=actor.user_id,
+                    username=settings.bootstrap_admin_username,
+                    display_name=settings.bootstrap_admin_username,
+                    platform_role=PlatformRole.platform_admin.value,
+                    password_change_required=False,
+                )
+            ),
+            active_tenant_id=actor.active_tenant_id,
+            tenant_role=actor.tenant_role.value if actor.tenant_role is not None else None,
+            authentication_method=actor.authentication_method.value,
+            session_id=actor.session_id,
+            csrf_token=None,
+            expires_at=None,
+        )
     async with connect() as conn:
         user = await load_session_user(conn, user_id=actor.user_id)
         csrf_token = await rotate_csrf_token(conn, session_id=actor.session_id)
@@ -784,7 +844,7 @@ async def list_kb_grants(kb_id: str, request: Request) -> list[dict[str, Any]]:
         result = await conn.execute(
             text(
                 """
-                SELECT id, subject_type, subject_id, role, created_by_user_id, created_at, updated_at
+                SELECT id, subject_type, subject_id, role, created_by_user_id, metadata, created_at, updated_at
                 FROM knowledge_base_grants
                 WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id
                 ORDER BY created_at DESC
@@ -796,7 +856,7 @@ async def list_kb_grants(kb_id: str, request: Request) -> list[dict[str, Any]]:
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/grants")
-async def create_kb_grant(kb_id: str, payload: KnowledgeBaseGrantCreate, request: Request) -> dict[str, str]:
+async def create_kb_grant(kb_id: str, payload: KnowledgeBaseGrantCreate, request: Request) -> dict[str, Any]:
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
     role = KnowledgeBaseRole(payload.role)
@@ -805,15 +865,26 @@ async def create_kb_grant(kb_id: str, payload: KnowledgeBaseGrantCreate, request
         required = KnowledgeBaseRole.owner if role == KnowledgeBaseRole.owner else KnowledgeBaseRole.manager
         await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=required)
         grant_id = str(uuid.uuid4())
+        metadata = await _kb_grant_acl_metadata(
+            conn,
+            tenant_id=tenant_id,
+            subject_type=subject_type,
+            subject_id=payload.subject_id,
+            role=role,
+            actor=actor,
+        )
         await conn.execute(
             text(
                 """
                 INSERT INTO knowledge_base_grants(
-                  id, tenant_id, knowledge_base_id, subject_type, subject_id, role, created_by_user_id
+                  id, tenant_id, knowledge_base_id, subject_type, subject_id, role, created_by_user_id, metadata
                 )
-                VALUES (:id, :tenant_id, :kb_id, :subject_type, :subject_id, :role, :created_by_user_id)
+                VALUES (
+                  :id, :tenant_id, :kb_id, :subject_type, :subject_id, :role,
+                  :created_by_user_id, CAST(:metadata AS jsonb)
+                )
                 ON CONFLICT (tenant_id, knowledge_base_id, subject_type, subject_id)
-                DO UPDATE SET role = EXCLUDED.role, updated_at = now()
+                DO UPDATE SET role = EXCLUDED.role, metadata = EXCLUDED.metadata, updated_at = now()
                 """
             ),
             {
@@ -824,6 +895,7 @@ async def create_kb_grant(kb_id: str, payload: KnowledgeBaseGrantCreate, request
                 "subject_id": payload.subject_id,
                 "role": role.value,
                 "created_by_user_id": actor.user_id,
+                "metadata": json.dumps(metadata, ensure_ascii=False),
             },
         )
         await _audit(
@@ -835,7 +907,7 @@ async def create_kb_grant(kb_id: str, payload: KnowledgeBaseGrantCreate, request
             target_id=kb_id,
             outcome="success",
         )
-    return {"id": grant_id, "role": role.value}
+    return {"id": grant_id, "role": role.value, "metadata": metadata}
 
 
 @app.patch("/api/v1/knowledge-bases/{kb_id}/grants/{grant_id}")
@@ -844,22 +916,49 @@ async def patch_kb_grant(
     grant_id: str,
     payload: KnowledgeBaseGrantPatch,
     request: Request,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
     role = KnowledgeBaseRole(payload.role)
     async with connect() as conn:
         required = KnowledgeBaseRole.owner if role == KnowledgeBaseRole.owner else KnowledgeBaseRole.manager
         await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=required)
+        existing = await conn.execute(
+            text(
+                """
+                SELECT subject_type, subject_id
+                FROM knowledge_base_grants
+                WHERE id = :id AND tenant_id = :tenant_id AND knowledge_base_id = :kb_id
+                """
+            ),
+            {"id": grant_id, "tenant_id": tenant_id, "kb_id": kb_id},
+        )
+        grant = existing.mappings().first()
+        if grant is None:
+            raise HTTPException(status_code=404, detail="knowledge base grant not found")
+        metadata = await _kb_grant_acl_metadata(
+            conn,
+            tenant_id=tenant_id,
+            subject_type=GrantSubjectType(str(grant["subject_type"])),
+            subject_id=str(grant["subject_id"]),
+            role=role,
+            actor=actor,
+        )
         await conn.execute(
             text(
                 """
                 UPDATE knowledge_base_grants
-                SET role = :role, updated_at = now()
+                SET role = :role, metadata = CAST(:metadata AS jsonb), updated_at = now()
                 WHERE id = :id AND tenant_id = :tenant_id AND knowledge_base_id = :kb_id
                 """
             ),
-            {"id": grant_id, "tenant_id": tenant_id, "kb_id": kb_id, "role": role.value},
+            {
+                "id": grant_id,
+                "tenant_id": tenant_id,
+                "kb_id": kb_id,
+                "role": role.value,
+                "metadata": json.dumps(metadata, ensure_ascii=False),
+            },
         )
         await _audit(
             conn,
@@ -870,7 +969,7 @@ async def patch_kb_grant(
             target_id=grant_id,
             outcome="success",
         )
-    return {"status": "updated"}
+    return {"status": "updated", "metadata": metadata}
 
 
 @app.delete("/api/v1/knowledge-bases/{kb_id}/grants/{grant_id}")
@@ -1078,6 +1177,119 @@ async def create_upload_session_endpoint(payload: UploadSessionCreate, request: 
     )
 
 
+@app.post("/api/v1/uploads/batches")
+async def create_upload_batch_endpoint(payload: UploadBatchCreate, request: Request) -> UploadBatchAccepted:
+    settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    kb_id = payload.knowledge_base_id or settings.default_kb_id
+    sanitized_items: list[tuple[int, str]] = []
+    seen_items: set[tuple[str, str]] = set()
+    for index, item in enumerate(payload.items):
+        try:
+            filename = safe_upload_filename(item.filename)
+        except UploadValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"code": exc.code, "message": exc.safe_message, "details": {"item_index": index}}},
+            ) from exc
+        duplicate_key = (filename.casefold(), item.checksum_sha256.lower())
+        if duplicate_key in seen_items:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": {
+                        "code": "DUPLICATE_BATCH_ITEM",
+                        "message": "batch contains duplicate filename/checksum item",
+                        "details": {"item_index": index},
+                    }
+                },
+            )
+        seen_items.add(duplicate_key)
+        sanitized_items.append((index, filename))
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
+        kb = await get_knowledge_base(conn, tenant_id, kb_id)
+    if kb is None:
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+
+    async with connect() as conn:
+        batch_id = await create_upload_batch(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            total_items=len(payload.items),
+            metadata={**payload.metadata, "upload_contract": "upload_batches_v1"},
+        )
+        accepted_items: list[UploadBatchItemAccepted] = []
+        for index, filename in sanitized_items:
+            item = payload.items[index]
+            checksum = item.checksum_sha256.lower()
+            object_key = (
+                f"uploads/{tenant_id}/{kb_id}/batches/{batch_id}/{index:04d}-"
+                f"{stable_hash([filename, checksum], 16)}/{checksum}"
+            )
+            session_id, expires_at = await create_upload_session(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                batch_id=str(batch_id),
+                filename=filename,
+                content_type=item.content_type,
+                size_bytes=item.size_bytes,
+                checksum_sha256=checksum,
+                object_key=object_key,
+                parser_profile=item.parser_profile,
+                metadata=item.metadata,
+                ttl_seconds=settings.upload_session_ttl_seconds,
+            )
+            upload_url = await asyncio.to_thread(
+                create_presigned_put_url,
+                object_key,
+                content_type=item.content_type,
+                expires_seconds=settings.upload_session_ttl_seconds,
+                settings=settings,
+            )
+            accepted_items.append(
+                UploadBatchItemAccepted(
+                    upload_session_id=str(session_id),
+                    upload_url=upload_url,
+                    expires_at=expires_at,
+                    required_headers={"Content-Type": item.content_type},
+                    filename=filename,
+                    content_type=item.content_type,
+                    size_bytes=item.size_bytes,
+                    checksum_sha256=checksum,
+                )
+            )
+    return UploadBatchAccepted(
+        batch_id=str(batch_id),
+        knowledge_base_id=kb_id,
+        status="received",
+        total_items=len(accepted_items),
+        items=accepted_items,
+    )
+
+
+@app.get("/api/v1/uploads/batches/{batch_id}")
+async def get_upload_batch_endpoint(batch_id: str, request: Request) -> UploadBatchStatus:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        status = await get_upload_batch_status(conn, tenant_id=tenant_id, batch_id=batch_id)
+        if status is not None:
+            await _require_kb_role(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_id=str(status["knowledge_base_id"]),
+                role=KnowledgeBaseRole.editor,
+            )
+    if status is None:
+        raise HTTPException(status_code=404, detail="upload batch not found")
+    return UploadBatchStatus.model_validate(status)
+
+
 @app.post("/api/v1/uploads/sessions/{upload_session_id}:complete")
 async def complete_upload_session_endpoint(
     upload_session_id: str,
@@ -1193,6 +1405,68 @@ async def get_document_versions(document_id: str, request: Request) -> dict[str,
     return {"document_id": document_id, "versions": _jsonable(versions)}
 
 
+@app.delete("/api/v1/documents/{document_id}", status_code=202)
+async def delete_document(document_id: str, request: Request) -> DocumentDeleteResponse:
+    settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    purge_after = datetime.now(UTC) + timedelta(days=max(0, settings.document_soft_delete_retention_days))
+    async with connect() as conn:
+        document = await get_document_lifecycle(conn, tenant_id, document_id)
+        if document is None:
+            raise HTTPException(status_code=404, detail="document not found")
+        kb_id = str(document["knowledge_base_id"])
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.owner)
+        kb = await get_knowledge_base(conn, tenant_id, kb_id)
+        read_alias = str(kb.get("active_index") or READ_ALIAS) if kb else READ_ALIAS
+        if document.get("lifecycle_state") == "deleted":
+            return DocumentDeleteResponse(
+                document_id=document_id,
+                job_id=None,
+                lifecycle_state="deleted",
+                purge_after=cast(datetime | None, document.get("purge_after")),
+            )
+        await soft_delete_document(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            document_id=document_id,
+            deleted_by_user_id=actor.user_id,
+            purge_after=purge_after,
+            deletion_reason="user_requested",
+        )
+        job_id = await create_document_deletion_job(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            document_id=document_id,
+            purge_after=purge_after,
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="document.delete_requested",
+            target_type="document",
+            target_id=document_id,
+            outcome="success",
+        )
+    await asyncio.to_thread(
+        delete_document_chunks,
+        tenant_id=tenant_id,
+        knowledge_base_id=kb_id,
+        document_id=document_id,
+        settings=settings,
+        read_alias=read_alias,
+    )
+    return DocumentDeleteResponse(
+        document_id=document_id,
+        job_id=str(job_id),
+        lifecycle_state="deleting",
+        purge_after=purge_after,
+    )
+
+
 @app.post("/api/v1/documents/{document_id}:reprocess")
 async def reprocess_document(document_id: str, request: Request) -> DocumentReprocessResponse:
     actor = await _require_actor(request)
@@ -1223,6 +1497,42 @@ async def reprocess_document(document_id: str, request: Request) -> DocumentRepr
     )
 
 
+@app.post("/api/v1/search")
+async def search(payload: SearchRequest, request: Request) -> SearchResponse:
+    settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    kb_ids = _kb_scope_ids(payload.knowledge_base_ids, settings.default_kb_id)
+    try:
+        async with connect() as conn:
+            await _require_kb_scope_role(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_ids=kb_ids,
+                role=KnowledgeBaseRole.viewer,
+            )
+            await _require_search_scope_ready(conn, tenant_id=tenant_id, kb_ids=kb_ids)
+            rows = await search_public_chunks(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_ids=kb_ids,
+                query=payload.query,
+                limit=payload.limit,
+                offset=payload.offset,
+                filters=payload.filters.model_dump(mode="json", exclude_none=True),
+            )
+    except KnowledgeBaseNotReady as exc:
+        raise _kb_not_ready_http(exc, actor.request_id) from exc
+    has_more = len(rows) > payload.limit
+    return SearchResponse(
+        results=[_search_result(row, query=payload.query) for row in rows[: payload.limit]],
+        limit=payload.limit,
+        offset=payload.offset,
+        has_more=has_more,
+    )
+
+
 @app.post("/api/v1/chat")
 async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     settings = get_settings()
@@ -1235,31 +1545,70 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
         settings,
         payload.retrieval_overrides,
     )
-    kb_id = _single_kb_id(payload.knowledge_base_ids, settings.default_kb_id, request_id=request_id)
+    kb_ids = _kb_scope_ids(payload.knowledge_base_ids, settings.default_kb_id)
+    primary_kb_id = kb_ids[0]
+    classifier_suggested_extended = should_start_extended(payload.message)
+    route_decision = initial_route_decision(
+        mode=payload.mode.value,
+        extended_policy=active_profile.postprocess.extended_search,
+        classifier_suggested_extended=classifier_suggested_extended,
+    )
+    if len(kb_ids) > 1 and route_decision["route"] != "direct_retrieval":
+        route_decision = {
+            "route": "direct_retrieval",
+            "reason": "multi_kb_extended_search_not_enabled_v1",
+        }
+    search_plan = build_search_plan(
+        query=payload.message,
+        mode=payload.mode.value,
+        route=route_decision["route"],
+        route_reason=route_decision["reason"],
+        knowledge_base_id=primary_kb_id,
+        knowledge_base_ids=kb_ids,
+        trace_id=trace_id,
+        profile=active_profile,
+    )
     try:
         async with connect() as conn:
-            await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
-            await validate_active_retrieval_contract(
+            await _require_kb_scope_role(
                 conn,
+                actor=actor,
                 tenant_id=tenant_id,
-                knowledge_base_id=kb_id,
-                profile=active_profile,
-                retrieval_overrides=payload.retrieval_overrides,
-                settings=settings,
+                kb_ids=kb_ids,
+                role=KnowledgeBaseRole.viewer,
             )
+            for kb_id in kb_ids:
+                await validate_active_retrieval_contract(
+                    conn,
+                    tenant_id=tenant_id,
+                    knowledge_base_id=kb_id,
+                    profile=active_profile,
+                    retrieval_overrides=payload.retrieval_overrides,
+                    settings=settings,
+                )
     except KnowledgeBaseNotReady as exc:
         raise _kb_not_ready_http(exc, request_id) from exc
     async with connect() as conn:
+        initial_usage = _initial_query_run_usage(
+            mode=payload.mode.value,
+            profile=active_profile,
+            retrieval_overrides=payload.retrieval_overrides,
+            knowledge_base_ids=kb_ids,
+            route_decision=route_decision,
+            trace_id=trace_id,
+            settings=settings,
+        )
         query_run_id = await create_query_run(
             conn,
             tenant_id=tenant_id,
-            knowledge_base_id=kb_id,
+            knowledge_base_id=primary_kb_id,
             user_id=actor.user_id,
             request_id=request_id,
             client_request_id=payload.client_request_id,
             mode=payload.mode.value,
             input_text=payload.message,
             trace_id=trace_id,
+            usage=initial_usage,
         )
 
     async def event_stream() -> AsyncIterator[str]:
@@ -1267,22 +1616,36 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
         current_stage = "question_received"
         last_successful_stage = "question_received"
         retrieval: Any | None = None
+        actual_search_plan = search_plan
         yield _event(
             SseEvent(
                 event="run.started",
                 request_id=request_id,
                 query_run_id=str(query_run_id),
                 sequence=sequence,
-                data={"trace_id": trace_id},
+                data={"trace_id": trace_id, "search_plan": actual_search_plan},
             )
         )
         try:
             async with connect() as conn:
                 current_stage = "path_selected"
-                use_harness_first = payload.mode.value == "extended" or (
-                    active_profile.postprocess.extended_search in {"always", "conditional"}
-                    and should_start_extended(payload.message)
+                await insert_retrieval_event(
+                    conn,
+                    tenant_id=tenant_id,
+                    query_run_id=str(query_run_id),
+                    trace_id=trace_id,
+                    event_type="query_stage",
+                    stage="path_selected",
+                    payload=_path_selection_event(
+                        mode=payload.mode.value,
+                        route_decision=route_decision,
+                        knowledge_base_ids=kb_ids,
+                        profile=active_profile,
+                        search_plan=actual_search_plan,
+                        retrieval_overrides=payload.retrieval_overrides,
+                    ),
                 )
+                use_harness_first = route_decision["route"] == "extended_first"
                 last_successful_stage = "path_selected"
                 if use_harness_first:
                     current_stage = "extended_search"
@@ -1290,7 +1653,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         conn,
                         payload.message,
                         tenant_id=tenant_id,
-                        knowledge_base_id=kb_id,
+                        knowledge_base_id=primary_kb_id,
                         query_run_id=str(query_run_id),
                         trace_id=trace_id,
                         settings=settings,
@@ -1300,19 +1663,33 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     last_successful_stage = "extended_search"
                 else:
                     current_stage = "retrieval"
-                    retrieval = await retrieve(
-                        conn,
-                        payload.message,
-                        tenant_id=tenant_id,
-                        knowledge_base_id=kb_id,
-                        query_run_id=str(query_run_id),
-                        trace_id=trace_id,
-                        settings=settings,
-                        profile=active_profile,
-                    )
+                    if len(kb_ids) > 1:
+                        retrieval = await retrieve_multi(
+                            conn,
+                            payload.message,
+                            tenant_id=tenant_id,
+                            knowledge_base_ids=kb_ids,
+                            query_run_id=str(query_run_id),
+                            trace_id=trace_id,
+                            settings=settings,
+                            profile=active_profile,
+                            profile_overrides=payload.retrieval_overrides,
+                        )
+                    else:
+                        retrieval = await retrieve(
+                            conn,
+                            payload.message,
+                            tenant_id=tenant_id,
+                            knowledge_base_id=primary_kb_id,
+                            query_run_id=str(query_run_id),
+                            trace_id=trace_id,
+                            settings=settings,
+                            profile=active_profile,
+                        )
                     last_successful_stage = "retrieval"
                     if (
-                        retrieval.answerability
+                        len(kb_ids) == 1
+                        and retrieval.answerability
                         and should_try_extended_search(retrieval.answerability)
                         and active_profile.postprocess.extended_search
                         in {
@@ -1320,12 +1697,44 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                             "conditional",
                         }
                     ):
+                        repair_decision = repair_route_decision(retrieval.answerability)
+                        actual_search_plan = build_search_plan(
+                            query=payload.message,
+                            mode=payload.mode.value,
+                            route=repair_decision["route"],
+                            route_reason=repair_decision["reason"],
+                            knowledge_base_id=primary_kb_id,
+                            knowledge_base_ids=kb_ids,
+                            trace_id=trace_id,
+                            profile=active_profile,
+                        )
                         current_stage = "extended_search"
+                        await update_query_run_usage(
+                            conn,
+                            query_run_id=str(query_run_id),
+                            usage={"extended_search_repair": repair_decision},
+                        )
+                        await insert_retrieval_event(
+                            conn,
+                            tenant_id=tenant_id,
+                            query_run_id=str(query_run_id),
+                            trace_id=trace_id,
+                            event_type="query_stage",
+                            stage="path_selected",
+                            payload=_path_selection_event(
+                                mode=payload.mode.value,
+                                route_decision=repair_decision,
+                                knowledge_base_ids=kb_ids,
+                                profile=active_profile,
+                                search_plan=actual_search_plan,
+                                retrieval_overrides=payload.retrieval_overrides,
+                            ),
+                        )
                         retrieval = await run_extended_search(
                             conn,
                             payload.message,
                             tenant_id=tenant_id,
-                            knowledge_base_id=kb_id,
+                            knowledge_base_id=primary_kb_id,
                             query_run_id=str(query_run_id),
                             trace_id=trace_id,
                             settings=settings,
@@ -1337,6 +1746,15 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
             answer, validation = await generate_answer(payload.message, retrieval, settings, active_profile)
             last_successful_stage = "answer_generation"
             timings_ms = _combined_timings(retrieval.model_dump(), validation)
+            answer_artifact = build_answer_artifact(
+                query_run_id=str(query_run_id),
+                knowledge_base_id=primary_kb_id,
+                search_plan=actual_search_plan,
+                retrieval=retrieval,
+                validation=cast(dict[str, Any], validation),
+                timings_ms=timings_ms,
+                answer_present=bool(answer),
+            )
             sequence += 1
             yield _event(
                 SseEvent(
@@ -1361,11 +1779,25 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         "retrieval": retrieval.model_dump(),
                         "citation_validation": validation,
                         "timings_ms": timings_ms,
+                        "search_plan": actual_search_plan,
+                        "root_cause": answer_artifact["root_cause"],
+                        "answer_artifact": answer_artifact,
                     },
                 )
             )
             async with connect() as conn:
                 current_stage = "query_run_complete"
+                await _insert_answer_events(
+                    conn,
+                    tenant_id=tenant_id,
+                    query_run_id=str(query_run_id),
+                    trace_id=trace_id,
+                    retrieval=retrieval,
+                    answer=answer,
+                    validation=cast(dict[str, Any], validation),
+                    timings_ms=timings_ms,
+                    answer_artifact=answer_artifact,
+                )
                 await complete_query_run(
                     conn,
                     query_run_id=str(query_run_id),
@@ -1376,9 +1808,14 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                         "provider": validation.get("provider"),
                         "provider_cost": validation.get("provider_cost"),
                         "model_alias": validation.get("model_alias"),
+                        "model_gateway": validation.get("model_gateway", {}),
                         "timings_ms": timings_ms,
                         "index_contract_id": retrieval.index_contract_id,
                         "run_contract_id": retrieval.run_contract_id,
+                        "knowledge_base_ids": kb_ids,
+                        "search_plan": actual_search_plan,
+                        "root_cause": answer_artifact["root_cause"],
+                        "answer_artifact": answer_artifact,
                     },
                     model_alias=str(validation.get("model_alias") or ""),
                     provider_request_id=str(validation.get("provider_request_id") or ""),
@@ -1391,7 +1828,7 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                     request_id=request_id,
                     query_run_id=str(query_run_id),
                     sequence=sequence,
-                    data={"answer": answer},
+                    data={"answer": answer, "root_cause": answer_artifact["root_cause"]},
                 )
             )
         except asyncio.CancelledError:
@@ -1400,6 +1837,20 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
             raise
         except Exception as exc:
             async with connect() as conn:
+                await insert_retrieval_event(
+                    conn,
+                    tenant_id=tenant_id,
+                    query_run_id=str(query_run_id),
+                    trace_id=trace_id,
+                    event_type="answer_stage" if current_stage == "answer_generation" else "query_stage",
+                    stage=current_stage,
+                    payload=_failure_stage_event(
+                        exc,
+                        stage=current_stage,
+                        last_successful_stage=last_successful_stage,
+                        retrieval=retrieval,
+                    ),
+                )
                 await fail_query_run(conn, query_run_id=str(query_run_id), error_code=type(exc).__name__)
             sequence += 1
             failure = _safe_failure_payload(
@@ -1408,6 +1859,9 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
                 last_successful_stage=last_successful_stage,
                 trace_id=trace_id,
                 retrieval=retrieval,
+                query_run_id=str(query_run_id),
+                knowledge_base_id=primary_kb_id,
+                search_plan=actual_search_plan,
             )
             yield _event(
                 SseEvent(
@@ -1430,15 +1884,85 @@ async def query_run_retrieval(query_run_id: str, request: Request) -> dict[str, 
         run = await _load_query_run_for_actor(conn, tenant_id=tenant_id, query_run_id=query_run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="query run not found")
-        await _require_kb_role(
+        await _require_kb_scope_role(
             conn,
             actor=actor,
             tenant_id=tenant_id,
-            kb_id=str(run["knowledge_base_id"]),
+            kb_ids=_query_run_kb_scope(run),
             role=KnowledgeBaseRole.editor,
         )
         events = await load_retrieval_events(conn, tenant_id, query_run_id)
-    return {"query_run_id": query_run_id, "events": _jsonable(events)}
+    return {"query_run_id": query_run_id, "run": _query_run_summary(run), "events": _jsonable(events)}
+
+
+@app.post("/api/v1/query-runs/{query_run_id}/feedback")
+async def query_run_feedback(query_run_id: str, payload: QueryRunFeedbackRequest, request: Request) -> dict[str, Any]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    settings = get_settings()
+    async with connect() as conn:
+        run = await _load_query_run_for_actor(conn, tenant_id=tenant_id, query_run_id=query_run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="query run not found")
+        await _require_kb_scope_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_ids=_query_run_kb_scope(run),
+            role=KnowledgeBaseRole.editor,
+        )
+        event_payload = {
+            "stage": "feedback",
+            "rating": payload.rating,
+            "feedback": safe_telemetry_payload(payload.model_dump(mode="json"), settings=settings),
+        }
+        await insert_retrieval_event(
+            conn,
+            tenant_id=tenant_id,
+            query_run_id=query_run_id,
+            trace_id=str(run["trace_id"]),
+            event_type="feedback",
+            stage="feedback",
+            payload=event_payload,
+        )
+    return {"query_run_id": query_run_id, "status": "recorded"}
+
+
+@app.post("/api/v1/query-runs/{query_run_id}/evaluation")
+async def query_run_evaluation(
+    query_run_id: str, payload: QueryRunEvaluationRequest, request: Request
+) -> dict[str, Any]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    settings = get_settings()
+    async with connect() as conn:
+        run = await _load_query_run_for_actor(conn, tenant_id=tenant_id, query_run_id=query_run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="query run not found")
+        await _require_kb_scope_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_ids=_query_run_kb_scope(run),
+            role=KnowledgeBaseRole.editor,
+        )
+        event_payload = {
+            "stage": "evaluation",
+            "evaluator": payload.evaluator,
+            "scores": payload.scores,
+            "reason_codes": payload.reason_codes,
+            "evaluation": safe_telemetry_payload(payload.model_dump(mode="json"), settings=settings),
+        }
+        await insert_retrieval_event(
+            conn,
+            tenant_id=tenant_id,
+            query_run_id=query_run_id,
+            trace_id=str(run["trace_id"]),
+            event_type="evaluation",
+            stage="evaluation",
+            payload=event_payload,
+        )
+    return {"query_run_id": query_run_id, "status": "recorded"}
 
 
 @app.post("/api/v1/search:debug")
@@ -1446,18 +1970,80 @@ async def search_debug(payload: DebugSearchRequest, request: Request) -> dict[st
     settings = get_settings()
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
-    trace_id = stable_hash(["debug", payload.message], 32)
+    request_id = str(uuid.uuid4())
+    trace_id = stable_hash([request_id, payload.message], 32)
     profile = get_retrieval_profile(payload.retrieval_profile, settings, payload.retrieval_overrides)
-    kb_id = _single_kb_id(payload.knowledge_base_ids, settings.default_kb_id, request_id=trace_id)
+    kb_ids = _kb_scope_ids(payload.knowledge_base_ids, settings.default_kb_id)
+    primary_kb_id = kb_ids[0]
+    route_decision = {
+        "route": "direct_retrieval",
+        "reason": "search_debug_endpoint",
+    }
+    search_plan = build_search_plan(
+        query=payload.message,
+        mode="debug",
+        route=route_decision["route"],
+        route_reason=route_decision["reason"],
+        knowledge_base_id=primary_kb_id,
+        knowledge_base_ids=kb_ids,
+        trace_id=trace_id,
+        profile=profile,
+        top_k=payload.top_k,
+        include_generation=False,
+    )
+    query_run_id: str | None = None
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
+        await _require_kb_scope_role(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_ids=kb_ids,
+            role=KnowledgeBaseRole.editor,
+        )
+        created = await create_query_run(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=primary_kb_id,
+            user_id=actor.user_id,
+            request_id=request_id,
+            client_request_id=None,
+            mode="debug",
+            input_text=payload.message,
+            trace_id=trace_id,
+            usage=_initial_query_run_usage(
+                mode="debug",
+                profile=profile,
+                retrieval_overrides=payload.retrieval_overrides,
+                knowledge_base_ids=kb_ids,
+                route_decision=route_decision,
+                trace_id=trace_id,
+                settings=settings,
+            ),
+        )
+        query_run_id = str(created)
+        await insert_retrieval_event(
+            conn,
+            tenant_id=tenant_id,
+            query_run_id=query_run_id,
+            trace_id=trace_id,
+            event_type="query_stage",
+            stage="path_selected",
+            payload=_path_selection_event(
+                mode="debug",
+                route_decision=route_decision,
+                knowledge_base_ids=kb_ids,
+                profile=profile,
+                search_plan=search_plan,
+                retrieval_overrides=payload.retrieval_overrides,
+            ),
+        )
         try:
-            result = await retrieve(
+            result = await retrieve_multi(
                 conn,
                 payload.message,
                 tenant_id=tenant_id,
-                knowledge_base_id=kb_id,
-                query_run_id=None,
+                knowledge_base_ids=kb_ids,
+                query_run_id=query_run_id,
                 trace_id=trace_id,
                 settings=settings,
                 top_k=payload.top_k,
@@ -1465,8 +2051,42 @@ async def search_debug(payload: DebugSearchRequest, request: Request) -> dict[st
                 profile_overrides=payload.retrieval_overrides,
             )
         except KnowledgeBaseNotReady as exc:
+            await fail_query_run(conn, query_run_id=query_run_id, error_code=exc.code)
             raise _kb_not_ready_http(exc, trace_id) from exc
-    return result.model_dump()
+        except Exception as exc:
+            await fail_query_run(conn, query_run_id=query_run_id, error_code=safe_error_code(exc))
+            raise
+    output = result.model_dump()
+    answer_artifact = build_answer_artifact(
+        query_run_id=query_run_id,
+        knowledge_base_id=primary_kb_id,
+        search_plan=search_plan,
+        retrieval=result,
+        validation=None,
+        timings_ms=_combined_timings(output, {}),
+        answer_present=False,
+    )
+    output["search_plan"] = search_plan
+    output["root_cause"] = answer_artifact["root_cause"]
+    output["answer_artifact"] = answer_artifact
+    output["query_run_id"] = query_run_id
+    async with connect() as conn:
+        await complete_query_run(
+            conn,
+            query_run_id=query_run_id,
+            answer="",
+            usage={
+                "citations": [],
+                "timings_ms": _combined_timings(output, {}),
+                "index_contract_id": result.index_contract_id,
+                "run_contract_id": result.run_contract_id,
+                "knowledge_base_ids": kb_ids,
+                "search_plan": search_plan,
+                "root_cause": answer_artifact["root_cause"],
+                "answer_artifact": answer_artifact,
+            },
+        )
+    return output
 
 
 def _event(event: SseEvent) -> str:
@@ -1477,6 +2097,11 @@ async def _load_actor(request: Request) -> ActorContext | None:
     settings = get_settings()
     request_id = _request_id(request)
     trace_id = request.headers.get("x-trace-id", request_id)[:128]
+    if settings.auth_disabled:
+        async with connect() as conn:
+            user = await load_bootstrap_admin_user(conn, settings)
+        user_id = user.user_id if user is not None else settings.default_user_id
+        return auth_disabled_actor(settings, user_id=user_id, request_id=request_id, trace_id=trace_id)
     if settings.auth_mode == "test":
         return test_actor_context(settings, request_id=request_id, trace_id=trace_id)
     session_token = request.cookies.get(settings.session_cookie_name)
@@ -1492,12 +2117,13 @@ async def _load_actor(request: Request) -> ActorContext | None:
 
 
 async def _require_actor(request: Request) -> ActorContext:
+    settings = get_settings()
     actor = await _load_actor(request)
     if actor is None:
         raise AuthenticationError("UNAUTHENTICATED", "authentication required")
     if request.method in {"POST", "PATCH", "DELETE"}:
         await _require_csrf(actor, request.headers.get("X-CSRF-Token"))
-    if request.url.path not in {
+    if not settings.auth_disabled and request.url.path not in {
         "/api/v1/auth/local/password",
         "/api/v1/auth/logout",
         "/api/v1/auth/session",
@@ -1532,6 +2158,45 @@ async def _require_kb_role(
         knowledge_base_id=kb_id,
     )
     enforce_kb_role(actual, role)
+
+
+async def _kb_grant_acl_metadata(
+    conn: Any,
+    *,
+    tenant_id: str,
+    subject_type: GrantSubjectType,
+    subject_id: str,
+    role: KnowledgeBaseRole,
+    actor: ActorContext,
+) -> dict[str, Any]:
+    source = "direct_user_grant"
+    external_group_path = None
+    if subject_type == GrantSubjectType.group:
+        group = await _load_group(conn, tenant_id=tenant_id, group_id=subject_id)
+        group_type = str(group.get("group_type") or "") if group else ""
+        source = "oidc_group_grant" if group_type == GroupType.oidc.value else "local_group_grant"
+        if group is not None and group_type == GroupType.oidc.value:
+            external_group_path = str(group.get("external_id") or group.get("name") or "")
+    synced_at = datetime.now(UTC).isoformat()
+    acl_sync: dict[str, Any] = {
+        "source": source,
+        "status": "in_sync",
+        "last_synced_at": synced_at,
+    }
+    if external_group_path:
+        acl_sync["external_group_path"] = external_group_path
+    return {
+        "schema_version": "kb_grant_acl_metadata_v1",
+        "acl_snapshot": {
+            "scope": "knowledge_base",
+            "subject_type": subject_type.value,
+            "subject_id": subject_id,
+            "role": role.value,
+            "source": "knowledge_base_grants",
+        },
+        "acl_sync": acl_sync,
+        "updated_by_user_id": actor.user_id,
+    }
 
 
 async def _replace_local_group_members(conn: Any, *, group_id: str, member_user_ids: list[str]) -> None:
@@ -1579,23 +2244,139 @@ async def _load_query_run_for_actor(conn: Any, *, tenant_id: str, query_run_id: 
     return dict(row) if row is not None else None
 
 
-def _single_kb_id(knowledge_base_ids: list[str], default_kb_id: str, *, request_id: str) -> str:
-    if len(knowledge_base_ids) > 1:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": {
-                    "code": "MULTI_KB_UNSUPPORTED",
-                    "message": "multi-knowledge-base retrieval is not supported yet",
-                    "request_id": request_id,
-                    "details": {},
-                }
-            },
+def _kb_scope_ids(knowledge_base_ids: list[str], default_kb_id: str) -> list[str]:
+    scope: list[str] = []
+    for kb_id in knowledge_base_ids or [default_kb_id]:
+        normalized = str(kb_id).strip()
+        if normalized and normalized not in scope:
+            scope.append(normalized)
+    return scope or [default_kb_id]
+
+
+async def _require_search_scope_ready(conn: Any, *, tenant_id: str, kb_ids: list[str]) -> None:
+    for kb_id in kb_ids:
+        kb = await get_knowledge_base(conn, tenant_id, kb_id)
+        if kb is None:
+            raise KnowledgeBaseNotReady("knowledge base is not available", details={"knowledge_base_id": kb_id})
+        read_alias = str(kb.get("active_index") or "")
+        if not read_alias:
+            raise KnowledgeBaseNotReady("knowledge base has no active index", details={"knowledge_base_id": kb_id})
+        index_version = await load_index_version_by_read_alias(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            read_alias=read_alias,
         )
-    return knowledge_base_ids[0] if knowledge_base_ids else default_kb_id
+        if index_version is None:
+            raise KnowledgeBaseNotReady(
+                "active index has no registered index version",
+                details={"knowledge_base_id": kb_id, "read_alias": read_alias},
+            )
+
+
+def _search_result(row: dict[str, Any], *, query: str) -> SearchResult:
+    chunk_metadata = dict(row.get("chunk_metadata") or {})
+    locator = row.get("locator")
+    if not isinstance(locator, dict) or not locator:
+        locator = chunk_metadata.get("locator")
+    document_date = _parse_search_date(row.get("document_date"))
+    return SearchResult(
+        document_id=str(row.get("document_id") or ""),
+        document_version_id=str(row["document_version_id"]) if row.get("document_version_id") else None,
+        knowledge_base_id=str(row.get("knowledge_base_id") or ""),
+        title=str(row.get("title") or ""),
+        snippet=_search_snippet(str(row.get("content") or ""), query=query),
+        section_path=[str(item) for item in row.get("section_path") or []],
+        source_url=str(row.get("source_url") or ""),
+        source_type=str(row.get("source_type") or ""),
+        document_type=str(row["document_type"]) if row.get("document_type") else None,
+        language=str(row["language"]) if row.get("language") else None,
+        document_date=document_date,
+        locator=cast(dict[str, Any], locator if isinstance(locator, dict) else {}),
+        score=float(row.get("score") or 0.0),
+        ranks=dict(row.get("ranks") or {}),
+    )
+
+
+def _parse_search_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _search_snippet(content: str, *, query: str, max_chars: int = 360) -> str:
+    normalized_content = " ".join(content.split())
+    if len(normalized_content) <= max_chars:
+        return normalized_content
+    needle = " ".join(query.split()).casefold()
+    haystack = normalized_content.casefold()
+    index = haystack.find(needle) if needle else -1
+    if index < 0:
+        return normalized_content[: max_chars - 3].rstrip() + "..."
+    start = max(0, index - 90)
+    end = min(len(normalized_content), start + max_chars)
+    start = max(0, end - max_chars)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(normalized_content) else ""
+    return prefix + normalized_content[start:end].strip() + suffix
+
+
+async def _require_kb_scope_role(
+    conn: Any,
+    *,
+    actor: ActorContext,
+    tenant_id: str,
+    kb_ids: list[str],
+    role: KnowledgeBaseRole,
+) -> None:
+    for kb_id in kb_ids:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=role)
+
+
+def _query_run_kb_scope(run: dict[str, Any]) -> list[str]:
+    usage = run.get("usage")
+    if isinstance(usage, dict):
+        raw_scope = usage.get("knowledge_base_ids")
+        if isinstance(raw_scope, list):
+            scope = [str(kb_id) for kb_id in raw_scope if str(kb_id)]
+            if scope:
+                return scope
+    kb_id = run.get("knowledge_base_id")
+    return [str(kb_id)] if kb_id else []
+
+
+def _query_run_summary(run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(run.get("id") or ""),
+        "tenant_id": str(run.get("tenant_id") or ""),
+        "knowledge_base_id": str(run.get("knowledge_base_id") or ""),
+        "user_id": str(run.get("user_id") or ""),
+        "request_id": str(run.get("request_id") or ""),
+        "client_request_id": run.get("client_request_id"),
+        "mode": run.get("mode"),
+        "status": run.get("status"),
+        "input_text": run.get("input_text"),
+        "answer": run.get("answer"),
+        "model_alias": run.get("model_alias"),
+        "provider_request_id": run.get("provider_request_id"),
+        "error_code": run.get("error_code"),
+        "usage": run.get("usage") if isinstance(run.get("usage"), dict) else {},
+        "trace_id": run.get("trace_id"),
+        "started_at": run.get("started_at"),
+        "completed_at": run.get("completed_at"),
+        "created_at": run.get("created_at"),
+    }
 
 
 async def _require_csrf(actor: ActorContext, csrf_token: str | None) -> None:
+    settings = get_settings()
+    if settings.auth_disabled:
+        return
     if actor.authentication_method == AuthenticationMethod.test:
         return
     if not csrf_token:
@@ -1679,6 +2460,172 @@ def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(_jsonable(data), ensure_ascii=False)}\n\n"
 
 
+def _initial_query_run_usage(
+    *,
+    mode: str,
+    profile: Any,
+    retrieval_overrides: dict[str, Any],
+    knowledge_base_ids: list[str],
+    route_decision: dict[str, str],
+    trace_id: str,
+    settings: Any,
+) -> dict[str, Any]:
+    return {
+        "trace_id": trace_id,
+        "mode": mode,
+        "retrieval_profile": {
+            "name": profile.name,
+            "source": profile.source,
+            "version": profile.version,
+        },
+        "retrieval_overrides": retrieval_overrides,
+        "knowledge_base_ids": knowledge_base_ids,
+        "route_decision": route_decision,
+        "extended_search": _extended_search_status(
+            route_decision=route_decision,
+            knowledge_base_ids=knowledge_base_ids,
+            extended_policy=profile.postprocess.extended_search,
+        ),
+        "content_policy": content_policy(settings),
+    }
+
+
+def _extended_search_status(
+    *,
+    route_decision: dict[str, str],
+    knowledge_base_ids: list[str],
+    extended_policy: str,
+) -> dict[str, str]:
+    route = route_decision.get("route", "")
+    reason = route_decision.get("reason", "")
+    if route in {"extended_first", "extended_repair"}:
+        return {"decision": "started", "reason": reason}
+    if len(knowledge_base_ids) > 1:
+        return {"decision": "skipped", "reason": reason or "multi_kb_extended_search_not_enabled_v1"}
+    if extended_policy == "off":
+        return {"decision": "skipped", "reason": "extended_search_policy_off"}
+    return {"decision": "skipped", "reason": reason or "direct_path_selected"}
+
+
+def _path_selection_event(
+    *,
+    mode: str,
+    route_decision: dict[str, str],
+    knowledge_base_ids: list[str],
+    profile: Any,
+    search_plan: dict[str, Any],
+    retrieval_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "stage": "path_selected",
+        "stable_stage": "path_selected",
+        "mode": mode,
+        "route": route_decision.get("route"),
+        "reason": route_decision.get("reason"),
+        "retrieval_profile": profile.name,
+        "retrieval_overrides": retrieval_overrides,
+        "knowledge_base_ids": knowledge_base_ids,
+        "extended_search": _extended_search_status(
+            route_decision=route_decision,
+            knowledge_base_ids=knowledge_base_ids,
+            extended_policy=profile.postprocess.extended_search,
+        ),
+        "search_plan": search_plan,
+    }
+
+
+async def _insert_answer_events(
+    conn: Any,
+    *,
+    tenant_id: str,
+    query_run_id: str,
+    trace_id: str,
+    retrieval: RetrievalResult,
+    answer: str,
+    validation: dict[str, Any],
+    timings_ms: dict[str, int],
+    answer_artifact: dict[str, Any],
+) -> None:
+    context_source_summary = _context_source_summary(retrieval, list(validation.get("citations") or []))
+    await insert_retrieval_event(
+        conn,
+        tenant_id=tenant_id,
+        query_run_id=query_run_id,
+        trace_id=trace_id,
+        event_type="answer_stage",
+        stage="answer_generation",
+        payload={
+            "stage": "answer_generation",
+            "stable_stage": "answer_generation",
+            "answer": answer,
+            "model_call": validation.get("model_gateway", {}),
+            "context_source_summary": context_source_summary,
+            "latency_ms": timings_ms.get("generation_total", 0),
+        },
+    )
+    await insert_retrieval_event(
+        conn,
+        tenant_id=tenant_id,
+        query_run_id=query_run_id,
+        trace_id=trace_id,
+        event_type="answer_stage",
+        stage="citation_validation",
+        payload={
+            "stage": "citation_validation",
+            "stable_stage": "citation_validation",
+            "valid": validation.get("valid"),
+            "status": validation.get("status"),
+            "citations": list(validation.get("citations") or []),
+            "unknown": list(validation.get("unknown") or []),
+            "unsupported_claims": list(validation.get("unsupported_claims") or []),
+            "phantom_claim_citations": list(validation.get("phantom_claim_citations") or []),
+            "source_url_errors": list(validation.get("source_url_errors") or []),
+            "latency_ms": timings_ms.get("citation_validation", 0),
+        },
+    )
+    claim_verification = validation.get("claim_verification")
+    if isinstance(claim_verification, dict):
+        await insert_retrieval_event(
+            conn,
+            tenant_id=tenant_id,
+            query_run_id=query_run_id,
+            trace_id=trace_id,
+            event_type="answer_stage",
+            stage="claim_verification",
+            payload={
+                "stage": "claim_verification",
+                "stable_stage": "claim_verification",
+                "status": claim_verification.get("status"),
+                "model_call": claim_verification.get("model_gateway", {}),
+                "verdicts": claim_verification.get("verdicts", []),
+                "unsupported_claims": claim_verification.get("unsupported_claims", []),
+                "contradicted_claims": claim_verification.get("contradicted_claims", []),
+                "latency_ms": timings_ms.get("claim_verification", 0),
+            },
+        )
+    await insert_retrieval_event(
+        conn,
+        tenant_id=tenant_id,
+        query_run_id=query_run_id,
+        trace_id=trace_id,
+        event_type="query_stage",
+        stage="query_complete",
+        payload={
+            "stage": "query_complete",
+            "stable_stage": "query_complete",
+            "answer_present": bool(answer),
+            "citations": list(validation.get("citations") or []),
+            "context_source_summary": context_source_summary,
+            "citation_validation": {
+                "valid": validation.get("valid"),
+                "status": validation.get("status"),
+            },
+            "root_cause": answer_artifact.get("root_cause", {}),
+            "timings_ms": timings_ms,
+        },
+    )
+
+
 def _combined_timings(retrieval: dict[str, Any], validation: dict[str, object]) -> dict[str, int]:
     timings: dict[str, int] = {}
     for event in retrieval.get("events", []):
@@ -1686,7 +2633,9 @@ def _combined_timings(retrieval: dict[str, Any], validation: dict[str, object]) 
             continue
         if event.get("stage") == "timings" and isinstance(event.get("timings_ms"), dict):
             timings.update(_safe_timing_dict(event["timings_ms"]))
-        if event.get("stage") == "harness_tool" and isinstance(event.get("latency_ms"), int | float):
+        if event.get("stage") in {"harness_tool", "retrieval.extended"} and isinstance(
+            event.get("latency_ms"), int | float
+        ):
             timings["extended_tool_search_total"] = timings.get("extended_tool_search_total", 0) + int(
                 event["latency_ms"]
             )
@@ -1704,6 +2653,59 @@ def _safe_timing_dict(payload: dict[Any, Any]) -> dict[str, int]:
     }
 
 
+def _failure_stage_event(
+    exc: Exception,
+    *,
+    stage: str,
+    last_successful_stage: str,
+    retrieval: RetrievalResult | None = None,
+) -> dict[str, Any]:
+    metadata = getattr(exc, "metadata", None)
+    model_call = dict(metadata) if isinstance(metadata, dict) else {}
+    code = safe_error_code(exc)
+    if model_call and "safe_error_code" not in model_call:
+        model_call["safe_error_code"] = code
+    return {
+        "stage": stage,
+        "stable_stage": stage,
+        "status": "failed",
+        "last_successful_stage": last_successful_stage,
+        "error": {
+            "code": code,
+            "type": type(exc).__name__,
+        },
+        "model_call": model_call,
+        "context_source_summary": _context_source_summary(retrieval, []),
+    }
+
+
+def _context_source_summary(retrieval: RetrievalResult | None, citations: list[Any]) -> list[dict[str, Any]]:
+    if retrieval is None:
+        return []
+    citation_ids = {str(citation) for citation in citations}
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for evidence in retrieval.evidence:
+        metadata = dict(evidence.metadata or {})
+        raw_query_context = metadata.get("query_context")
+        query_context: dict[Any, Any] = raw_query_context if isinstance(raw_query_context, dict) else {}
+        subquery_id = str(metadata.get("subquery_id") or query_context.get("subquery_id") or "unknown")
+        transform_id = str(metadata.get("transform_id") or query_context.get("transform_id") or "unknown")
+        key = (subquery_id, transform_id)
+        item = grouped.setdefault(
+            key,
+            {
+                "subquery_id": subquery_id,
+                "transform_id": transform_id,
+                "evidence_count": 0,
+                "citation_ids": [],
+            },
+        )
+        item["evidence_count"] += 1
+        if evidence.evidence_id in citation_ids:
+            item["citation_ids"].append(evidence.evidence_id)
+    return list(grouped.values())
+
+
 def _safe_failure_payload(
     exc: Exception,
     *,
@@ -1711,17 +2713,37 @@ def _safe_failure_payload(
     last_successful_stage: str,
     trace_id: str,
     retrieval: Any | None,
+    query_run_id: str | None = None,
+    knowledge_base_id: str = "",
+    search_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    retryable = _retryable_error(exc)
+    safe_search_plan = search_plan or {}
+    typed_retrieval = cast(RetrievalResult | None, retrieval)
+    artifact = build_failure_artifact(
+        query_run_id=query_run_id,
+        knowledge_base_id=knowledge_base_id,
+        search_plan=safe_search_plan,
+        retrieval=typed_retrieval,
+        stage=stage,
+        last_successful_stage=last_successful_stage,
+        code=type(exc).__name__,
+        retryable=retryable,
+        trace_id=trace_id,
+    )
     return {
         "error": "chat run failed",
         "stage": stage,
         "code": type(exc).__name__,
-        "retryable": _retryable_error(exc),
+        "retryable": retryable,
         "attempt": 1,
         "last_successful_stage": last_successful_stage,
         "trace_id": trace_id,
         "safe_message": type(exc).__name__,
         "retrieval": _safe_retrieval_snapshot(retrieval),
+        "search_plan": safe_search_plan,
+        "root_cause": artifact["root_cause"],
+        "answer_artifact": artifact,
     }
 
 

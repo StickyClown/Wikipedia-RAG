@@ -74,6 +74,19 @@ def local_login_enabled(settings: Settings) -> bool:
     return settings.auth_mode in {"local", "hybrid"}
 
 
+def auth_disabled_actor(settings: Settings, *, user_id: str, request_id: str, trace_id: str) -> ActorContext:
+    return ActorContext(
+        user_id=user_id,
+        platform_role=PlatformRole.platform_admin,
+        active_tenant_id=settings.default_tenant_id,
+        tenant_role=TenantRole.tenant_admin,
+        session_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"auth-disabled:{user_id}")),
+        authentication_method=AuthenticationMethod.local,
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+
 def read_secret_file(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -81,14 +94,15 @@ def read_secret_file(path: Path) -> str | None:
     return value or None
 
 
+def bootstrap_admin_password(settings: Settings) -> str | None:
+    return read_secret_file(settings.bootstrap_admin_password_file) or settings.bootstrap_admin_password.strip() or None
+
+
 async def ensure_bootstrap_admin(conn: AsyncConnection, settings: Settings) -> bool:
-    if settings.auth_mode not in {"local", "hybrid"}:
-        return False
-    existing_admin = await conn.execute(text("SELECT 1 FROM users WHERE platform_role = 'PLATFORM_ADMIN' LIMIT 1"))
-    if existing_admin.first() is not None:
+    if settings.auth_mode not in {"local", "hybrid"} and not settings.auth_disabled:
         return False
 
-    password = read_secret_file(settings.bootstrap_admin_password_file)
+    password = bootstrap_admin_password(settings)
     if password is None:
         return False
 
@@ -115,7 +129,7 @@ async def ensure_bootstrap_admin(conn: AsyncConnection, settings: Settings) -> b
                 )
                 VALUES (
                   :id, :email, :username, :display_name, 'PLATFORM_ADMIN',
-                  :password_hash, true, false
+                  :password_hash, false, false
                 )
                 """
             ),
@@ -129,14 +143,19 @@ async def ensure_bootstrap_admin(conn: AsyncConnection, settings: Settings) -> b
         )
     else:
         user_id = str(existing_user["id"])
-        assignments = ["platform_role = 'PLATFORM_ADMIN'", "password_change_required = true", "updated_at = now()"]
-        params: dict[str, Any] = {"id": user_id}
-        if existing_user["password_hash"] is None:
-            assignments.append("password_hash = :password_hash")
-            params["password_hash"] = password_hash
         await conn.execute(
-            text(f"UPDATE users SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
-            params,
+            text(
+                """
+                UPDATE users
+                SET platform_role = 'PLATFORM_ADMIN',
+                    password_hash = :password_hash,
+                    password_change_required = false,
+                    is_disabled = false,
+                    updated_at = now()
+                WHERE id = :id
+                """
+            ),
+            {"id": user_id, "password_hash": password_hash},
         )
 
     await conn.execute(
@@ -160,6 +179,29 @@ async def ensure_bootstrap_admin(conn: AsyncConnection, settings: Settings) -> b
         },
     )
     return True
+
+
+async def load_bootstrap_admin_user(conn: AsyncConnection, settings: Settings) -> AuthenticatedUser | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, username, display_name, platform_role, password_change_required
+            FROM users
+            WHERE username = :username AND is_disabled = false
+            """
+        ),
+        {"username": settings.bootstrap_admin_username},
+    )
+    row = result.mappings().first()
+    if row is None:
+        return None
+    return AuthenticatedUser(
+        user_id=str(row["id"]),
+        username=str(row["username"]) if row["username"] is not None else None,
+        display_name=str(row["display_name"]) if row["display_name"] is not None else None,
+        platform_role=PlatformRole(row["platform_role"]),
+        password_change_required=bool(row["password_change_required"]),
+    )
 
 
 async def authenticate_local_user(

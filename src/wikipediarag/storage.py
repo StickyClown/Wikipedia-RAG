@@ -92,6 +92,36 @@ def head_object(key: str, settings: Settings | None = None) -> dict[str, Any]:
     }
 
 
+def delete_objects(keys: list[str], settings: Settings | None = None) -> int:
+    resolved = settings or get_settings()
+    unique_keys = sorted({key for key in keys if key})
+    if not unique_keys:
+        return 0
+    client = _client(resolved)
+    deleted = 0
+    for index in range(0, len(unique_keys), 1000):
+        batch = unique_keys[index : index + 1000]
+        response = client.delete_objects(
+            Bucket=resolved.minio_bucket,
+            Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+        )
+        errors = response.get("Errors", [])
+        blocking_errors = [error for error in errors if error.get("Code") not in {"NoSuchKey", "NotFound"}]
+        if blocking_errors:
+            first = blocking_errors[0]
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": str(first.get("Code") or "DeleteObjectsFailed"),
+                        "Message": "object deletion failed",
+                    }
+                },
+                "DeleteObjects",
+            )
+        deleted += len(batch) - len(blocking_errors)
+    return deleted
+
+
 def create_presigned_put_url(
     key: str,
     *,

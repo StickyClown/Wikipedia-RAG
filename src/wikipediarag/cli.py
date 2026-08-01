@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
@@ -123,7 +124,13 @@ def build_parser() -> argparse.ArgumentParser:
     eval_trusted_report_parser.add_argument("--suite", default="trusted-wikipedia-v2")
 
     eval_miracl_parser = subparsers.add_parser("eval-miracl-map")
-    eval_miracl_parser.add_argument("--input", required=True)
+    eval_miracl_parser.add_argument("--input", default=None)
+    eval_miracl_parser.add_argument("--from-huggingface", action="store_true")
+    eval_miracl_parser.add_argument("--split", choices=["dev", "train"], default="dev")
+    eval_miracl_parser.add_argument("--limit", type=int, default=100)
+    eval_miracl_parser.add_argument("--output-suite", default="miracl-ru-local-v1")
+    eval_miracl_parser.add_argument("--cache-dir", default="artifacts/eval/external/miracl-ru/cache")
+    eval_miracl_parser.add_argument("--min-text-overlap", type=float, default=0.08)
 
     eval_review_parser = subparsers.add_parser("eval-review-candidates")
     eval_review_parser.add_argument("--input", required=True)
@@ -161,6 +168,17 @@ def build_parser() -> argparse.ArgumentParser:
     eval_reviewed_short_parser.add_argument("--skip-answer", action="store_true")
     eval_reviewed_short_parser.add_argument("--skip-retrieval", action="store_true")
 
+    eval_profile_retrieval_parser = subparsers.add_parser("eval-profile-retrieval")
+    eval_profile_retrieval_parser.add_argument("--suite", default="reviewed-wikipedia-smoke-v1")
+    eval_profile_retrieval_parser.add_argument("--split", choices=["dev", "test"], default="dev")
+    eval_profile_retrieval_parser.add_argument("--api", default="http://localhost:8000")
+    eval_profile_retrieval_parser.add_argument("--config-id", default="sota_mvp_normal")
+    eval_profile_retrieval_parser.add_argument("--task-id", action="append", default=[])
+    eval_profile_retrieval_parser.add_argument("--limit", type=int, default=5)
+    eval_profile_retrieval_parser.add_argument("--warmup-iterations", type=int, default=1)
+    eval_profile_retrieval_parser.add_argument("--measured-iterations", type=int, default=1)
+    eval_profile_retrieval_parser.add_argument("--batch-size", type=int, default=5)
+
     eval_full_parser = subparsers.add_parser("eval-full")
     eval_full_parser.add_argument("--count", type=int, default=None)
     eval_full_parser.add_argument("--api", default="http://localhost:8000")
@@ -192,6 +210,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--metadata-service",
         default=os.environ.get("METADATA_SERVICE_PUBLIC_URL", "http://localhost:8090"),
     )
+    verify_upload_parser.add_argument(
+        "--admin-username",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_USERNAME", "admin"),
+        help="local or hybrid auth platform-admin username",
+    )
+    verify_upload_parser.add_argument(
+        "--admin-secret",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD", "admin"),  # noqa: S106
+        help="platform-admin local login secret; defaults to the local bootstrap admin password",
+    )
+    verify_upload_parser.add_argument(
+        "--admin-secret-file",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD_FILE"),
+        help="file containing the platform-admin local login secret, or WIKIPEDIARAG_ADMIN_PASSWORD_FILE",
+    )
     verify_upload_parser.add_argument("--skip-compose", action="store_true")
     verify_upload_parser.add_argument("--down-after", action="store_true")
 
@@ -215,6 +248,26 @@ def build_parser() -> argparse.ArgumentParser:
     verify_corpus_parser.add_argument("--max-documents", type=int, default=None)
     verify_corpus_parser.add_argument("--skip-compose", action="store_true")
     verify_corpus_parser.add_argument("--down-after", action="store_true")
+
+    hardening_parser = subparsers.add_parser("verify-cross-tenant-hardening")
+    hardening_parser.add_argument("--api", default="http://localhost:8000")
+    hardening_parser.add_argument(
+        "--admin-username",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_USERNAME", "admin"),
+        help="local or hybrid auth platform-admin username",
+    )
+    hardening_parser.add_argument(
+        "--admin-secret",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD", "admin"),  # noqa: S106
+        help="platform-admin local login secret; defaults to the local bootstrap admin password",
+    )
+    hardening_parser.add_argument(
+        "--admin-secret-file",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD_FILE"),
+        help="file containing the platform-admin local login secret, or WIKIPEDIARAG_ADMIN_PASSWORD_FILE",
+    )
+    hardening_parser.add_argument("--skip-compose", action="store_true")
+    hardening_parser.add_argument("--down-after", action="store_true")
     return parser
 
 
@@ -257,7 +310,7 @@ def main() -> None:
     elif args.command == "eval-trusted-report":
         run_eval_trusted_report(args.suite)
     elif args.command == "eval-miracl-map":
-        run_eval_miracl_map(args.input)
+        run_eval_miracl_map(args)
     elif args.command == "eval-review-candidates":
         run_eval_review_candidates(args.input, args.output_suite)
     elif args.command == "eval-freeze-reviewed":
@@ -270,6 +323,8 @@ def main() -> None:
         run_eval_task_diagnostics(args.suite, args.split, args.config_id, list(args.task_id), args.json)
     elif args.command == "eval-reviewed-short":
         run_eval_reviewed_short(args)
+    elif args.command == "eval-profile-retrieval":
+        run_eval_profile_retrieval(args)
     elif args.command == "eval-full":
         run_eval_full(args)
     elif args.command == "smoke-models":
@@ -283,6 +338,8 @@ def main() -> None:
         verify_document_upload(args)
     elif args.command == "verify-document-corpus":
         verify_document_corpus(args)
+    elif args.command == "verify-cross-tenant-hardening":
+        verify_cross_tenant_hardening(args)
 
 
 def _add_eval_generate_arguments(parser: argparse.ArgumentParser) -> None:
@@ -577,10 +634,20 @@ def run_eval_trusted_report(suite: str) -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
-def run_eval_miracl_map(input_path: str) -> None:
+def run_eval_miracl_map(args: argparse.Namespace) -> None:
     from wikipediarag.eval.commands import eval_miracl_map
 
-    report = asyncio.run(eval_miracl_map(input_path=Path(input_path)))
+    report = asyncio.run(
+        eval_miracl_map(
+            input_path=Path(args.input) if args.input else None,
+            from_huggingface=bool(args.from_huggingface),
+            split=str(args.split),
+            limit=int(args.limit),
+            output_suite=str(args.output_suite),
+            cache_dir=Path(args.cache_dir) if args.cache_dir else None,
+            min_text_overlap=float(args.min_text_overlap),
+        )
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
@@ -603,10 +670,21 @@ def run_eval_release_gate(suite: str, api: str) -> None:
     from wikipediarag.eval.review import ReleaseGateCliReporter
 
     _require_api_ready(api)
+    _require_release_gate_provider_smoke()
     report = asyncio.run(eval_release_gate(suite=suite, api=api, progress_callback=ReleaseGateCliReporter()))
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if not report.get("passed"):
         raise SystemExit("eval-release-gate failed")
+
+
+def _require_release_gate_provider_smoke() -> None:
+    from wikipediarag.config import get_settings
+    from wikipediarag.eval.settings import adapt_eval_settings
+
+    settings = adapt_eval_settings(get_settings())
+    if settings.model_provider != "openrouter":
+        return
+    smoke_models(settings.model_gateway_url.rstrip("/"), "openrouter")
 
 
 def run_eval_release_gate_status(suite: str, report_id: str | None, json_mode: bool) -> None:
@@ -651,6 +729,26 @@ def run_eval_reviewed_short(args: argparse.Namespace) -> None:
             retrieval_batch_size=args.retrieval_batch_size,
             run_answer=not args.skip_answer,
             run_retrieval=not args.skip_retrieval,
+        )
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_profile_retrieval(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_profile_retrieval
+
+    _require_api_ready(args.api)
+    report = asyncio.run(
+        eval_profile_retrieval(
+            suite=args.suite,
+            split=args.split,
+            api=args.api,
+            config_id=args.config_id,
+            task_ids=list(args.task_id) or None,
+            limit=args.limit,
+            warmup_iterations=args.warmup_iterations,
+            measured_iterations=args.measured_iterations,
+            batch_size=args.batch_size,
         )
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -856,6 +954,13 @@ def verify_document_upload(args: argparse.Namespace) -> None:
             _record_check(report, "docling_convert", True)
             _wait_json_ready(client, f"{api}/ready", "api", require_ok=True)
             _record_check(report, "api_ready", True)
+            _authenticate_smoke_session(
+                client,
+                api,
+                username=str(args.admin_username),
+                admin_secret=_resolve_hardening_admin_secret(args),
+            )
+            _record_check(report, "platform_admin_login", True)
             kb_id = _create_verify_knowledge_base(client, api)
             report["knowledge_base_id"] = kb_id
             for fixture in _document_upload_fixtures():
@@ -988,6 +1093,475 @@ def verify_document_corpus(args: argparse.Namespace) -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if exit_code:
         raise SystemExit(exit_code)
+
+
+def verify_cross_tenant_hardening(args: argparse.Namespace) -> None:
+    api = str(args.api).rstrip("/")
+    admin_secret = _resolve_hardening_admin_secret(args)
+    report_dir = Path("artifacts/validation/cross-tenant-hardening") / time.strftime(
+        "%Y%m%dT%H%M%SZ",
+        time.gmtime(),
+    )
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {
+        "passed": False,
+        "api": api,
+        "report_dir": str(report_dir),
+        "checks": [],
+        "negative_probes": [],
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    exit_code = 0
+    try:
+        if not admin_secret:
+            raise RuntimeError(
+                "verify-cross-tenant-hardening resolved an empty admin secret; configure --admin-secret-file, "
+                "WIKIPEDIARAG_ADMIN_PASSWORD_FILE, --admin-secret or WIKIPEDIARAG_ADMIN_PASSWORD"
+            )
+        if not args.skip_compose:
+            _compose_up_cross_tenant_hardening_stack()
+            _record_check(report, "compose_up", True)
+        with httpx.Client(timeout=180, follow_redirects=True) as client:
+            _wait_json_ready(client, f"{api}/ready", "api", require_ok=True)
+            _record_check(report, "api_ready", True)
+            _login_for_hardening(client, api, str(args.admin_username), admin_secret)
+            _record_check(report, "platform_admin_login", True)
+
+            suffix = time.strftime("%Y%m%d%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
+            tenant_a = _create_hardening_tenant(client, api, suffix, "a")
+            tenant_b = _create_hardening_tenant(client, api, suffix, "b")
+            report["tenant_a_id"] = tenant_a
+            report["tenant_b_id"] = tenant_b
+            _record_check(report, "two_real_tenants_created", True)
+
+            _select_hardening_tenant(client, api, tenant_a)
+            kb_a = _create_verify_knowledge_base(client, api)
+            report["tenant_a_kb_id"] = kb_a
+            upload_result = _upload_hardening_fixture(client, api, kb_a, tenant_a)
+            _assert_presigned_url_uses_tenant_kb_path(upload_result["upload_session"], tenant_a, kb_a)
+            job_payload = _wait_job_terminal(client, api, str(upload_result["job_id"]))
+            if job_payload.get("status") != "completed":
+                raise RuntimeError(f"tenant A upload job did not complete: {job_payload}")
+            document = _get_json(client, f"{api}/api/v1/documents/{upload_result['document_id']}")
+            versions = _get_json(client, f"{api}/api/v1/documents/{upload_result['document_id']}/versions")
+            _assert_public_payload_is_safe(document)
+            _assert_public_payload_is_safe(versions)
+            _verify_uploaded_retrieval(client, api, kb_a)
+            query_run_id = _run_hardening_chat(client, api, kb_a)
+            _record_check(report, "tenant_a_upload_chat_retrieval", True)
+
+            _select_hardening_tenant(client, api, tenant_b)
+            kb_b = _create_verify_knowledge_base(client, api)
+            report["tenant_b_kb_id"] = kb_b
+            _record_check(report, "tenant_b_context_selected", True)
+
+            probes = [
+                _negative_probe(client, "GET", f"{api}/api/v1/knowledge-bases/{kb_a}", "tenant_b_get_tenant_a_kb"),
+                _negative_probe(
+                    client,
+                    "POST",
+                    f"{api}/api/v1/uploads/sessions",
+                    "tenant_b_create_upload_in_tenant_a_kb",
+                    json_payload=_hardening_upload_session_payload(kb_a),
+                ),
+                _negative_probe(
+                    client,
+                    "POST",
+                    f"{api}/api/v1/uploads/sessions/{upload_result['upload_session_id']}:complete",
+                    "tenant_b_complete_tenant_a_upload_session",
+                    json_payload={"metadata": {"tenant_id": tenant_b, "object_key": "uploads/evil"}},
+                ),
+                _negative_probe(
+                    client,
+                    "GET",
+                    f"{api}/api/v1/ingestion-jobs/{upload_result['job_id']}",
+                    "tenant_b_get_tenant_a_job",
+                ),
+                _negative_probe(
+                    client,
+                    "POST",
+                    f"{api}/api/v1/ingestion-jobs/{upload_result['job_id']}:cancel",
+                    "tenant_b_cancel_tenant_a_job",
+                ),
+                _negative_probe(
+                    client,
+                    "POST",
+                    f"{api}/api/v1/ingestion-jobs/{upload_result['job_id']}:resume",
+                    "tenant_b_resume_tenant_a_job",
+                ),
+                _negative_probe(
+                    client,
+                    "GET",
+                    f"{api}/api/v1/documents/{upload_result['document_id']}",
+                    "tenant_b_get_tenant_a_document",
+                ),
+                _negative_probe(
+                    client,
+                    "GET",
+                    f"{api}/api/v1/documents/{upload_result['document_id']}/versions",
+                    "tenant_b_get_tenant_a_document_versions",
+                ),
+                _negative_probe(
+                    client,
+                    "POST",
+                    f"{api}/api/v1/documents/{upload_result['document_id']}:reprocess",
+                    "tenant_b_reprocess_tenant_a_document",
+                ),
+                _negative_probe(
+                    client,
+                    "GET",
+                    f"{api}/api/v1/query-runs/{query_run_id}/retrieval",
+                    "tenant_b_get_tenant_a_query_run_retrieval",
+                ),
+                _negative_probe(
+                    client,
+                    "POST",
+                    f"{api}/api/v1/search:debug",
+                    "tenant_b_debug_search_tenant_a_kb",
+                    json_payload={
+                        "message": "hardening tenant isolation marker",
+                        "knowledge_base_ids": [kb_a],
+                        "retrieval_profile": "upload_sota_mvp",
+                        "tenant_id": tenant_a,
+                        "filters": {"tenant_id": tenant_a},
+                    },
+                    accepted_statuses={403, 404, 409},
+                ),
+                _negative_probe(
+                    client,
+                    "POST",
+                    f"{api}/api/v1/chat",
+                    "tenant_b_chat_tenant_a_kb",
+                    json_payload={
+                        "message": "hardening tenant isolation marker",
+                        "knowledge_base_ids": [kb_a],
+                        "retrieval_profile": "upload_sota_mvp",
+                        "tenant_id": tenant_a,
+                        "stream": True,
+                    },
+                    accepted_statuses={403, 404, 409},
+                ),
+            ]
+            for probe in probes:
+                _append_negative_probe(report, probe)
+            failures = [probe for probe in probes if not bool(probe.get("passed"))]
+            if failures:
+                raise RuntimeError(f"cross-tenant hardening failed for {len(failures)} probe(s)")
+        report["passed"] = True
+    except Exception as exc:
+        exit_code = 1
+        report["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+    finally:
+        report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_cross_tenant_hardening_reports(report_dir, report)
+        if args.down_after:
+            subprocess.run([_docker_executable(), "compose", "down"], check=False)  # noqa: S603
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+def _resolve_hardening_admin_secret(args: argparse.Namespace) -> str:
+    raw_path = getattr(args, "admin_secret_file", None)
+    if raw_path:
+        return Path(str(raw_path)).read_text(encoding="utf-8").strip()
+    return str(getattr(args, "admin_secret", "admin") or "admin")
+
+
+def _login_for_hardening(client: httpx.Client, api: str, username: str, admin_secret: str) -> None:
+    response = client.post(
+        f"{api}/api/v1/auth/local/login",
+        json={"username": username, "password": admin_secret, "remember_me": False},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    user = payload.get("user") if isinstance(payload, dict) else None
+    if not isinstance(user, dict) or user.get("platform_role") != "PLATFORM_ADMIN":
+        raise RuntimeError("hardening smoke requires a PLATFORM_ADMIN local/hybrid login")
+    if user.get("password_change_required"):
+        raise RuntimeError("hardening smoke requires password_change_required=false for the admin user")
+    session = _get_json(client, f"{api}/api/v1/auth/session")
+    csrf_token = session.get("csrf_token")
+    if not isinstance(csrf_token, str) or not csrf_token:
+        raise RuntimeError(f"authenticated session did not return a CSRF token: {session}")
+    client.headers.update({"X-CSRF-Token": csrf_token})
+
+
+def _authenticate_smoke_session(client: httpx.Client, api: str, *, username: str, admin_secret: str) -> None:
+    session_response = client.get(f"{api}/api/v1/auth/session", timeout=30)
+    session_response.raise_for_status()
+    session = session_response.json()
+    if isinstance(session, dict) and session.get("authenticated"):
+        csrf_token = session.get("csrf_token")
+        if isinstance(csrf_token, str) and csrf_token:
+            client.headers.update({"X-CSRF-Token": csrf_token})
+        return
+    _login_for_hardening(client, api, username, admin_secret)
+
+
+def _create_hardening_tenant(client: httpx.Client, api: str, suffix: str, label: str) -> str:
+    response = client.post(
+        f"{api}/api/v1/admin/tenants",
+        json={"slug": f"hardening-{label}-{suffix}", "name": f"Hardening Tenant {label.upper()} {suffix}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    tenant_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(tenant_id, str) or not tenant_id:
+        raise RuntimeError(f"tenant creation returned an invalid payload: {payload}")
+    return tenant_id
+
+
+def _select_hardening_tenant(client: httpx.Client, api: str, tenant_id: str) -> None:
+    response = client.post(f"{api}/api/v1/auth/session/tenant", json={"tenant_id": tenant_id}, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("active_tenant_id") != tenant_id:
+        raise RuntimeError(f"tenant selection did not activate {tenant_id}: {payload}")
+    session = _get_json(client, f"{api}/api/v1/auth/session")
+    csrf_token = session.get("csrf_token")
+    if not isinstance(csrf_token, str) or not csrf_token:
+        raise RuntimeError(f"tenant-selected session did not return a CSRF token: {session}")
+    client.headers.update({"X-CSRF-Token": csrf_token})
+
+
+def _hardening_upload_session_payload(knowledge_base_id: str) -> dict[str, Any]:
+    content = b"hardening tenant isolation marker 2026-07-30"
+    return {
+        "filename": "hardening-isolation.txt",
+        "content_type": "text/plain",
+        "size_bytes": len(content),
+        "checksum_sha256": hashlib.sha256(content).hexdigest(),
+        "knowledge_base_id": knowledge_base_id,
+        "parser_profile": "standard",
+        "metadata": {
+            "tenant_id": "client-supplied-tenant-must-be-ignored",
+            "user_id": "client-supplied-user-must-be-ignored",
+            "object_key": "uploads/client/supplied/key",
+        },
+    }
+
+
+def _upload_hardening_fixture(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    tenant_id: str,
+) -> dict[str, Any]:
+    content = b"hardening tenant isolation marker 2026-07-30"
+    session_response = client.post(
+        f"{api}/api/v1/uploads/sessions",
+        json=_hardening_upload_session_payload(knowledge_base_id),
+        timeout=30,
+    )
+    session_response.raise_for_status()
+    session = session_response.json()
+    upload_response = httpx.put(
+        session["upload_url"],
+        content=content,
+        headers=session.get("required_headers") or {},
+        timeout=120,
+    )
+    upload_response.raise_for_status()
+    complete_response = client.post(
+        f"{api}/api/v1/uploads/sessions/{session['upload_session_id']}:complete",
+        json={"metadata": {"tenant_id": tenant_id, "object_key": "uploads/client/supplied/key"}},
+        timeout=30,
+    )
+    complete_response.raise_for_status()
+    payload = complete_response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("upload complete returned a non-object JSON payload")
+    return {
+        **payload,
+        "upload_session_id": session["upload_session_id"],
+        "upload_session": session,
+    }
+
+
+def _run_hardening_chat(client: httpx.Client, api: str, knowledge_base_id: str) -> str:
+    with client.stream(
+        "POST",
+        f"{api}/api/v1/chat",
+        json={
+            "message": "hardening tenant isolation marker",
+            "knowledge_base_ids": [knowledge_base_id],
+            "retrieval_profile": "upload_sota_mvp",
+            "stream": True,
+            "tenant_id": "client-supplied-tenant-must-be-ignored",
+        },
+        timeout=120,
+    ) as response:
+        response.raise_for_status()
+        events = list(_iter_sse(response.iter_lines()))
+    names = [event["event"] for event in events]
+    if "run.completed" not in names:
+        raise RuntimeError(f"hardening chat did not complete: {names}")
+    for event in events:
+        query_run_id = event.get("data", {}).get("query_run_id") or event.get("query_run_id")
+        if isinstance(query_run_id, str) and query_run_id:
+            return query_run_id
+    raise RuntimeError(f"hardening chat did not expose query_run_id: {events}")
+
+
+def _assert_presigned_url_uses_tenant_kb_path(upload_session: Any, tenant_id: str, knowledge_base_id: str) -> None:
+    if not isinstance(upload_session, dict):
+        raise RuntimeError("upload session payload is not an object")
+    serialized = json.dumps(upload_session, ensure_ascii=False)
+    expected = f"uploads/{tenant_id}/{knowledge_base_id}/"
+    if expected not in serialized:
+        raise RuntimeError("presigned upload URL does not include the server-owned tenant and KB path")
+    unexpected = "uploads/client/supplied/key"
+    if unexpected in serialized:
+        raise RuntimeError("presigned upload URL used a client-supplied object key")
+
+
+def _negative_probe(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    name: str,
+    *,
+    json_payload: dict[str, Any] | None = None,
+    accepted_statuses: set[int] | None = None,
+) -> dict[str, Any]:
+    accepted = accepted_statuses or {403, 404}
+    response = client.request(method, url, json=json_payload, timeout=60)
+    body: dict[str, Any] = {}
+    try:
+        payload = response.json()
+        body = payload if isinstance(payload, dict) else {}
+    except ValueError:
+        body = {}
+    safe_payload = _safe_probe_payload(body)
+    passed = response.status_code in accepted and not _payload_has_cross_tenant_leak(safe_payload)
+    return {
+        "name": name,
+        "method": method,
+        "status_code": response.status_code,
+        "accepted_statuses": sorted(accepted),
+        "passed": passed,
+        "error_code": _extract_error_code(body),
+        "safe_payload": safe_payload,
+    }
+
+
+def _payload_has_cross_tenant_leak(payload: Any) -> bool:
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    unsafe_tokens = (
+        "object_key",
+        "original_artifact_key",
+        "normalized_artifact_key",
+        "server_side_tokens",
+        "access_token",
+        "refresh_token",
+        "hardening tenant isolation marker 2026-07-30",
+        "uploads/client/supplied/key",
+    )
+    return any(token in serialized for token in unsafe_tokens)
+
+
+def _safe_probe_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    if isinstance(error, dict):
+        return {
+            "error": {
+                "code": error.get("code"),
+                "message": error.get("message"),
+                "details": error.get("details") if isinstance(error.get("details"), dict) else {},
+            }
+        }
+    if "detail" in payload:
+        return {"detail": str(payload.get("detail"))[:300]}
+    return {}
+
+
+def _extract_error_code(payload: dict[str, Any]) -> str | None:
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else None
+    if isinstance(error, dict) and isinstance(error.get("code"), str):
+        return str(error["code"])
+    detail = payload.get("detail")
+    return str(detail)[:80] if detail is not None else None
+
+
+def _append_negative_probe(report: dict[str, Any], item: dict[str, Any]) -> None:
+    probes = report.setdefault("negative_probes", [])
+    if isinstance(probes, list):
+        probes.append(item)
+
+
+def _write_cross_tenant_hardening_reports(report_dir: Path, report: dict[str, Any]) -> None:
+    report_path = report_dir / "cross-tenant-hardening-report.json"
+    junit_path = report_dir / "cross-tenant-hardening-junit.xml"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    raw_probes = report.get("negative_probes")
+    probes: list[Any] = raw_probes if isinstance(raw_probes, list) else []
+    failures = [probe for probe in probes if isinstance(probe, dict) and not probe.get("passed")]
+    if not failures and report.get("error"):
+        failures = [{"name": "verify_cross_tenant_hardening", "error": report["error"]}]
+    testcases: list[str] = []
+    for probe in probes:
+        if not isinstance(probe, dict):
+            continue
+        failure_xml = ""
+        if not probe.get("passed"):
+            failure_xml = (
+                f'<failure type="{escape(str(probe.get("error_code") or "CrossTenantProbeFailed"))}">'
+                f"{escape(json.dumps(probe, ensure_ascii=False))}</failure>"
+            )
+        testcases.append(
+            f'  <testcase classname="wikipediarag.cli" name="{escape(str(probe.get("name") or "probe"))}">'
+            f"{failure_xml}</testcase>\n"
+        )
+    if not testcases and report.get("error"):
+        error = report["error"] if isinstance(report["error"], dict) else {}
+        testcases.append(
+            '  <testcase classname="wikipediarag.cli" name="verify_cross_tenant_hardening">'
+            f'<failure type="{escape(str(error.get("code") or "Error"))}">'
+            f"{escape(str(error.get('message') or ''))}</failure></testcase>\n"
+        )
+    junit = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<testsuite name="verify-cross-tenant-hardening" tests="{len(testcases)}" failures="{len(failures)}">\n'
+        f"{''.join(testcases)}</testsuite>\n"
+    )
+    junit_path.write_text(junit, encoding="utf-8")
+
+
+def _compose_up_cross_tenant_hardening_stack() -> None:
+    env = {
+        **os.environ,
+        "AUTH_MODE": "local",
+        "SESSION_COOKIE_SECURE": "false",
+        "MODEL_PROVIDER": "mock",
+        "RETRIEVAL_PROFILE": "test_mock",
+        "DOCUMENT_PARSER_SERVICES_REQUIRED": "true",
+        "MINIO_PUBLIC_ENDPOINT": os.environ.get("MINIO_PUBLIC_ENDPOINT", "http://localhost:9000"),
+        "API_PUBLIC_BASE_URL": os.environ.get("API_PUBLIC_BASE_URL", "http://localhost:8000"),
+        "XBERG_URL": os.environ.get("XBERG_URL", "http://xberg:8000"),
+        "DOCLING_URL": os.environ.get("DOCLING_URL", "http://docling:5001"),
+        "METADATA_SERVICE_URL": os.environ.get("METADATA_SERVICE_URL", "http://metadata-service:8090"),
+    }
+    services = [
+        "postgres",
+        "redis",
+        "minio",
+        "opensearch",
+        "mock-provider",
+        "model-gateway",
+        "metadata-service",
+        "xberg",
+        "docling",
+        "api",
+        "worker",
+    ]
+    subprocess.run(  # noqa: S603
+        [_docker_executable(), "compose", "up", "-d", "--build", "--force-recreate", *services],
+        check=True,
+        env=env,
+    )
 
 
 def _materialize_external_corpus(
@@ -1226,7 +1800,7 @@ def _verify_corpus_retrieval(
             "message": item.retrieval_query,
             "top_k": 5,
             "knowledge_base_ids": [knowledge_base_id],
-            "retrieval_profile": "upload_mock",
+            "retrieval_profile": "upload_sota_mvp",
         },
         timeout=120,
     )
@@ -1558,7 +2132,7 @@ def _verify_uploaded_retrieval(client: httpx.Client, api: str, knowledge_base_id
             "message": "Проверочный документ 2026-07-29",
             "top_k": 5,
             "knowledge_base_ids": [knowledge_base_id],
-            "retrieval_profile": "upload_mock",
+            "retrieval_profile": "upload_sota_mvp",
         },
         timeout=120,
     )

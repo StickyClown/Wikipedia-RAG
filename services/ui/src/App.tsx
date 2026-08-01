@@ -1,6 +1,7 @@
 import {
   Bug,
   Database,
+  ExternalLink,
   FileUp,
   KeyRound,
   LogIn,
@@ -48,6 +49,19 @@ type RetrievalEvent = {
   stage: string;
   payload: unknown;
   event_type?: string;
+  created_at?: string;
+};
+
+type QueryRunSummary = {
+  id?: string;
+  mode?: string;
+  status?: string;
+  input_text?: string;
+  answer?: string | null;
+  model_alias?: string | null;
+  error_code?: string | null;
+  trace_id?: string;
+  usage?: Record<string, unknown>;
 };
 
 type SsePayload = {
@@ -80,6 +94,63 @@ type UploadCompleteResponse = {
   document_version_id: string;
   job_id: string;
   status: string;
+};
+
+type UploadBatchAccepted = {
+  batch_id: string;
+  knowledge_base_id: string;
+  status: string;
+  total_items: number;
+  items: Array<
+    UploadSessionAccepted & {
+      filename: string;
+      content_type: string;
+      size_bytes: number;
+      checksum_sha256: string;
+    }
+  >;
+};
+
+type UploadBatchItemStatus = {
+  upload_session_id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  checksum_sha256: string;
+  status: string;
+  upload_completed_at?: string | null;
+  document_id?: string | null;
+  document_version_id?: string | null;
+  job_id?: string | null;
+  job_status?: string | null;
+  progress?: Job["progress"];
+  error_code?: string | null;
+  error_message?: string | null;
+};
+
+type UploadBatchStatus = {
+  batch_id: string;
+  knowledge_base_id: string;
+  status: string;
+  total_items: number;
+  completed_items: number;
+  failed_items: number;
+  cancelled_items: number;
+  pending_items: number;
+  items: UploadBatchItemStatus[];
+};
+
+type UploadItemState = {
+  id: string;
+  filename: string;
+  size_bytes: number;
+  status: string;
+  upload_session_id?: string;
+  document_id?: string | null;
+  job_id?: string | null;
+  progress?: Job["progress"];
+  error_code?: string | null;
+  error_message?: string | null;
 };
 
 type AuthSession = {
@@ -118,6 +189,38 @@ type DocumentPublicMetadata = {
   public_metadata?: Record<string, unknown>;
 };
 
+type SearchFilters = {
+  document_type?: string;
+  language?: string;
+  date_from?: string;
+  date_to?: string;
+  source?: string;
+};
+
+type SearchResult = {
+  document_id: string;
+  document_version_id: string;
+  knowledge_base_id: string;
+  title: string;
+  snippet: string;
+  section_path: string[];
+  source_url: string;
+  source_type: string;
+  document_type?: string | null;
+  language?: string | null;
+  document_date?: string | null;
+  locator?: Record<string, unknown> | null;
+  score: number;
+  ranks: Record<string, number>;
+};
+
+type SearchResponse = {
+  results: SearchResult[];
+  limit: number;
+  offset: number;
+  has_more: boolean;
+};
+
 export function App() {
   const [ready, setReady] = useState("checking");
   const [session, setSession] = useState<AuthSession>({
@@ -128,6 +231,8 @@ export function App() {
   const [authError, setAuthError] = useState("");
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
   const [selectedKnowledgeBaseId, setSelectedKnowledgeBaseId] = useState("");
+  const [selectedRetrievalKnowledgeBaseIds, setSelectedRetrievalKnowledgeBaseIds] =
+    useState<string[]>([]);
   const [newKnowledgeBaseName, setNewKnowledgeBaseName] = useState("");
   const [limit, setLimit] = useState(1000);
   const [job, setJob] = useState<Job | null>(null);
@@ -149,12 +254,26 @@ export function App() {
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [queryRunId, setQueryRunId] = useState("");
   const [events, setEvents] = useState<RetrievalEvent[]>([]);
+  const [debuggerRun, setDebuggerRun] = useState<QueryRunSummary | null>(null);
   const [uploadStatus, setUploadStatus] = useState("");
   const [uploadBusy, setUploadBusy] = useState(false);
-  const [uploadJob, setUploadJob] = useState<Job | null>(null);
+  const [uploadBatch, setUploadBatch] = useState<UploadBatchStatus | null>(
+    null,
+  );
+  const [uploadItems, setUploadItems] = useState<UploadItemState[]>([]);
   const [uploadDocument, setUploadDocument] =
     useState<DocumentPublicMetadata | null>(null);
   const [uploadError, setUploadError] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searchBusy, setSearchBusy] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [searchHasMore, setSearchHasMore] = useState(false);
+  const [searchDocumentType, setSearchDocumentType] = useState("");
+  const [searchLanguage, setSearchLanguage] = useState("");
+  const [searchDateFrom, setSearchDateFrom] = useState("");
+  const [searchDateTo, setSearchDateTo] = useState("");
+  const [searchSource, setSearchSource] = useState("");
 
   useEffect(() => {
     fetch(`${API_BASE}/ready`)
@@ -181,6 +300,7 @@ export function App() {
       setKnowledgeBases(items);
       if (items[0]) {
         setSelectedKnowledgeBaseId(items[0].id);
+        setSelectedRetrievalKnowledgeBaseIds([items[0].id]);
       }
     }
     void loadInitialSession();
@@ -191,6 +311,12 @@ export function App() {
 
   const imported = useMemo(() => job?.progress?.pages_imported ?? 0, [job]);
   const chunks = useMemo(() => job?.progress?.chunks_indexed ?? 0, [job]);
+  const searchKnowledgeBaseIds =
+    selectedRetrievalKnowledgeBaseIds.length > 0
+      ? selectedRetrievalKnowledgeBaseIds
+      : selectedKnowledgeBaseId
+        ? [selectedKnowledgeBaseId]
+        : [];
 
   async function apiFetch(path: string, init: RequestInit = {}) {
     const method = init.method?.toUpperCase() ?? "GET";
@@ -258,6 +384,9 @@ export function App() {
       setSession({ authenticated: false });
       setKnowledgeBases([]);
       setSelectedKnowledgeBaseId("");
+      setSelectedRetrievalKnowledgeBaseIds([]);
+      setSearchResults([]);
+      setSearchError("");
     }
   }
 
@@ -268,6 +397,9 @@ export function App() {
     setKnowledgeBases(items);
     if (!selectedKnowledgeBaseId && items[0]) {
       setSelectedKnowledgeBaseId(items[0].id);
+    }
+    if (selectedRetrievalKnowledgeBaseIds.length === 0 && items[0]) {
+      setSelectedRetrievalKnowledgeBaseIds([items[0].id]);
     }
   }
 
@@ -309,14 +441,18 @@ export function App() {
     setAnswer("");
     setEvidence([]);
     setEvents([]);
+    setDebuggerRun(null);
     const response = await apiFetch("/api/v1/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message: question,
-        knowledge_base_ids: selectedKnowledgeBaseId
-          ? [selectedKnowledgeBaseId]
-          : [],
+        knowledge_base_ids:
+          selectedRetrievalKnowledgeBaseIds.length > 0
+            ? selectedRetrievalKnowledgeBaseIds
+            : selectedKnowledgeBaseId
+              ? [selectedKnowledgeBaseId]
+              : [],
         mode,
         stream: true,
         retrieval_profile: retrievalProfile,
@@ -355,61 +491,168 @@ export function App() {
     }
   }
 
+  async function submitSearch(event: FormEvent) {
+    event.preventDefault();
+    await runSearch(0);
+  }
+
+  async function loadMoreSearch() {
+    await runSearch(searchResults.length);
+  }
+
+  async function runSearch(offset: number) {
+    const query = searchQuery.trim();
+    if (!query || searchKnowledgeBaseIds.length === 0) return;
+    setSearchBusy(true);
+    setSearchError("");
+    if (offset === 0) {
+      setSearchResults([]);
+      setSearchHasMore(false);
+    }
+    try {
+      const filters = buildSearchFilters({
+        documentType: searchDocumentType,
+        language: searchLanguage,
+        dateFrom: searchDateFrom,
+        dateTo: searchDateTo,
+        source: searchSource,
+      });
+      const response = await apiFetch("/api/v1/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query,
+          knowledge_base_ids: searchKnowledgeBaseIds,
+          limit: 10,
+          offset,
+          filters,
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as SearchResponse;
+      setSearchResults((items) =>
+        offset === 0 ? payload.results : [...items, ...payload.results],
+      );
+      setSearchHasMore(payload.has_more);
+    } catch (error) {
+      setSearchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSearchBusy(false);
+    }
+  }
+
   async function loadDebugger() {
     if (!queryRunId) return;
     const response = await apiFetch(
       `/api/v1/query-runs/${queryRunId}/retrieval`,
     );
     const data = await response.json();
+    setDebuggerRun(data.run ?? null);
     setEvents(data.events);
+  }
+
+  function toggleRetrievalKnowledgeBase(kbId: string): void {
+    setSelectedRetrievalKnowledgeBaseIds((selected) =>
+      selected.includes(kbId)
+        ? selected.filter((candidate) => candidate !== kbId)
+        : [...selected, kbId],
+    );
+  }
+
+  function patchUploadItem(
+    id: string,
+    patch: Partial<UploadItemState>,
+  ): void {
+    setUploadItems((items) =>
+      items.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+    );
   }
 
   async function uploadFile(event: React.ChangeEvent<HTMLInputElement>) {
     const input = event.currentTarget;
-    const file = input.files?.[0];
-    if (!file) return;
+    const files = Array.from(input.files ?? []);
+    if (files.length === 0) return;
+    const planned = files.map((file, index) => ({
+      id: `local-${Date.now()}-${index}`,
+      filename: file.name,
+      size_bytes: file.size,
+      status: "preparing",
+    }));
     setUploadBusy(true);
     setUploadError("");
-    setUploadJob(null);
+    setUploadBatch(null);
+    setUploadItems(planned);
     setUploadDocument(null);
-    setUploadStatus(`Preparing ${file.name}`);
+    setUploadStatus(`Preparing ${files.length} file(s)`);
     try {
-      const checksum = await sha256Hex(file);
-      const sessionResponse = await apiFetch("/api/v1/uploads/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const batchItems = [];
+      for (const [index, file] of files.entries()) {
+        patchUploadItem(planned[index].id, { status: "hashing" });
+        batchItems.push({
           filename: file.name,
           content_type: file.type || "application/octet-stream",
           size_bytes: file.size,
-          checksum_sha256: checksum,
+          checksum_sha256: await sha256Hex(file),
           parser_profile: "standard",
+          metadata: { ui_upload: true },
+        });
+      }
+      const batchResponse = await apiFetch("/api/v1/uploads/batches", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
           knowledge_base_id: selectedKnowledgeBaseId || undefined,
+          metadata: { ui_upload: true },
+          items: batchItems,
         }),
       });
-      if (!sessionResponse.ok) throw new Error(await sessionResponse.text());
-      const session = (await sessionResponse.json()) as UploadSessionAccepted;
-      setUploadStatus("Uploading to object storage");
-      const putResponse = await fetch(session.upload_url, {
-        method: "PUT",
-        headers: session.required_headers,
-        body: file,
-      });
-      if (!putResponse.ok) throw new Error(await putResponse.text());
-      setUploadStatus("Completing upload session");
-      const completeResponse = await apiFetch(
-        `/api/v1/uploads/sessions/${session.upload_session_id}:complete`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ metadata: { ui_upload: true } }),
-        },
-      );
-      if (!completeResponse.ok) throw new Error(await completeResponse.text());
-      const completed =
-        (await completeResponse.json()) as UploadCompleteResponse;
-      setUploadStatus(`Queued ${file.name}`);
-      void pollUploadJob(completed.job_id, completed.document_id);
+      if (!batchResponse.ok) throw new Error(await batchResponse.text());
+      const batch = (await batchResponse.json()) as UploadBatchAccepted;
+      setUploadStatus(`Created batch ${batch.batch_id}`);
+      for (const [index, item] of batch.items.entries()) {
+        const localId = planned[index].id;
+        patchUploadItem(localId, {
+          status: "uploading",
+          upload_session_id: item.upload_session_id,
+        });
+        const putResponse = await fetch(item.upload_url, {
+          method: "PUT",
+          headers: item.required_headers,
+          body: files[index],
+        });
+        if (!putResponse.ok) {
+          patchUploadItem(localId, {
+            status: "failed",
+            error_message: await putResponse.text(),
+          });
+          continue;
+        }
+        patchUploadItem(localId, { status: "completing" });
+        const completeResponse = await apiFetch(
+          `/api/v1/uploads/sessions/${item.upload_session_id}:complete`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ metadata: { ui_upload: true } }),
+          },
+        );
+        if (!completeResponse.ok) {
+          patchUploadItem(localId, {
+            status: "failed",
+            error_message: await completeResponse.text(),
+          });
+          continue;
+        }
+        const completed =
+          (await completeResponse.json()) as UploadCompleteResponse;
+        patchUploadItem(localId, {
+          status: "queued",
+          document_id: completed.document_id,
+          job_id: completed.job_id,
+        });
+      }
+      setUploadStatus(`Queued batch ${batch.batch_id}`);
+      void pollUploadBatch(batch.batch_id);
     } catch (error) {
       setUploadBusy(false);
       setUploadError(error instanceof Error ? error.message : String(error));
@@ -419,31 +662,74 @@ export function App() {
     }
   }
 
-  async function pollUploadJob(jobId: string, documentId: string) {
-    const response = await apiFetch(`/api/v1/ingestion-jobs/${jobId}`);
-    const nextJob = (await response.json()) as Job;
-    setUploadJob(nextJob);
-    const stage = nextJob.progress?.stage ?? nextJob.status;
-    setUploadStatus(`Ingestion ${stage}`);
-    if (!["completed", "failed", "cancelled"].includes(nextJob.status)) {
-      window.setTimeout(() => pollUploadJob(jobId, documentId), 1500);
+  async function pollUploadBatch(batchId: string) {
+    const response = await apiFetch(
+      `/api/v1/uploads/batches/${encodeURIComponent(batchId)}`,
+    );
+    if (!response.ok) {
+      setUploadBusy(false);
+      setUploadError(await response.text());
+      return;
+    }
+    const nextBatch = (await response.json()) as UploadBatchStatus;
+    setUploadBatch(nextBatch);
+    setUploadItems((items) =>
+      items.map((item) => {
+        const serverItem = nextBatch.items.find(
+          (candidate) =>
+            candidate.upload_session_id === item.upload_session_id,
+        );
+        if (!serverItem) return item;
+        return {
+          ...item,
+          filename: serverItem.filename,
+          size_bytes: serverItem.size_bytes,
+          status: serverItem.status,
+          document_id: serverItem.document_id,
+          job_id: serverItem.job_id,
+          progress: serverItem.progress,
+          error_code: serverItem.error_code,
+          error_message: serverItem.error_message,
+        };
+      }),
+    );
+    setUploadStatus(
+      `Batch ${nextBatch.status}: ${nextBatch.completed_items}/${nextBatch.total_items} complete`,
+    );
+    if (!["completed", "failed", "cancelled"].includes(nextBatch.status)) {
+      window.setTimeout(() => pollUploadBatch(batchId), 1500);
       return;
     }
     setUploadBusy(false);
-    if (nextJob.status === "completed") {
+    const firstCompleted = nextBatch.items.find((item) => item.document_id);
+    if (firstCompleted?.document_id) {
       const documentResponse = await apiFetch(
-        `/api/v1/documents/${encodeURIComponent(documentId)}`,
+        `/api/v1/documents/${encodeURIComponent(firstCompleted.document_id)}`,
       );
       if (documentResponse.ok) {
         setUploadDocument(
           (await documentResponse.json()) as DocumentPublicMetadata,
         );
       }
-    } else {
-      setUploadError(
-        nextJob.error_code ?? nextJob.error_message ?? nextJob.status,
-      );
     }
+  }
+
+  async function retryUploadItem(item: UploadItemState) {
+    if (!item.job_id || !uploadBatch) return;
+    patchUploadItem(item.id, { status: "resume_requested" });
+    const response = await apiFetch(
+      `/api/v1/ingestion-jobs/${item.job_id}:resume`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      patchUploadItem(item.id, {
+        status: "failed",
+        error_message: await response.text(),
+      });
+      return;
+    }
+    setUploadBusy(true);
+    void pollUploadBatch(uploadBatch.batch_id);
   }
 
   return (
@@ -504,7 +790,7 @@ export function App() {
       {session.authenticated && (
         <section className="band kb-toolbar">
           <label>
-            Knowledge base
+            Primary knowledge base
             <select
               value={selectedKnowledgeBaseId}
               onChange={(event) =>
@@ -518,6 +804,19 @@ export function App() {
               ))}
             </select>
           </label>
+          <fieldset className="kb-scope">
+            <legend>Retrieval scope</legend>
+            {knowledgeBases.map((kb) => (
+              <label key={kb.id}>
+                <input
+                  type="checkbox"
+                  checked={selectedRetrievalKnowledgeBaseIds.includes(kb.id)}
+                  onChange={() => toggleRetrievalKnowledgeBase(kb.id)}
+                />
+                <span>{kb.name}</span>
+              </label>
+            ))}
+          </fieldset>
           <form className="row" onSubmit={createKnowledgeBase}>
             <input
               value={newKnowledgeBaseName}
@@ -569,25 +868,53 @@ export function App() {
           <input
             type="file"
             accept=".txt,.md,.markdown,.html,.htm,.csv,.tsv,.json,.jsonl,.pdf,.docx,.pptx,.xlsx"
+            multiple
             onChange={uploadFile}
             disabled={uploadBusy}
           />
           {uploadStatus && <p className="upload-status">{uploadStatus}</p>}
-          {uploadJob && (
+          {uploadBatch && (
             <div className="progress upload-progress">
-              <strong>{uploadJob.status}</strong>
-              <span>{uploadJob.progress?.stage ?? "received"}</span>
-              <span>
-                {uploadJob.progress?.parser_route ?? "parser pending"}
-              </span>
-              <span>{uploadJob.progress?.bytes_received ?? 0} bytes</span>
-              <span>
-                {uploadJob.progress?.chunks_staged ?? 0} staged /{" "}
-                {uploadJob.progress?.chunks_published ?? 0} published
-              </span>
-              {uploadJob.error_code && (
-                <span className="error">{uploadJob.error_code}</span>
-              )}
+              <strong>{uploadBatch.status}</strong>
+              <span>{uploadBatch.total_items} files</span>
+              <span>{uploadBatch.completed_items} completed</span>
+              <span>{uploadBatch.failed_items} failed</span>
+              <span>{uploadBatch.pending_items} pending</span>
+            </div>
+          )}
+          {uploadItems.length > 0 && (
+            <div className="upload-items">
+              {uploadItems.map((item) => (
+                <article key={item.id} className="upload-item">
+                  <div>
+                    <strong>{item.filename}</strong>
+                    <span>{item.size_bytes} bytes</span>
+                  </div>
+                  <div>
+                    <span>{item.status}</span>
+                    <span>{item.progress?.stage ?? "waiting"}</span>
+                    <span>
+                      {item.progress?.parser_route ?? "parser pending"}
+                    </span>
+                    <span>
+                      {item.progress?.chunks_published ?? 0} published
+                    </span>
+                  </div>
+                  {(item.error_code || item.error_message) && (
+                    <p className="error">
+                      {item.error_code ?? item.error_message}
+                    </p>
+                  )}
+                  {item.status === "failed" && item.job_id && (
+                    <button
+                      type="button"
+                      onClick={() => void retryUploadItem(item)}
+                    >
+                      <RotateCw size={16} /> Retry
+                    </button>
+                  )}
+                </article>
+              ))}
             </div>
           )}
           {uploadDocument && (
@@ -623,6 +950,112 @@ export function App() {
           </section>
 
           <section className="band">
+        <form className="search-panel" onSubmit={submitSearch}>
+          <h2>
+            <Search size={18} /> Search
+          </h2>
+          <div className="search-query">
+            <input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="Search documents"
+            />
+            <button
+              type="submit"
+              disabled={
+                searchBusy ||
+                !searchQuery.trim() ||
+                searchKnowledgeBaseIds.length === 0
+              }
+            >
+              <Search size={16} /> Search
+            </button>
+          </div>
+          <div className="search-filters">
+            <label>
+              Document type
+              <input
+                value={searchDocumentType}
+                onChange={(event) => setSearchDocumentType(event.target.value)}
+                placeholder="pdf, text, html"
+              />
+            </label>
+            <label>
+              Language
+              <input
+                value={searchLanguage}
+                onChange={(event) => setSearchLanguage(event.target.value)}
+                placeholder="ru"
+              />
+            </label>
+            <label>
+              Date from
+              <input
+                type="date"
+                value={searchDateFrom}
+                onChange={(event) => setSearchDateFrom(event.target.value)}
+              />
+            </label>
+            <label>
+              Date to
+              <input
+                type="date"
+                value={searchDateTo}
+                onChange={(event) => setSearchDateTo(event.target.value)}
+              />
+            </label>
+            <label>
+              Source
+              <input
+                value={searchSource}
+                onChange={(event) => setSearchSource(event.target.value)}
+                placeholder="upload, wikipedia, url"
+              />
+            </label>
+          </div>
+        </form>
+
+        <div className="search-results">
+          {searchError && <p className="error">{searchError}</p>}
+          {!searchBusy && !searchError && searchQuery && searchResults.length === 0 && (
+            <p className="empty-state">No results</p>
+          )}
+          {searchResults.map((item, index) => (
+            <article key={`${item.document_version_id}-${index}`} className="search-result">
+              <div>
+                <h3>{item.title}</h3>
+                <p>{item.snippet}</p>
+              </div>
+              <div className="search-meta">
+                <span>{knowledgeBaseName(knowledgeBases, item.knowledge_base_id)}</span>
+                <span>{item.section_path.join(" / ") || "No section"}</span>
+                <span>{item.document_date ?? "No date"}</span>
+                <span>{item.document_type ?? item.source_type}</span>
+                <span>{item.language ?? "No language"}</span>
+              </div>
+              {item.locator && (
+                <code className="locator">{JSON.stringify(item.locator)}</code>
+              )}
+              <div className="search-actions">
+                {item.source_url ? (
+                  <a href={item.source_url} target="_blank" rel="noreferrer">
+                    <ExternalLink size={15} /> Open
+                  </a>
+                ) : (
+                  <span>Document {item.document_id}</span>
+                )}
+              </div>
+            </article>
+          ))}
+          {searchHasMore && (
+            <button type="button" onClick={loadMoreSearch} disabled={searchBusy}>
+              {searchBusy ? "Loading" : "Load more"}
+            </button>
+          )}
+        </div>
+          </section>
+
+          <section className="band">
         <form className="chat" onSubmit={submitChat}>
           <h2>
             <MessageSquare size={18} /> Chat
@@ -644,6 +1077,8 @@ export function App() {
                 >
                   <option value="sota_mvp">sota_mvp</option>
                   <option value="test_mock">test_mock</option>
+                  <option value="upload_mock">upload_mock</option>
+                  <option value="upload_sota_mvp">upload_sota_mvp</option>
                   <option value="bm25_only">bm25_only</option>
                   <option value="rewrite_off">rewrite_off</option>
                   <option value="parent_expansion_off">
@@ -773,9 +1208,7 @@ export function App() {
         {events.length > 0 && (
           <div className="debugger">
             <h2>Retrieval Debugger</h2>
-            {events.map((event, index) => (
-              <DebugStage key={`${event.stage}-${index}`} event={event} />
-            ))}
+            <RetrievalDebugger run={debuggerRun} events={events} />
           </div>
         )}
           </section>
@@ -799,6 +1232,36 @@ function buildRetrievalOverrides(state: RetrievalOverrideState) {
       extended_search: state.extendedSearchMode,
     },
   };
+}
+
+function buildSearchFilters(values: {
+  documentType: string;
+  language: string;
+  dateFrom: string;
+  dateTo: string;
+  source: string;
+}): SearchFilters {
+  const filters: SearchFilters = {};
+  if (values.documentType.trim()) {
+    filters.document_type = values.documentType.trim();
+  }
+  if (values.language.trim()) {
+    filters.language = values.language.trim();
+  }
+  if (values.dateFrom) {
+    filters.date_from = values.dateFrom;
+  }
+  if (values.dateTo) {
+    filters.date_to = values.dateTo;
+  }
+  if (values.source.trim()) {
+    filters.source = values.source.trim();
+  }
+  return filters;
+}
+
+function knowledgeBaseName(knowledgeBases: KnowledgeBase[], id: string): string {
+  return knowledgeBases.find((kb) => kb.id === id)?.name ?? id;
 }
 
 async function sha256Hex(file: File) {
@@ -827,12 +1290,243 @@ function formatTimestamp(value?: string | null) {
   }).format(new Date(value));
 }
 
-function DebugStage({ event }: { event: RetrievalEvent }) {
-  const payload =
-    typeof event.payload === "object" && event.payload !== null
-      ? (event.payload as Record<string, unknown>)
-      : (event as unknown as Record<string, unknown>);
-  const stage = String(payload.stage ?? event.stage);
+function RetrievalDebugger({
+  run,
+  events,
+}: {
+  run: QueryRunSummary | null;
+  events: RetrievalEvent[];
+}) {
+  const payloads = events.map(eventPayload);
+  const transforms = payloads
+    .filter((payload) => String(payload.stage ?? "") === "query_transform")
+    .flatMap((payload) => {
+      const raw = payload.transforms;
+      return Array.isArray(raw) ? raw : [];
+    })
+    .filter((item): item is Record<string, unknown> => {
+      return typeof item === "object" && item !== null;
+    });
+  const candidates = payloads.flatMap(candidateRows);
+  const queryYields = payloads.filter((payload) => {
+    return payload.stage === "harness_tool" && payload.tool === "search";
+  });
+  const decisions = payloads.filter((payload) => {
+    return Boolean(payload.decision || payload.reason || payload.reason_codes);
+  });
+  const context = payloads.find((payload) => {
+    return payload.stable_stage === "context_selection" || payload.stage === "context";
+  });
+  const answerEvent = payloads.find((payload) => payload.stage === "answer_generation");
+  const citationEvent = payloads.find((payload) => payload.stage === "citation_validation");
+  const feedbackEvents = payloads.filter((payload) => payload.stage === "feedback" || payload.stage === "evaluation");
+
+  return (
+    <>
+      <div className="debug-summary">
+        <span>{run?.status ?? "unknown"}</span>
+        <span>{run?.mode ?? ""}</span>
+        <span>{run?.model_alias ?? ""}</span>
+        <code>{run?.trace_id ?? ""}</code>
+      </div>
+
+      <section className="debug-stage">
+        <h3>Timeline</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Stage</th>
+              <th>Subquery</th>
+              <th>Count</th>
+              <th>Latency</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {payloads.map((payload, index) => (
+              <tr key={`timeline-${index}`}>
+                <td>{stageName(payload)}</td>
+                <td>{queryContextValue(payload, "subquery_id")}</td>
+                <td>{String(payload.count ?? "")}</td>
+                <td>{String(payload.latency_ms ?? payload.stage_latency_ms ?? "")}</td>
+                <td>{String(payload.status ?? payload.decision ?? payload.reason ?? "")}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+
+      {transforms.length > 0 && (
+        <section className="debug-stage">
+          <h3>Query Transforms</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Order</th>
+                <th>ID</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Output Subqueries</th>
+                <th>Value</th>
+              </tr>
+            </thead>
+            <tbody>
+              {transforms.map((transform, index) => (
+                <tr key={`transform-${index}`}>
+                  <td>{String(transform.order ?? index + 1)}</td>
+                  <td>{String(transform.transform_id ?? "")}</td>
+                  <td>{String(transform.type ?? "")}</td>
+                  <td>{String(transform.status ?? (transform.changed ? "changed" : ""))}</td>
+                  <td>
+                    <code>{queryRefIds(transform.query_refs)}</code>
+                  </td>
+                  <td>
+                    <code>
+                      {JSON.stringify(
+                        transform.text ?? transform.queries ?? transform.reason ?? "",
+                      )}
+                    </code>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      {queryYields.length > 0 && (
+        <section className="debug-stage">
+          <h3>Query Yield</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Step</th>
+                <th>Subquery</th>
+                <th>Transform</th>
+                <th>New</th>
+                <th>Selected</th>
+                <th>Coverage</th>
+                <th>Max BM25</th>
+                <th>Max Dense</th>
+                <th>Max Fusion</th>
+                <th>Max Rerank</th>
+                <th>Latency</th>
+              </tr>
+            </thead>
+            <tbody>
+              {queryYields.map((payload, index) => (
+                <tr key={`query-yield-${index}`}>
+                  <td>{String(payload.step ?? "")}</td>
+                  <td>{queryContextValue(payload, "subquery_id")}</td>
+                  <td>{queryContextValue(payload, "transform_id")}</td>
+                  <td>{String(payload.new_evidence ?? "")}</td>
+                  <td>{String(payload.selected_count ?? "")}</td>
+                  <td>{formatNumber(payload.coverage)}</td>
+                  <td>{formatNumber(payload.max_bm25_score)}</td>
+                  <td>{formatNumber(payload.max_dense_score)}</td>
+                  <td>{formatNumber(payload.max_fusion_score)}</td>
+                  <td>{formatNumber(payload.max_rerank_score)}</td>
+                  <td>{String(payload.latency_ms ?? "")}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      {candidates.length > 0 && (
+        <section className="debug-stage">
+          <h3>Candidate Movement</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Stage</th>
+                <th>Subquery</th>
+                <th>Chunk</th>
+                <th>Document</th>
+                <th>KB</th>
+                <th>BM25</th>
+                <th>Dense</th>
+                <th>Fusion</th>
+                <th>Rerank</th>
+                <th>Final</th>
+              </tr>
+            </thead>
+            <tbody>
+              {candidates.map((row, index) => (
+                <tr key={`candidate-${index}`}>
+                  <td>{row.stage}</td>
+                  <td>{row.subqueryId}</td>
+                  <td>{row.chunkId}</td>
+                  <td>{row.documentId}</td>
+                  <td>{row.kbId}</td>
+                  <td>{rankScore(row, "bm25")}</td>
+                  <td>{rankScore(row, "dense")}</td>
+                  <td>{rankScore(row, "fusion")}</td>
+                  <td>{rankScore(row, "rerank")}</td>
+                  <td>{row.ranks.final ?? ""}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      {decisions.length > 0 && (
+        <section className="debug-stage">
+          <h3>Decisions</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Stage</th>
+                <th>Chunk</th>
+                <th>Decision</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {decisions.map((payload, index) => (
+                <tr key={`decision-${index}`}>
+                  <td>{stageName(payload)}</td>
+                  <td>{String(payload.chunk_id ?? "")}</td>
+                  <td>{String(payload.decision ?? "")}</td>
+                  <td>
+                    <code>{JSON.stringify(payload.reason_codes ?? payload.reason ?? "")}</code>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      {(context || answerEvent || citationEvent || feedbackEvents.length > 0) && (
+        <section className="debug-stage">
+          <h3>Final Context</h3>
+          <pre>
+            {JSON.stringify(
+              {
+                context,
+                answer_generation: answerEvent,
+                citation_validation: citationEvent,
+                feedback: feedbackEvents,
+              },
+              null,
+              2,
+            )}
+          </pre>
+        </section>
+      )}
+
+      {payloads.map((payload, index) => (
+        <DebugStage key={`raw-${index}`} payload={payload} />
+      ))}
+    </>
+  );
+}
+
+function DebugStage({ payload }: { payload: Record<string, unknown> }) {
+  const stage = String(payload.stage ?? "");
   const rawCandidates = payload.candidates;
   const candidates = Array.isArray(rawCandidates)
     ? rawCandidates
@@ -874,6 +1568,89 @@ function DebugStage({ event }: { event: RetrievalEvent }) {
       )}
     </section>
   );
+}
+
+function eventPayload(event: RetrievalEvent): Record<string, unknown> {
+  return typeof event.payload === "object" && event.payload !== null
+    ? (event.payload as Record<string, unknown>)
+    : (event as unknown as Record<string, unknown>);
+}
+
+function stageName(payload: Record<string, unknown>): string {
+  return String(payload.stable_stage ?? payload.stage ?? "");
+}
+
+type CandidateRow = {
+  stage: string;
+  subqueryId: string;
+  transformId: string;
+  chunkId: string;
+  documentId: string;
+  kbId: string;
+  ranks: Record<string, number>;
+  scores: Record<string, number>;
+};
+
+function candidateRows(payload: Record<string, unknown>): CandidateRow[] {
+  const raw = payload.candidates;
+  const payloadSubqueryId = queryContextValue(payload, "subquery_id");
+  const payloadTransformId = queryContextValue(payload, "transform_id");
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((candidate): candidate is Record<string, unknown> => {
+      return typeof candidate === "object" && candidate !== null;
+    })
+    .map((candidate) => ({
+      stage: stageName(payload),
+      subqueryId: String(candidate.subquery_id ?? queryContextValue(candidate, "subquery_id") ?? payloadSubqueryId),
+      transformId: String(candidate.transform_id ?? queryContextValue(candidate, "transform_id") ?? payloadTransformId),
+      chunkId: String(candidate.chunk_id ?? ""),
+      documentId: String(candidate.document_id ?? ""),
+      kbId: String(candidate.knowledge_base_id ?? ""),
+      ranks: numericRecord(candidate.ranks),
+      scores: numericRecord(candidate.scores),
+    }));
+}
+
+function queryContextValue(payload: Record<string, unknown>, key: string): string {
+  const direct = payload[key];
+  if (typeof direct === "string") return direct;
+  const context = payload.query_context;
+  if (typeof context === "object" && context !== null) {
+    const value = (context as Record<string, unknown>)[key];
+    if (typeof value === "string") return value;
+  }
+  return "";
+}
+
+function queryRefIds(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  const ids = value
+    .filter((item): item is Record<string, unknown> => {
+      return typeof item === "object" && item !== null;
+    })
+    .map((item) => String(item.subquery_id ?? ""))
+    .filter(Boolean);
+  return ids.join(", ");
+}
+
+function formatNumber(value: unknown): string {
+  return typeof value === "number" ? value.toFixed(3) : "";
+}
+
+function numericRecord(value: unknown): Record<string, number> {
+  if (typeof value !== "object" || value === null) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter((entry): entry is [string, number] => typeof entry[1] === "number"),
+  );
+}
+
+function rankScore(row: CandidateRow, key: string): string {
+  const rank = row.ranks[key];
+  const score = row.scores[key] ?? row.scores[`rrf_${key}`];
+  if (rank === undefined && score === undefined) return "";
+  return `${rank ?? ""}${score === undefined ? "" : ` / ${score.toFixed(3)}`}`;
 }
 
 function parseSse(block: string): { event: string; data: SsePayload } | null {

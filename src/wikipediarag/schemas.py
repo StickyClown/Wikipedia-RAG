@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 
 class JobStatus(StrEnum):
@@ -39,6 +39,65 @@ class DebugSearchRequest(BaseModel):
     knowledge_base_ids: list[str] = Field(default_factory=list, max_length=50)
     retrieval_profile: str | None = Field(default=None, max_length=80)
     retrieval_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class SearchFilters(BaseModel):
+    document_type: str | None = Field(default=None, min_length=1, max_length=120)
+    language: str | None = Field(default=None, min_length=2, max_length=16)
+    date_from: date | None = None
+    date_to: date | None = None
+    source: str | None = Field(default=None, min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def validate_date_range(self) -> SearchFilters:
+        if self.date_from is not None and self.date_to is not None and self.date_from > self.date_to:
+            raise ValueError("date_from must be <= date_to")
+        return self
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=32000)
+    knowledge_base_ids: list[str] = Field(default_factory=list, max_length=50)
+    limit: int = Field(default=10, ge=1, le=50)
+    offset: int = Field(default=0, ge=0, le=500)
+    filters: SearchFilters = Field(default_factory=SearchFilters)
+
+
+class SearchResult(BaseModel):
+    document_id: str
+    document_version_id: str | None = None
+    knowledge_base_id: str
+    title: str
+    snippet: str
+    section_path: list[str] = Field(default_factory=list)
+    source_url: str
+    source_type: str
+    document_type: str | None = None
+    language: str | None = None
+    document_date: date | None = None
+    locator: dict[str, Any] = Field(default_factory=dict)
+    score: float
+    ranks: dict[str, int] = Field(default_factory=dict)
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResult]
+    limit: int
+    offset: int
+    has_more: bool
+
+
+class QueryRunFeedbackRequest(BaseModel):
+    rating: int | None = Field(default=None, ge=-1, le=1)
+    comment: str | None = Field(default=None, max_length=4000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class QueryRunEvaluationRequest(BaseModel):
+    evaluator: str = Field(min_length=1, max_length=120)
+    scores: dict[str, float] = Field(default_factory=dict)
+    reason_codes: list[str] = Field(default_factory=list, max_length=50)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ImportRequest(BaseModel):
@@ -162,6 +221,7 @@ class SseEvent(BaseModel):
 class Evidence(BaseModel):
     evidence_id: str
     chunk_id: str
+    knowledge_base_id: str = ""
     title: str
     section_path: list[str]
     content: str
@@ -186,7 +246,14 @@ class AnswerabilityDecision(BaseModel):
     required_parts: list[str] = Field(default_factory=list)
     covered_parts: list[str] = Field(default_factory=list)
     missing_parts: list[str] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
     signals: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def fill_reason_codes(self) -> AnswerabilityDecision:
+        if not self.reason_codes:
+            self.reason_codes = [self.reason, f"status_{self.status.value.lower()}"]
+        return self
 
 
 class RetrievalResult(BaseModel):
@@ -222,6 +289,36 @@ class UploadSessionAccepted(BaseModel):
     required_headers: dict[str, str] = Field(default_factory=dict)
 
 
+class UploadBatchItemCreate(BaseModel):
+    filename: str = Field(min_length=1, max_length=240)
+    content_type: str = Field(default="application/octet-stream", max_length=200)
+    size_bytes: int = Field(ge=1)
+    checksum_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
+    parser_profile: str = Field(default="standard", max_length=40)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class UploadBatchCreate(BaseModel):
+    knowledge_base_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    items: list[UploadBatchItemCreate] = Field(min_length=1, max_length=25)
+
+
+class UploadBatchItemAccepted(UploadSessionAccepted):
+    filename: str
+    content_type: str
+    size_bytes: int
+    checksum_sha256: str
+
+
+class UploadBatchAccepted(BaseModel):
+    batch_id: str
+    knowledge_base_id: str
+    status: str
+    total_items: int
+    items: list[UploadBatchItemAccepted]
+
+
 class UploadSessionComplete(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -233,8 +330,44 @@ class UploadCompleteResponse(BaseModel):
     status: str
 
 
+class UploadBatchItemStatus(BaseModel):
+    upload_session_id: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    checksum_sha256: str
+    status: str
+    upload_completed_at: datetime | None = None
+    document_id: str | None = None
+    document_version_id: str | None = None
+    job_id: str | None = None
+    job_status: str | None = None
+    progress: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class UploadBatchStatus(BaseModel):
+    batch_id: str
+    knowledge_base_id: str
+    status: str
+    total_items: int
+    completed_items: int
+    failed_items: int
+    cancelled_items: int
+    pending_items: int
+    items: list[UploadBatchItemStatus]
+
+
 class DocumentReprocessResponse(BaseModel):
     document_id: str
     document_version_id: str
     job_id: str
     status: str
+
+
+class DocumentDeleteResponse(BaseModel):
+    document_id: str
+    job_id: str | None = None
+    lifecycle_state: str
+    purge_after: datetime | None = None

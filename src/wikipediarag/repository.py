@@ -42,6 +42,54 @@ async def create_ingestion_job(
     return job_id
 
 
+async def create_document_deletion_job(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    purge_after: datetime,
+) -> uuid.UUID:
+    existing = await conn.execute(
+        text(
+            """
+            SELECT id
+            FROM ingestion_jobs
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND kind = 'document_delete'
+              AND status IN ('received','running')
+              AND config ->> 'document_id' = :document_id
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "document_id": document_id},
+    )
+    row = existing.mappings().first()
+    if row is not None:
+        return uuid.UUID(str(row["id"]))
+
+    job_id = new_uuid()
+    await conn.execute(
+        text(
+            """
+            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress)
+            VALUES (:id, :tenant_id, :kb_id, 'document_delete', 'received',
+                    CAST(:config AS jsonb), CAST(:progress AS jsonb))
+            """
+        ),
+        {
+            "id": str(job_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "config": json_dumps({"document_id": document_id, "purge_after": purge_after.isoformat()}),
+            "progress": json_dumps({"stage": "scheduled", "purge_after": purge_after.isoformat()}),
+        },
+    )
+    return job_id
+
+
 async def get_job(conn: AsyncConnection, job_id: str) -> dict[str, Any] | None:
     result = await conn.execute(text("SELECT * FROM ingestion_jobs WHERE id = :id"), {"id": job_id})
     row = result.mappings().first()
@@ -54,6 +102,11 @@ async def claim_next_job(conn: AsyncConnection) -> dict[str, Any] | None:
             """
             SELECT * FROM ingestion_jobs
             WHERE status IN ('received','running') AND cancel_requested = false
+              AND (
+                kind <> 'document_delete'
+                OR config ->> 'purge_after' IS NULL
+                OR (config ->> 'purge_after')::timestamptz <= now()
+              )
             ORDER BY created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
@@ -155,6 +208,7 @@ async def create_upload_session(
     *,
     tenant_id: str,
     knowledge_base_id: str,
+    batch_id: str | None = None,
     filename: str,
     content_type: str,
     size_bytes: int,
@@ -170,11 +224,11 @@ async def create_upload_session(
         text(
             """
             INSERT INTO upload_sessions(
-              id, tenant_id, knowledge_base_id, status, filename, content_type, size_bytes,
+              id, tenant_id, knowledge_base_id, batch_id, status, filename, content_type, size_bytes,
               checksum_sha256, object_key, parser_profile, metadata, expires_at
             )
             VALUES (
-              :id, :tenant_id, :kb_id, 'created', :filename, :content_type, :size_bytes,
+              :id, :tenant_id, :kb_id, :batch_id, 'created', :filename, :content_type, :size_bytes,
               :checksum_sha256, :object_key, :parser_profile, CAST(:metadata AS jsonb), :expires_at
             )
             """
@@ -183,6 +237,7 @@ async def create_upload_session(
             "id": str(session_id),
             "tenant_id": tenant_id,
             "kb_id": knowledge_base_id,
+            "batch_id": batch_id,
             "filename": filename,
             "content_type": content_type,
             "size_bytes": size_bytes,
@@ -194,6 +249,33 @@ async def create_upload_session(
         },
     )
     return session_id, expires_at
+
+
+async def create_upload_batch(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    total_items: int,
+    metadata: dict[str, Any],
+) -> uuid.UUID:
+    batch_id = new_uuid()
+    await conn.execute(
+        text(
+            """
+            INSERT INTO upload_batches(id, tenant_id, knowledge_base_id, status, total_items, metadata)
+            VALUES (:id, :tenant_id, :kb_id, 'received', :total_items, CAST(:metadata AS jsonb))
+            """
+        ),
+        {
+            "id": str(batch_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "total_items": total_items,
+            "metadata": json_dumps(metadata),
+        },
+    )
+    return batch_id
 
 
 async def get_upload_session(
@@ -216,6 +298,116 @@ async def get_upload_session(
     return dict(row) if row is not None else None
 
 
+async def get_upload_batch_status(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    batch_id: str,
+) -> dict[str, Any] | None:
+    batch_result = await conn.execute(
+        text(
+            """
+            SELECT id, tenant_id, knowledge_base_id, total_items, metadata, created_at, updated_at
+            FROM upload_batches
+            WHERE id = :id AND tenant_id = :tenant_id
+            """
+        ),
+        {"id": batch_id, "tenant_id": tenant_id},
+    )
+    batch = batch_result.mappings().first()
+    if batch is None:
+        return None
+
+    items_result = await conn.execute(
+        text(
+            """
+            SELECT s.id AS upload_session_id,
+                   s.filename,
+                   s.content_type,
+                   s.size_bytes,
+                   s.checksum_sha256,
+                   s.status AS upload_status,
+                   s.upload_completed_at,
+                   i.document_id,
+                   i.document_version_id,
+                   i.job_id,
+                   i.status AS item_status,
+                   i.progress,
+                   i.error_code,
+                   i.error_message,
+                   j.status AS job_status
+            FROM upload_sessions s
+            LEFT JOIN ingestion_job_items i
+              ON i.upload_session_id = s.id
+             AND i.tenant_id = s.tenant_id
+            LEFT JOIN ingestion_jobs j
+              ON j.id = i.job_id
+             AND j.tenant_id = s.tenant_id
+            WHERE s.batch_id = :batch_id
+              AND s.tenant_id = :tenant_id
+            ORDER BY s.created_at, s.filename, s.id
+            """
+        ),
+        {"batch_id": batch_id, "tenant_id": tenant_id},
+    )
+    items: list[dict[str, Any]] = []
+    completed_items = 0
+    failed_items = 0
+    cancelled_items = 0
+    for row in items_result.mappings():
+        item = dict(row)
+        status = str(item.get("job_status") or item.get("item_status") or item.get("upload_status") or "created")
+        if status == "completed":
+            completed_items += 1
+        elif status == "failed":
+            failed_items += 1
+        elif status == "cancelled":
+            cancelled_items += 1
+        items.append(
+            {
+                "upload_session_id": str(item["upload_session_id"]),
+                "filename": item["filename"],
+                "content_type": item["content_type"],
+                "size_bytes": item["size_bytes"],
+                "checksum_sha256": item["checksum_sha256"],
+                "status": status,
+                "upload_completed_at": item.get("upload_completed_at"),
+                "document_id": item.get("document_id"),
+                "document_version_id": item.get("document_version_id"),
+                "job_id": str(item["job_id"]) if item.get("job_id") is not None else None,
+                "job_status": item.get("job_status"),
+                "progress": item.get("progress") or {},
+                "error_code": item.get("error_code"),
+                "error_message": item.get("error_message"),
+            }
+        )
+
+    total_items = max(int(batch["total_items"]), len(items))
+    terminal_items = completed_items + failed_items + cancelled_items
+    pending_items = max(0, total_items - terminal_items)
+    if total_items > 0 and completed_items == total_items:
+        status = "completed"
+    elif total_items > 0 and cancelled_items == total_items:
+        status = "cancelled"
+    elif pending_items == 0 and failed_items > 0:
+        status = "failed"
+    elif terminal_items > 0 or any(item["status"] in {"uploaded", "completed", "running"} for item in items):
+        status = "running"
+    else:
+        status = "received"
+    return {
+        "batch_id": str(batch["id"]),
+        "knowledge_base_id": str(batch["knowledge_base_id"]),
+        "status": status,
+        "total_items": total_items,
+        "completed_items": completed_items,
+        "failed_items": failed_items,
+        "cancelled_items": cancelled_items,
+        "pending_items": pending_items,
+        "items": items,
+    }
+
+
 async def create_document_upload_records(
     conn: AsyncConnection,
     *,
@@ -228,7 +420,8 @@ async def create_document_upload_records(
     metadata: dict[str, Any],
 ) -> uuid.UUID:
     job_id = new_uuid()
-    batch_id = new_uuid()
+    existing_batch_id = upload_session.get("batch_id")
+    batch_id = uuid.UUID(str(existing_batch_id)) if existing_batch_id is not None else new_uuid()
     item_id = new_uuid()
     source_id = stable_uuid([tenant_id, knowledge_base_id, "direct_upload"])
     filename = str(upload_session["filename"])
@@ -259,15 +452,16 @@ async def create_document_upload_records(
             "metadata": json_dumps({"created_by": "async_upload_pipeline"}),
         },
     )
-    await conn.execute(
-        text(
-            """
-            INSERT INTO upload_batches(id, tenant_id, knowledge_base_id, status, total_items, metadata)
-            VALUES (:id, :tenant_id, :kb_id, 'received', 1, CAST(:metadata AS jsonb))
-            """
-        ),
-        {"id": str(batch_id), "tenant_id": tenant_id, "kb_id": knowledge_base_id, "metadata": json_dumps({})},
-    )
+    if existing_batch_id is None:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO upload_batches(id, tenant_id, knowledge_base_id, status, total_items, metadata)
+                VALUES (:id, :tenant_id, :kb_id, 'received', 1, CAST(:metadata AS jsonb))
+                """
+            ),
+            {"id": str(batch_id), "tenant_id": tenant_id, "kb_id": knowledge_base_id, "metadata": json_dumps({})},
+        )
     await conn.execute(
         text(
             """
@@ -638,6 +832,7 @@ async def get_document_public(conn: AsyncConnection, tenant_id: str, document_id
             SELECT d.id, d.knowledge_base_id, d.title, d.source_type,
                    COALESCE(d.metadata ->> 'source_kind', d.source_type) AS source_kind,
                    d.metadata, d.created_at, d.updated_at,
+                   d.lifecycle_state, d.deleted_at, d.purge_after,
                    v.id AS current_version_id, v.status AS version_status, v.status AS status,
                    v.public_metadata ->> 'filename' AS filename, v.public_metadata,
                    v.parser_route, v.parser_name, v.parser_version, v.content_hash, v.normalized_hash,
@@ -650,6 +845,25 @@ async def get_document_public(conn: AsyncConnection, tenant_id: str, document_id
               ORDER BY created_at DESC
               LIMIT 1
             ) v ON true
+            WHERE d.tenant_id = :tenant_id
+              AND d.id = :document_id
+              AND d.lifecycle_state = 'active'
+            """
+        ),
+        {"tenant_id": tenant_id, "document_id": document_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def get_document_lifecycle(conn: AsyncConnection, tenant_id: str, document_id: str) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT d.id, d.knowledge_base_id, d.lifecycle_state, d.deleted_at, d.purge_after,
+                   d.deleted_by_user_id, d.deletion_reason,
+                   d.metadata ->> 'current_version_id' AS current_version_id
+            FROM documents d
             WHERE d.tenant_id = :tenant_id AND d.id = :document_id
             """
         ),
@@ -657,6 +871,231 @@ async def get_document_public(conn: AsyncConnection, tenant_id: str, document_id
     )
     row = result.mappings().first()
     return dict(row) if row is not None else None
+
+
+async def soft_delete_document(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    deleted_by_user_id: str,
+    purge_after: datetime,
+    deletion_reason: str,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE documents
+            SET lifecycle_state = CASE
+                    WHEN lifecycle_state = 'deleted' THEN lifecycle_state
+                    ELSE 'deleting'
+                END,
+                deleted_at = COALESCE(deleted_at, now()),
+                purge_after = COALESCE(purge_after, :purge_after),
+                deleted_by_user_id = COALESCE(deleted_by_user_id, :deleted_by_user_id),
+                deletion_reason = COALESCE(deletion_reason, :deletion_reason),
+                updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND id = :document_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "deleted_by_user_id": deleted_by_user_id,
+            "purge_after": purge_after,
+            "deletion_reason": deletion_reason[:200],
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE document_versions
+            SET lifecycle_state = CASE
+                    WHEN lifecycle_state = 'deleted' THEN lifecycle_state
+                    ELSE 'deleting'
+                END,
+                deleted_at = COALESCE(deleted_at, now()),
+                purge_after = COALESCE(purge_after, :purge_after),
+                deleted_by_user_id = COALESCE(deleted_by_user_id, :deleted_by_user_id),
+                deletion_reason = COALESCE(deletion_reason, :deletion_reason),
+                updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "deleted_by_user_id": deleted_by_user_id,
+            "purge_after": purge_after,
+            "deletion_reason": deletion_reason[:200],
+        },
+    )
+    await mark_document_chunks_deleted(
+        conn,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        document_id=document_id,
+    )
+
+
+async def mark_document_chunks_deleted(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+) -> int:
+    result = await conn.execute(
+        text(
+            """
+            UPDATE chunks
+            SET publication_status = 'deleted',
+                metadata = metadata || CAST(:metadata AS jsonb)
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+              AND publication_status <> 'deleted'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "metadata": json_dumps({"publication_status": "deleted"}),
+        },
+    )
+    return int(result.rowcount or 0)
+
+
+async def list_document_artifact_keys(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+) -> list[str]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT object_key
+            FROM document_artifacts
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "document_id": document_id},
+    )
+    return [str(row["object_key"]) for row in result.mappings()]
+
+
+async def mark_document_purge_failed(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    safe_error_code: str,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE documents
+            SET lifecycle_state = 'purge_failed',
+                metadata = metadata || CAST(:metadata AS jsonb),
+                updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND id = :document_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "metadata": json_dumps({"purge_error_code": safe_error_code[:120]}),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE document_versions
+            SET lifecycle_state = 'purge_failed',
+                updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "document_id": document_id},
+    )
+
+
+async def mark_document_purged(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+) -> int:
+    chunk_result = await conn.execute(
+        text(
+            """
+            DELETE FROM chunks
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "document_id": document_id},
+    )
+    await conn.execute(
+        text(
+            """
+            DELETE FROM document_artifacts
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "document_id": document_id},
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE document_versions
+            SET lifecycle_state = 'deleted',
+                original_artifact_key = 'purged',
+                normalized_artifact_key = NULL,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "document_id": document_id},
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE documents
+            SET lifecycle_state = 'deleted',
+                updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND id = :document_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "document_id": document_id},
+    )
+    return int(chunk_result.rowcount or 0)
 
 
 async def list_document_versions_public(
@@ -859,7 +1298,8 @@ async def fetch_chunks_for_dense_scan(
     result = await conn.execute(
         text(
             """
-            SELECT id, title, section_path, content, source_url, embedding, page_id, document_id, metadata
+            SELECT id, knowledge_base_id, title, section_path, content, source_url,
+                   embedding, page_id, document_id, metadata
             FROM chunks
             WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND publication_status = 'published'
             ORDER BY created_at DESC
@@ -1007,6 +1447,118 @@ async def load_index_version_by_read_alias(
     return dict(row) if row is not None else None
 
 
+async def search_public_chunks(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_ids: list[str],
+    query: str,
+    limit: int,
+    offset: int,
+    filters: dict[str, Any],
+) -> list[dict[str, Any]]:
+    query_pattern = f"%{query.strip()}%"
+    document_type = str(filters.get("document_type") or "").strip().casefold()
+    language = str(filters.get("language") or "").strip().casefold()
+    source = str(filters.get("source") or "").strip().casefold()
+    date_from = filters.get("date_from")
+    date_to = filters.get("date_to")
+    document_type_pattern = f"%{document_type}%" if document_type else None
+    source_pattern = f"%{source}%" if source else None
+    result = await conn.execute(
+        text(
+            """
+            WITH searchable_chunks AS (
+              SELECT
+                c.id AS chunk_id,
+                c.document_id,
+                c.document_version_id,
+                c.knowledge_base_id,
+                c.title,
+                c.section_path,
+                c.content,
+                c.source_url,
+                c.source_uri,
+                c.page_id,
+                c.locator,
+                c.metadata AS chunk_metadata,
+                d.source_type,
+                d.metadata AS document_metadata,
+                v.public_metadata,
+                COALESCE(
+                  v.public_metadata ->> 'content_type',
+                  v.public_metadata ->> 'detected_mime',
+                  c.metadata ->> 'content_type',
+                  d.source_type
+                ) AS document_type,
+                COALESCE(v.public_metadata ->> 'detected_language', c.metadata ->> 'language') AS language,
+                COALESCE(v.public_metadata ->> 'document_date', c.metadata ->> 'document_date') AS document_date,
+                CASE WHEN c.title ILIKE :query_pattern THEN 4.0 ELSE 0.0 END
+                  + CASE WHEN array_to_string(c.section_path, ' ') ILIKE :query_pattern THEN 2.0 ELSE 0.0 END
+                  + CASE WHEN c.content ILIKE :query_pattern THEN 1.0 ELSE 0.0 END AS score
+              FROM chunks c
+              JOIN documents d
+                ON d.id = c.document_id
+               AND d.tenant_id = c.tenant_id
+               AND d.knowledge_base_id = c.knowledge_base_id
+              LEFT JOIN document_versions v
+                ON v.id = c.document_version_id
+               AND v.tenant_id = c.tenant_id
+               AND v.knowledge_base_id = c.knowledge_base_id
+              WHERE c.tenant_id = :tenant_id
+                AND c.knowledge_base_id = ANY(CAST(:knowledge_base_ids AS uuid[]))
+                AND c.publication_status = 'published'
+                AND d.lifecycle_state = 'active'
+                AND (
+                  c.title ILIKE :query_pattern
+                  OR array_to_string(c.section_path, ' ') ILIKE :query_pattern
+                  OR c.content ILIKE :query_pattern
+                )
+            )
+            SELECT *
+            FROM searchable_chunks
+            WHERE (
+                CAST(:document_type_pattern AS text) IS NULL
+                OR lower(COALESCE(document_type, '')) LIKE :document_type_pattern
+              )
+              AND (CAST(:language AS text) IS NULL OR lower(COALESCE(language, '')) = :language)
+              AND (CAST(:date_from AS text) IS NULL OR COALESCE(document_date, '') >= :date_from)
+              AND (CAST(:date_to AS text) IS NULL OR COALESCE(document_date, '') <= :date_to)
+              AND (
+                CAST(:source_pattern AS text) IS NULL
+                OR lower(
+                  concat_ws(
+                    ' ',
+                    source_type,
+                    source_uri,
+                    source_url,
+                    COALESCE(public_metadata ->> 'filename', '')
+                  )
+                ) LIKE :source_pattern
+              )
+            ORDER BY score DESC, title ASC, chunk_id ASC
+            LIMIT :limit_plus_one OFFSET :offset
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "knowledge_base_ids": knowledge_base_ids,
+            "query_pattern": query_pattern,
+            "document_type_pattern": document_type_pattern,
+            "language": language or None,
+            "date_from": str(date_from) if date_from is not None else None,
+            "date_to": str(date_to) if date_to is not None else None,
+            "source_pattern": source_pattern,
+            "limit_plus_one": limit + 1,
+            "offset": offset,
+        },
+    )
+    rows = [dict(row) for row in result.mappings()]
+    for rank, row in enumerate(rows, start=offset + 1):
+        row["ranks"] = {"search": rank}
+    return rows
+
+
 async def insert_retrieval_event(
     conn: AsyncConnection,
     *,
@@ -1063,6 +1615,7 @@ async def create_query_run(
     mode: str,
     input_text: str,
     trace_id: str,
+    usage: dict[str, Any] | None = None,
 ) -> uuid.UUID:
     query_run_id = new_uuid()
     await conn.execute(
@@ -1070,10 +1623,10 @@ async def create_query_run(
             """
             INSERT INTO query_runs(
               id, tenant_id, knowledge_base_id, user_id, request_id, client_request_id, mode, status,
-              input_text, trace_id, started_at
+              input_text, usage, trace_id, started_at
             )
             VALUES (:id, :tenant_id, :knowledge_base_id, :user_id, :request_id, :client_request_id, :mode,
-                    'running', :input_text, :trace_id, now())
+                    'running', :input_text, CAST(:usage AS jsonb), :trace_id, now())
             """
         ),
         {
@@ -1085,6 +1638,7 @@ async def create_query_run(
             "client_request_id": client_request_id,
             "mode": mode,
             "input_text": input_text,
+            "usage": json_dumps(usage or {}),
             "trace_id": trace_id,
         },
     )
@@ -1278,7 +1832,7 @@ async def complete_query_run(
                 answer = :answer,
                 model_alias = :model_alias,
                 provider_request_id = :provider_request_id,
-                usage = CAST(:usage AS jsonb),
+                usage = usage || CAST(:usage AS jsonb),
                 completed_at = now()
             WHERE id = :id
             """
@@ -1290,6 +1844,19 @@ async def complete_query_run(
             "model_alias": model_alias,
             "provider_request_id": provider_request_id,
         },
+    )
+
+
+async def update_query_run_usage(conn: AsyncConnection, *, query_run_id: str, usage: dict[str, Any]) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE query_runs
+            SET usage = usage || CAST(:usage AS jsonb)
+            WHERE id = :id
+            """
+        ),
+        {"id": query_run_id, "usage": json_dumps(usage)},
     )
 
 

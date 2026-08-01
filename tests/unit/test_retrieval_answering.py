@@ -7,7 +7,8 @@ import pytest
 
 from wikipediarag.answering import generate_answer, validate_citations, validate_citations_with_policy
 from wikipediarag.config import Settings
-from wikipediarag.retrieval import build_stage_events, postprocess_candidates, rrf_fuse
+from wikipediarag.observability import safe_telemetry_payload
+from wikipediarag.retrieval import _snapshot_candidates, build_stage_events, postprocess_candidates, rrf_fuse
 from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import AnswerabilityDecision, AnswerabilityStatus, Evidence, RetrievalResult
 
@@ -20,8 +21,10 @@ def test_rrf_fuses_stage_ranks() -> None:
 
     assert fused[0]["chunk_id"] == "a"
     assert fused[0]["scores"]["rrf_total"] > 0
+    assert fused[0]["scores"]["fusion"] == fused[0]["scores"]["rrf_total"]
     assert fused[0]["ranks"]["bm25"] == 1
     assert fused[0]["ranks"]["dense"] == 1
+    assert fused[0]["ranks"]["fusion"] == 1
 
 
 def test_citation_validator_rejects_unknown_ids() -> None:
@@ -81,7 +84,7 @@ def test_citation_validation_warn_records_underlying_failure() -> None:
 
 def test_retrieval_stage_events_include_additive_timings() -> None:
     profile = get_retrieval_profile("test_mock", Settings())
-    candidate = {
+    candidate: dict[str, Any] = {
         "chunk_id": "c1",
         "title": "Россия",
         "section_path": ["Россия"],
@@ -111,9 +114,60 @@ def test_retrieval_stage_events_include_additive_timings() -> None:
     assert profile_event["index_contract_id"] == "sha256:index"
     assert profile_event["run_contract_id"] == "sha256:run"
     assert next(event for event in events if event["stage"] == "bm25")["latency_ms"] == 3
+    assert next(event for event in events if event["stage"] == "bm25")["query_context"]["subquery_id"] == "sq.primary.1"
+    assert next(event for event in events if event["stage"] == "bm25")["candidates"][0]["subquery_id"] == "sq.primary.1"
+    query_event = next(event for event in events if event["stage"] == "query_transform")
+    assert query_event["transforms"][0]["transform_id"] == "tr.original.1"
+    assert query_event["transforms"][1]["transform_id"] == "tr.normalization.1"
+    assert query_event["query_refs"][0]["subquery_id"] == "sq.primary.1"
+    assert [item["type"] for item in query_event["transforms"]] == [
+        "original",
+        "normalization",
+        "rewrite",
+        "decomposition",
+    ]
     assert next(event for event in events if event["stage"] == "context")["latency_ms"] == 15
     assert next(event for event in events if event["stage"] == "context")["stage_latency_ms"] == 2
+    assert next(event for event in events if event["stage"] == "context")["stable_stage"] == "context_selection"
     assert next(event for event in events if event["stage"] == "timings")["timings_ms"]["retrieval_total"] == 15
+
+
+def test_retrieval_stage_snapshots_preserve_rank_movement() -> None:
+    profile = get_retrieval_profile("test_mock", Settings())
+    candidate: dict[str, Any] = {
+        "chunk_id": "c1",
+        "title": "Россия",
+        "section_path": ["Россия"],
+        "content": "Россия - государство.",
+        "source_url": "http://localhost/source",
+        "scores": {"bm25": 1.0, "fusion": 0.1},
+        "ranks": {"bm25": 1, "fusion": 1},
+        "metadata": {},
+    }
+    fused_snapshot = _snapshot_candidates([candidate])
+    candidate["scores"]["rerank"] = 0.9
+    candidate["ranks"]["rerank"] = 1
+
+    events = build_stage_events(
+        query="Россия",
+        normalized_query="Россия",
+        profile=profile,
+        read_alias="wiki",
+        result_sets={"bm25": _snapshot_candidates([candidate])},
+        fused=fused_snapshot,
+        reranked=[candidate],
+        selected=[candidate],
+        policy_events=[],
+        latency_ms=15,
+        timings_ms={"bm25": 3, "fusion": 1, "rerank": 4, "context": 2, "retrieval_total": 15},
+    )
+
+    rrf_candidate = next(event for event in events if event["stage"] == "rrf")["candidates"][0]
+    rerank_candidate = next(event for event in events if event["stage"] == "rerank")["candidates"][0]
+    assert "rerank" not in rrf_candidate["scores"]
+    assert "rerank" not in rrf_candidate["ranks"]
+    assert rerank_candidate["scores"]["rerank"] == 0.9
+    assert rerank_candidate["ranks"]["rerank"] == 1
 
 
 def test_postprocess_drops_explicit_negative_title_from_final_context() -> None:
@@ -129,6 +183,7 @@ def test_postprocess_drops_explicit_negative_title_from_final_context() -> None:
     )
 
     assert [item["title"] for item in selected] == ["Россия"]
+    assert selected[0]["ranks"]["final"] == 1
     dropped = [event for event in events if event.get("reason") == "EXPLICIT_NEGATIVE_TITLE"]
     assert dropped
     assert dropped[0]["chunk_id"] == "c2"
@@ -149,6 +204,38 @@ def test_postprocess_keeps_quoted_title_without_negative_marker() -> None:
 
     assert [item["title"] for item in selected] == ["Россия", "Канада"]
     assert not [event for event in events if event.get("reason") == "EXPLICIT_NEGATIVE_TITLE"]
+
+
+def test_safe_telemetry_projection_masks_content_by_default() -> None:
+    settings = Settings(telemetry_content_capture="off")
+    payload = {
+        "query": "raw user question",
+        "candidate": {
+            "chunk_id": "c1",
+            "document_id": "d1",
+            "scores": {"bm25": 1.0},
+            "content": "full document text",
+            "object_key": "tenant/secret/object",
+        },
+    }
+
+    safe = safe_telemetry_payload(payload, settings=settings)
+
+    assert safe["query"]["hash"]
+    assert "raw user question" not in json.dumps(safe)
+    assert "full document text" not in json.dumps(safe)
+    assert "tenant/secret/object" not in json.dumps(safe)
+    assert safe["candidate"]["chunk_id"] == "c1"
+    assert safe["candidate"]["scores"]["bm25"] == 1.0
+
+
+def test_safe_telemetry_projection_masked_mode_truncates() -> None:
+    settings = Settings(telemetry_content_capture="masked", telemetry_max_text_chars=8)
+
+    safe = safe_telemetry_payload({"comment": "email user@example.test 123456789"}, settings=settings)
+
+    assert safe["comment"]["masked_text"] == "email [R"
+    assert safe["comment"]["truncated"] is True
 
 
 @pytest.mark.asyncio
