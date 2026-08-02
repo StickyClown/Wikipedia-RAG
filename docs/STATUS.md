@@ -9,9 +9,10 @@ Extended Search baseline. It is a durable single-KB lifecycle with worker
 episodes, typed evidence memory, coverage records, operational reflections,
 pause/resume/cancel and an ACL-trimmed report surface.
 
-Completion criterion for the next increment: run a small runtime smoke and
-quality/context experiments to choose default packing policy by evidence
-quality, citation/coverage safety, context size and latency.
+The latest increment ran the mock-provider Deep Research runtime smoke and
+offline quality/context matrix. Runtime default packing remains 45% productive
+target until a true runtime policy override or local-Qwen experiment confirms a
+safe improvement.
 
 ## Implemented now
 
@@ -71,19 +72,66 @@ quality, citation/coverage safety, context size and latency.
   ACL-visible evidence. Context budgets are ratios of the retrieval profile's
   declared max context: 45% productive target, 55% soft limit, 70% hard input
   limit, 15% output reserve and 15% safety reserve.
-- Eval and validation tooling: local-auth eval client, release-gate provider preflight, warm retrieval profiling, MIRACL-RU adapter, document corpus verification and cross-tenant hardening smoke command.
+- Eval and validation tooling: local-auth eval client, release-gate provider preflight, warm retrieval profiling, MIRACL-RU adapter, document corpus verification, cross-tenant hardening smoke command and Deep Research complex fixture/evaluator/runtime smoke harness.
 
 ## In progress
 
-- Deep Research runtime smoke plus quality/context experiments: compare context
-  target ratios, evidence packing variants, episode granularity, reflection
-  policy and low-confidence/conflicting counter-evidence policy before treating
-  V1 defaults as tuned.
+- Deep Research policy tuning beyond V1: add a runtime policy override and run
+  optional local Qwen/qwen3.6-27b validation before changing the default 45%
+  productive context target.
 - Browser UI OIDC through Dockerized API after the public/internal Keycloak URL strategy is decided.
 - External deployment hardening remains planned, not supported production operation.
 
 ## Latest validation
 
+- Deep Research runtime smoke and policy matrix validation on 2026-08-02:
+  `make` was unavailable in the Windows shell, so the Makefile-equivalent `uv`
+  commands were run directly. `uv run python -m wikipediarag.cli
+  deep-research-smoke` -> exit 0, passed=true, 10/10 fixtures passed with
+  compose rebuild/start, API readiness, platform-admin login, seeded viewer,
+  upload-backed ingestion, ACL trimming and pause/resume/cancel lifecycle.
+  Runtime report:
+  `artifacts/validation/deep-research/20260802T152743Z/report.json`.
+  The smoke exposed and fixed four harness/runtime issues during the run:
+  host-side DB seeding now rewrites compose hostname `postgres` to `localhost`
+  when needed, tenant-membership seeding no longer assumes an `updated_at`
+  column, smoke auth refreshes CSRF after `/auth/session`, and
+  `create_research_run` now inserts the `ingestion_jobs` row before the
+  `research_runs.active_job_id` FK reference. It also exposed a pre-claim
+  lifecycle bug: pause/cancel now marks received Deep Research jobs cancelled
+  and moves the run to `paused`/`cancelled` instead of leaving
+  `received/cancel_requested=true`. `uv run python -m wikipediarag.cli
+  deep-research-matrix` -> exit 0, passed=true, 27 policy aggregates and 270
+  fixture-policy rows passed; offline recommended policy:
+  `target_35_abstracts_only_none`; report:
+  `artifacts/validation/deep-research-matrix/20260802T153246Z/report.json`.
+  This recommendation is offline/synthetic, so the runtime 45% default remains
+  unchanged until measured through runtime policy override or local-Qwen
+  validation. Final stable checks after fixes:
+  `uv run ruff check .` -> exit 0;
+  `uv run ruff format --check src tests` -> exit 0, 128 files already
+  formatted;
+  `uv run mypy src tests` -> exit 0, no issues found in 128 source files;
+  `uv run pytest tests\unit -q` -> exit 0, 266 passed, 2 warnings;
+  `uv run pytest tests\integration -q` -> exit 0, 14 passed;
+  `docker compose config --quiet` -> exit 0;
+  `git diff --check` -> exit 0, with Git CRLF normalization warnings only.
+- Deep Research testing harness validation on 2026-08-02:
+  Added `tests/fixtures/deep_research/research_tasks.json` with 10 complex
+  synthetic tasks, `wikipediarag.deep_research_eval` fixture validation and
+  offline scoring, `deep-research-smoke` CLI/Make target with report/JUnit
+  artifact output and architecture/operation docs. Deterministic validation:
+  `uv run ruff format src tests` -> exit 0, 128 files left unchanged;
+  `uv run ruff check .` -> exit 0;
+  `uv run ruff format --check src tests` -> exit 0, 128 files already
+  formatted;
+  `uv run mypy src tests` -> exit 0, no issues found in 128 source files;
+  `uv run pytest tests\unit -q` -> exit 0, 260 passed, 2 warnings;
+  `uv run pytest tests\integration -q` -> exit 0, 14 passed;
+  `uv run python -m wikipediarag.cli deep-research-smoke --help` -> exit 0;
+  `docker compose config --quiet` -> exit 0;
+  `git diff --check` -> exit 0, with Git CRLF normalization warnings only.
+  Runtime `make deep-research-smoke` was not run in this deterministic pass.
 - Durable Deep Research V1 validation on 2026-08-02:
   Added durable single-KB research lifecycle tables, repository operations,
   `POST/GET /api/v1/research-runs`, detail/events and pause/resume/cancel
@@ -469,6 +517,9 @@ quality, citation/coverage safety, context size and latency.
 ## Active blockers and risks
 
 - Multi-KB direct retrieval is implemented; Multi-KB Extended Search remains future work.
+- Offline Deep Research matrix results are not yet a provider/runtime policy
+  benchmark. The current 45% productive-target default should not be changed
+  solely from the synthetic packer matrix.
 - API `/ready` currently checks PostgreSQL and Model Gateway readiness; Redis/Valkey, MinIO and OpenSearch are Compose dependencies but are not confirmed readiness checks.
 - Redis/Valkey is configured and present in Compose, but no Redis client usage was found in `src/`; current ingestion job claiming uses PostgreSQL `FOR UPDATE SKIP LOCKED`.
 - Malware scanning, external ACL connector import policy, restore drills, production TLS/secrets, observability retention and resource sizing remain production hardening work.
@@ -477,11 +528,10 @@ quality, citation/coverage safety, context size and latency.
 
 ## Next approved task
 
-Promote the current single-KB Extended Search harness into durable Deep
-Research runs with typed evidence memory, explicit coverage records and a
-managed run lifecycle. Stage 4 external source connection foundations and the
-minimal Search Quality V2 ACL/security trimming baseline are already
-implemented and should be treated as prerequisites for this increment.
+If Deep Research tuning continues, implement a runtime context-policy override
+for smoke/experiment runs and compare the current 45% default against the
+offline winner under mock and optional local Qwen/qwen3.6-27b validation before
+changing production defaults.
 
 ## Related artifacts
 

@@ -315,6 +315,34 @@ Context strategy:
   compact over-budget signal and later work must compact or narrow evidence
   breadth before generation-heavy use.
 
+Quality and context validation:
+
+- `tests/fixtures/deep_research/research_tasks.json` contains compact
+  synthetic complex research tasks for single facts, multi-hop bridging,
+  comparison matrices, temporal updates, contradictions, insufficient evidence,
+  noisy distractors, soft-limit context pressure, mixed ACL visibility and
+  pause/resume/cancel lifecycle.
+- `wikipediarag.deep_research_eval` validates fixture schema and scores
+  `ResearchRunDetail` payloads for coverage, expected evidence marker recall,
+  unsupported claims, contradiction handling, ACL leakage, resume integrity and
+  packed-context efficiency.
+- `make deep-research-smoke` runs the upload-backed runtime smoke with mock
+  model provider defaults, writes
+  `artifacts/validation/deep-research/<timestamp>/report.json` plus JUnit XML.
+- `make deep-research-matrix` runs the offline context-packer policy matrix for
+  target ratios `35%`, `45%` and `55%` across evidence packing and reflection
+  modes, then writes
+  `artifacts/validation/deep-research-matrix/<timestamp>/report.json` plus
+  JUnit XML.
+- Latest measured local validation on 2026-08-02:
+  `artifacts/validation/deep-research/20260802T152743Z/report.json` passed
+  10/10 runtime fixtures; `artifacts/validation/deep-research-matrix/20260802T153246Z/report.json`
+  passed 27 policy aggregates / 270 fixture-policy rows and ranked
+  `target_35_abstracts_only_none` first in the offline packer sweep.
+- The 45% productive target remains the default unless measured experiment rows
+  show a safe Pareto improvement with no ACL/security regression, no increase
+  in unsupported claims and equal or better coverage/evidence recall.
+
 Current Deep Research V1 limits:
 
 - single KB only;
@@ -325,12 +353,12 @@ Current Deep Research V1 limits:
   report synthesis;
 - contrarian/counter-evidence is represented through `conflicting` coverage
   state, not as an always-on extra episode policy;
-- quality defaults still need fixture-based experiments before being treated as
-  tuned.
+- offline policy experiments are deterministic context-packer checks, not a
+  replacement for runtime provider/local-Qwen experiments.
 
-Future work should focus on research quality fixtures, context packing
-experiments, runtime smoke coverage, richer claim verification and measured
-latency/coverage tradeoffs before adding broader orchestration.
+Future work should focus on runtime policy overrides, local-Qwen validation,
+richer claim verification and measured latency/coverage tradeoffs before
+adding broader orchestration.
 
 ## Security And Tenancy
 

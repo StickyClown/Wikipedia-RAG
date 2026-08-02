@@ -1,0 +1,311 @@
+{
+  "schema_version": "deep_research_fixture_v1",
+  "tasks": [
+    {
+      "task_id": "single_fact_grounded",
+      "topic": "Когда запущен проект Alpha Beacon?",
+      "documents": [
+        {
+          "id": "alpha_launch",
+          "filename": "alpha-launch.md",
+          "content_type": "text/markdown",
+          "content": "# Alpha Beacon\n\nDR_SINGLE_FACT_MARKER Проект Alpha Beacon запущен 2026-02-14. Владелец проекта - отдел платформы."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Alpha Beacon", "allowed_statuses": ["covered"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "alpha_launch", "marker": "DR_SINGLE_FACT_MARKER" }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 1 },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["single_hop", "fact"]
+    },
+    {
+      "task_id": "multi_hop_bridge",
+      "topic": "Какая команда отвечает за сервис, связанный с кодом BRIDGE-77, и какой у него SLA?",
+      "documents": [
+        {
+          "id": "bridge_catalog",
+          "filename": "bridge-catalog.md",
+          "content_type": "text/markdown",
+          "content": "# Каталог сервисов\n\nDR_MULTI_HOP_SERVICE Маркер BRIDGE-77 относится к сервису Северный шлюз."
+        },
+        {
+          "id": "bridge_sla",
+          "filename": "bridge-sla.md",
+          "content_type": "text/markdown",
+          "content": "# Северный шлюз\n\nDR_MULTI_HOP_OWNER Сервис Северный шлюз поддерживает команда Atlas. SLA сервиса составляет 99.7%."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "BRIDGE-77", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "SLA", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "bridge_catalog", "marker": "DR_MULTI_HOP_SERVICE" },
+        { "document_id": "bridge_sla", "marker": "DR_MULTI_HOP_OWNER" }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 1, "allow_partial": true },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["multi_hop", "bridge", "sla"]
+    },
+    {
+      "task_id": "comparison_matrix",
+      "topic": "Сравни Falcon, Lynx и Orion по стоимости и сроку внедрения.",
+      "documents": [
+        {
+          "id": "falcon_profile",
+          "filename": "falcon-profile.md",
+          "content_type": "text/markdown",
+          "content": "# Falcon\n\nDR_COMPARE_FALCON Falcon стоит 120 кредитов и внедряется за 4 недели."
+        },
+        {
+          "id": "lynx_profile",
+          "filename": "lynx-profile.md",
+          "content_type": "text/markdown",
+          "content": "# Lynx\n\nDR_COMPARE_LYNX Lynx стоит 90 кредитов и внедряется за 6 недель."
+        },
+        {
+          "id": "orion_profile",
+          "filename": "orion-profile.md",
+          "content_type": "text/markdown",
+          "content": "# Orion\n\nDR_COMPARE_ORION Orion стоит 150 кредитов и внедряется за 3 недели."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Falcon", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "Lynx", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "Orion", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "falcon_profile", "marker": "DR_COMPARE_FALCON" },
+        { "document_id": "lynx_profile", "marker": "DR_COMPARE_LYNX" },
+        { "document_id": "orion_profile", "marker": "DR_COMPARE_ORION" }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 1, "allow_partial": true },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["comparison", "matrix"]
+    },
+    {
+      "task_id": "temporal_update",
+      "topic": "Какой текущий лимит очереди Delta согласно последнему документу?",
+      "documents": [
+        {
+          "id": "delta_old",
+          "filename": "delta-old.md",
+          "content_type": "text/markdown",
+          "content": "# Delta memo 2025-12-01\n\nDR_TEMPORAL_OLD Старый лимит очереди Delta составлял 40 задач."
+        },
+        {
+          "id": "delta_new",
+          "filename": "delta-new.md",
+          "content_type": "text/markdown",
+          "content": "# Delta memo 2026-03-20\n\nDR_TEMPORAL_NEW Текущий лимит очереди Delta составляет 65 задач."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Delta", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "последнему", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "delta_new", "marker": "DR_TEMPORAL_NEW" }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 1, "allow_partial": true },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["temporal", "latest"]
+    },
+    {
+      "task_id": "conflicting_sources",
+      "topic": "Какой регион указан для проекта Quartz и есть ли противоречие?",
+      "documents": [
+        {
+          "id": "quartz_east",
+          "filename": "quartz-east.md",
+          "content_type": "text/markdown",
+          "content": "# Quartz source A\n\nDR_CONFLICT_EAST Проект Quartz относится к восточному региону."
+        },
+        {
+          "id": "quartz_west",
+          "filename": "quartz-west.md",
+          "content_type": "text/markdown",
+          "content": "# Quartz source B\n\nDR_CONFLICT_WEST Проект Quartz относится к западному региону."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Quartz", "allowed_statuses": ["conflicting", "partial", "covered"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "quartz_east", "marker": "DR_CONFLICT_EAST" },
+        { "document_id": "quartz_west", "marker": "DR_CONFLICT_WEST" }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 0, "allow_partial": true, "requires_conflicting": true },
+      "expected_contradictions": ["Quartz region mismatch"],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["conflict", "counter_evidence"]
+    },
+    {
+      "task_id": "insufficient_evidence",
+      "topic": "Определи бюджет, владельца и дату завершения инициативы Nebula.",
+      "documents": [
+        {
+          "id": "nebula_owner",
+          "filename": "nebula-owner.md",
+          "content_type": "text/markdown",
+          "content": "# Nebula\n\nDR_INSUFFICIENT_OWNER Инициативой Nebula владеет команда Vega. Бюджет и дата завершения в этом документе не указаны."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Nebula", "allowed_statuses": ["partial", "missing", "covered"] },
+        { "question_contains": "бюджет", "allowed_statuses": ["partial", "missing"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "nebula_owner", "marker": "DR_INSUFFICIENT_OWNER" }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 0, "allow_partial": true, "requires_missing": true },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["insufficient", "missing_evidence"]
+    },
+    {
+      "task_id": "noisy_distractors",
+      "topic": "Найди владельца релиза Mercury-Prime среди похожих релизов.",
+      "documents": [
+        {
+          "id": "mercury_prime",
+          "filename": "mercury-prime.md",
+          "content_type": "text/markdown",
+          "content": "# Mercury-Prime\n\nDR_NOISY_RELEVANT Релиз Mercury-Prime принадлежит команде Helios."
+        },
+        {
+          "id": "mercury_alpha",
+          "filename": "mercury-alpha.md",
+          "content_type": "text/markdown",
+          "content": "# Mercury-Alpha\n\nDR_NOISY_DISTRACTOR_A Релиз Mercury-Alpha принадлежит команде Selene."
+        },
+        {
+          "id": "mercury_beta",
+          "filename": "mercury-beta.md",
+          "content_type": "text/markdown",
+          "content": "# Mercury-Beta\n\nDR_NOISY_DISTRACTOR_B Релиз Mercury-Beta принадлежит команде Aster."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Mercury-Prime", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "mercury_prime", "marker": "DR_NOISY_RELEVANT" }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 1, "allow_partial": true },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["noise", "distractors"]
+    },
+    {
+      "task_id": "long_context_pressure",
+      "topic": "Собери обзор по инициативам ContextPack 1, 2, 3, 4, 5, 6, 7 и 8.",
+      "documents": [
+        {
+          "id": "context_pack",
+          "filename": "context-pack.md",
+          "content_type": "text/markdown",
+          "content": "# ContextPack\n\nDR_CONTEXT_1 ContextPack 1 имеет риск latency.\n\nDR_CONTEXT_2 ContextPack 2 имеет риск cost.\n\nDR_CONTEXT_3 ContextPack 3 имеет риск recall.\n\nDR_CONTEXT_4 ContextPack 4 имеет риск precision.\n\nDR_CONTEXT_5 ContextPack 5 имеет риск freshness.\n\nDR_CONTEXT_6 ContextPack 6 имеет риск duplication.\n\nDR_CONTEXT_7 ContextPack 7 имеет риск leakage.\n\nDR_CONTEXT_8 ContextPack 8 имеет риск drift."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "ContextPack", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "context_pack", "marker": "DR_CONTEXT_1" },
+        { "document_id": "context_pack", "marker": "DR_CONTEXT_8", "required": false }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 1, "allow_partial": true },
+      "expected_contradictions": [],
+      "hidden_markers": ["DR_CONTEXT_HIDDEN_SHOULD_NOT_EXIST"],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["context_pressure", "packing"]
+    },
+    {
+      "task_id": "acl_mixed_visibility",
+      "topic": "Какая часть проекта Iris видима обычному исследователю?",
+      "documents": [
+        {
+          "id": "iris_public",
+          "filename": "iris-public.md",
+          "content_type": "text/markdown",
+          "content": "# Iris public\n\nDR_ACL_VISIBLE_MARKER Проект Iris имеет публичный компонент Portal."
+        },
+        {
+          "id": "iris_restricted",
+          "filename": "iris-restricted.md",
+          "content_type": "text/markdown",
+          "content": "# Iris restricted\n\nDR_ACL_HIDDEN_MARKER Проект Iris имеет закрытый компонент Vault.",
+          "access": { "policy": "restricted", "user_ids": ["00000000-0000-4000-8000-000000000000"], "group_ids": [] },
+          "expected_visible": false
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Iris", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "iris_public", "marker": "DR_ACL_VISIBLE_MARKER" }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 1, "allow_partial": true },
+      "expected_contradictions": [],
+      "hidden_markers": ["DR_ACL_HIDDEN_MARKER"],
+      "acl_setup": { "mode": "mixed_visibility" },
+      "quality_tags": ["acl", "security"]
+    },
+    {
+      "task_id": "pause_resume_cancel",
+      "topic": "Проверь статусы Wave One, Wave Two и Wave Three.",
+      "documents": [
+        {
+          "id": "wave_one",
+          "filename": "wave-one.md",
+          "content_type": "text/markdown",
+          "content": "# Wave One\n\nDR_LIFECYCLE_ONE Wave One завершена."
+        },
+        {
+          "id": "wave_two",
+          "filename": "wave-two.md",
+          "content_type": "text/markdown",
+          "content": "# Wave Two\n\nDR_LIFECYCLE_TWO Wave Two выполняется."
+        },
+        {
+          "id": "wave_three",
+          "filename": "wave-three.md",
+          "content_type": "text/markdown",
+          "content": "# Wave Three\n\nDR_LIFECYCLE_THREE Wave Three запланирована."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Wave One", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "Wave Two", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "Wave Three", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "wave_one", "marker": "DR_LIFECYCLE_ONE" },
+        { "document_id": "wave_two", "marker": "DR_LIFECYCLE_TWO" },
+        { "document_id": "wave_three", "marker": "DR_LIFECYCLE_THREE" }
+      ],
+      "expected_coverage": { "min_total": 1, "min_covered": 1, "allow_partial": true },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb", "exercise_actions": true },
+      "quality_tags": ["lifecycle", "pause_resume_cancel"]
+    }
+  ]
+}

@@ -26,12 +26,14 @@
 - durable Deep Research V1: single-KB research runs, typed evidence memory,
   coverage records, operational reflections, pause/resume/cancel и compact UI.
 
-Следующий Pareto-инкремент после Deep Research V1 - runtime smoke и
-исследовательские quality/context experiments для выбора дефолтов packing
-policy без ухудшения безопасности. Минимальный document-level ACL/security
-trimming уже реализован поверх trusted `metadata.document_access`:
-обычные документы остаются KB-visible, restricted-документы видят только
-админы/KB managers/owners или явно разрешённые users/groups.
+Следующий Pareto-инкремент после Deep Research V1 уже частично закрыт:
+mock-provider runtime smoke и offline quality/context matrix выполнены. Новый
+следующий шаг теперь более узкий: дать runtime policy override для
+экспериментов и подтвердить candidate policy на локальных моделях/Qwen без
+ухудшения безопасности. Минимальный document-level ACL/security trimming уже
+реализован поверх trusted `metadata.document_access`: обычные документы
+остаются KB-visible, restricted-документы видят только админы/KB
+managers/owners или явно разрешённые users/groups.
 
 ## Этап 1. Закрепить текущую версию
 
@@ -176,10 +178,13 @@ runtime не входят в V1.
 
 ## Этап 9. Улучшить проверки качества
 
-Статус: следующий фокус. Нужны fixtures и короткие эксперименты по context
-target ratios, raw/abstract evidence packing, episode granularity, reflection
-policy и contrarian policy перед тем, как считать текущие Deep Research
-дефолты оптимальными.
+Статус: реализованы deterministic fixtures, offline evaluator, runtime smoke
+CLI и offline multi-policy context matrix. Полный mock runtime smoke прошёл
+10/10 fixtures; offline matrix прошла 27 policy aggregates / 270 fixture-policy
+rows и рекомендовала `target_35_abstracts_only_none` как самый экономный
+synthetic packer policy. Это не меняет runtime default автоматически: нужен
+runtime policy override и локальная/Qwen-проверка перед сменой текущего 45%
+профиля.
 
 Что сделать:
 
@@ -212,9 +217,9 @@ policy и contrarian policy перед тем, как считать текущ�
 4. Подготовить подключение источников. Выполнено как foundations.
 5. Добавить права на документы. Выполнено минимально.
 6. Сделать выбор способа поиска по типу вопроса. Foundations реализованы.
-7. Сохранять полный путь к ответу как typed evidence memory и coverage records. Следующий этап.
-8. Добавить глубокое исследование как durable run lifecycle.
-9. Расширить проверки качества.
+7. Сохранять полный путь к ответу как typed evidence memory и coverage records. Выполнено.
+8. Добавить глубокое исследование как durable run lifecycle. Выполнено V1.
+9. Расширить проверки качества. Fixtures/evaluator/smoke CLI и offline matrix выполнены; следующий шаг - runtime policy override и локальная/Qwen-проверка кандидата перед сменой default.
 10. Отдельно исследовать графовый поиск.
 
 ## Критерии готовности

@@ -268,6 +268,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hardening_parser.add_argument("--skip-compose", action="store_true")
     hardening_parser.add_argument("--down-after", action="store_true")
+
+    deep_research_parser = subparsers.add_parser("deep-research-smoke")
+    deep_research_parser.add_argument("--api", default="http://localhost:8000")
+    deep_research_parser.add_argument("--fixture-path", default="tests/fixtures/deep_research/research_tasks.json")
+    deep_research_parser.add_argument("--task-id", action="append", default=[])
+    deep_research_parser.add_argument("--max-tasks", type=int, default=None)
+    deep_research_parser.add_argument("--retrieval-profile", default="upload_mock")
+    deep_research_parser.add_argument("--declared-context-tokens", type=int, default=12000)
+    deep_research_parser.add_argument("--timeout-seconds", type=int, default=480)
+    deep_research_parser.add_argument(
+        "--admin-username",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_USERNAME", "admin"),
+        help="local or hybrid auth platform-admin username",
+    )
+    deep_research_parser.add_argument(
+        "--admin-secret",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD", "admin"),  # noqa: S106
+        help="platform-admin local login secret; defaults to the local bootstrap admin password",
+    )
+    deep_research_parser.add_argument(
+        "--admin-secret-file",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD_FILE"),
+        help="file containing the platform-admin local login secret, or WIKIPEDIARAG_ADMIN_PASSWORD_FILE",
+    )
+    deep_research_parser.add_argument("--skip-compose", action="store_true")
+    deep_research_parser.add_argument("--down-after", action="store_true")
+
+    deep_research_matrix_parser = subparsers.add_parser("deep-research-matrix")
+    deep_research_matrix_parser.add_argument(
+        "--fixture-path",
+        default="tests/fixtures/deep_research/research_tasks.json",
+    )
+    deep_research_matrix_parser.add_argument("--task-id", action="append", default=[])
+    deep_research_matrix_parser.add_argument("--max-tasks", type=int, default=None)
+    deep_research_matrix_parser.add_argument("--declared-context-tokens", type=int, default=12000)
+    deep_research_matrix_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="optional output directory; defaults to artifacts/validation/deep-research-matrix/<timestamp>",
+    )
     return parser
 
 
@@ -340,6 +380,10 @@ def main() -> None:
         verify_document_corpus(args)
     elif args.command == "verify-cross-tenant-hardening":
         verify_cross_tenant_hardening(args)
+    elif args.command == "deep-research-smoke":
+        verify_deep_research_smoke(args)
+    elif args.command == "deep-research-matrix":
+        verify_deep_research_matrix(args)
 
 
 def _add_eval_generate_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1261,11 +1305,633 @@ def verify_cross_tenant_hardening(args: argparse.Namespace) -> None:
         raise SystemExit(exit_code)
 
 
+def verify_deep_research_smoke(args: argparse.Namespace) -> None:
+    from wikipediarag.deep_research_eval import (
+        DEFAULT_DEEP_RESEARCH_POLICY_ID,
+        build_context_experiment_report,
+        load_deep_research_fixtures,
+    )
+
+    api = str(args.api).rstrip("/")
+    admin_secret = _resolve_hardening_admin_secret(args)
+    fixture_path = Path(str(args.fixture_path))
+    report_dir = Path("artifacts/validation/deep-research") / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    report_dir.mkdir(parents=True, exist_ok=True)
+    fixtures = load_deep_research_fixtures(fixture_path)
+    if args.task_id:
+        requested = set(str(task_id) for task_id in args.task_id)
+        fixtures = [fixture for fixture in fixtures if fixture.task_id in requested]
+        missing = sorted(requested - {fixture.task_id for fixture in fixtures})
+        if missing:
+            raise RuntimeError(f"unknown Deep Research fixture task-id(s): {missing}")
+    if args.max_tasks is not None:
+        fixtures = fixtures[: max(0, int(args.max_tasks))]
+    report: dict[str, Any] = {
+        "passed": False,
+        "api": api,
+        "fixture_path": str(fixture_path),
+        "retrieval_profile": str(args.retrieval_profile),
+        "declared_context_tokens": int(args.declared_context_tokens),
+        "report_dir": str(report_dir),
+        "checks": [],
+        "items": [],
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    exit_code = 0
+    try:
+        if not fixtures:
+            raise RuntimeError("no Deep Research fixtures selected")
+        if not admin_secret:
+            raise RuntimeError("deep-research-smoke requires a non-empty admin secret")
+        if not args.skip_compose:
+            _compose_up_deep_research_stack()
+            _record_check(report, "compose_up", True)
+        with httpx.Client(timeout=180, follow_redirects=True) as admin_client:
+            _wait_json_ready(admin_client, f"{api}/ready", "api", require_ok=True)
+            _record_check(report, "api_ready", True)
+            _authenticate_smoke_session(
+                admin_client,
+                api,
+                username=str(args.admin_username),
+                admin_secret=admin_secret,
+            )
+            _record_check(report, "platform_admin_login", True)
+            admin_session = _get_json(admin_client, f"{api}/api/v1/auth/session")
+            _update_csrf_from_session(admin_client, admin_session)
+            tenant_id = str(admin_session.get("active_tenant_id") or "")
+            if not tenant_id:
+                raise RuntimeError(f"admin session has no active tenant: {admin_session}")
+            viewer_credentials: dict[str, str] | None = None
+            if any(str(fixture.acl_setup.get("mode") or "") == "mixed_visibility" for fixture in fixtures):
+                viewer_credentials = asyncio.run(_seed_deep_research_viewer_user(tenant_id=tenant_id))
+                _record_check(report, "viewer_user_seeded", True, {"user_id": viewer_credentials["user_id"]})
+            for index, fixture in enumerate(fixtures, start=1):
+                item = _run_deep_research_fixture(
+                    admin_client,
+                    api,
+                    fixture,
+                    retrieval_profile=str(args.retrieval_profile),
+                    declared_context_tokens=int(args.declared_context_tokens),
+                    timeout_seconds=int(args.timeout_seconds),
+                    viewer_credentials=viewer_credentials,
+                )
+                item["policy_id"] = DEFAULT_DEEP_RESEARCH_POLICY_ID
+                _append_report_item(report, item)
+                print(
+                    json.dumps(
+                        {
+                            "deep_research_task": fixture.task_id,
+                            "processed": index,
+                            "total": len(fixtures),
+                            "passed": item.get("passed"),
+                            "run_status": item.get("metrics", {}).get("run_status") if isinstance(item, dict) else None,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            evaluations = [item for item in report["items"] if isinstance(item, dict)]
+            report["context_experiments"] = build_context_experiment_report(
+                [
+                    {
+                        "policy_id": str(item.get("policy_id") or DEFAULT_DEEP_RESEARCH_POLICY_ID),
+                        "passed": bool(item.get("passed")),
+                        "metrics": item.get("metrics") if isinstance(item.get("metrics"), dict) else {},
+                    }
+                    for item in evaluations
+                ]
+            )
+            failures = [item for item in evaluations if not item.get("passed")]
+            if failures:
+                raise RuntimeError(f"deep research smoke failed for {len(failures)} fixture(s)")
+        report["passed"] = True
+    except Exception as exc:
+        exit_code = 1
+        report["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+    finally:
+        report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_deep_research_reports(report_dir, report)
+        if args.down_after:
+            subprocess.run([_docker_executable(), "compose", "down"], check=False)  # noqa: S603
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+def verify_deep_research_matrix(args: argparse.Namespace) -> None:
+    from wikipediarag.deep_research_eval import (
+        build_context_experiment_report,
+        load_deep_research_fixtures,
+        run_context_policy_experiment_rows,
+    )
+
+    fixture_path = Path(str(args.fixture_path))
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    report_dir = (
+        Path(str(args.output_dir)) if args.output_dir else Path("artifacts/validation/deep-research-matrix") / timestamp
+    )
+    report_dir.mkdir(parents=True, exist_ok=True)
+    fixtures = load_deep_research_fixtures(fixture_path)
+    if args.task_id:
+        requested = set(str(task_id) for task_id in args.task_id)
+        fixtures = [fixture for fixture in fixtures if fixture.task_id in requested]
+        missing = sorted(requested - {fixture.task_id for fixture in fixtures})
+        if missing:
+            raise RuntimeError(f"unknown Deep Research fixture task-id(s): {missing}")
+    if args.max_tasks is not None:
+        fixtures = fixtures[: max(0, int(args.max_tasks))]
+    if not fixtures:
+        raise RuntimeError("no Deep Research fixtures selected")
+    rows = run_context_policy_experiment_rows(
+        fixtures,
+        declared_context_tokens=int(args.declared_context_tokens),
+    )
+    experiment_report = build_context_experiment_report(rows)
+    policy_results = experiment_report.get("policy_results")
+    report: dict[str, Any] = {
+        "passed": True,
+        "schema_version": "deep_research_matrix_report_v1",
+        "fixture_path": str(fixture_path),
+        "fixture_count": len(fixtures),
+        "declared_context_tokens": int(args.declared_context_tokens),
+        "report_dir": str(report_dir),
+        "started_at": timestamp,
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "items": policy_results if isinstance(policy_results, list) else [],
+        "context_experiments": experiment_report,
+        "notes": [
+            "Matrix mode is an offline context-packer experiment over synthetic fixture records.",
+            "It exercises all 27 target/packing/reflection policies without requiring Qwen or provider calls.",
+            "Runtime Deep Research currently stores the 45% policy from retrieval profile; "
+            "API-level policy override is future work.",
+        ],
+    }
+    _write_deep_research_matrix_reports(report_dir, report)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
 def _resolve_hardening_admin_secret(args: argparse.Namespace) -> str:
     raw_path = getattr(args, "admin_secret_file", None)
     if raw_path:
         return Path(str(raw_path)).read_text(encoding="utf-8").strip()
     return str(getattr(args, "admin_secret", "admin") or "admin")
+
+
+def _run_deep_research_fixture(
+    admin_client: httpx.Client,
+    api: str,
+    fixture: Any,
+    *,
+    retrieval_profile: str,
+    declared_context_tokens: int,
+    timeout_seconds: int,
+    viewer_credentials: dict[str, str] | None,
+) -> dict[str, Any]:
+    from wikipediarag.deep_research_eval import evaluate_research_detail
+
+    started = time.monotonic()
+    result: dict[str, Any] = {
+        "task_id": fixture.task_id,
+        "quality_tags": list(fixture.quality_tags),
+        "passed": False,
+        "uploads": [],
+        "actions": [],
+    }
+    try:
+        knowledge_base_id = _create_deep_research_knowledge_base(admin_client, api, str(fixture.task_id))
+        result["knowledge_base_id"] = knowledge_base_id
+        viewer_client: httpx.Client | None = None
+        runner_client = admin_client
+        if str(fixture.acl_setup.get("mode") or "") == "mixed_visibility":
+            if viewer_credentials is None:
+                raise RuntimeError("ACL fixture requires seeded viewer credentials")
+            _grant_deep_research_viewer(admin_client, api, knowledge_base_id, viewer_credentials["user_id"])
+            viewer_client = httpx.Client(timeout=180, follow_redirects=True)
+            _login_deep_research_viewer(
+                viewer_client,
+                api,
+                viewer_credentials["username"],
+                viewer_credentials["password"],
+            )
+            runner_client = viewer_client
+            result["viewer_user_id"] = viewer_credentials["user_id"]
+        try:
+            for document in fixture.documents:
+                upload = _upload_deep_research_fixture_document(admin_client, api, knowledge_base_id, fixture, document)
+                result["uploads"].append(upload)
+                if document.access is not None:
+                    _patch_deep_research_document_access(
+                        admin_client,
+                        api,
+                        str(upload["document_id"]),
+                        dict(document.access),
+                    )
+            if bool(fixture.acl_setup.get("exercise_actions")):
+                action_detail = _exercise_deep_research_actions(
+                    runner_client,
+                    api,
+                    knowledge_base_id,
+                    str(fixture.topic),
+                    retrieval_profile=retrieval_profile,
+                    timeout_seconds=timeout_seconds,
+                )
+                result["actions"].extend(action_detail["actions"])
+                detail = action_detail["detail"]
+            else:
+                run_id = _create_deep_research_run(
+                    runner_client,
+                    api,
+                    knowledge_base_id,
+                    str(fixture.topic),
+                    retrieval_profile=retrieval_profile,
+                )
+                result["run_id"] = run_id
+                detail = _wait_research_run_terminal(runner_client, api, run_id, timeout_seconds=timeout_seconds)
+            evaluation = evaluate_research_detail(
+                fixture,
+                detail,
+                declared_context_tokens=declared_context_tokens,
+            )
+            result.update(evaluation)
+            result["latency_seconds"] = round(time.monotonic() - started, 3)
+            metrics = result.get("metrics")
+            if isinstance(metrics, dict):
+                metrics["latency_seconds"] = result["latency_seconds"]
+        finally:
+            if viewer_client is not None:
+                viewer_client.close()
+    except Exception as exc:
+        result["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+    return result
+
+
+async def _seed_deep_research_viewer_user(*, tenant_id: str) -> dict[str, str]:
+    from sqlalchemy import text
+
+    from wikipediarag.auth_service import hash_password
+    from wikipediarag.config import get_settings
+    from wikipediarag.db import connect
+    from wikipediarag.ids import new_uuid
+
+    settings = get_settings()
+    database_url = _host_reachable_database_url(settings.database_url)
+    if database_url != settings.database_url:
+        settings = settings.model_copy(update={"database_url": database_url})
+    suffix = time.strftime("%Y%m%d%H%M%S", time.gmtime()) + uuid.uuid4().hex[:8]
+    user_id = str(new_uuid())
+    username = f"deep-research-viewer-{suffix}"
+    password = f"DeepResearchSmoke-{suffix}-Password-123"
+    email = f"{username}@example.test"
+    async with connect(settings) as conn:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO users(
+                  id, email, username, display_name, platform_role,
+                  password_hash, password_change_required, is_disabled
+                )
+                VALUES (
+                  :id, :email, :username, :display_name, 'USER',
+                  :password_hash, false, false
+                )
+                """
+            ),
+            {
+                "id": user_id,
+                "email": email,
+                "username": username,
+                "display_name": username,
+                "password_hash": hash_password(password),
+            },
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO tenant_memberships(tenant_id, user_id, role)
+                VALUES (:tenant_id, :user_id, 'MEMBER')
+                ON CONFLICT (tenant_id, user_id) DO UPDATE
+                SET role = EXCLUDED.role
+                """
+            ),
+            {"tenant_id": tenant_id, "user_id": user_id},
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO auth_identities(
+                  id, user_id, issuer, subject, identity_key, provider_type, username, email
+                )
+                VALUES (
+                  :id, :user_id, 'local', :subject, :identity_key, 'LOCAL', :username, :email
+                )
+                """
+            ),
+            {
+                "id": str(new_uuid()),
+                "user_id": user_id,
+                "subject": username,
+                "identity_key": f"local:{username}",
+                "username": username,
+                "email": email,
+            },
+        )
+    return {"user_id": user_id, "username": username, "password": password}
+
+
+def _host_reachable_database_url(database_url: str) -> str:
+    return database_url.replace("@postgres:", "@localhost:").replace("@postgres/", "@localhost/")
+
+
+def _create_deep_research_knowledge_base(client: httpx.Client, api: str, task_id: str) -> str:
+    response = client.post(
+        f"{api}/api/v1/knowledge-bases",
+        json={"name": f"Deep Research Smoke {task_id} {time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("id"):
+        raise RuntimeError(f"knowledge base creation returned invalid payload: {payload}")
+    return str(payload["id"])
+
+
+def _grant_deep_research_viewer(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    user_id: str,
+) -> None:
+    response = client.post(
+        f"{api}/api/v1/knowledge-bases/{knowledge_base_id}/grants",
+        json={"subject_type": "USER", "subject_id": user_id, "role": "VIEWER"},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
+def _login_deep_research_viewer(client: httpx.Client, api: str, username: str, password: str) -> None:
+    response = client.post(
+        f"{api}/api/v1/auth/local/login",
+        json={"username": username, "password": password, "remember_me": False},
+        timeout=30,
+    )
+    response.raise_for_status()
+    session = _get_json(client, f"{api}/api/v1/auth/session")
+    csrf_token = session.get("csrf_token")
+    if not isinstance(csrf_token, str) or not csrf_token:
+        raise RuntimeError(f"viewer session did not return a CSRF token: {session}")
+    client.headers.update({"X-CSRF-Token": csrf_token})
+
+
+def _update_csrf_from_session(client: httpx.Client, session: dict[str, Any]) -> None:
+    csrf_token = session.get("csrf_token")
+    if isinstance(csrf_token, str) and csrf_token:
+        client.headers.update({"X-CSRF-Token": csrf_token})
+
+
+def _upload_deep_research_fixture_document(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    fixture: Any,
+    document: Any,
+) -> dict[str, Any]:
+    content = str(document.content).encode("utf-8")
+    checksum = hashlib.sha256(content).hexdigest()
+    session_response = client.post(
+        f"{api}/api/v1/uploads/sessions",
+        json={
+            "filename": str(document.filename),
+            "content_type": str(document.content_type),
+            "size_bytes": len(content),
+            "checksum_sha256": checksum,
+            "knowledge_base_id": knowledge_base_id,
+            "parser_profile": str(document.parser_profile),
+            "metadata": {
+                "deep_research_fixture": True,
+                "task_id": str(fixture.task_id),
+                "fixture_document_id": str(document.id),
+                **dict(document.metadata),
+            },
+        },
+        timeout=30,
+    )
+    session_response.raise_for_status()
+    session = session_response.json()
+    upload_response = client.put(
+        session["upload_url"],
+        content=content,
+        headers=session.get("required_headers") or {},
+        timeout=120,
+    )
+    upload_response.raise_for_status()
+    complete_response = client.post(
+        f"{api}/api/v1/uploads/sessions/{session['upload_session_id']}:complete",
+        json={"metadata": {"deep_research_fixture_completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}},
+        timeout=30,
+    )
+    complete_response.raise_for_status()
+    completed = complete_response.json()
+    if not isinstance(completed, dict):
+        raise RuntimeError("upload complete returned a non-object JSON payload")
+    job_payload = _wait_job_terminal(client, api, str(completed["job_id"]))
+    if job_payload.get("status") != "completed":
+        raise RuntimeError(f"Deep Research fixture upload job failed: {job_payload}")
+    return {
+        "fixture_document_id": str(document.id),
+        "document_id": str(completed["document_id"]),
+        "document_version_id": str(completed["document_version_id"]),
+        "job_id": str(completed["job_id"]),
+        "job_status": str(job_payload.get("status")),
+    }
+
+
+def _patch_deep_research_document_access(
+    client: httpx.Client,
+    api: str,
+    document_id: str,
+    access: dict[str, Any],
+) -> None:
+    response = client.patch(
+        f"{api}/api/v1/documents/{document_id}/access",
+        json=access,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+
+def _create_deep_research_run(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    topic: str,
+    *,
+    retrieval_profile: str,
+) -> str:
+    response = client.post(
+        f"{api}/api/v1/research-runs",
+        json={
+            "topic": topic,
+            "knowledge_base_id": knowledge_base_id,
+            "retrieval_profile": retrieval_profile,
+            "retrieval_overrides": {
+                "retrieval": {"top_k": 12},
+                "postprocess": {"extended_search": "always"},
+            },
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("run_id"):
+        raise RuntimeError(f"research run creation returned invalid payload: {payload}")
+    return str(payload["run_id"])
+
+
+def _wait_research_run_terminal(
+    client: httpx.Client,
+    api: str,
+    research_run_id: str,
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_payload: dict[str, Any] = {}
+    terminal = {"completed", "failed", "cancelled", "paused"}
+    while time.monotonic() < deadline:
+        payload = _get_json(client, f"{api}/api/v1/research-runs/{research_run_id}")
+        last_payload = payload if isinstance(payload, dict) else {}
+        run_payload = last_payload.get("run")
+        run = run_payload if isinstance(run_payload, dict) else {}
+        status = str(run.get("status") or "")
+        if status in terminal:
+            return last_payload
+        print(
+            json.dumps(
+                {
+                    "research_run_id": research_run_id,
+                    "status": status,
+                    "progress": run.get("progress") if isinstance(run, dict) else {},
+                },
+                ensure_ascii=False,
+            )
+        )
+        time.sleep(3)
+    raise RuntimeError(f"research run did not reach terminal state: {last_payload}")
+
+
+def _exercise_deep_research_actions(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    topic: str,
+    *,
+    retrieval_profile: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    actions: list[dict[str, Any]] = []
+    pause_run_id = _create_deep_research_run(
+        client,
+        api,
+        knowledge_base_id,
+        topic,
+        retrieval_profile=retrieval_profile,
+    )
+    pause_response = client.post(f"{api}/api/v1/research-runs/{pause_run_id}:pause", timeout=30)
+    actions.append({"action": "pause", "status_code": pause_response.status_code})
+    pause_response.raise_for_status()
+    pause_detail = _wait_research_run_terminal(client, api, pause_run_id, timeout_seconds=timeout_seconds)
+    pause_status = str(_mapping_from_payload(pause_detail, "run").get("status") or "")
+    if pause_status == "paused":
+        resume_response = client.post(f"{api}/api/v1/research-runs/{pause_run_id}:resume", timeout=30)
+        actions.append({"action": "resume", "status_code": resume_response.status_code})
+        resume_response.raise_for_status()
+        pause_detail = _wait_research_run_terminal(client, api, pause_run_id, timeout_seconds=timeout_seconds)
+    cancel_run_id = _create_deep_research_run(
+        client,
+        api,
+        knowledge_base_id,
+        topic,
+        retrieval_profile=retrieval_profile,
+    )
+    cancel_response = client.post(f"{api}/api/v1/research-runs/{cancel_run_id}:cancel", timeout=30)
+    actions.append({"action": "cancel", "status_code": cancel_response.status_code})
+    cancel_response.raise_for_status()
+    cancel_detail = _wait_research_run_terminal(client, api, cancel_run_id, timeout_seconds=timeout_seconds)
+    actions.append({"action": "cancel_terminal", "status": _mapping_from_payload(cancel_detail, "run").get("status")})
+    return {"actions": actions, "detail": pause_detail}
+
+
+def _mapping_from_payload(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _write_deep_research_reports(report_dir: Path, report: dict[str, Any]) -> None:
+    report_path = report_dir / "report.json"
+    junit_path = report_dir / "junit.xml"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    raw_items = report.get("items")
+    items: list[Any] = raw_items if isinstance(raw_items, list) else []
+    failures = [item for item in items if isinstance(item, dict) and not item.get("passed")]
+    failure_count = len(failures) + (1 if not failures and report.get("error") else 0)
+    testcases: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        failure_xml = ""
+        item_failures = item.get("failures") if isinstance(item.get("failures"), list) else []
+        error = item.get("error") if isinstance(item.get("error"), dict) else None
+        if item_failures or error:
+            message = json.dumps({"failures": item_failures, "error": error}, ensure_ascii=False)
+            failure_xml = f'<failure type="DeepResearchFixtureFailed">{escape(message)}</failure>'
+        testcases.append(
+            f'  <testcase classname="wikipediarag.cli" name="{escape(str(item.get("task_id") or "task"))}">'
+            f"{failure_xml}</testcase>\n"
+        )
+    if not testcases and report.get("error"):
+        error = report["error"] if isinstance(report["error"], dict) else {}
+        testcases.append(
+            '  <testcase classname="wikipediarag.cli" name="deep_research_smoke">'
+            f'<failure type="{escape(str(error.get("code") or "Error"))}">'
+            f"{escape(str(error.get('message') or ''))}</failure></testcase>\n"
+        )
+    junit = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<testsuite name="deep-research-smoke" tests="{len(testcases)}" failures="{failure_count}">\n'
+        f"{''.join(testcases)}</testsuite>\n"
+    )
+    junit_path.write_text(junit, encoding="utf-8")
+
+
+def _write_deep_research_matrix_reports(report_dir: Path, report: dict[str, Any]) -> None:
+    report_path = report_dir / "report.json"
+    junit_path = report_dir / "junit.xml"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    raw_items = report.get("items")
+    items: list[Any] = raw_items if isinstance(raw_items, list) else []
+    acl_failures = [item for item in items if isinstance(item, dict) and item.get("acl_safety") is False]
+    testcases: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        failure_xml = ""
+        if item.get("acl_safety") is False:
+            message = json.dumps({"failures": item.get("failures")}, ensure_ascii=False)
+            failure_xml = f'<failure type="DeepResearchMatrixAclFailure">{escape(message)}</failure>'
+        testcases.append(
+            f'  <testcase classname="wikipediarag.cli" name="{escape(str(item.get("policy_id") or "policy"))}">'
+            f"{failure_xml}</testcase>\n"
+        )
+    junit = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<testsuite name="deep-research-matrix" tests="{len(testcases)}" failures="{len(acl_failures)}">\n'
+        f"{''.join(testcases)}</testsuite>\n"
+    )
+    junit_path.write_text(junit, encoding="utf-8")
+
+
+def _compose_up_deep_research_stack() -> None:
+    _compose_up_document_upload_stack()
 
 
 def _login_for_hardening(client: httpx.Client, api: str, username: str, admin_secret: str) -> None:

@@ -147,6 +147,8 @@ make smoke-models PROVIDER=mock
 make verify-document-upload
 make verify-document-corpus
 make verify-cross-tenant-hardening
+make deep-research-smoke
+make deep-research-matrix
 ```
 
 Provider-backed release gates must only start when API `/ready` is `ok` and,

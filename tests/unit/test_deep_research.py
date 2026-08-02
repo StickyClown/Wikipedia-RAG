@@ -16,7 +16,13 @@ from wikipediarag.deep_research import (
     visible_research_evidence,
 )
 from wikipediarag.document_access import DocumentAccessScope
-from wikipediarag.repository import create_research_episode, load_next_research_question
+from wikipediarag.repository import (
+    create_research_episode,
+    create_research_run,
+    load_next_research_question,
+    request_research_cancel,
+    request_research_pause,
+)
 from wikipediarag.retrieval_profile import get_retrieval_profile
 
 
@@ -204,3 +210,59 @@ async def test_create_research_episode_marks_question_running() -> None:
     )
 
     assert any("UPDATE research_questions" in sql and "status = 'running'" in sql for sql in conn.sql)
+
+
+@pytest.mark.asyncio
+async def test_create_research_run_inserts_job_before_run_fk_reference() -> None:
+    conn = _RecordingConnection()
+
+    await create_research_run(
+        cast(Any, conn),
+        tenant_id="11111111-1111-4111-8111-111111111111",
+        knowledge_base_id="33333333-3333-4333-8333-333333333333",
+        user_id="22222222-2222-4222-8222-222222222222",
+        topic="topic",
+        retrieval_profile="upload_mock",
+        retrieval_overrides={},
+        context_policy={},
+        questions=["Question?"],
+    )
+
+    job_insert_index = next(index for index, sql in enumerate(conn.sql) if "INSERT INTO ingestion_jobs" in sql)
+    run_insert_index = next(index for index, sql in enumerate(conn.sql) if "INSERT INTO research_runs" in sql)
+    assert job_insert_index < run_insert_index
+
+
+@pytest.mark.asyncio
+async def test_pause_research_run_marks_preclaim_run_paused_and_job_cancelled() -> None:
+    conn = _RecordingConnection()
+
+    await request_research_pause(cast(Any, conn), tenant_id="tenant", research_run_id="run")
+
+    assert any("UPDATE research_runs" in sql and "THEN 'paused'" in sql for sql in conn.sql)
+    assert any(
+        "UPDATE ingestion_jobs" in sql
+        and "THEN 'cancelled'" in sql
+        and "paused_before_start" in sql
+        and "completed_at = CASE WHEN status = 'received'" in sql
+        for sql in conn.sql
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_research_run_marks_preclaim_or_paused_run_cancelled() -> None:
+    conn = _RecordingConnection()
+
+    await request_research_cancel(cast(Any, conn), tenant_id="tenant", research_run_id="run")
+
+    assert any("UPDATE research_runs" in sql and "THEN 'cancelled'" in sql for sql in conn.sql)
+    assert any(
+        "WHERE tenant_id = :tenant_id AND id = :id AND status IN ('received','running','paused')" in sql
+        for sql in conn.sql
+    )
+    assert any(
+        "UPDATE ingestion_jobs" in sql
+        and "cancelled_before_start" in sql
+        and "completed_at = CASE WHEN status = 'received'" in sql
+        for sql in conn.sql
+    )

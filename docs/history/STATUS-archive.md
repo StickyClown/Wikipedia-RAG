@@ -30,13 +30,19 @@ Historical implementation references:
 
 - Reviewed Wikipedia provider gate passed on 2026-07-30 with `passed=true` and `blocking_failures=0`.
   Report: `artifacts/eval/release-gates/reviewed-wikipedia-smoke-v1/20260730T195822Z-reviewed-wikipedia-smoke-v1-release-gate-5b04e45f/report.json`.
+- Deep Research mock runtime smoke and offline policy matrix later passed on
+  2026-08-02. Reports:
+  `artifacts/validation/deep-research/20260802T152743Z/report.json` and
+  `artifacts/validation/deep-research-matrix/20260802T153246Z/report.json`.
 - Document corpus verification reports retained from 2026-07-29:
   `artifacts/validation/document-corpus/20260729T205604Z`,
   `artifacts/validation/document-corpus/20260729T205923Z`,
   `artifacts/validation/document-corpus/20260729T210847Z`.
 - Document upload verification retained from 2026-07-29:
   `artifacts/validation/document-upload/20260729T210047Z`.
-- Cross-tenant hardening smoke command was added and unit/help validation was recorded in prior status history. Runtime hardening smoke remains part of the next approved smoke set.
+- Cross-tenant hardening smoke command was added in earlier status history and
+  later runtime Deep Research validation reused the same local-auth/smoke
+  harness patterns.
 
 ## Historical Local Data State
 

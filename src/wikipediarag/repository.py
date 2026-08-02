@@ -3211,6 +3211,22 @@ async def create_research_run(
     await conn.execute(
         text(
             """
+            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress)
+            VALUES (:id, :tenant_id, :kb_id, 'deep_research', 'received',
+                    CAST(:config AS jsonb), CAST(:progress AS jsonb))
+            """
+        ),
+        {
+            "id": str(job_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "config": json_dumps({"research_run_id": str(run_id)}),
+            "progress": json_dumps({"stage": "received", "research_run_id": str(run_id)}),
+        },
+    )
+    await conn.execute(
+        text(
+            """
             INSERT INTO research_runs(
               id, tenant_id, knowledge_base_id, user_id, active_job_id, topic, retrieval_profile,
               retrieval_overrides, status, progress, checkpoint, context_policy
@@ -3260,22 +3276,6 @@ async def create_research_run(
                 "metadata": json_dumps({}),
             },
         )
-    await conn.execute(
-        text(
-            """
-            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress)
-            VALUES (:id, :tenant_id, :kb_id, 'deep_research', 'received',
-                    CAST(:config AS jsonb), CAST(:progress AS jsonb))
-            """
-        ),
-        {
-            "id": str(job_id),
-            "tenant_id": tenant_id,
-            "kb_id": knowledge_base_id,
-            "config": json_dumps({"research_run_id": str(run_id)}),
-            "progress": json_dumps({"stage": "received", "research_run_id": str(run_id)}),
-        },
-    )
     return run_id, job_id
 
 
@@ -3461,7 +3461,13 @@ async def request_research_pause(conn: AsyncConnection, *, tenant_id: str, resea
         text(
             """
             UPDATE research_runs
-            SET pause_requested = true, updated_at = now()
+            SET pause_requested = true,
+                status = CASE WHEN status = 'received' THEN 'paused' ELSE status END,
+                progress = CASE
+                  WHEN status = 'received' THEN jsonb_build_object('stage', 'paused')
+                  ELSE progress
+                END,
+                updated_at = now()
             WHERE tenant_id = :tenant_id AND id = :id AND status IN ('received','running')
             """
         ),
@@ -3471,7 +3477,14 @@ async def request_research_pause(conn: AsyncConnection, *, tenant_id: str, resea
         text(
             """
             UPDATE ingestion_jobs
-            SET cancel_requested = true, updated_at = now()
+            SET cancel_requested = true,
+                status = CASE WHEN status = 'received' THEN 'cancelled' ELSE status END,
+                progress = CASE
+                  WHEN status = 'received' THEN jsonb_build_object('stage', 'paused_before_start')
+                  ELSE progress
+                END,
+                completed_at = CASE WHEN status = 'received' THEN now() ELSE completed_at END,
+                updated_at = now()
             WHERE tenant_id = :tenant_id
               AND kind = 'deep_research'
               AND status IN ('received','running')
@@ -3487,8 +3500,16 @@ async def request_research_cancel(conn: AsyncConnection, *, tenant_id: str, rese
         text(
             """
             UPDATE research_runs
-            SET cancel_requested = true, pause_requested = false, updated_at = now()
-            WHERE tenant_id = :tenant_id AND id = :id
+            SET cancel_requested = true,
+                pause_requested = false,
+                status = CASE WHEN status IN ('received','paused') THEN 'cancelled' ELSE status END,
+                progress = CASE
+                  WHEN status IN ('received','paused') THEN jsonb_build_object('stage', 'cancelled')
+                  ELSE progress
+                END,
+                completed_at = CASE WHEN status IN ('received','paused') THEN now() ELSE completed_at END,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND id = :id AND status IN ('received','running','paused')
             """
         ),
         {"tenant_id": tenant_id, "id": research_run_id},
@@ -3497,7 +3518,14 @@ async def request_research_cancel(conn: AsyncConnection, *, tenant_id: str, rese
         text(
             """
             UPDATE ingestion_jobs
-            SET cancel_requested = true, updated_at = now()
+            SET cancel_requested = true,
+                status = CASE WHEN status = 'received' THEN 'cancelled' ELSE status END,
+                progress = CASE
+                  WHEN status = 'received' THEN jsonb_build_object('stage', 'cancelled_before_start')
+                  ELSE progress
+                END,
+                completed_at = CASE WHEN status = 'received' THEN now() ELSE completed_at END,
+                updated_at = now()
             WHERE tenant_id = :tenant_id
               AND kind = 'deep_research'
               AND status IN ('received','running')
