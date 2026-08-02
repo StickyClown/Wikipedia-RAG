@@ -231,7 +231,12 @@ def chunks_for_page(
                 source_url=f"https://ru.wikipedia.org/wiki/{page.title.replace(' ', '_')}",
                 content_hash=content_hash,
                 embedding=embed_text(f"{page.title}\n{content}", dimensions),
-                metadata={"source_type": "wikipedia_xml", "snapshot_id": snapshot_id},
+                metadata={
+                    "source_type": "wikipedia_xml",
+                    "snapshot_id": snapshot_id,
+                    "chunk_ordinal": 1,
+                    "locator": {"page_id": page.page_id, "section_index": 1, "chunk_index": 1},
+                },
             )
         ]
 
@@ -249,6 +254,7 @@ def chunks_for_page(
                 end = min(start + target_words, len(words))
             content = " ".join(words[start:end])
             content_hash = stable_hash([content])
+            chunk_ordinal = len(chunks) + 1
             chunk_id = "wiki:" + stable_hash(
                 [
                     snapshot_id,
@@ -260,6 +266,7 @@ def chunks_for_page(
                 ],
                 32,
             )
+            section_id = f"section:{stable_hash([snapshot_id, page.page_id, page.revision_id, *section.path], 24)}"
             chunks.append(
                 Chunk(
                     id=chunk_id,
@@ -276,7 +283,17 @@ def chunks_for_page(
                     source_url=f"https://ru.wikipedia.org/wiki/{page.title.replace(' ', '_')}",
                     content_hash=content_hash,
                     embedding=embed_text(f"{page.title}\n{' / '.join(section.path)}\n{content}", dimensions),
-                    metadata={"source_type": "wikipedia_xml", "snapshot_id": snapshot_id},
+                    metadata={
+                        "source_type": "wikipedia_xml",
+                        "snapshot_id": snapshot_id,
+                        "chunk_ordinal": chunk_ordinal,
+                        "section_id": section_id,
+                        "locator": {
+                            "page_id": page.page_id,
+                            "section_index": len(chunks) + 1,
+                            "chunk_index": sequence + 1,
+                        },
+                    },
                 )
             )
             start = end

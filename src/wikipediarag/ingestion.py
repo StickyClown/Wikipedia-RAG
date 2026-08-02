@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import Iterator
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -27,19 +28,34 @@ from wikipediarag.model_client import embeddings
 from wikipediarag.model_registry import get_model_registry
 from wikipediarag.repository import (
     claim_next_ingestion_job_item,
+    create_document_deletion_job,
+    create_source_document_ingestion_item,
+    finish_knowledge_source_sync,
     get_job,
     get_knowledge_base,
+    get_knowledge_source,
+    get_source_document_state,
     insert_document_artifact,
+    list_document_artifact_keys,
+    list_source_document_states,
     load_document_version,
     load_index_version_by_read_alias,
+    mark_document_purge_failed,
+    mark_document_purged,
+    mark_document_version_chunks_deleted,
+    mark_source_document_tombstone,
+    replace_document_sections_from_chunks,
     save_index_version,
     set_knowledge_base_active_index,
+    soft_delete_document,
     summarize_ingestion_job_items,
     update_document_version,
     update_ingestion_job_item,
     update_job,
+    update_source_sync_run,
     upsert_chunk,
     upsert_document,
+    upsert_source_document_state,
     upsert_wiki_page_and_chunks,
 )
 from wikipediarag.retrieval_contract import build_index_contract, index_contract_metadata
@@ -51,9 +67,12 @@ from wikipediarag.search_index import (
     WRITE_ALIAS,
     build_index_names,
     bulk_index_chunks,
+    delete_document_chunks,
+    delete_document_version_chunks,
     ensure_index,
 )
-from wikipediarag.storage import get_bytes, put_text
+from wikipediarag.source_connectors import ConnectorError, SourceDocument, connector_for_kind
+from wikipediarag.storage import delete_objects, get_bytes, put_bytes, put_text
 from wikipediarag.wiki_dump import (
     Chunk,
     chunks_for_page,
@@ -149,6 +168,15 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
                         knowledge_base_id=kb_id,
                         snapshot_id=snapshot_id,
                         page=page,
+                        chunks=chunks,
+                    )
+                    document_id = chunks[0].document_id if chunks else f"wiki:{snapshot_id}:{page.page_id}"
+                    await replace_document_sections_from_chunks(
+                        conn,
+                        tenant_id=tenant_id,
+                        knowledge_base_id=kb_id,
+                        document_id=document_id,
+                        document_version_id=None,
                         chunks=chunks,
                     )
                     pages_imported += 1
@@ -550,6 +578,14 @@ async def _flush_zim_batch(
             )
             for chunk in embedded_page_chunks:
                 await upsert_chunk(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, chunk=chunk)
+            await replace_document_sections_from_chunks(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=document_id,
+                document_version_id=None,
+                chunks=embedded_page_chunks,
+            )
             all_chunks.extend(embedded_page_chunks)
     await asyncio.to_thread(
         bulk_index_chunks,
@@ -816,6 +852,12 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
             parser_profile=parser_profile,
             settings=settings,
         )
+        parser_runtime_progress = _parser_runtime_progress(normalized)
+        await _update_item_stage(
+            item_id,
+            stage,
+            {"stage": stage, "parser_route": normalized.parser_route, **parser_runtime_progress},
+        )
         normalized_hash = normalized_document_hash(normalized)
         normalized_key = f"documents/{tenant_id}/{document_id}/{document_version_id}/normalized.json"
         normalized_payload = normalized.model_dump_json(indent=2)
@@ -932,6 +974,14 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
         async with connect() as conn:
             for chunk in published_chunks:
                 await upsert_chunk(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, chunk=chunk)
+            await replace_document_sections_from_chunks(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=document_id,
+                document_version_id=document_version_id,
+                chunks=published_chunks,
+            )
             await update_document_version(conn, document_version_id, status="published")
             await update_ingestion_job_item(
                 conn,
@@ -941,6 +991,7 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
                 progress={
                     "stage": stage,
                     "parser_route": normalized.parser_route,
+                    **parser_runtime_progress,
                     "chunks_staged": len(embedded_chunks),
                     "chunks_published": indexed,
                 },
@@ -1157,6 +1208,9 @@ async def _latest_document_upload_item_progress(conn: Any, job_id: str) -> dict[
     for key in (
         "bytes_received",
         "parser_route",
+        "parser_queue_wait_ms",
+        "parser_latency_ms",
+        "parser_endpoint_pool_size",
         "chunks_staged",
         "chunks_published",
         "safe_error_code",
@@ -1169,8 +1223,541 @@ async def _latest_document_upload_item_progress(conn: Any, job_id: str) -> dict[
     return safe
 
 
+def _parser_runtime_progress(normalized: Any) -> dict[str, int]:
+    options = dict(getattr(normalized, "parser_options", {}) or {})
+    mapping = {
+        "queue_wait_ms": "parser_queue_wait_ms",
+        "parser_latency_ms": "parser_latency_ms",
+        "endpoint_pool_size": "parser_endpoint_pool_size",
+    }
+    progress: dict[str, int] = {}
+    for source, target in mapping.items():
+        value = options.get(source)
+        if isinstance(value, int | float):
+            progress[target] = max(0, int(value))
+    return progress
+
+
 def _with_publication_status(chunks: list[Chunk], status: str) -> list[Chunk]:
     return [replace(chunk, metadata={**chunk.metadata, "publication_status": status}) for chunk in chunks]
+
+
+async def process_source_sync(job: dict[str, Any], settings: Settings | None = None) -> None:
+    resolved = settings or get_settings()
+    job_id = str(job["id"])
+    tenant_id = str(job["tenant_id"])
+    kb_id = str(job["knowledge_base_id"])
+    config = dict(job.get("config") or {})
+    source_id = str(config.get("source_id") or "")
+    sync_run_id = str(config.get("sync_run_id") or "")
+    mode = str(config.get("mode") or "incremental")
+    await _mark_running(job_id)
+    if not source_id or not sync_run_id:
+        async with connect() as conn:
+            await update_job(
+                conn,
+                job_id,
+                status=JobStatus.failed,
+                progress={"stage": "failed", "safe_error_code": "SOURCE_SYNC_CONFIG_INVALID"},
+                error_code="SOURCE_SYNC_CONFIG_INVALID",
+                error_message="source sync job config is invalid",
+            )
+        return
+
+    stats: dict[str, int] = {
+        "documents_seen": 0,
+        "documents_skipped": 0,
+        "documents_changed": 0,
+        "documents_published": 0,
+        "documents_failed": 0,
+        "tombstones_seen": 0,
+        "tombstones_applied": 0,
+    }
+    cursor_after: dict[str, Any] = {}
+    refresh_interval_seconds: int | None = None
+    try:
+        async with connect() as conn:
+            source = await get_knowledge_source(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                source_id=source_id,
+                include_credentials=True,
+            )
+            if source is None:
+                raise ConnectorError("SOURCE_NOT_FOUND", "source is not available")
+            await update_source_sync_run(conn, run_id=sync_run_id, status="running", checkpoint={"stage": "connecting"})
+            known_states = await list_source_document_states(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                source_id=source_id,
+            )
+        refresh_interval_seconds = (
+            int(source["refresh_interval_seconds"]) if source.get("refresh_interval_seconds") is not None else None
+        )
+        connector = connector_for_kind(
+            str(source["kind"]),
+            dict(source.get("config") or {}),
+            _decrypt_connector_credentials(resolved, dict(source.get("encrypted_credentials") or {})),
+        )
+        payload = await connector.sync(
+            mode=mode,
+            cursor=dict(source.get("sync_cursor") or {}),
+            known_external_ids={str(row["external_id"]) for row in known_states if row.get("status") == "active"},
+        )
+        cursor_after = payload.next_cursor
+        stats.update({key: int(value) for key, value in payload.stats.items() if isinstance(value, int)})
+        stats["documents_seen"] = len(payload.documents)
+        stats["tombstones_seen"] = len(payload.tombstones)
+        await _save_source_sync_progress(job_id, sync_run_id, "documents", stats)
+
+        for document in payload.documents:
+            if await _cancel_requested(job_id):
+                raise asyncio.CancelledError
+            result = await _ingest_source_document(
+                job_id=job_id,
+                sync_run_id=sync_run_id,
+                source_id=source_id,
+                tenant_id=tenant_id,
+                kb_id=kb_id,
+                document=document,
+                settings=resolved,
+            )
+            stats[result] += 1
+            if result == "documents_changed":
+                stats["documents_published"] += 1
+            await _save_source_sync_progress(job_id, sync_run_id, "documents", stats)
+
+        for tombstone in payload.tombstones:
+            if await _cancel_requested(job_id):
+                raise asyncio.CancelledError
+            applied = await _apply_source_tombstone(
+                sync_run_id=sync_run_id,
+                source_id=source_id,
+                tenant_id=tenant_id,
+                kb_id=kb_id,
+                external_id=tombstone.external_id,
+                tombstone_version=tombstone.source_version,
+                metadata=tombstone.metadata,
+                settings=resolved,
+            )
+            if applied:
+                stats["tombstones_applied"] += 1
+            await _save_source_sync_progress(job_id, sync_run_id, "tombstones", stats)
+
+        async with connect() as conn:
+            await update_source_sync_run(
+                conn,
+                run_id=sync_run_id,
+                status="completed",
+                cursor_after=cursor_after,
+                checkpoint={"stage": "completed"},
+                stats=stats,
+            )
+            await finish_knowledge_source_sync(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                source_id=source_id,
+                run_id=sync_run_id,
+                status="completed",
+                cursor_after=cursor_after,
+                refresh_interval_seconds=refresh_interval_seconds,
+            )
+            await update_job(conn, job_id, status=JobStatus.completed, progress={"stage": "completed", **stats})
+    except asyncio.CancelledError:
+        async with connect() as conn:
+            await update_source_sync_run(
+                conn,
+                run_id=sync_run_id,
+                status="cancelled",
+                cursor_after=cursor_after,
+                checkpoint={"stage": "cancelled"},
+                stats=stats,
+            )
+            await finish_knowledge_source_sync(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                source_id=source_id,
+                run_id=sync_run_id,
+                status="cancelled",
+                cursor_after=cursor_after,
+                refresh_interval_seconds=refresh_interval_seconds,
+            )
+            await update_job(conn, job_id, status=JobStatus.cancelled, progress={"stage": "cancelled", **stats})
+    except ConnectorError as exc:
+        await _fail_source_sync(
+            job_id,
+            sync_run_id,
+            source_id,
+            tenant_id,
+            kb_id,
+            cursor_after,
+            stats,
+            refresh_interval_seconds,
+            exc.code,
+            exc.safe_message,
+        )
+    except Exception as exc:
+        await _fail_source_sync(
+            job_id,
+            sync_run_id,
+            source_id,
+            tenant_id,
+            kb_id,
+            cursor_after,
+            stats,
+            refresh_interval_seconds,
+            type(exc).__name__,
+            "source sync failed",
+        )
+
+
+def _decrypt_connector_credentials(settings: Settings, payload: dict[str, Any]) -> dict[str, Any]:
+    if not payload:
+        return {}
+    from wikipediarag.oidc_service import decrypt_server_tokens
+
+    return decrypt_server_tokens(settings, {str(key): str(value) for key, value in payload.items()})
+
+
+async def _ingest_source_document(
+    *,
+    job_id: str,
+    sync_run_id: str,
+    source_id: str,
+    tenant_id: str,
+    kb_id: str,
+    document: SourceDocument,
+    settings: Settings,
+) -> str:
+    parser_profile = str(document.metadata.get("parser_profile") or "standard")
+    async with connect() as conn:
+        existing = await get_source_document_state(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            source_id=source_id,
+            external_id=document.external_id,
+        )
+    if (
+        existing is not None
+        and existing.get("status") == "active"
+        and str(existing.get("source_version")) == document.source_version
+        and str(existing.get("content_hash")) == document.content_hash
+    ):
+        async with connect() as conn:
+            await upsert_source_document_state(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                source_id=source_id,
+                sync_run_id=sync_run_id,
+                external_id=document.external_id,
+                title=document.title,
+                source_uri=document.source_uri,
+                source_url=document.source_url,
+                source_version=document.source_version,
+                content_hash=document.content_hash,
+                document_id=str(existing["document_id"]),
+                document_version_id=str(existing["document_version_id"]),
+                metadata=document.metadata,
+            )
+        return "documents_skipped"
+
+    object_key = (
+        f"sources/{tenant_id}/{kb_id}/{source_id}/{stable_hash([document.external_id], 24)}/{document.content_hash}"
+    )
+    await asyncio.to_thread(
+        put_bytes,
+        object_key,
+        document.content_bytes,
+        content_type=document.content_type,
+        settings=settings,
+    )
+    async with connect() as conn:
+        document_id, document_version_id, item_id = await create_source_document_ingestion_item(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            source_id=source_id,
+            sync_run_id=sync_run_id,
+            job_id=job_id,
+            external_id=document.external_id,
+            title=document.title,
+            source_uri=document.source_uri,
+            source_url=document.source_url,
+            source_version=document.source_version,
+            content_hash=document.content_hash,
+            object_key=object_key,
+            content_type=document.content_type,
+            size_bytes=len(document.content_bytes),
+            parser_profile=parser_profile,
+            metadata=document.metadata,
+        )
+    await _process_document_upload_item(
+        {
+            "id": str(item_id),
+            "job_id": job_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+            "tenant_id": tenant_id,
+            "knowledge_base_id": kb_id,
+        },
+        settings,
+    )
+    async with connect() as conn:
+        item = await conn.execute(text("SELECT status FROM ingestion_job_items WHERE id = :id"), {"id": str(item_id)})
+        item_row = item.mappings().first()
+        if item_row is None or str(item_row["status"]) != JobStatus.completed.value:
+            return "documents_failed"
+        old_version_id = str(existing.get("document_version_id")) if existing is not None else ""
+        await upsert_source_document_state(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            source_id=source_id,
+            sync_run_id=sync_run_id,
+            external_id=document.external_id,
+            title=document.title,
+            source_uri=document.source_uri,
+            source_url=document.source_url,
+            source_version=document.source_version,
+            content_hash=document.content_hash,
+            document_id=document_id,
+            document_version_id=document_version_id,
+            metadata=document.metadata,
+        )
+        if old_version_id and old_version_id != document_version_id:
+            await mark_document_version_chunks_deleted(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_version_id=old_version_id,
+            )
+            kb = await get_knowledge_base(conn, tenant_id, kb_id)
+            read_alias = str(kb.get("active_index") or READ_ALIAS) if kb else READ_ALIAS
+            await asyncio.to_thread(
+                delete_document_version_chunks,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_version_id=old_version_id,
+                settings=settings,
+                read_alias=read_alias,
+            )
+    return "documents_changed"
+
+
+async def _apply_source_tombstone(
+    *,
+    sync_run_id: str,
+    source_id: str,
+    tenant_id: str,
+    kb_id: str,
+    external_id: str,
+    tombstone_version: str,
+    metadata: dict[str, Any],
+    settings: Settings,
+) -> bool:
+    async with connect() as conn:
+        state = await mark_source_document_tombstone(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            source_id=source_id,
+            sync_run_id=sync_run_id,
+            external_id=external_id,
+            tombstone_version=tombstone_version,
+            metadata=metadata,
+        )
+        if state is None or not state.get("document_id"):
+            return False
+        document_id = str(state["document_id"])
+        purge_after = datetime.now(UTC).replace(microsecond=0) + _source_delete_retention(settings)
+        await soft_delete_document(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            document_id=document_id,
+            deleted_by_user_id=settings.default_user_id,
+            purge_after=purge_after,
+            deletion_reason="source_tombstone",
+        )
+        await create_document_deletion_job(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            document_id=document_id,
+            purge_after=purge_after,
+        )
+        kb = await get_knowledge_base(conn, tenant_id, kb_id)
+        read_alias = str(kb.get("active_index") or READ_ALIAS) if kb else READ_ALIAS
+    await asyncio.to_thread(
+        delete_document_chunks,
+        tenant_id=tenant_id,
+        knowledge_base_id=kb_id,
+        document_id=document_id,
+        settings=settings,
+        read_alias=read_alias,
+    )
+    return True
+
+
+def _source_delete_retention(settings: Settings) -> timedelta:
+    return timedelta(days=max(0, settings.document_soft_delete_retention_days))
+
+
+async def _save_source_sync_progress(job_id: str, sync_run_id: str, stage: str, stats: dict[str, int]) -> None:
+    progress = {"stage": stage, "sync_run_id": sync_run_id, **stats}
+    async with connect() as conn:
+        await update_source_sync_run(
+            conn,
+            run_id=sync_run_id,
+            status="running",
+            checkpoint={"stage": stage},
+            stats=stats,
+        )
+        await update_job(conn, job_id, progress=progress)
+
+
+async def _fail_source_sync(
+    job_id: str,
+    sync_run_id: str,
+    source_id: str,
+    tenant_id: str,
+    kb_id: str,
+    cursor_after: dict[str, Any],
+    stats: dict[str, int],
+    refresh_interval_seconds: int | None,
+    error_code: str,
+    error_message: str,
+) -> None:
+    async with connect() as conn:
+        await update_source_sync_run(
+            conn,
+            run_id=sync_run_id,
+            status="failed",
+            cursor_after=cursor_after,
+            checkpoint={"stage": "failed", "safe_error_code": error_code[:120]},
+            stats=stats,
+            error_code=error_code,
+            error_message=error_message,
+        )
+        await finish_knowledge_source_sync(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            source_id=source_id,
+            run_id=sync_run_id,
+            status="failed",
+            cursor_after=cursor_after,
+            refresh_interval_seconds=refresh_interval_seconds,
+        )
+        await update_job(
+            conn,
+            job_id,
+            status=JobStatus.failed,
+            progress={"stage": "failed", "safe_error_code": error_code[:120], **stats},
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+
+async def process_document_delete(job: dict[str, Any], settings: Settings | None = None) -> None:
+    resolved = settings or get_settings()
+    job_id = str(job["id"])
+    tenant_id = str(job["tenant_id"])
+    kb_id = str(job["knowledge_base_id"])
+    config = dict(job.get("config") or {})
+    document_id = str(config.get("document_id") or "")
+    purge_after = _parse_due_time(config.get("purge_after"))
+    if not document_id:
+        async with connect() as conn:
+            await update_job(
+                conn,
+                job_id,
+                status=JobStatus.failed,
+                progress={"stage": "failed", "safe_error_code": "DOCUMENT_ID_MISSING"},
+                error_code="DOCUMENT_ID_MISSING",
+                error_message="document deletion job is invalid",
+            )
+        return
+    if purge_after is not None and purge_after > datetime.now(UTC):
+        async with connect() as conn:
+            await update_job(conn, job_id, progress={"stage": "scheduled", "purge_after": purge_after.isoformat()})
+        return
+
+    await _mark_running(job_id)
+    try:
+        async with connect() as conn:
+            await update_job(conn, job_id, progress={"stage": "loading_artifacts"})
+            artifact_keys = await list_document_artifact_keys(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=document_id,
+            )
+            kb = await get_knowledge_base(conn, tenant_id, kb_id)
+        deleted_objects = await asyncio.to_thread(delete_objects, artifact_keys, resolved)
+        read_alias = str(kb.get("active_index") or READ_ALIAS) if kb else READ_ALIAS
+        deleted_search_chunks = await asyncio.to_thread(
+            delete_document_chunks,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            document_id=document_id,
+            settings=resolved,
+            read_alias=read_alias,
+        )
+        async with connect() as conn:
+            deleted_db_chunks = await mark_document_purged(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=document_id,
+            )
+            await update_job(
+                conn,
+                job_id,
+                status=JobStatus.completed,
+                progress={
+                    "stage": "purged",
+                    "objects_deleted": deleted_objects,
+                    "search_chunks_deleted": deleted_search_chunks,
+                    "db_chunks_deleted": deleted_db_chunks,
+                },
+            )
+    except Exception as exc:
+        safe_error_code = type(exc).__name__
+        async with connect() as conn:
+            await mark_document_purge_failed(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=document_id,
+                safe_error_code=safe_error_code,
+            )
+            await update_job(
+                conn,
+                job_id,
+                status=JobStatus.failed,
+                progress={"stage": "purge_failed", "safe_error_code": safe_error_code},
+                error_code=safe_error_code,
+                error_message="document purge failed",
+            )
+
+
+def _parse_due_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 async def process_job(job: dict[str, Any], settings: Settings | None = None) -> None:
@@ -1180,6 +1767,10 @@ async def process_job(job: dict[str, Any], settings: Settings | None = None) -> 
         await process_zim_import(job, settings)
     elif job["kind"] == "document_upload":
         await process_document_upload(job, settings)
+    elif job["kind"] == "source_sync":
+        await process_source_sync(job, settings)
+    elif job["kind"] == "document_delete":
+        await process_document_delete(job, settings)
     else:
         raise ValueError(f"unsupported ingestion job kind {job['kind']}")
 

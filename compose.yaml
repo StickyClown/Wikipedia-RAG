@@ -87,6 +87,21 @@ services:
       - "8091:8000"
     volumes:
       - xberg-cache:/app/.xberg
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1024m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD-SHELL", "xberg --help >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
 
   docling:
     image: quay.io/docling-project/docling-serve-cpu:v1.28.0
@@ -100,6 +115,25 @@ services:
       - "8092:5001"
     volumes:
       - docling-cache:/root/.cache
+    read_only: true
+    tmpfs:
+      - /tmp:size=1024m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 4096m
+    cpus: 2.0
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5001/health', timeout=5).read()\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
 
   metadata-service:
     build:
@@ -158,10 +192,15 @@ services:
       MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL:-http://model-gateway:8080}
       API_PUBLIC_BASE_URL: ${API_PUBLIC_BASE_URL:-http://localhost:8000}
       XBERG_URL: ${XBERG_URL:-http://xberg:8000}
+      XBERG_URLS: ${XBERG_URLS:-}
       DOCLING_URL: ${DOCLING_URL:-http://docling:5001}
+      DOCLING_URLS: ${DOCLING_URLS:-}
       METADATA_SERVICE_URL: ${METADATA_SERVICE_URL:-http://metadata-service:8090}
       DOCUMENT_PARSER_SERVICES_REQUIRED: ${DOCUMENT_PARSER_SERVICES_REQUIRED:-false}
+      DOCUMENT_PARSER_XBERG_CONCURRENCY: ${DOCUMENT_PARSER_XBERG_CONCURRENCY:-2}
+      DOCUMENT_PARSER_DOCLING_CONCURRENCY: ${DOCUMENT_PARSER_DOCLING_CONCURRENCY:-1}
       RETRIEVAL_PROFILE: ${RETRIEVAL_PROFILE:-test_mock}
+      DOCUMENT_SOFT_DELETE_RETENTION_DAYS: ${DOCUMENT_SOFT_DELETE_RETENTION_DAYS:-30}
       MODELS_CONFIG_PATH: ${MODELS_CONFIG_PATH:-/app/config/models.yaml}
       RETRIEVAL_CONFIG_PATH: ${RETRIEVAL_CONFIG_PATH:-/app/config/retrieval.yaml}
       WIKI_XML_PATH: ${WIKI_XML_PATH:-/data/ruwiki-20260701-pages-articles-multistream.xml.bz2}
@@ -171,9 +210,44 @@ services:
       KIWIX_PUBLIC_BASE_URL: ${KIWIX_PUBLIC_BASE_URL:-http://localhost:8083}
       KIWIX_INTERNAL_BASE_URL: ${KIWIX_INTERNAL_BASE_URL:-http://kiwix:8080}
       KIWIX_BOOK_NAME: ${KIWIX_BOOK_NAME:-}
+      AUTH_DISABLED: ${AUTH_DISABLED:-false}
+      AUTH_MODE: ${AUTH_MODE:-local}
+      APP_SECRET_FILE: ${APP_SECRET_FILE:-/run/secrets/app_secret}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD_FILE: ${BOOTSTRAP_ADMIN_PASSWORD_FILE:-/run/secrets/bootstrap_admin_password}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-wikipediarag_session}
+      SESSION_IDLE_SECONDS: ${SESSION_IDLE_SECONDS:-2592000}
+      SESSION_MAX_SECONDS: ${SESSION_MAX_SECONDS:-2592000}
+      REMEMBER_ME_IDLE_SECONDS: ${REMEMBER_ME_IDLE_SECONDS:-2592000}
+      REMEMBER_ME_MAX_SECONDS: ${REMEMBER_ME_MAX_SECONDS:-7776000}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      SESSION_COOKIE_SAMESITE: ${SESSION_COOKIE_SAMESITE:-lax}
+      OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL:-}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET_FILE: ${OIDC_CLIENT_SECRET_FILE:-/run/secrets/oidc_client_secret}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://localhost:8000/api/v1/auth/oidc/callback}
+      OIDC_SCOPE: ${OIDC_SCOPE:-openid profile email}
+      OIDC_CLAIM_SUB: ${OIDC_CLAIM_SUB:-sub}
+      OIDC_CLAIM_USERNAME: ${OIDC_CLAIM_USERNAME:-preferred_username}
+      OIDC_CLAIM_NAME: ${OIDC_CLAIM_NAME:-name}
+      OIDC_CLAIM_EMAIL: ${OIDC_CLAIM_EMAIL:-email}
+      OIDC_CLAIM_EMAIL_VERIFIED: ${OIDC_CLAIM_EMAIL_VERIFIED:-email_verified}
+      OIDC_CLAIM_GROUPS: ${OIDC_CLAIM_GROUPS:-groups}
+      OIDC_CLAIM_REALM_ROLES: ${OIDC_CLAIM_REALM_ROLES:-realm_access.roles}
+      OIDC_AUTO_PROVISION_DOMAINS: ${OIDC_AUTO_PROVISION_DOMAINS:-}
+      OIDC_AUTO_PROVISION_GROUPS: ${OIDC_AUTO_PROVISION_GROUPS:-}
+      OIDC_AUTO_PROVISION_ROLES: ${OIDC_AUTO_PROVISION_ROLES:-}
+      OIDC_PLATFORM_ADMIN_ROLES: ${OIDC_PLATFORM_ADMIN_ROLES:-}
+      OIDC_GROUP_CATALOG_SYNC_ENABLED: ${OIDC_GROUP_CATALOG_SYNC_ENABLED:-false}
+      SSL_CERT_FILE: ${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}
+      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}
     volumes:
       - ./zip:/data:ro
       - ./zim:/zim:ro
+      - ./certificates:/opt/corporate-ca:ro
     ports:
       - "8000:8000"
     depends_on:
@@ -205,10 +279,15 @@ services:
       MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL:-http://model-gateway:8080}
       API_PUBLIC_BASE_URL: ${API_PUBLIC_BASE_URL:-http://localhost:8000}
       XBERG_URL: ${XBERG_URL:-http://xberg:8000}
+      XBERG_URLS: ${XBERG_URLS:-}
       DOCLING_URL: ${DOCLING_URL:-http://docling:5001}
+      DOCLING_URLS: ${DOCLING_URLS:-}
       METADATA_SERVICE_URL: ${METADATA_SERVICE_URL:-http://metadata-service:8090}
       DOCUMENT_PARSER_SERVICES_REQUIRED: ${DOCUMENT_PARSER_SERVICES_REQUIRED:-true}
+      DOCUMENT_PARSER_XBERG_CONCURRENCY: ${DOCUMENT_PARSER_XBERG_CONCURRENCY:-2}
+      DOCUMENT_PARSER_DOCLING_CONCURRENCY: ${DOCUMENT_PARSER_DOCLING_CONCURRENCY:-1}
       RETRIEVAL_PROFILE: ${RETRIEVAL_PROFILE:-test_mock}
+      DOCUMENT_SOFT_DELETE_RETENTION_DAYS: ${DOCUMENT_SOFT_DELETE_RETENTION_DAYS:-30}
       MODELS_CONFIG_PATH: ${MODELS_CONFIG_PATH:-/app/config/models.yaml}
       RETRIEVAL_CONFIG_PATH: ${RETRIEVAL_CONFIG_PATH:-/app/config/retrieval.yaml}
       WIKI_XML_PATH: ${WIKI_XML_PATH:-/data/ruwiki-20260701-pages-articles-multistream.xml.bz2}
@@ -218,9 +297,12 @@ services:
       KIWIX_PUBLIC_BASE_URL: ${KIWIX_PUBLIC_BASE_URL:-http://localhost:8083}
       KIWIX_INTERNAL_BASE_URL: ${KIWIX_INTERNAL_BASE_URL:-http://kiwix:8080}
       KIWIX_BOOK_NAME: ${KIWIX_BOOK_NAME:-}
+      SSL_CERT_FILE: ${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}
+      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}
     volumes:
       - ./zip:/data:ro
       - ./zim:/zim:ro
+      - ./certificates:/opt/corporate-ca:ro
     depends_on:
       api:
         condition: service_started

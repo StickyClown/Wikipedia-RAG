@@ -58,6 +58,7 @@ def ensure_index(
                         "tenant_id": {"type": "keyword"},
                         "knowledge_base_id": {"type": "keyword"},
                         "document_id": {"type": "keyword"},
+                        "document_version_id": {"type": "keyword"},
                         "chunk_id": {"type": "keyword"},
                         "page_id": {"type": "long"},
                         "revision_id": {"type": "long"},
@@ -113,6 +114,7 @@ def bulk_index_chunks(
                 "tenant_id": tenant_id,
                 "knowledge_base_id": knowledge_base_id,
                 "document_id": chunk.document_id,
+                "document_version_id": str(chunk.metadata.get("document_version_id") or ""),
                 "chunk_id": chunk.id,
                 "page_id": chunk.page_id,
                 "revision_id": chunk.revision_id,
@@ -144,20 +146,23 @@ def bm25_search(
     top_k: int,
     settings: Settings | None = None,
     read_alias: str = READ_ALIAS,
+    filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     resolved = settings or get_settings()
     ensure_index(resolved)
     client = get_client(resolved)
+    filter_clauses = [
+        {"term": {"tenant_id": tenant_id}},
+        {"term": {"knowledge_base_id": knowledge_base_id}},
+        *_public_filter_clauses(filters or {}),
+    ]
     response = client.search(
         index=read_alias,
         body={
             "size": top_k,
             "query": {
                 "bool": {
-                    "filter": [
-                        {"term": {"tenant_id": tenant_id}},
-                        {"term": {"knowledge_base_id": knowledge_base_id}},
-                    ],
+                    "filter": filter_clauses,
                     "must": [
                         {
                             "multi_match": {
@@ -181,19 +186,22 @@ def dense_search(
     top_k: int,
     settings: Settings | None = None,
     read_alias: str = READ_ALIAS,
+    filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     resolved = settings or get_settings()
     client = get_client(resolved)
+    filter_clauses = [
+        {"term": {"tenant_id": tenant_id}},
+        {"term": {"knowledge_base_id": knowledge_base_id}},
+        *_public_filter_clauses(filters or {}),
+    ]
     response = client.search(
         index=read_alias,
         body={
             "size": top_k,
             "query": {
                 "bool": {
-                    "filter": [
-                        {"term": {"tenant_id": tenant_id}},
-                        {"term": {"knowledge_base_id": knowledge_base_id}},
-                    ],
+                    "filter": filter_clauses,
                     "must": [{"knn": {"embedding": {"vector": query_vector, "k": top_k}}}],
                 }
             },
@@ -202,16 +210,146 @@ def dense_search(
     return [_hit_to_candidate(hit, "dense") for hit in response["hits"]["hits"]]
 
 
+def delete_document_chunks(
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    settings: Settings | None = None,
+    read_alias: str = READ_ALIAS,
+) -> int:
+    resolved = settings or get_settings()
+    client = get_client(resolved)
+    response = client.delete_by_query(
+        index=read_alias,
+        body={
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"tenant_id": tenant_id}},
+                        {"term": {"knowledge_base_id": knowledge_base_id}},
+                        {"term": {"document_id": document_id}},
+                    ]
+                }
+            }
+        },
+        conflicts="proceed",
+        refresh=True,
+    )
+    return int(response.get("deleted") or 0)
+
+
+def delete_document_version_chunks(
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_version_id: str,
+    settings: Settings | None = None,
+    read_alias: str = READ_ALIAS,
+) -> int:
+    resolved = settings or get_settings()
+    client = get_client(resolved)
+    response = client.delete_by_query(
+        index=read_alias,
+        body={
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"tenant_id": tenant_id}},
+                        {"term": {"knowledge_base_id": knowledge_base_id}},
+                        {"term": {"document_version_id": document_version_id}},
+                    ]
+                }
+            }
+        },
+        conflicts="proceed",
+        refresh=True,
+    )
+    return int(response.get("deleted") or 0)
+
+
+def _public_filter_clauses(filters: dict[str, Any]) -> list[dict[str, Any]]:
+    clauses: list[dict[str, Any]] = []
+    document_type = _optional_text(filters.get("document_type"))
+    language = _optional_text(filters.get("language"))
+    date_from = _optional_text(filters.get("date_from"))
+    date_to = _optional_text(filters.get("date_to"))
+    source_kind = _optional_text(filters.get("source_kind"))
+    source_id = _optional_text(filters.get("source_id"))
+    document_id = _optional_text(filters.get("document_id"))
+    title = _optional_text(filters.get("title"))
+
+    if document_type:
+        clauses.append(
+            {
+                "bool": {
+                    "should": [
+                        {"term": {"metadata.content_type.keyword": document_type}},
+                        {"term": {"metadata.detected_mime.keyword": document_type}},
+                        {"term": {"metadata.source_type.keyword": document_type}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+        )
+    if language:
+        clauses.append(
+            {
+                "bool": {
+                    "should": [
+                        {"term": {"metadata.language.keyword": language}},
+                        {"term": {"metadata.detected_language.keyword": language}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+        )
+    if date_from or date_to:
+        date_range: dict[str, str] = {}
+        if date_from:
+            date_range["gte"] = date_from
+        if date_to:
+            date_range["lte"] = date_to
+        clauses.append({"range": {"metadata.document_date.keyword": date_range}})
+    if source_kind:
+        clauses.append(
+            {
+                "bool": {
+                    "should": [
+                        {"term": {"metadata.source_kind.keyword": source_kind}},
+                        {"term": {"metadata.source_type.keyword": source_kind}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+        )
+    if source_id:
+        clauses.append({"term": {"metadata.source_id.keyword": source_id}})
+    if document_id:
+        clauses.append({"term": {"document_id": document_id}})
+    if title:
+        clauses.append({"match_phrase": {"title": title}})
+    return clauses
+
+
+def _optional_text(value: Any) -> str:
+    return str(value).strip().casefold() if value is not None and str(value).strip() else ""
+
+
 def _hit_to_candidate(hit: dict[str, Any], stage: str) -> dict[str, Any]:
     source = hit["_source"]
     return {
         "chunk_id": source["chunk_id"],
+        "knowledge_base_id": source.get("knowledge_base_id", ""),
         "document_id": source["document_id"],
+        "document_version_id": source.get("document_version_id", ""),
         "page_id": source.get("page_id"),
         "title": source["title"],
         "section_path": source.get("section_path_text", "").split(" / ") if source.get("section_path_text") else [],
         "content": source["content"],
+        "source_uri": source.get("source_uri", ""),
         "source_url": source.get("source_url", ""),
+        "locator": source.get("metadata", {}).get("locator", {}),
         "scores": {stage: float(hit.get("_score") or 0.0)},
         "ranks": {},
         "embedding": source.get("embedding", []),

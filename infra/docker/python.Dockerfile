@@ -11,6 +11,9 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY config ./config
+COPY infra/docker/python-entrypoint.sh /usr/local/bin/wikipediarag-python-entrypoint
+RUN chmod +x /usr/local/bin/wikipediarag-python-entrypoint
 RUN pip install --no-cache-dir .
 
 EXPOSE 8080 8000
+ENTRYPOINT ["wikipediarag-python-entrypoint"]

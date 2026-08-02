@@ -1,16 +1,17 @@
 # Project Status
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 ## Current milestone
 
-Stage 2 ordinary search has been implemented on top of the current runtime
-baseline. The project now has a viewer-safe `POST /api/v1/search` endpoint and
-a separate UI search section independent from chat and `search:debug`.
+Search Quality V2 foundations have been implemented on top of the Stage 4
+external source connection baseline. Ordinary user search now reuses the hybrid
+retrieval pipeline instead of PostgreSQL substring ranking, while keeping the
+existing KB-level authorization model and published-document readiness checks.
 
-Completion criterion for the next increment: improve document navigation by
-adding document structure, in-document search and opening a precise document
-location from ordinary search results.
+Completion criterion for the next increment: harden document-level ACL/security
+trimming and then promote Extended Search into durable Deep Research runs with
+typed evidence memory and coverage records.
 
 ## Implemented now
 
@@ -23,10 +24,32 @@ location from ordinary search results.
 - Parser runtime hardening in Compose: Xberg, Docling and metadata-service with sandbox settings, separate concurrency limiters and safe parser progress metadata.
 - Retrieval: BM25, dense vectors, RRF, rerank, dedup/page quota, parent expansion, answerability, citation validation and experimental safe diagnostics.
 - Direct Multi-KB chat/debug retrieval with all-KB role validation and all-KB readiness preflight. Extended Search remains single-KB.
-- Ordinary user search: viewer-scoped `POST /api/v1/search`, metadata filters,
-  published active-document results only, safe `KB_NOT_READY` handling and a
-  separate React/Vite search section with result list, source open action and
-  uploaded-document locator fallback.
+- Ordinary user search: viewer-scoped `POST /api/v1/search` now runs through
+  the hybrid retrieval pipeline with OpenSearch BM25/vector search, RRF,
+  optional rerank, typed filter expressions, cursor pagination, optional
+  highlights, facets and document grouping while preserving safe
+  `KB_NOT_READY` handling and exact document-viewer open action by `chunk_id`.
+- Document navigation: `document_sections` persisted from published chunks,
+  section-aware uploaded-document chunking, deterministic Wikipedia/ZIM chunk
+  ordinals/locators, viewer-safe document structure/context/in-document search
+  APIs and an inline React text viewer with TOC, local document search and
+  neighboring chunk context.
+- External source connection foundations: `knowledge_sources` now carry
+  encrypted connector credentials, refresh metadata and sync cursors; source
+  document states and sync-run journals track source versions, content hashes,
+  current document versions and tombstones; APIs manage sources, healthchecks
+  and sync jobs; worker scheduling enqueues due incremental source syncs.
+- Stage 4 connectors: Confluence Data Center, Jira Data Center, GitLab
+  Self-Managed, local folder, internal crawler, Kiwix/ZIM source-version
+  tracking and deterministic Sunduk/DocSmart mocks share a connector contract
+  that feeds the existing document ingestion pipeline.
+- React/Vite source management UI now exposes the Stage 4 source kinds for the
+  selected KB with safe create/list, healthcheck, incremental/full sync,
+  disable/enable and sync-run status polling without returning stored
+  credentials to the browser.
+- Upload parity: `POST /api/v1/knowledge-bases/{kb_id}/documents` accepts
+  multipart uploads through the API and reuses the same document upload records
+  and async worker ingestion path as UI drag-and-drop uploads.
 - Query-run observability V1: chat/debug queries persist protected query runs and retrieval events with stable stage names, query transforms, candidate rank movement, decision reasons, answerability reason codes, Model Gateway safe metadata, feedback/evaluation event endpoints and an updated Retrieval Debugger. PostgreSQL remains the source of truth; OpenTelemetry export is optional/no-op when packages are absent.
 - Retrieval observability now carries explicit per-run `transform_id`/`subquery_id` query context through direct, extended and Multi-KB stage events, candidate debug payloads, extended harness search yield metrics and answer context source summaries.
 - Eval and validation tooling: local-auth eval client, release-gate provider preflight, warm retrieval profiling, MIRACL-RU adapter, document corpus verification and cross-tenant hardening smoke command.
@@ -38,6 +61,129 @@ location from ordinary search results.
 
 ## Latest validation
 
+- Search/deep-research runtime validation on 2026-08-02:
+  `docker compose up -d --build api worker ui` -> exit 0;
+  authenticated API smoke created KB `82d4f568-cb38-408b-bcea-dfb3f7e9ff2a`,
+  uploaded document `doc:04ce3e7844c7fb96b1469765`, observed ingestion job
+  `8382d53e-18d5-4e05-80fa-02373c2666b9` complete with
+  `chunks_published=1`, verified `POST /api/v1/search` without explicit
+  `ranking_profile` returned HTTP 200 with 1 result, facets, groups,
+  highlights, `chunk_id`, source metadata and score/ranks, verified document
+  structure/context APIs, then verified extended chat completed with query run
+  `b1e18d2d-52ea-4c59-a678-850567813acc` and retrieval events including
+  extended harness stages. Artifact:
+  `artifacts/validation/runtime-smokes/20260802T085033Z-search-v2-deep-research/report.json`.
+  The runtime check exposed that upload search needs a compatible default
+  profile when clients omit `ranking_profile`; public search now infers
+  `upload_sota_mvp`/`upload_mock` from active upload index metadata for
+  homogeneous upload scopes. Browser connector validation against
+  `http://localhost:5173` with local auth `admin` selected the same KB,
+  narrowed retrieval scope to that KB, searched
+  `SEARCH_V2_DEEP_RESEARCH_MARKER_20260802T085033Z`, observed the result with
+  facets, document grouping, highlight text and `score 0.929`, opened it in the
+  document viewer, and ran Chat in `Extended` mode with `upload_sota_mvp`;
+  the UI produced an answer with citation `[S1]`, the marker evidence and an
+  enabled Debug action. Final readiness checks:
+  `Invoke-RestMethod http://localhost:8000/ready` -> exit 0, status ok;
+  `Invoke-RestMethod http://localhost:8081/ready` -> exit 0, status ok.
+  Post-fix stable checks: `uv run pytest
+  tests\unit\test_search_endpoint.py tests\unit\test_search_service.py -q`
+  -> exit 0, 8 passed, 2 warnings; `uv run ruff check .` -> exit 0;
+  `uv run ruff format --check src tests` -> exit 0;
+  `uv run mypy src tests` -> exit 0, no issues found in 102 source files;
+  `uv run pytest tests\unit -q` -> exit 0, 228 passed, 4 warnings;
+  `uv run pytest tests\integration -q` -> exit 0, 14 passed;
+  `cd services/ui; pnpm lint` -> exit 0; `cd services/ui; pnpm typecheck`
+  -> exit 0; `cd services/ui; pnpm build` -> exit 0;
+  `cd services/ui; pnpm format:check` -> exit 0;
+  `docker compose config --quiet` -> exit 0.
+- Search Quality V2 foundation validation on 2026-08-02:
+  `uv run pytest tests\unit\test_search_endpoint.py tests\unit\test_search_service.py -q`
+  -> exit 0, 7 passed, 2 warnings;
+  `uv run ruff check src\wikipediarag\schemas.py src\wikipediarag\search_index.py src\wikipediarag\retrieval.py src\wikipediarag\search_service.py src\wikipediarag\api_app.py tests\unit\test_search_endpoint.py tests\unit\test_search_service.py`
+  -> exit 0;
+  `uv run mypy src\wikipediarag\schemas.py src\wikipediarag\search_index.py src\wikipediarag\retrieval.py src\wikipediarag\search_service.py src\wikipediarag\api_app.py tests\unit\test_search_endpoint.py tests\unit\test_search_service.py`
+  -> exit 0, no issues found in 7 source files;
+  `uv run ruff format --check src\wikipediarag\schemas.py src\wikipediarag\search_index.py src\wikipediarag\retrieval.py src\wikipediarag\search_service.py src\wikipediarag\api_app.py tests\unit\test_search_endpoint.py tests\unit\test_search_service.py`
+  -> exit 0, 7 files already formatted;
+  `uv run pytest tests\unit\test_retrieval_answering.py tests\unit\test_multi_kb_retrieval.py tests\unit\test_search_endpoint.py tests\unit\test_search_service.py -q`
+  -> exit 0, 29 passed, 2 warnings;
+  `uv run pytest tests\unit -q` -> exit 0, 227 passed, 4 warnings;
+  `uv run pytest tests\integration -q` -> exit 0, 14 passed;
+  `uv run ruff check .` -> exit 0;
+  `uv run ruff format --check src tests` -> exit 0, 102 files already formatted;
+  `uv run mypy src tests` -> exit 0, no issues found in 102 source files;
+  `cd services/ui; pnpm lint` -> exit 0;
+  `cd services/ui; pnpm typecheck` -> exit 0;
+  `cd services/ui; pnpm build` -> exit 0;
+  `cd services/ui; pnpm format:check` -> exit 0;
+  `docker compose config --quiet` -> exit 0.
+- Stage 4 source UI validation on 2026-08-02:
+  `cd services/ui; pnpm exec prettier --write src/App.tsx src/styles.css`
+  -> exit 0;
+  `cd services/ui; pnpm lint` -> exit 0;
+  `cd services/ui; pnpm typecheck` -> exit 0;
+  `cd services/ui; pnpm build` -> exit 0;
+  `cd services/ui; pnpm format:check` -> exit 0;
+  `uv run pytest tests\unit\test_external_sources.py -q -k "local_folder_connector_reports_changes_and_full_sync_tombstones or corporate_mock_connectors_freeze_contracts"`
+  -> exit 0, 2 passed, 5 deselected, 2 warnings;
+  Vite dev server was started with `pnpm exec vite --host 127.0.0.1 --port 5174`
+  and `Invoke-WebRequest http://127.0.0.1:5174` -> exit 0, HTTP 200.
+- Stage 4 external source foundations validation on 2026-08-02:
+  `uv run ruff check src\wikipediarag\source_connectors.py src\wikipediarag\api_app.py src\wikipediarag\repository.py src\wikipediarag\ingestion.py src\wikipediarag\search_index.py src\wikipediarag\worker.py src\wikipediarag\schemas.py tests\unit\test_external_sources.py`
+  -> exit 0;
+  `uv run ruff format --check src\wikipediarag\source_connectors.py src\wikipediarag\api_app.py src\wikipediarag\repository.py src\wikipediarag\ingestion.py src\wikipediarag\search_index.py src\wikipediarag\worker.py src\wikipediarag\schemas.py tests\unit\test_external_sources.py`
+  -> exit 0, 8 files already formatted;
+  `uv run mypy src\wikipediarag\source_connectors.py src\wikipediarag\api_app.py src\wikipediarag\repository.py src\wikipediarag\ingestion.py src\wikipediarag\search_index.py src\wikipediarag\worker.py src\wikipediarag\schemas.py tests\unit\test_external_sources.py`
+  -> exit 0, no issues found in 8 source files;
+  `uv run pytest tests\unit\test_external_sources.py tests\unit\test_upload_batches.py tests\unit\test_document_deletion_lifecycle.py tests\unit\test_search_endpoint.py tests\unit\test_document_viewer.py tests\unit\test_document_ingestion.py -q`
+  -> exit 0, 35 passed, 2 warnings;
+  `uv run pytest tests\unit -q` -> exit 0, 224 passed, 4 warnings;
+  `docker compose config --quiet` -> exit 0.
+- Stage 3 document navigation implementation validation on 2026-08-01:
+  `uv run pytest tests\unit\test_document_ingestion.py tests\unit\test_search_endpoint.py tests\unit\test_document_viewer.py tests\unit\test_document_deletion_lifecycle.py tests\unit\test_cli_cross_tenant_hardening.py -q`
+  -> exit 0, 33 passed, 2 warnings;
+  `uv run ruff check src\wikipediarag\db.py src\wikipediarag\document_ingestion.py src\wikipediarag\wiki_dump.py src\wikipediarag\zim_dump.py src\wikipediarag\repository.py src\wikipediarag\ingestion.py src\wikipediarag\schemas.py src\wikipediarag\api_app.py tests\unit\test_document_ingestion.py tests\unit\test_search_endpoint.py tests\unit\test_document_viewer.py`
+  -> exit 0;
+  `uv run ruff format --check src\wikipediarag\db.py src\wikipediarag\document_ingestion.py src\wikipediarag\wiki_dump.py src\wikipediarag\zim_dump.py src\wikipediarag\repository.py src\wikipediarag\ingestion.py src\wikipediarag\schemas.py src\wikipediarag\api_app.py tests\unit\test_document_ingestion.py tests\unit\test_search_endpoint.py tests\unit\test_document_viewer.py`
+  -> exit 0, 11 files already formatted;
+  `uv run mypy src\wikipediarag\document_ingestion.py src\wikipediarag\wiki_dump.py src\wikipediarag\zim_dump.py src\wikipediarag\repository.py src\wikipediarag\ingestion.py src\wikipediarag\schemas.py src\wikipediarag\api_app.py tests\unit\test_document_ingestion.py tests\unit\test_search_endpoint.py tests\unit\test_document_viewer.py`
+  -> exit 0, no issues found in 10 source files;
+  `docker compose config --quiet` -> exit 0;
+  `cd services/ui; pnpm lint` -> exit 0;
+  `cd services/ui; pnpm typecheck` -> exit 0;
+  `cd services/ui; pnpm build` -> exit 0.
+- Stage 3 browser/MinIO upload smoke on 2026-08-01:
+  Browser connector drove the React UI at `http://localhost:5173` with local
+  auth `admin`, created KB `f763e161-9392-44f9-b0f4-c1d0cbc431f7`, uploaded
+  `artifacts/validation/runtime-smokes/stage3-browser-upload-fixture-retry.md`
+  through the UI file chooser and MinIO-backed upload path, and observed batch
+  completion with `1 completed`, `0 failed`, `1 published`,
+  parser `local_text_adapter`.
+  Ordinary search for
+  `STAGE3_BROWSER_MINIO_MARKER_20260801_232237` returned the uploaded document
+  with `Open in viewer`; opening the result loaded `.document-viewer` with one
+  `.document-chunk.highlighted`, marker text and locator chips
+  `page: 1` / `block_index: 1`. In-document search returned the same hit, hit
+  click reloaded the highlighted chunk, and TOC click loaded section context.
+  The smoke initially exposed asyncpg `AmbiguousParameterError` on nullable
+  `document_version_id` predicates in section replacement and viewer reads;
+  fixed by explicit `CAST(:document_version_id AS text)` in the affected
+  repository SQL.
+  Follow-up checks:
+  `uv run pytest tests\unit\test_document_viewer.py -q` -> exit 0, 6 passed,
+  2 warnings;
+  `uv run pytest tests\unit\test_document_ingestion.py tests\unit\test_search_endpoint.py tests\unit\test_document_viewer.py tests\unit\test_document_deletion_lifecycle.py tests\unit\test_cli_cross_tenant_hardening.py -q`
+  -> exit 0, 34 passed, 2 warnings;
+  `uv run ruff check src\wikipediarag\repository.py tests\unit\test_document_viewer.py`
+  -> exit 0;
+  `uv run ruff format --check src\wikipediarag\repository.py tests\unit\test_document_viewer.py`
+  -> exit 0, 2 files already formatted;
+  `uv run mypy src\wikipediarag\repository.py tests\unit\test_document_viewer.py`
+  -> exit 0, no issues found in 2 source files;
+  `docker compose up -d --build api worker` -> exit 0;
+  final `Invoke-RestMethod http://localhost:8000/ready` -> exit 0, status ok
+  for PostgreSQL and Model Gateway.
 - Stage 2 ordinary search implementation validation on 2026-08-01:
   `uv run pytest tests\unit\test_auth_service.py tests\unit\test_document_deletion_lifecycle.py tests\unit\test_cli_cross_tenant_hardening.py tests\unit\test_search_endpoint.py tests\unit\test_api_auth_disabled.py tests\unit\test_multi_kb_retrieval.py -q`
   -> exit 0, 40 passed, 2 warnings;
@@ -233,7 +379,6 @@ location from ordinary search results.
 
 ## Active blockers and risks
 
-- Runtime browser/MinIO batch upload smoke has not yet been recorded for the implemented public multi-file UI.
 - Multi-KB direct retrieval is implemented; Multi-KB Extended Search remains future work.
 - API `/ready` currently checks PostgreSQL and Model Gateway readiness; Redis/Valkey, MinIO and OpenSearch are Compose dependencies but are not confirmed readiness checks.
 - Redis/Valkey is configured and present in Compose, but no Redis client usage was found in `src/`; current ingestion job claiming uses PostgreSQL `FOR UPDATE SKIP LOCKED`.
@@ -243,9 +388,9 @@ location from ordinary search results.
 
 ## Next approved task
 
-No new implementation task is approved. The next roadmap item is Stage 3:
-document structure, in-document search and opening precise locations from
-ordinary search results.
+No new implementation task is approved. The next roadmap item is Stage 4:
+external source connection foundations, regular refresh and changed/deleted
+source document handling.
 
 ## Related artifacts
 

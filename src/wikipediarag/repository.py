@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.auth import ActorContext, KnowledgeBaseRole, PlatformRole, TenantRole, effective_knowledge_base_role
 from wikipediarag.db import json_dumps
-from wikipediarag.ids import new_uuid, stable_uuid
+from wikipediarag.ids import new_uuid, stable_hash, stable_uuid
 from wikipediarag.schemas import JobStatus
 from wikipediarag.wiki_dump import Chunk, WikiPage
 
@@ -88,6 +88,93 @@ async def create_document_deletion_job(
         },
     )
     return job_id
+
+
+async def create_source_sync_job(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+    mode: str,
+    cursor_before: dict[str, Any],
+) -> tuple[uuid.UUID, uuid.UUID]:
+    existing = await conn.execute(
+        text(
+            """
+            SELECT id, config ->> 'sync_run_id' AS sync_run_id
+            FROM ingestion_jobs
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND kind = 'source_sync'
+              AND status IN ('received','running')
+              AND config ->> 'source_id' = :source_id
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "source_id": source_id},
+    )
+    row = existing.mappings().first()
+    if row is not None and row.get("sync_run_id"):
+        return uuid.UUID(str(row["id"])), uuid.UUID(str(row["sync_run_id"]))
+
+    job_id = new_uuid()
+    run_id = new_uuid()
+    await conn.execute(
+        text(
+            """
+            INSERT INTO source_sync_runs(
+              id, tenant_id, knowledge_base_id, source_id, job_id, mode, status,
+              cursor_before, checkpoint, stats
+            )
+            VALUES (
+              :id, :tenant_id, :kb_id, :source_id, :job_id, :mode, 'received',
+              CAST(:cursor_before AS jsonb), CAST(:checkpoint AS jsonb), CAST(:stats AS jsonb)
+            )
+            """
+        ),
+        {
+            "id": str(run_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "source_id": source_id,
+            "job_id": str(job_id),
+            "mode": mode,
+            "cursor_before": json_dumps(cursor_before),
+            "checkpoint": json_dumps({"stage": "received"}),
+            "stats": json_dumps({}),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress)
+            VALUES (:id, :tenant_id, :kb_id, 'source_sync', 'received',
+                    CAST(:config AS jsonb), CAST(:progress AS jsonb))
+            """
+        ),
+        {
+            "id": str(job_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "config": json_dumps({"source_id": source_id, "sync_run_id": str(run_id), "mode": mode}),
+            "progress": json_dumps({"stage": "received", "source_id": source_id, "sync_run_id": str(run_id)}),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE knowledge_sources
+            SET last_sync_run_id = :run_id,
+                last_sync_status = 'received',
+                updated_at = now()
+            WHERE id = :source_id AND tenant_id = :tenant_id AND knowledge_base_id = :kb_id
+            """
+        ),
+        {"run_id": str(run_id), "source_id": source_id, "tenant_id": tenant_id, "kb_id": knowledge_base_id},
+    )
+    return job_id, run_id
 
 
 async def get_job(conn: AsyncConnection, job_id: str) -> dict[str, Any] | None:
@@ -612,6 +699,629 @@ async def create_document_upload_records(
     return job_id
 
 
+async def create_knowledge_source(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    kind: str,
+    name: str,
+    config: dict[str, Any],
+    encrypted_credentials: dict[str, Any],
+    metadata: dict[str, Any],
+    refresh_interval_seconds: int | None,
+) -> uuid.UUID:
+    source_id = new_uuid()
+    await conn.execute(
+        text(
+            """
+            INSERT INTO knowledge_sources(
+              id, tenant_id, knowledge_base_id, kind, name, config, encrypted_credentials,
+              metadata, refresh_interval_seconds, next_sync_at
+            )
+            VALUES (
+              :id, :tenant_id, :kb_id, :kind, :name, CAST(:config AS jsonb),
+              CAST(:encrypted_credentials AS jsonb), CAST(:metadata AS jsonb),
+              :refresh_interval_seconds,
+              CASE WHEN CAST(:refresh_interval_seconds AS int) IS NULL THEN NULL ELSE now() END
+            )
+            """
+        ),
+        {
+            "id": str(source_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "kind": kind,
+            "name": name,
+            "config": json_dumps(config),
+            "encrypted_credentials": json_dumps(encrypted_credentials),
+            "metadata": json_dumps(metadata),
+            "refresh_interval_seconds": refresh_interval_seconds,
+        },
+    )
+    return source_id
+
+
+async def list_knowledge_sources_public(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, tenant_id, knowledge_base_id, kind, name, status, config, metadata,
+                   refresh_interval_seconds, last_sync_run_id, last_sync_status,
+                   last_synced_at, next_sync_at, created_at, updated_at
+            FROM knowledge_sources
+            WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id
+            ORDER BY created_at DESC
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def get_knowledge_source(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+    include_credentials: bool = False,
+) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, tenant_id, knowledge_base_id, kind, name, status, config,
+                   encrypted_credentials, metadata, refresh_interval_seconds, sync_cursor,
+                   last_sync_run_id, last_sync_status, last_synced_at, next_sync_at,
+                   created_at, updated_at
+            FROM knowledge_sources
+            WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND id = :source_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "source_id": source_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        return None
+    payload = dict(row)
+    if not include_credentials:
+        payload.pop("encrypted_credentials", None)
+    return payload
+
+
+async def update_knowledge_source(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+    name: str | None = None,
+    status: str | None = None,
+    config: dict[str, Any] | None = None,
+    encrypted_credentials: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+    refresh_interval_seconds: int | None = None,
+    refresh_interval_supplied: bool = False,
+) -> None:
+    assignments = ["updated_at = now()"]
+    params: dict[str, Any] = {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "source_id": source_id}
+    if name is not None:
+        assignments.append("name = :name")
+        params["name"] = name
+    if status is not None:
+        assignments.append("status = :status")
+        params["status"] = status
+    if config is not None:
+        assignments.append("config = CAST(:config AS jsonb)")
+        params["config"] = json_dumps(config)
+    if encrypted_credentials is not None:
+        assignments.append("encrypted_credentials = CAST(:encrypted_credentials AS jsonb)")
+        params["encrypted_credentials"] = json_dumps(encrypted_credentials)
+    if metadata is not None:
+        assignments.append("metadata = CAST(:metadata AS jsonb)")
+        params["metadata"] = json_dumps(metadata)
+    if refresh_interval_supplied:
+        assignments.append("refresh_interval_seconds = :refresh_interval_seconds")
+        assignments.append(
+            "next_sync_at = CASE "
+            "WHEN CAST(:refresh_interval_seconds AS int) IS NULL THEN NULL "
+            "ELSE COALESCE(next_sync_at, now()) END"
+        )
+        params["refresh_interval_seconds"] = refresh_interval_seconds
+    await conn.execute(
+        text(
+            f"""
+            UPDATE knowledge_sources
+            SET {", ".join(assignments)}
+            WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND id = :source_id
+            """  # noqa: S608
+        ),
+        params,
+    )
+
+
+async def get_source_sync_run_public(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    run_id: str,
+) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, source_id, knowledge_base_id, mode, status, cursor_before, cursor_after,
+                   checkpoint, stats, error_code, error_message, started_at, completed_at,
+                   created_at, updated_at
+            FROM source_sync_runs
+            WHERE tenant_id = :tenant_id AND id = :run_id
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": run_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def list_source_document_states(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT *
+            FROM source_document_states
+            WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND source_id = :source_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "source_id": source_id},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def get_source_document_state(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+    external_id: str,
+) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT *
+            FROM source_document_states
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND source_id = :source_id
+              AND external_id = :external_id
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "source_id": source_id, "external_id": external_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def create_source_document_ingestion_item(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+    sync_run_id: str,
+    job_id: str,
+    external_id: str,
+    title: str,
+    source_uri: str,
+    source_url: str,
+    source_version: str,
+    content_hash: str,
+    object_key: str,
+    content_type: str,
+    size_bytes: int,
+    parser_profile: str,
+    metadata: dict[str, Any],
+) -> tuple[str, str, uuid.UUID]:
+    document_id = f"src:{stable_hash([tenant_id, knowledge_base_id, source_id, external_id], 32)}"
+    document_version_id = "docv:" + stable_hash(
+        [document_id, source_version, content_hash, parser_profile, "normalized_document_v1"],
+        32,
+    )
+    item_id = new_uuid()
+    source_metadata = {
+        **metadata,
+        "source_id": source_id,
+        "source_external_id": external_id,
+        "source_version": source_version,
+        "source_uri": source_uri,
+        "source_url": source_url,
+    }
+    await conn.execute(
+        text(
+            """
+            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata)
+            VALUES (:id, :tenant_id, :kb_id, 'external_source', :title, :source_uri, CAST(:metadata AS jsonb))
+            ON CONFLICT (id) DO UPDATE
+            SET title = EXCLUDED.title,
+                source_uri = EXCLUDED.source_uri,
+                lifecycle_state = 'active',
+                deleted_at = NULL,
+                purge_after = NULL,
+                deletion_reason = NULL,
+                metadata = documents.metadata || EXCLUDED.metadata,
+                updated_at = now()
+            """
+        ),
+        {
+            "id": document_id,
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "title": title,
+            "source_uri": source_uri,
+            "metadata": json_dumps(
+                {
+                    "knowledge_source_id": source_id,
+                    "source_kind": "external_source",
+                    "source_external_id": external_id,
+                    "source_url": source_url,
+                    "current_version_id": document_version_id,
+                }
+            ),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO document_versions(
+              id, document_id, tenant_id, knowledge_base_id, version_ordinal, status,
+              content_hash, original_artifact_key, parser_options, source_metadata,
+              public_metadata, uploaded_at, upload_completed_at
+            )
+            VALUES (
+              :id, :document_id, :tenant_id, :kb_id,
+              COALESCE(
+                (SELECT max(version_ordinal) + 1 FROM document_versions WHERE document_id = :document_id),
+                1
+              ),
+              'received', :content_hash, :original_artifact_key,
+              CAST(:parser_options AS jsonb), CAST(:source_metadata AS jsonb),
+              CAST(:public_metadata AS jsonb), now(), now()
+            )
+            ON CONFLICT (id) DO UPDATE
+            SET status = 'received',
+                lifecycle_state = 'active',
+                deleted_at = NULL,
+                purge_after = NULL,
+                original_artifact_key = EXCLUDED.original_artifact_key,
+                public_metadata = EXCLUDED.public_metadata,
+                updated_at = now()
+            """
+        ),
+        {
+            "id": document_version_id,
+            "document_id": document_id,
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "content_hash": content_hash,
+            "original_artifact_key": object_key,
+            "parser_options": json_dumps({"profile": parser_profile}),
+            "source_metadata": json_dumps(source_metadata),
+            "public_metadata": json_dumps(
+                {
+                    "filename": title,
+                    "content_type": content_type,
+                    "size_bytes": size_bytes,
+                    "checksum_sha256": content_hash,
+                    "source_url": source_url,
+                    "source_external_id": external_id,
+                }
+            ),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO document_artifacts(
+              id, tenant_id, knowledge_base_id, document_id, document_version_id,
+              kind, object_key, content_type, size_bytes, checksum_sha256, metadata
+            )
+            VALUES (
+              :id, :tenant_id, :kb_id, :document_id, :document_version_id, 'original',
+              :object_key, :content_type, :size_bytes, :checksum_sha256, CAST(:metadata AS jsonb)
+            )
+            ON CONFLICT DO NOTHING
+            """
+        ),
+        {
+            "id": str(new_uuid()),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+            "object_key": object_key,
+            "content_type": content_type,
+            "size_bytes": size_bytes,
+            "checksum_sha256": content_hash,
+            "metadata": json_dumps({"artifact_contract": "source_document_artifact_v1", "sync_run_id": sync_run_id}),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO ingestion_job_items(
+              id, job_id, tenant_id, knowledge_base_id, document_id, document_version_id,
+              status, stage, progress
+            )
+            VALUES (
+              :id, :job_id, :tenant_id, :kb_id, :document_id, :document_version_id,
+              'received', 'received', CAST(:progress AS jsonb)
+            )
+            ON CONFLICT (job_id, document_version_id) DO NOTHING
+            """
+        ),
+        {
+            "id": str(item_id),
+            "job_id": job_id,
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+            "progress": json_dumps({"stage": "received", "sync_run_id": sync_run_id}),
+        },
+    )
+    return document_id, document_version_id, item_id
+
+
+async def upsert_source_document_state(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+    sync_run_id: str,
+    external_id: str,
+    title: str,
+    source_uri: str,
+    source_url: str,
+    source_version: str,
+    content_hash: str,
+    document_id: str,
+    document_version_id: str,
+    metadata: dict[str, Any],
+) -> None:
+    await conn.execute(
+        text(
+            """
+            INSERT INTO source_document_states(
+              tenant_id, knowledge_base_id, source_id, external_id, source_uri, source_url,
+              title, source_version, content_hash, document_id, document_version_id,
+              last_sync_run_id, status, metadata, last_seen_at
+            )
+            VALUES (
+              :tenant_id, :kb_id, :source_id, :external_id, :source_uri, :source_url,
+              :title, :source_version, :content_hash, :document_id, :document_version_id,
+              :sync_run_id, 'active', CAST(:metadata AS jsonb), now()
+            )
+            ON CONFLICT (tenant_id, knowledge_base_id, source_id, external_id) DO UPDATE
+            SET source_uri = EXCLUDED.source_uri,
+                source_url = EXCLUDED.source_url,
+                title = EXCLUDED.title,
+                source_version = EXCLUDED.source_version,
+                content_hash = EXCLUDED.content_hash,
+                document_id = EXCLUDED.document_id,
+                document_version_id = EXCLUDED.document_version_id,
+                last_sync_run_id = EXCLUDED.last_sync_run_id,
+                status = 'active',
+                metadata = EXCLUDED.metadata,
+                last_seen_at = now(),
+                deleted_at = NULL,
+                tombstone_version = NULL,
+                updated_at = now()
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "source_id": source_id,
+            "external_id": external_id,
+            "source_uri": source_uri,
+            "source_url": source_url,
+            "title": title,
+            "source_version": source_version,
+            "content_hash": content_hash,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+            "sync_run_id": sync_run_id,
+            "metadata": json_dumps(metadata),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE documents
+            SET metadata = metadata || CAST(:metadata AS jsonb),
+                lifecycle_state = 'active',
+                deleted_at = NULL,
+                purge_after = NULL,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND id = :document_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "metadata": json_dumps({"current_version_id": document_version_id, "source_url": source_url}),
+        },
+    )
+
+
+async def mark_source_document_tombstone(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+    sync_run_id: str,
+    external_id: str,
+    tombstone_version: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any] | None:
+    state = await get_source_document_state(
+        conn,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        source_id=source_id,
+        external_id=external_id,
+    )
+    if state is None:
+        return None
+    await conn.execute(
+        text(
+            """
+            UPDATE source_document_states
+            SET status = 'deleted',
+                deleted_at = COALESCE(deleted_at, now()),
+                tombstone_version = :tombstone_version,
+                last_sync_run_id = :sync_run_id,
+                metadata = metadata || CAST(:metadata AS jsonb),
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id
+              AND source_id = :source_id AND external_id = :external_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "source_id": source_id,
+            "external_id": external_id,
+            "tombstone_version": tombstone_version,
+            "sync_run_id": sync_run_id,
+            "metadata": json_dumps(metadata),
+        },
+    )
+    return state
+
+
+async def update_source_sync_run(
+    conn: AsyncConnection,
+    *,
+    run_id: str,
+    status: str,
+    cursor_after: dict[str, Any] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+    stats: dict[str, Any] | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    assignments = ["status = :status", "updated_at = now()"]
+    params: dict[str, Any] = {"run_id": run_id, "status": status}
+    if status == "running":
+        assignments.append("started_at = COALESCE(started_at, now())")
+    if status in {"completed", "failed", "cancelled"}:
+        assignments.append("completed_at = now()")
+    for key, value in {
+        "cursor_after": cursor_after,
+        "checkpoint": checkpoint,
+        "stats": stats,
+    }.items():
+        if value is not None:
+            assignments.append(f"{key} = CAST(:{key} AS jsonb)")
+            params[key] = json_dumps(value)
+    if error_code is not None:
+        assignments.append("error_code = :error_code")
+        params["error_code"] = error_code[:120]
+    if error_message is not None:
+        assignments.append("error_message = :error_message")
+        params["error_message"] = error_message[:1000]
+    await conn.execute(
+        text(f"UPDATE source_sync_runs SET {', '.join(assignments)} WHERE id = :run_id"),  # noqa: S608
+        params,
+    )
+
+
+async def finish_knowledge_source_sync(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+    run_id: str,
+    status: str,
+    cursor_after: dict[str, Any],
+    refresh_interval_seconds: int | None,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE knowledge_sources
+            SET sync_cursor = CAST(:cursor_after AS jsonb),
+                last_sync_run_id = :run_id,
+                last_sync_status = :status,
+                last_synced_at = CASE WHEN :status = 'completed' THEN now() ELSE last_synced_at END,
+                next_sync_at = CASE
+                  WHEN CAST(:refresh_interval_seconds AS int) IS NULL THEN NULL
+                  WHEN :status = 'completed' THEN now() + make_interval(secs => CAST(:refresh_interval_seconds AS int))
+                  ELSE now() + interval '5 minutes'
+                END,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND id = :source_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "source_id": source_id,
+            "run_id": run_id,
+            "status": status,
+            "cursor_after": json_dumps(cursor_after),
+            "refresh_interval_seconds": refresh_interval_seconds,
+        },
+    )
+
+
+async def enqueue_due_source_sync_jobs(conn: AsyncConnection) -> int:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, tenant_id, knowledge_base_id, sync_cursor
+            FROM knowledge_sources
+            WHERE status = 'active'
+              AND refresh_interval_seconds IS NOT NULL
+              AND next_sync_at IS NOT NULL
+              AND next_sync_at <= now()
+            ORDER BY next_sync_at
+            LIMIT 10
+            FOR UPDATE SKIP LOCKED
+            """
+        )
+    )
+    rows = [dict(row) for row in result.mappings()]
+    created = 0
+    for row in rows:
+        before = dict(row.get("sync_cursor") or {})
+        await create_source_sync_job(
+            conn,
+            tenant_id=str(row["tenant_id"]),
+            knowledge_base_id=str(row["knowledge_base_id"]),
+            source_id=str(row["id"]),
+            mode="incremental",
+            cursor_before=before,
+        )
+        created += 1
+    return created
+
+
 async def claim_next_ingestion_job_item(conn: AsyncConnection, job_id: str) -> dict[str, Any] | None:
     result = await conn.execute(
         text(
@@ -974,6 +1684,35 @@ async def mark_document_chunks_deleted(
     return int(result.rowcount or 0)
 
 
+async def mark_document_version_chunks_deleted(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_version_id: str,
+) -> int:
+    result = await conn.execute(
+        text(
+            """
+            UPDATE chunks
+            SET publication_status = 'deleted',
+                metadata = metadata || CAST(:metadata AS jsonb)
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_version_id = :document_version_id
+              AND publication_status <> 'deleted'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_version_id": document_version_id,
+            "metadata": json_dumps({"publication_status": "deleted"}),
+        },
+    )
+    return int(result.rowcount or 0)
+
+
 async def list_document_artifact_keys(
     conn: AsyncConnection,
     *,
@@ -1289,6 +2028,134 @@ async def upsert_chunk(
     )
 
 
+async def replace_document_sections_from_chunks(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_version_id: str | None,
+    chunks: list[Chunk],
+) -> None:
+    await conn.execute(
+        text(
+            """
+            DELETE FROM document_sections
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+              AND (
+                (CAST(:document_version_id AS text) IS NULL AND document_version_id IS NULL)
+                OR document_version_id = CAST(:document_version_id AS text)
+              )
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+        },
+    )
+    sections = _sections_from_chunks(document_id=document_id, document_version_id=document_version_id, chunks=chunks)
+    for section in sections:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO document_sections(
+                  section_id, tenant_id, knowledge_base_id, document_id, document_version_id,
+                  parent_section_id, title, level, path, ordinal, locator,
+                  first_chunk_id, last_chunk_id, metadata
+                )
+                VALUES (
+                  :section_id, :tenant_id, :kb_id, :document_id, :document_version_id,
+                  :parent_section_id, :title, :level, :path, :ordinal, CAST(:locator AS jsonb),
+                  :first_chunk_id, :last_chunk_id, CAST(:metadata AS jsonb)
+                )
+                ON CONFLICT (tenant_id, knowledge_base_id, document_id, section_id) DO UPDATE
+                SET document_version_id = EXCLUDED.document_version_id,
+                    parent_section_id = EXCLUDED.parent_section_id,
+                    title = EXCLUDED.title,
+                    level = EXCLUDED.level,
+                    path = EXCLUDED.path,
+                    ordinal = EXCLUDED.ordinal,
+                    locator = EXCLUDED.locator,
+                    first_chunk_id = EXCLUDED.first_chunk_id,
+                    last_chunk_id = EXCLUDED.last_chunk_id,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = now()
+                """
+            ),
+            {
+                "section_id": section["section_id"],
+                "tenant_id": tenant_id,
+                "kb_id": knowledge_base_id,
+                "document_id": document_id,
+                "document_version_id": document_version_id,
+                "parent_section_id": section["parent_section_id"],
+                "title": section["title"],
+                "level": section["level"],
+                "path": section["path"],
+                "ordinal": section["ordinal"],
+                "locator": json_dumps(section["locator"]),
+                "first_chunk_id": section["first_chunk_id"],
+                "last_chunk_id": section["last_chunk_id"],
+                "metadata": json_dumps(section["metadata"]),
+            },
+        )
+
+
+def _sections_from_chunks(
+    *, document_id: str, document_version_id: str | None, chunks: list[Chunk]
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, ...], dict[str, Any]] = {}
+    for fallback_ordinal, chunk in enumerate(chunks, start=1):
+        path = tuple(str(item) for item in chunk.section_path if str(item)) or (chunk.title,)
+        metadata = dict(chunk.metadata or {})
+        raw_locator = metadata.get("locator")
+        locator: dict[str, Any] = dict(raw_locator) if isinstance(raw_locator, dict) else {}
+        chunk_ordinal = metadata.get("chunk_ordinal")
+        ordinal = (
+            int(chunk_ordinal)
+            if isinstance(chunk_ordinal, int | float | str) and str(chunk_ordinal).isdigit()
+            else fallback_ordinal
+        )
+        section = grouped.setdefault(
+            path,
+            {
+                "section_id": str(
+                    metadata.get("section_id") or _stable_section_id(document_id, document_version_id, path)
+                ),
+                "parent_section_id": _parent_section_id(document_id, document_version_id, path),
+                "title": path[-1],
+                "level": len(path),
+                "path": list(path),
+                "ordinal": ordinal,
+                "locator": locator,
+                "first_chunk_id": chunk.id,
+                "last_chunk_id": chunk.id,
+                "metadata": {"source": "chunks"},
+            },
+        )
+        if ordinal < int(section["ordinal"]):
+            section["ordinal"] = ordinal
+            section["first_chunk_id"] = chunk.id
+            section["locator"] = locator
+        if ordinal >= int(section["ordinal"]):
+            section["last_chunk_id"] = chunk.id
+    return sorted(grouped.values(), key=lambda item: (int(item["ordinal"]), item["path"]))
+
+
+def _stable_section_id(document_id: str, document_version_id: str | None, path: tuple[str, ...]) -> str:
+    return "section:" + stable_hash([document_version_id or document_id, *path], 24)
+
+
+def _parent_section_id(document_id: str, document_version_id: str | None, path: tuple[str, ...]) -> str | None:
+    if len(path) <= 1:
+        return None
+    return _stable_section_id(document_id, document_version_id, path[:-1])
+
+
 async def fetch_chunks_for_dense_scan(
     conn: AsyncConnection,
     tenant_id: str,
@@ -1298,8 +2165,8 @@ async def fetch_chunks_for_dense_scan(
     result = await conn.execute(
         text(
             """
-            SELECT id, knowledge_base_id, title, section_path, content, source_url,
-                   embedding, page_id, document_id, metadata
+            SELECT id, knowledge_base_id, title, section_path, content, source_uri, source_url,
+                   embedding, page_id, document_id, document_version_id, locator, metadata
             FROM chunks
             WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND publication_status = 'published'
             ORDER BY created_at DESC
@@ -1556,6 +2423,292 @@ async def search_public_chunks(
     rows = [dict(row) for row in result.mappings()]
     for rank, row in enumerate(rows, start=offset + 1):
         row["ranks"] = {"search": rank}
+    return rows
+
+
+async def list_document_sections(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_version_id: str | None,
+) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT section_id, parent_section_id, title, level, path, ordinal,
+                   locator, first_chunk_id, last_chunk_id, metadata
+            FROM document_sections
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+              AND (
+                (CAST(:document_version_id AS text) IS NULL AND document_version_id IS NULL)
+                OR document_version_id = CAST(:document_version_id AS text)
+              )
+            ORDER BY ordinal ASC, path ASC
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+        },
+    )
+    rows = [dict(row) for row in result.mappings()]
+    if rows:
+        return rows
+    return await list_document_sections_from_chunks(
+        conn,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        document_id=document_id,
+        document_version_id=document_version_id,
+    )
+
+
+async def list_document_sections_from_chunks(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_version_id: str | None,
+) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            WITH section_chunks AS (
+              SELECT
+                c.section_path,
+                MIN(COALESCE(c.chunk_ordinal, 2147483647)) AS ordinal,
+                (ARRAY_AGG(c.id ORDER BY COALESCE(c.chunk_ordinal, 2147483647), c.id))[1] AS first_chunk_id,
+                (ARRAY_AGG(c.id ORDER BY COALESCE(c.chunk_ordinal, 2147483647) DESC, c.id DESC))[1] AS last_chunk_id,
+                (ARRAY_AGG(c.locator ORDER BY COALESCE(c.chunk_ordinal, 2147483647), c.id))[1] AS locator
+              FROM chunks c
+              JOIN documents d
+                ON d.id = c.document_id
+               AND d.tenant_id = c.tenant_id
+               AND d.knowledge_base_id = c.knowledge_base_id
+              WHERE c.tenant_id = :tenant_id
+                AND c.knowledge_base_id = :kb_id
+                AND c.document_id = :document_id
+                AND c.publication_status = 'published'
+                AND d.lifecycle_state = 'active'
+                AND (
+                  (CAST(:document_version_id AS text) IS NULL AND c.document_version_id IS NULL)
+                  OR c.document_version_id = CAST(:document_version_id AS text)
+                  OR CAST(:document_version_id AS text) IS NULL
+                )
+              GROUP BY c.section_path
+            )
+            SELECT section_path, ordinal, first_chunk_id, last_chunk_id, locator
+            FROM section_chunks
+            ORDER BY ordinal ASC, section_path ASC
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+        },
+    )
+    sections: list[dict[str, Any]] = []
+    for index, row in enumerate(result.mappings(), start=1):
+        path = [str(item) for item in row.get("section_path") or [] if str(item)]
+        if not path:
+            continue
+        section_id = _stable_section_id(document_id, document_version_id, tuple(path))
+        sections.append(
+            {
+                "section_id": section_id,
+                "parent_section_id": _parent_section_id(document_id, document_version_id, tuple(path)),
+                "title": path[-1],
+                "level": len(path),
+                "path": path,
+                "ordinal": int(row.get("ordinal") or index),
+                "locator": dict(row.get("locator") or {}),
+                "first_chunk_id": row.get("first_chunk_id"),
+                "last_chunk_id": row.get("last_chunk_id"),
+                "metadata": {"source": "chunks_fallback"},
+            }
+        )
+    return sections
+
+
+async def fetch_document_context_chunks(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_version_id: str | None,
+    chunk_id: str | None = None,
+    section_path: list[str] | None = None,
+    before: int = 2,
+    after: int = 2,
+    limit: int = 80,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    if section_path:
+        result = await conn.execute(
+            text(
+                """
+                SELECT c.id AS chunk_id, c.document_id, c.document_version_id, c.knowledge_base_id,
+                       c.title, c.section_path, c.content, c.source_url, c.source_uri,
+                       c.page_id, c.locator, c.metadata AS chunk_metadata,
+                       c.prev_chunk_id, c.next_chunk_id, c.chunk_ordinal
+                FROM chunks c
+                JOIN documents d
+                  ON d.id = c.document_id
+                 AND d.tenant_id = c.tenant_id
+                 AND d.knowledge_base_id = c.knowledge_base_id
+                WHERE c.tenant_id = :tenant_id
+                  AND c.knowledge_base_id = :kb_id
+                  AND c.document_id = :document_id
+                  AND c.publication_status = 'published'
+                  AND d.lifecycle_state = 'active'
+                  AND c.section_path = CAST(:section_path AS text[])
+                  AND (
+                    (CAST(:document_version_id AS text) IS NULL AND c.document_version_id IS NULL)
+                    OR c.document_version_id = CAST(:document_version_id AS text)
+                    OR CAST(:document_version_id AS text) IS NULL
+                  )
+                ORDER BY COALESCE(c.chunk_ordinal, 2147483647), c.id
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "kb_id": knowledge_base_id,
+                "document_id": document_id,
+                "document_version_id": document_version_id,
+                "section_path": section_path,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        return [dict(row) for row in result.mappings()]
+
+    result = await conn.execute(
+        text(
+            """
+            WITH ordered_chunks AS (
+              SELECT c.id AS chunk_id, c.document_id, c.document_version_id, c.knowledge_base_id,
+                     c.title, c.section_path, c.content, c.source_url, c.source_uri,
+                     c.page_id, c.locator, c.metadata AS chunk_metadata,
+                     c.prev_chunk_id, c.next_chunk_id, c.chunk_ordinal,
+                     ROW_NUMBER() OVER (ORDER BY COALESCE(c.chunk_ordinal, 2147483647), c.id) AS row_number
+              FROM chunks c
+              JOIN documents d
+                ON d.id = c.document_id
+               AND d.tenant_id = c.tenant_id
+               AND d.knowledge_base_id = c.knowledge_base_id
+              WHERE c.tenant_id = :tenant_id
+                AND c.knowledge_base_id = :kb_id
+                AND c.document_id = :document_id
+                AND c.publication_status = 'published'
+                AND d.lifecycle_state = 'active'
+                AND (
+                  (CAST(:document_version_id AS text) IS NULL AND c.document_version_id IS NULL)
+                  OR c.document_version_id = CAST(:document_version_id AS text)
+                  OR CAST(:document_version_id AS text) IS NULL
+                )
+            ),
+            anchor AS (
+              SELECT row_number
+              FROM ordered_chunks
+              WHERE chunk_id = :chunk_id
+              UNION ALL
+              SELECT 1 AS row_number
+              WHERE :chunk_id IS NULL
+              LIMIT 1
+            )
+            SELECT ordered_chunks.*
+            FROM ordered_chunks, anchor
+            WHERE ordered_chunks.row_number BETWEEN GREATEST(anchor.row_number - :before, 1)
+                                                AND anchor.row_number + :after
+            ORDER BY ordered_chunks.row_number
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+            "chunk_id": chunk_id,
+            "before": before,
+            "after": after,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def search_document_chunks(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_version_id: str | None,
+    query: str,
+    limit: int,
+    offset: int,
+) -> list[dict[str, Any]]:
+    query_pattern = f"%{query.strip()}%"
+    result = await conn.execute(
+        text(
+            """
+            SELECT c.id AS chunk_id, c.document_id, c.document_version_id, c.knowledge_base_id,
+                   c.title, c.section_path, c.content, c.source_url, c.source_uri,
+                   c.page_id, c.locator, c.metadata AS chunk_metadata,
+                   c.prev_chunk_id, c.next_chunk_id, c.chunk_ordinal,
+                   CASE WHEN c.title ILIKE :query_pattern THEN 4.0 ELSE 0.0 END
+                     + CASE WHEN array_to_string(c.section_path, ' ') ILIKE :query_pattern THEN 2.0 ELSE 0.0 END
+                     + CASE WHEN c.content ILIKE :query_pattern THEN 1.0 ELSE 0.0 END AS score
+            FROM chunks c
+            JOIN documents d
+              ON d.id = c.document_id
+             AND d.tenant_id = c.tenant_id
+             AND d.knowledge_base_id = c.knowledge_base_id
+            WHERE c.tenant_id = :tenant_id
+              AND c.knowledge_base_id = :kb_id
+              AND c.document_id = :document_id
+              AND c.publication_status = 'published'
+              AND d.lifecycle_state = 'active'
+              AND (
+                (CAST(:document_version_id AS text) IS NULL AND c.document_version_id IS NULL)
+                OR c.document_version_id = CAST(:document_version_id AS text)
+                OR CAST(:document_version_id AS text) IS NULL
+              )
+              AND (
+                c.title ILIKE :query_pattern
+                OR array_to_string(c.section_path, ' ') ILIKE :query_pattern
+                OR c.content ILIKE :query_pattern
+              )
+            ORDER BY score DESC, COALESCE(c.chunk_ordinal, 2147483647), c.id
+            LIMIT :limit_plus_one OFFSET :offset
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+            "query_pattern": query_pattern,
+            "limit_plus_one": limit + 1,
+            "offset": offset,
+        },
+    )
+    rows = [dict(row) for row in result.mappings()]
+    for rank, row in enumerate(rows, start=offset + 1):
+        row["ranks"] = {"document_search": rank}
     return rows
 
 

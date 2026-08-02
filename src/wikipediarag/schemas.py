@@ -47,6 +47,8 @@ class SearchFilters(BaseModel):
     date_from: date | None = None
     date_to: date | None = None
     source: str | None = Field(default=None, min_length=1, max_length=240)
+    source_kind: str | None = Field(default=None, min_length=1, max_length=120)
+    source_id: str | None = Field(default=None, min_length=1, max_length=120)
 
     @model_validator(mode="after")
     def validate_date_range(self) -> SearchFilters:
@@ -55,15 +57,45 @@ class SearchFilters(BaseModel):
         return self
 
 
+class FilterExpression(BaseModel):
+    field: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_.:-]+$")
+    operator: str = Field(pattern=r"^(eq|contains|in|gte|lte)$")
+    value: str | int | float | bool | date | list[str] | list[int] | list[float] | list[bool]
+    scope: str = Field(default="document", pattern=r"^(document|chunk|source|metadata)$")
+    source: str = Field(default="user", pattern=r"^(user|system|simple_filter)$")
+
+
+class SearchHighlight(BaseModel):
+    field: str
+    fragments: list[str] = Field(default_factory=list)
+
+
+class SearchFacetBucket(BaseModel):
+    value: str
+    count: int
+
+
+class SearchFacet(BaseModel):
+    field: str
+    buckets: list[SearchFacetBucket] = Field(default_factory=list)
+
+
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=32000)
     knowledge_base_ids: list[str] = Field(default_factory=list, max_length=50)
     limit: int = Field(default=10, ge=1, le=50)
     offset: int = Field(default=0, ge=0, le=500)
+    cursor: str | None = Field(default=None, max_length=512)
+    ranking_profile: str | None = Field(default=None, max_length=80)
+    group_by_document: bool = False
+    include_highlights: bool = True
+    include_facets: bool = False
     filters: SearchFilters = Field(default_factory=SearchFilters)
+    filter_expressions: list[FilterExpression] = Field(default_factory=list, max_length=32)
 
 
 class SearchResult(BaseModel):
+    chunk_id: str
     document_id: str
     document_version_id: str | None = None
     knowledge_base_id: str
@@ -78,10 +110,107 @@ class SearchResult(BaseModel):
     locator: dict[str, Any] = Field(default_factory=dict)
     score: float
     ranks: dict[str, int] = Field(default_factory=dict)
+    highlights: list[SearchHighlight] = Field(default_factory=list)
+
+
+class SearchDocumentGroup(BaseModel):
+    document_id: str
+    document_version_id: str | None = None
+    knowledge_base_id: str
+    title: str
+    source_url: str
+    source_type: str
+    best_score: float
+    hit_count: int
+    hits: list[SearchResult] = Field(default_factory=list)
 
 
 class SearchResponse(BaseModel):
     results: list[SearchResult]
+    limit: int
+    offset: int
+    has_more: bool
+    next_cursor: str | None = None
+    facets: list[SearchFacet] = Field(default_factory=list)
+    groups: list[SearchDocumentGroup] = Field(default_factory=list)
+
+
+class DocumentSection(BaseModel):
+    section_id: str
+    parent_section_id: str | None = None
+    title: str
+    level: int
+    path: list[str] = Field(default_factory=list)
+    ordinal: int
+    locator: dict[str, Any] = Field(default_factory=dict)
+    first_chunk_id: str | None = None
+    last_chunk_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentStructureResponse(BaseModel):
+    document_id: str
+    document_version_id: str | None = None
+    knowledge_base_id: str
+    title: str
+    source_type: str
+    source_url: str | None = None
+    sections: list[DocumentSection] = Field(default_factory=list)
+    public_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentContextChunk(BaseModel):
+    chunk_id: str
+    document_id: str
+    document_version_id: str | None = None
+    knowledge_base_id: str
+    title: str
+    section_path: list[str] = Field(default_factory=list)
+    content: str
+    source_url: str
+    locator: dict[str, Any] = Field(default_factory=dict)
+    prev_chunk_id: str | None = None
+    next_chunk_id: str | None = None
+    chunk_ordinal: int | None = None
+    highlighted: bool = False
+
+
+class DocumentContextResponse(BaseModel):
+    document_id: str
+    document_version_id: str | None = None
+    anchor_chunk_id: str | None = None
+    section_id: str | None = None
+    chunks: list[DocumentContextChunk]
+    limit: int
+    offset: int
+
+
+class DocumentSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=32000)
+    limit: int = Field(default=10, ge=1, le=50)
+    offset: int = Field(default=0, ge=0, le=500)
+
+
+class DocumentSearchResult(BaseModel):
+    chunk_id: str
+    document_id: str
+    document_version_id: str | None = None
+    knowledge_base_id: str
+    title: str
+    snippet: str
+    section_path: list[str] = Field(default_factory=list)
+    source_url: str
+    locator: dict[str, Any] = Field(default_factory=dict)
+    prev_chunk_id: str | None = None
+    next_chunk_id: str | None = None
+    score: float
+    ranks: dict[str, int] = Field(default_factory=dict)
+
+
+class DocumentSearchResponse(BaseModel):
+    document_id: str
+    document_version_id: str | None = None
+    results: list[DocumentSearchResult]
     limit: int
     offset: int
     has_more: bool
@@ -270,6 +399,77 @@ class RetrievalResult(BaseModel):
 class UploadResponse(BaseModel):
     document_id: str
     chunks_indexed: int
+
+
+class SourceCreate(BaseModel):
+    kind: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=240)
+    knowledge_base_id: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    credentials: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    refresh_interval_seconds: int | None = Field(default=None, ge=60)
+
+
+class SourcePatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=240)
+    status: str | None = Field(default=None, pattern=r"^(active|disabled|failed)$")
+    config: dict[str, Any] | None = None
+    credentials: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+    refresh_interval_seconds: int | None = Field(default=None, ge=60)
+
+
+class SourceResponse(BaseModel):
+    id: str
+    knowledge_base_id: str
+    kind: str
+    name: str
+    status: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    refresh_interval_seconds: int | None = None
+    last_sync_run_id: str | None = None
+    last_sync_status: str | None = None
+    last_synced_at: datetime | None = None
+    next_sync_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class SourceHealthResponse(BaseModel):
+    source_id: str
+    status: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class SourceSyncRequest(BaseModel):
+    mode: str = Field(default="incremental", pattern=r"^(full|incremental)$")
+
+
+class SourceSyncResponse(BaseModel):
+    source_id: str
+    run_id: str
+    job_id: str
+    status: str
+
+
+class SourceSyncRunResponse(BaseModel):
+    id: str
+    source_id: str
+    knowledge_base_id: str
+    mode: str
+    status: str
+    cursor_before: dict[str, Any] = Field(default_factory=dict)
+    cursor_after: dict[str, Any] = Field(default_factory=dict)
+    checkpoint: dict[str, Any] = Field(default_factory=dict)
+    stats: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+    error_message: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class UploadSessionCreate(BaseModel):

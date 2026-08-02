@@ -42,11 +42,16 @@ class Settings(BaseSettings):
     api_public_base_url: str = "http://localhost:8000"
 
     xberg_url: str = "http://localhost:8091"
+    xberg_urls: str = ""
     docling_url: str = "http://localhost:8092"
+    docling_urls: str = ""
     metadata_service_url: str = "http://localhost:8090"
     document_parser_services_required: bool = False
     document_parser_timeout_seconds: int = 180
+    document_parser_xberg_concurrency: int = 2
+    document_parser_docling_concurrency: int = 1
     document_ingestion_item_concurrency: int = 2
+    document_soft_delete_retention_days: int = 30
     upload_session_ttl_seconds: int = 900
     upload_max_bytes: int = 100 * 1024 * 1024
     upload_json_max_depth: int = 32
@@ -55,10 +60,12 @@ class Settings(BaseSettings):
     default_user_id: str = "22222222-2222-4222-8222-222222222222"
     default_kb_id: str = "33333333-3333-4333-8333-333333333333"
 
+    auth_disabled: bool = False
     auth_mode: Literal["local", "oidc", "hybrid", "test"] = "local"
     app_secret_file: Path = Path("/run/secrets/app_secret")
     bootstrap_admin_username: str = "admin"
     bootstrap_admin_email: str = ""
+    bootstrap_admin_password: str = "admin"  # noqa: S105
     bootstrap_admin_password_file: Path = Path("/run/secrets/bootstrap_admin_password")
     session_cookie_name: str = "wikipediarag_session"
     session_idle_seconds: int = 30 * 24 * 60 * 60
@@ -85,6 +92,14 @@ class Settings(BaseSettings):
     oidc_auto_provision_roles: str = ""
     oidc_platform_admin_roles: str = ""
     oidc_group_catalog_sync_enabled: bool = False
+
+    eval_auth_mode: Literal["none", "local"] = "local"
+    eval_auth_username: str = "admin"
+    eval_auth_password: str = "admin"  # noqa: S105
+
+    telemetry_content_capture: Literal["off", "masked"] = "off"
+    telemetry_max_text_chars: int = 256
+    telemetry_retention_days: int = 30
 
     @field_validator("models_config_path", "retrieval_config_path", mode="after")
     @classmethod

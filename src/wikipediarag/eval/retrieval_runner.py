@@ -108,7 +108,7 @@ async def run_retrieval_suite(
     run_dir = _run_dir(manifest.dataset_name, actual_run_id)
     configs = _filter_configs(eval_configs(resolved), config_ids)
     supported_configs = [config for config in configs if _is_supported(config)]
-    api_client = client or HttpEvalApiClient()
+    api_client = client or HttpEvalApiClient.from_settings(resolved, include_kiwix_urls=False)
     started_at = utc_now_iso()
     started = time.perf_counter()
     summaries: list[RetrievalConfigSummary] = []

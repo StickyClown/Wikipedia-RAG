@@ -226,17 +226,26 @@ def chunks_for_zim_page(
                 break
             content = " ".join(words[start:end])
             content_hash = stable_hash([content])
+            chunk_ordinal = len(chunks) + 1
             chunk_id = "zim:" + stable_hash(
                 [snapshot_id, page.zim_entry_path, section_index, sequence, content_hash],
                 32,
             )
             section_path = tuple(str(item) for item in section["path"])
+            section_id = f"section:{stable_hash([snapshot_id, page.zim_entry_path, *section_path], 24)}"
             metadata = {
                 **page.metadata,
                 "parent_text": parent_text,
                 "parent_tokens": min(len(words), parent_tokens_max),
                 "parent_tokens_min": parent_tokens_min,
                 "child_tokens": len(content.split()),
+                "chunk_ordinal": chunk_ordinal,
+                "section_id": section_id,
+                "locator": {
+                    "entry_index": page.entry_index,
+                    "section_index": section_index + 1,
+                    "chunk_index": sequence + 1,
+                },
             }
             chunks.append(
                 Chunk(

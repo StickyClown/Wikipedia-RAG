@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import json
 import re
+import time
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -11,6 +13,7 @@ from io import StringIO
 from typing import Any, Literal
 
 import httpx
+from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 
 from wikipediarag.config import Settings, get_settings
@@ -48,6 +51,9 @@ RU_MONTHS = {
     "ноября": 11,
     "декабря": 12,
 }
+_PARSER_LIMITERS: dict[tuple[str, int], asyncio.Semaphore] = {}
+_PARSER_ENDPOINT_LOCK = asyncio.Lock()
+_PARSER_ENDPOINT_INDEX: dict[tuple[str, tuple[str, ...]], int] = {}
 
 
 class UploadValidationError(RuntimeError):
@@ -329,6 +335,8 @@ def chunks_for_normalized_document(
     for ordinal, start in enumerate(range(0, len(words), 220), start=1):
         body = " ".join(words[start : start + 220])
         locator = _locator_for_offset(document.blocks, start)
+        section_path = _section_path_for_offset(document.blocks, start, document.title)
+        section_id = _section_id(document_version_id, section_path)
         content_hash = stable_hash([body], 64)
         chunk_id = "doc:" + stable_hash(
             [document_version_id, DOCUMENT_CHUNKER_VERSION, ordinal, stable_hash([body], 32)],
@@ -347,6 +355,7 @@ def chunks_for_normalized_document(
             "language": document.metadata.detected_language,
             "document_date": document.metadata.document_date,
             "chunker_version": DOCUMENT_CHUNKER_VERSION,
+            "section_id": section_id,
         }
         chunks.append(
             Chunk(
@@ -355,9 +364,9 @@ def chunks_for_normalized_document(
                 page_id=int(locator.get("page") or ordinal),
                 revision_id=0,
                 title=document.title,
-                section_path=(document.title,),
+                section_path=tuple(section_path),
                 content=body,
-                parent_chunk_id=None,
+                parent_chunk_id=section_id,
                 prev_chunk_id=None,
                 next_chunk_id=None,
                 source_uri=f"document://{document_version_id}#{ordinal}",
@@ -466,6 +475,43 @@ async def _normalize_structured(
     return document
 
 
+def _parser_limiter(parser: Literal["xberg", "docling"], settings: Settings) -> asyncio.Semaphore:
+    limit = (
+        settings.document_parser_xberg_concurrency
+        if parser == "xberg"
+        else settings.document_parser_docling_concurrency
+    )
+    normalized_limit = max(1, int(limit))
+    key = (parser, normalized_limit)
+    limiter = _PARSER_LIMITERS.get(key)
+    if limiter is None:
+        limiter = asyncio.Semaphore(normalized_limit)
+        _PARSER_LIMITERS[key] = limiter
+    return limiter
+
+
+async def _next_parser_endpoint(parser: Literal["xberg", "docling"], settings: Settings) -> tuple[str, int, int]:
+    endpoints = _parser_endpoints(parser, settings)
+    key = (parser, tuple(endpoints))
+    async with _PARSER_ENDPOINT_LOCK:
+        index = _PARSER_ENDPOINT_INDEX.get(key, 0)
+        _PARSER_ENDPOINT_INDEX[key] = (index + 1) % len(endpoints)
+    return endpoints[index], index, len(endpoints)
+
+
+def _parser_endpoints(parser: Literal["xberg", "docling"], settings: Settings) -> list[str]:
+    raw = settings.xberg_urls if parser == "xberg" else settings.docling_urls
+    fallback = settings.xberg_url if parser == "xberg" else settings.docling_url
+    endpoints = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    if not endpoints:
+        endpoints = [fallback.rstrip("/")]
+    return endpoints
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.perf_counter() - started) * 1000))
+
+
 async def _call_xberg(
     data: bytes,
     *,
@@ -473,15 +519,21 @@ async def _call_xberg(
     parser_profile: str,
     settings: Settings,
 ) -> NormalizedDocument:
-    url = f"{settings.xberg_url.rstrip('/')}/extract"
+    queue_started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=settings.document_parser_timeout_seconds) as client:
-            response = await client.post(
-                url,
-                files={"files": (validation.filename, data, validation.detected_mime)},
-            )
-            response.raise_for_status()
-            payload = response.json()
+        async with _parser_limiter("xberg", settings):
+            queue_wait_ms = _elapsed_ms(queue_started)
+            endpoint, endpoint_index, endpoint_pool_size = await _next_parser_endpoint("xberg", settings)
+            url = f"{endpoint}/extract"
+            parser_started = time.perf_counter()
+            async with httpx.AsyncClient(timeout=settings.document_parser_timeout_seconds) as client:
+                response = await client.post(
+                    url,
+                    files={"files": (validation.filename, data, validation.detected_mime)},
+                )
+                response.raise_for_status()
+                payload = response.json()
+            parser_latency_ms = _elapsed_ms(parser_started)
     except Exception as exc:
         raise ParserServiceError("xberg", type(exc).__name__, "xberg parser request failed") from exc
     return await _document_from_parser_payload(
@@ -492,6 +544,12 @@ async def _call_xberg(
         parser_route="xberg",
         parser_profile=parser_profile,
         settings=settings,
+        parser_runtime={
+            "endpoint_index": endpoint_index,
+            "endpoint_pool_size": endpoint_pool_size,
+            "queue_wait_ms": queue_wait_ms,
+            "parser_latency_ms": parser_latency_ms,
+        },
     )
 
 
@@ -502,16 +560,22 @@ async def _call_docling(
     parser_profile: str,
     settings: Settings,
 ) -> NormalizedDocument:
-    url = f"{settings.docling_url.rstrip('/')}/v1/convert/file"
+    queue_started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=settings.document_parser_timeout_seconds) as client:
-            response = await client.post(
-                url,
-                data={"to_formats": "md", "target_type": "inbody", "do_ocr": "true", "table_mode": "accurate"},
-                files={"files": (validation.filename, data, validation.detected_mime)},
-            )
-            response.raise_for_status()
-            payload = response.json()
+        async with _parser_limiter("docling", settings):
+            queue_wait_ms = _elapsed_ms(queue_started)
+            endpoint, endpoint_index, endpoint_pool_size = await _next_parser_endpoint("docling", settings)
+            url = f"{endpoint}/v1/convert/file"
+            parser_started = time.perf_counter()
+            async with httpx.AsyncClient(timeout=settings.document_parser_timeout_seconds) as client:
+                response = await client.post(
+                    url,
+                    data={"to_formats": "md", "target_type": "inbody", "do_ocr": "true", "table_mode": "accurate"},
+                    files={"files": (validation.filename, data, validation.detected_mime)},
+                )
+                response.raise_for_status()
+                payload = response.json()
+            parser_latency_ms = _elapsed_ms(parser_started)
     except Exception as exc:
         raise ParserServiceError("docling", type(exc).__name__, "docling parser request failed") from exc
     return await _document_from_parser_payload(
@@ -522,6 +586,12 @@ async def _call_docling(
         parser_route="docling",
         parser_profile=parser_profile,
         settings=settings,
+        parser_runtime={
+            "endpoint_index": endpoint_index,
+            "endpoint_pool_size": endpoint_pool_size,
+            "queue_wait_ms": queue_wait_ms,
+            "parser_latency_ms": parser_latency_ms,
+        },
     )
 
 
@@ -534,6 +604,7 @@ async def _document_from_parser_payload(
     parser_route: str,
     parser_profile: str,
     settings: Settings,
+    parser_runtime: dict[str, int] | None = None,
 ) -> NormalizedDocument:
     text = _extract_text_payload(payload)
     metadata = await extract_metadata(text, filename=validation.filename, settings=settings)
@@ -546,7 +617,7 @@ async def _document_from_parser_payload(
         parser_name=parser_name,
         parser_version=parser_version,
         parser_route=parser_route,
-        parser_options={"profile": parser_profile},
+        parser_options={"profile": parser_profile, **(parser_runtime or {})},
         source_metadata={"filename": validation.filename, "detected_mime": validation.detected_mime},
         warnings=warnings,
     )
@@ -566,21 +637,10 @@ def _document_from_text(
     source_metadata: dict[str, Any],
     warnings: list[str],
 ) -> NormalizedDocument:
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text.strip()) if part.strip()]
-    if not paragraphs and text.strip():
-        paragraphs = [text.strip()]
-    blocks = [
-        NormalizedBlock(
-            block_id=f"block:{index}",
-            kind="paragraph",
-            text=paragraph,
-            locator={"page": 1, "block_index": index},
-        )
-        for index, paragraph in enumerate(paragraphs, start=1)
-    ]
+    blocks = _blocks_from_text(text, title=title)
     return NormalizedDocument(
         title=title,
-        text="\n\n".join(paragraphs),
+        text="\n\n".join(block.text for block in blocks),
         blocks=blocks,
         parser_name=parser_name,
         parser_version=parser_version,
@@ -590,6 +650,146 @@ def _document_from_text(
         source_metadata=source_metadata,
         warnings=warnings,
     )
+
+
+def _blocks_from_text(text: str, *, title: str) -> list[NormalizedBlock]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if _looks_like_html(stripped):
+        blocks = _blocks_from_html(stripped, title=title)
+        if blocks:
+            return blocks
+    return _blocks_from_markdown_like(stripped, title=title)
+
+
+def _blocks_from_html(text: str, *, title: str) -> list[NormalizedBlock]:
+    soup = BeautifulSoup(text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "nav", "footer"]):
+        tag.decompose()
+    body = soup.body or soup
+    blocks: list[NormalizedBlock] = []
+    state = _SectionState(title)
+    for tag in body.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "td", "th"], recursive=True):
+        value = " ".join(tag.get_text(" ", strip=True).split())
+        if not value:
+            continue
+        if tag.name and tag.name.startswith("h"):
+            level = max(1, min(int(tag.name[1]), 6))
+            path = state.enter_heading(value, level)
+            kind: Literal["heading", "paragraph"] = "heading"
+        else:
+            level = None
+            path = state.current_path()
+            kind = "paragraph"
+        blocks.append(_normalized_block(len(blocks) + 1, value, kind=kind, level=level, section_path=path))
+    return blocks
+
+
+def _blocks_from_markdown_like(text: str, *, title: str) -> list[NormalizedBlock]:
+    blocks: list[NormalizedBlock] = []
+    state = _SectionState(title)
+    buffer: list[str] = []
+
+    def flush_paragraph() -> None:
+        if not buffer:
+            return
+        value = " ".join(" ".join(buffer).split())
+        buffer.clear()
+        if value:
+            blocks.append(
+                _normalized_block(
+                    len(blocks) + 1,
+                    value,
+                    kind="paragraph",
+                    level=None,
+                    section_path=state.current_path(),
+                )
+            )
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush_paragraph()
+            continue
+        heading = _markdown_heading(line) or _inline_html_heading(line)
+        if heading is not None:
+            flush_paragraph()
+            level, value = heading
+            path = state.enter_heading(value, level)
+            blocks.append(
+                _normalized_block(
+                    len(blocks) + 1,
+                    value,
+                    kind="heading",
+                    level=level,
+                    section_path=path,
+                )
+            )
+            continue
+        buffer.append(line)
+    flush_paragraph()
+    if blocks:
+        return blocks
+    return [_normalized_block(1, text, kind="paragraph", level=None, section_path=[title])]
+
+
+class _SectionState:
+    def __init__(self, title: str) -> None:
+        self.title = title.strip() or "Document"
+        self.stack: list[str] = []
+
+    def current_path(self) -> list[str]:
+        return [self.title, *self.stack]
+
+    def enter_heading(self, heading: str, level: int) -> list[str]:
+        normalized_heading = " ".join(heading.split())
+        if not normalized_heading:
+            return self.current_path()
+        if normalized_heading.casefold() == self.title.casefold():
+            self.stack = []
+            return self.current_path()
+        depth = max(0, min(level, 6) - 1)
+        self.stack = [*self.stack[:depth], normalized_heading]
+        return self.current_path()
+
+
+def _normalized_block(
+    index: int,
+    text: str,
+    *,
+    kind: Literal["heading", "paragraph"],
+    level: int | None,
+    section_path: list[str],
+) -> NormalizedBlock:
+    return NormalizedBlock(
+        block_id=f"block:{index}",
+        kind=kind,
+        text=text,
+        level=level,
+        locator={"page": 1, "block_index": index},
+        metadata={"section_path": section_path},
+    )
+
+
+def _looks_like_html(text: str) -> bool:
+    lowered = text[:4000].casefold()
+    return "<html" in lowered or "<body" in lowered or bool(re.search(r"<h[1-6][\s>]", lowered))
+
+
+def _markdown_heading(line: str) -> tuple[int, str] | None:
+    match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line)
+    if not match:
+        return None
+    return len(match.group(1)), match.group(2).strip()
+
+
+def _inline_html_heading(line: str) -> tuple[int, str] | None:
+    match = re.match(r"^<h([1-6])[^>]*>(.*?)</h\1>\s*$", line, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    value = re.sub(r"<[^>]+>", " ", match.group(2))
+    return int(match.group(1)), " ".join(value.split())
 
 
 def _extract_text_payload(payload: Any) -> str:
@@ -806,6 +1006,25 @@ def _locator_for_offset(blocks: list[NormalizedBlock], word_offset: int) -> dict
             return dict(block.locator)
         consumed += block_words
     return {"page": 1}
+
+
+def _section_path_for_offset(blocks: list[NormalizedBlock], word_offset: int, title: str) -> list[str]:
+    consumed = 0
+    fallback = [title]
+    for block in blocks:
+        block_words = len(block.text.split())
+        metadata = dict(block.metadata or {})
+        section_path = metadata.get("section_path")
+        if isinstance(section_path, list) and section_path:
+            fallback = [str(item) for item in section_path if str(item)]
+        if consumed <= word_offset < consumed + max(block_words, 1):
+            return fallback
+        consumed += block_words
+    return fallback
+
+
+def _section_id(document_version_id: str, section_path: list[str]) -> str:
+    return "section:" + stable_hash([document_version_id, *section_path], 24)
 
 
 def _link_neighbors(chunks: list[Chunk]) -> list[Chunk]:

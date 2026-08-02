@@ -196,10 +196,7 @@ async def run_suite(
     resolved_report_id = report_id or resolved_run_id
     run_dir = ARTIFACT_ROOT / "runs" / manifest.dataset_name / resolved_run_id
     configs = _filter_configs(eval_configs(resolved), config_ids)
-    api_client = client or HttpEvalApiClient(
-        kiwix_public_base_url=resolved.kiwix_public_base_url,
-        kiwix_internal_base_url=resolved.kiwix_internal_base_url,
-    )
+    api_client = client or HttpEvalApiClient.from_settings(resolved)
     summaries: list[ConfigSummary] = []
     started_at = utc_now_iso()
     started = time.perf_counter()

@@ -145,6 +145,7 @@ async def generate_answer(
     validation["model_alias"] = active_profile.model_aliases.generator_main
     validation["provider"] = payload.get("provider")
     validation["provider_request_id"] = payload.get("id")
+    validation["model_gateway"] = dict(payload.get("_gateway_metadata") or {})
     validation["provider_cost"] = payload.get("cost") or usage.get("cost") or usage.get("total_cost")
     validation["answerability_status"] = answerability_status.value if answerability_status else None
     validation["insufficient_evidence"] = retrieval.insufficient_evidence
@@ -165,6 +166,7 @@ async def generate_answer(
         )
         timings_ms["citation_validation"] += _elapsed_ms(validation_started)
         validation["usage"] = usage
+        validation["model_gateway"] = dict(payload.get("_gateway_metadata") or {})
         validation["timings_ms"] = {**timings_ms, "generation_total": _elapsed_ms(started)}
         return repaired, validation
     claim_payload = await verify_claims(

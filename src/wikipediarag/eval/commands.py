@@ -18,10 +18,11 @@ from wikipediarag.eval.artifacts import (
 )
 from wikipediarag.eval.corpus import load_candidate_chunks, load_corpus_snapshot
 from wikipediarag.eval.diagnostics import answer_result_diagnosis, retrieval_result_diagnosis
-from wikipediarag.eval.external import transfer_miracl_ru
+from wikipediarag.eval.external import transfer_miracl_ru, transfer_miracl_ru_from_huggingface
 from wikipediarag.eval.generate_runs import load_generate_status, load_latest_generate_status
 from wikipediarag.eval.generator import SMOKE_MARKER, build_smoke_tasks, generate_dataset
 from wikipediarag.eval.hashing import stable_json_hash
+from wikipediarag.eval.metrics import percentile
 from wikipediarag.eval.progress import EvalGenerateProgressCallback
 from wikipediarag.eval.reporting import load_latest_run, write_report
 from wikipediarag.eval.retrieval_reporting import write_retrieval_report
@@ -105,10 +106,7 @@ async def eval_smoke(
         jsonl_path=str(ARTIFACT_ROOT / "smoke" / "latest-tasks.jsonl"),
     )
     write_jsonl(Path(manifest.jsonl_path), tasks)
-    api_client = client or HttpEvalApiClient(
-        kiwix_public_base_url=resolved.kiwix_public_base_url,
-        kiwix_internal_base_url=resolved.kiwix_internal_base_url,
-    )
+    api_client = client or HttpEvalApiClient.from_settings(resolved)
     results: list[EvalTaskResult] = []
     for task in tasks:
         results.append(await run_task(task, config, api=api, manifest=manifest, client=api_client, settings=resolved))
@@ -358,8 +356,32 @@ def eval_trusted_report(*, suite: str = TRUSTED_DATASET_NAME) -> dict[str, str]:
     return write_trusted_report(suite=suite)
 
 
-async def eval_miracl_map(*, input_path: Path, settings: Settings | None = None) -> dict[str, str]:
-    return await transfer_miracl_ru(input_path=input_path, settings=adapt_eval_settings(settings or get_settings()))
+async def eval_miracl_map(
+    *,
+    input_path: Path | None = None,
+    from_huggingface: bool = False,
+    split: str = "dev",
+    limit: int = 100,
+    output_suite: str = "miracl-ru-local-v1",
+    cache_dir: Path | None = None,
+    min_text_overlap: float = 0.08,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    resolved = adapt_eval_settings(settings or get_settings())
+    if from_huggingface:
+        if split not in {"dev", "train"}:
+            raise ValueError("--split must be dev or train")
+        return await transfer_miracl_ru_from_huggingface(
+            split=cast(Literal["dev", "train"], split),
+            limit=limit,
+            output_suite=output_suite,
+            cache_dir=cache_dir,
+            min_text_overlap=min_text_overlap,
+            settings=resolved,
+        )
+    if input_path is None:
+        raise ValueError("eval-miracl-map requires --input unless --from-huggingface is used")
+    return await transfer_miracl_ru(input_path=input_path, settings=resolved)
 
 
 def eval_review_candidates(*, input_path: Path, output_suite: str) -> dict[str, Any]:
@@ -422,10 +444,7 @@ async def eval_reviewed_short(
     if not selected:
         raise ValueError(f"none of the requested task IDs exist in {suite}/{split}: {missing}")
     config = _single_eval_config(config_id, resolved)
-    client = HttpEvalApiClient(
-        kiwix_public_base_url=resolved.kiwix_public_base_url,
-        kiwix_internal_base_url=resolved.kiwix_internal_base_url,
-    )
+    client = HttpEvalApiClient.from_settings(resolved)
     answer_results: list[EvalTaskResult] = []
     retrieval_results: list[RetrievalTaskResult] = []
     if run_answer:
@@ -461,11 +480,209 @@ async def eval_reviewed_short(
     }
 
 
+async def eval_profile_retrieval(
+    *,
+    suite: str,
+    split: str = "dev",
+    api: str,
+    config_id: str = "sota_mvp_normal",
+    task_ids: list[str] | None = None,
+    limit: int = 5,
+    warmup_iterations: int = 1,
+    measured_iterations: int = 1,
+    batch_size: int = 5,
+    settings: Settings | None = None,
+    client: RetrievalEvalApiClient | None = None,
+) -> dict[str, Any]:
+    if split not in {"dev", "test"}:
+        raise ValueError("--split must be dev or test")
+    if limit < 1:
+        raise ValueError("--limit must be >= 1")
+    if warmup_iterations < 0:
+        raise ValueError("--warmup-iterations must be >= 0")
+    if measured_iterations < 1:
+        raise ValueError("--measured-iterations must be >= 1")
+    if batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+    resolved = adapt_eval_settings(settings or get_settings())
+    locked_split = cast(Literal["dev", "test"], split)
+    manifest, _payload = load_locked_split_manifest(suite, locked_split)
+    tasks = _profile_tasks(load_locked_split_tasks(manifest, locked_split), task_ids=task_ids, limit=limit)
+    config = _single_eval_config(config_id, resolved)
+    api_client = client or HttpEvalApiClient.from_settings(resolved, include_kiwix_urls=False)
+    started_at = utc_now_iso()
+    run_id = (
+        f"{_compact_timestamp(started_at)}-{suite}-{split}-retrieval-profile-"
+        f"{stable_json_hash([task.task_id for task in tasks])[:8]}"
+    )
+    run_dir = ARTIFACT_ROOT / "retrieval-profiles" / suite / run_id
+    warmup_results: list[RetrievalTaskResult] = []
+    measured_results: list[RetrievalTaskResult] = []
+    for iteration in range(1, warmup_iterations + 1):
+        warmup_results.extend(
+            await _run_profile_iteration(
+                tasks,
+                config,
+                api=api,
+                manifest=manifest,
+                client=api_client,
+                settings=resolved,
+                batch_size=batch_size,
+                iteration=iteration,
+            )
+        )
+        _write_retrieval_profile_status(run_dir, run_id, "warmup", started_at, warmup_results, measured_results)
+    for iteration in range(1, measured_iterations + 1):
+        measured_results.extend(
+            await _run_profile_iteration(
+                tasks,
+                config,
+                api=api,
+                manifest=manifest,
+                client=api_client,
+                settings=resolved,
+                batch_size=batch_size,
+                iteration=iteration,
+            )
+        )
+        _write_retrieval_profile_status(run_dir, run_id, "measuring", started_at, warmup_results, measured_results)
+    report = {
+        "run_id": run_id,
+        "suite": suite,
+        "split": split,
+        "api": api,
+        "config_id": config.config_id,
+        "config_hash": config.config_hash,
+        "retrieval_profile": config.retrieval_profile,
+        "task_ids": [task.task_id for task in tasks],
+        "warmup_iterations": warmup_iterations,
+        "measured_iterations": measured_iterations,
+        "batch_size": batch_size,
+        "started_at": started_at,
+        "finished_at": utc_now_iso(),
+        "run_dir": str(run_dir),
+        "warmup": _profile_result_counts(warmup_results),
+        "measured": _profile_result_counts(measured_results),
+        "stage_latency": _profile_stage_latency(measured_results),
+        "failed_task_ids": sorted({result.task_id for result in measured_results if result.status != "completed"}),
+        "errors": [error for result in measured_results for error in result.errors],
+    }
+    write_json(run_dir / "report.json", report)
+    write_json(ARTIFACT_ROOT / "retrieval-profiles" / suite / "latest.json", report)
+    _write_retrieval_profile_status(run_dir, run_id, "completed", started_at, warmup_results, measured_results)
+    return report
+
+
 def _single_eval_config(config_id: str, settings: Settings) -> EvalConfig:
     configs = {config.config_id: config for config in eval_configs(settings)}
     if config_id not in configs:
         raise ValueError(f"unknown eval config: {config_id}")
     return configs[config_id]
+
+
+def _profile_tasks(tasks: list[EvalTask], *, task_ids: list[str] | None, limit: int) -> list[EvalTask]:
+    if task_ids:
+        by_id = {task.task_id: task for task in tasks}
+        missing = [task_id for task_id in task_ids if task_id not in by_id]
+        if missing:
+            raise ValueError(f"unknown task IDs for profiling: {missing}")
+        selected = [by_id[task_id] for task_id in task_ids]
+    else:
+        selected = tasks[:limit]
+    if not selected:
+        raise ValueError("no profiling tasks selected")
+    return selected
+
+
+async def _run_profile_iteration(
+    tasks: list[EvalTask],
+    config: EvalConfig,
+    *,
+    api: str,
+    manifest: EvalDatasetManifest,
+    client: RetrievalEvalApiClient,
+    settings: Settings,
+    batch_size: int,
+    iteration: int,
+) -> list[RetrievalTaskResult]:
+    semaphore = asyncio.Semaphore(batch_size)
+
+    async def run_one(index: int, task: EvalTask) -> RetrievalTaskResult:
+        async with semaphore:
+            return await run_retrieval_task(
+                task,
+                config,
+                api=api,
+                manifest=manifest,
+                client=client,
+                settings=settings,
+                batch_index=iteration,
+                task_index=index,
+            )
+
+    return list(await asyncio.gather(*(run_one(index, task) for index, task in enumerate(tasks, start=1))))
+
+
+def _profile_result_counts(results: list[RetrievalTaskResult]) -> dict[str, int]:
+    return {
+        "total": len(results),
+        "completed": sum(1 for result in results if result.status == "completed"),
+        "failed": sum(1 for result in results if result.status != "completed"),
+    }
+
+
+def _profile_stage_latency(results: list[RetrievalTaskResult]) -> dict[str, dict[str, float]]:
+    completed = [result for result in results if result.status == "completed"]
+    preferred = [
+        "bm25",
+        "dense_embedding",
+        "dense_search",
+        "dense_total",
+        "fusion",
+        "rerank",
+        "context",
+        "retrieval_total",
+        "retrieval",
+        "total",
+    ]
+    keys = sorted({key for result in completed for key in result.latency_ms})
+    ordered_keys = [key for key in preferred if key in keys] + [key for key in keys if key not in preferred]
+    profile: dict[str, dict[str, float]] = {}
+    for key in ordered_keys:
+        values = [float(result.latency_ms[key]) for result in completed if key in result.latency_ms]
+        profile[key] = {
+            "count": float(len(values)),
+            "p50_ms": percentile(values, 50),
+            "p95_ms": percentile(values, 95),
+            "max_ms": max(values) if values else 0.0,
+        }
+    return profile
+
+
+def _compact_timestamp(value: str) -> str:
+    return value.replace("-", "").replace(":", "")
+
+
+def _write_retrieval_profile_status(
+    run_dir: Path,
+    run_id: str,
+    phase: str,
+    started_at: str,
+    warmup_results: list[RetrievalTaskResult],
+    measured_results: list[RetrievalTaskResult],
+) -> None:
+    status = {
+        "run_id": run_id,
+        "state": "completed" if phase == "completed" else "running",
+        "phase": phase,
+        "started_at": started_at,
+        "updated_at": utc_now_iso(),
+        "run_dir": str(run_dir),
+        "warmup": _profile_result_counts(warmup_results),
+        "measured": _profile_result_counts(measured_results),
+    }
+    write_json(run_dir / "status.json", status)
+    write_json(ARTIFACT_ROOT / "retrieval-profiles" / "latest-status.json", status)
 
 
 async def _run_short_answer_tasks(

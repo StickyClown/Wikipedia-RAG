@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from types import TracebackType
 from typing import Any, cast
 
@@ -11,7 +12,7 @@ import wikipediarag.api_app as api_app
 from wikipediarag.auth import ActorContext, AuthenticationMethod, KnowledgeBaseRole, PlatformRole, TenantRole
 from wikipediarag.auth_service import AuthenticationError
 from wikipediarag.repository import search_public_chunks
-from wikipediarag.schemas import SearchFilters, SearchRequest
+from wikipediarag.schemas import SearchFilters, SearchRequest, SearchResponse, SearchResult
 
 
 class _FakeConnectionContext:
@@ -84,34 +85,44 @@ async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeyp
     async def load_index(_conn: object, **kwargs: Any) -> dict[str, str]:
         return {"id": "index", "read_alias": kwargs["read_alias"]}
 
-    async def search_chunks(_conn: object, **kwargs: Any) -> list[dict[str, Any]]:
-        search_calls.append(kwargs)
-        return [
+    async def run_search(_conn: object, search_payload: SearchRequest, **kwargs: Any) -> SearchResponse:
+        search_calls.append(
             {
-                "document_id": "doc:1",
-                "document_version_id": "docv:1",
-                "knowledge_base_id": "33333333-3333-4333-8333-333333333333",
-                "title": "Report",
-                "content": "A long report about verification marker and public search.",
-                "section_path": ["Intro"],
-                "source_url": "http://localhost/doc",
-                "source_type": "upload",
-                "document_type": "application/pdf",
-                "language": "ru",
-                "document_date": "2026-07-29",
-                "locator": {"page": 1},
-                "chunk_metadata": {"locator": {"page": 1}},
-                "score": 7.0,
-                "ranks": {"search": 1},
+                **kwargs,
+                "filters": search_payload.filters.model_dump(mode="json", exclude_none=True),
             }
-        ]
+        )
+        return SearchResponse(
+            results=[
+                SearchResult(
+                    chunk_id="chunk:1",
+                    document_id="doc:1",
+                    document_version_id="docv:1",
+                    knowledge_base_id="33333333-3333-4333-8333-333333333333",
+                    title="Report",
+                    snippet="A long report about verification marker and public search.",
+                    section_path=["Intro"],
+                    source_url="http://localhost/doc",
+                    source_type="upload",
+                    document_type="application/pdf",
+                    language="ru",
+                    document_date=date(2026, 7, 29),
+                    locator={"page": 1},
+                    score=7.0,
+                    ranks={"search": 1},
+                )
+            ],
+            limit=search_payload.limit,
+            offset=search_payload.offset,
+            has_more=False,
+        )
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
     monkeypatch.setattr(api_app, "_require_kb_role", require_role)
     monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
     monkeypatch.setattr(api_app, "load_index_version_by_read_alias", load_index)
-    monkeypatch.setattr(api_app, "search_public_chunks", search_chunks)
+    monkeypatch.setattr(api_app, "run_public_search", run_search)
 
     payload = SearchRequest(
         query="verification marker",
@@ -123,6 +134,7 @@ async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeyp
     assert required_roles == [("33333333-3333-4333-8333-333333333333", KnowledgeBaseRole.viewer)]
     assert search_calls[0]["filters"] == {"document_type": "pdf", "language": "ru"}
     result = response.results[0]
+    assert result.chunk_id == "chunk:1"
     assert result.document_id == "doc:1"
     assert result.document_version_id == "docv:1"
     assert result.snippet == "A long report about verification marker and public search."

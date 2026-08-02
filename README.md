@@ -1,137 +1,80 @@
 # WikipediaRag
 
-WikipediaRag is a Docker-first local RAG platform for Russian Wikipedia and default-tenant document knowledge bases. It is currently a local MVP, not a production multi-tenant release.
+WikipediaRag is a Docker-first RAG platform for Russian Wikipedia and uploaded
+document knowledge bases. The current implementation is a local
+production-shaped MVP: it has production-style service boundaries, auth,
+tenancy, async ingestion and validation gates, but it is not yet an externally
+operated production deployment.
 
-First-read source of truth for an LLM or engineer:
+Current project state and the next approved task are tracked in
+[docs/STATUS.md](docs/STATUS.md).
 
-- `AGENTS.md` - work protocol, safety rules and implementation constraints.
-- `README.md` - project map, runbook and current capabilities.
-- `docs/architecture.md` - architecture contracts, service boundaries and invariants.
-- `docs/STATUS.md` - latest milestone, validation evidence, blockers and next work.
+## Main Capabilities
 
-## Current State
+- React/Vite web UI for login, knowledge-base selection, Wikipedia import, multi-file upload, chat and retrieval debugging.
+- FastAPI API with local auth, OIDC foundation, opaque session cookies, CSRF and server-owned `ActorContext`.
+- Tenant and knowledge-base role enforcement for chat, debug search, uploads, imports, document reads, reprocess, deletion and sharing APIs.
+- Async Wikipedia import from local ZIM via Kiwix/libzim, with XML fallback for local regression paths.
+- Async document ingestion through presigned MinIO upload, worker validation, parsing, normalization, chunking, embedding and publication.
+- Parser services for document formats: app-owned local adapters, Xberg default parser, Docling high-quality fallback and metadata-service language/date extraction.
+- Hybrid retrieval with BM25, dense vectors, RRF, rerank, parent expansion, answerability and citation validation.
+- Direct Multi-KB chat/debug retrieval with all-KB role and readiness checks; Extended Search remains single-KB.
+- Local eval, document corpus verification, release-gate reports and cross-tenant hardening smoke commands.
 
-Active milestone: ExecPlan 24 Slice 1-6 are implemented as a production-shaped MVP. ExecPlan 25.1+25.2 remains implemented for local async document ingestion on the seeded default KB compatibility path. ExecPlan 26 is complete for eval root-cause diagnostics. ExecPlan 21 remains complete for the reviewed Wikipedia smoke gate; the latest provider-backed reviewed gate is `completed`, `passed=true`, `blocking_failures=0`.
+## User Path
 
-Implemented MVP capabilities:
+1. Sign in with local credentials or OIDC.
+2. Select an active knowledge base, or create one from the toolbar.
+3. Import a bounded Wikipedia ZIM subset or upload documents.
+4. Watch ingestion progress while the worker validates, parses and publishes chunks.
+5. Ask questions in chat, inspect cited sources, and open the retrieval debugger for a query run.
 
-- FastAPI API, background worker and Model Gateway on Python 3.12.
-- React + Vite + TypeScript UI.
-- PostgreSQL control plane, OpenSearch search representation, MinIO artifacts, Redis/Valkey jobs/cache, Kiwix ZIM viewing and OpenTelemetry.
-- Model Gateway aliases for chat, embeddings and rerank; business code does not call OpenRouter or `llama-server` directly.
-- ZIM/libzim Wikipedia ingestion with Kiwix source URLs, checkpoints, redirects as provenance and deterministic chunks.
-- XML multistream Wikipedia fallback for regression/local development.
-- Async document upload sessions with presigned MinIO upload, completion, background validation/parsing/chunking/embedding and published-only retrieval.
-- Auth/tenancy foundation: forward-only schema for identities, sessions, groups, KB grants and audit events; typed `ActorContext`; KB role policy and safe API error envelopes.
-- Local auth foundation: bootstrap admin from `BOOTSTRAP_ADMIN_PASSWORD_FILE` only when no platform admin exists, Argon2id password hashes, opaque HttpOnly app session cookie, server-side session/CSRF hashes, logout revocation and active-tenant selection.
-- OIDC foundation: Authorization Code + PKCE S256, discovery/JWKS ID-token validation, exact issuer/audience/nonce checks, `issuer + sub` identity matching, no email/username auto-merge and encrypted server-side token storage.
-- Local/OIDC groups, KB owner-on-create and KB grant APIs.
-- Route-level tenant/KB enforcement through server-owned `ActorContext`; client-supplied tenant/user/group/filter/object-prefix authority is not accepted by API routes.
-- Isolated parser containers: Xberg default parser, Docling Serve CPU fallback/high-quality parser and local metadata-service for fast language/date extraction.
-- Universal document metadata: upload/system timestamps, document-date candidates, language/confidence, MIME/signature facts, parser route/report, hashes, warnings and safe public metadata.
-- Hybrid retrieval: BM25, dense vectors, RRF, rerank, dedup/page quota, parent expansion, answerability and citation validation.
-- Bounded Extended Search MVP for multi-query follow-up retrieval when evidence is partial or insufficient.
-- Local evaluation, trusted/reviewed dataset workflow, deterministic root-cause diagnostics and dated release-gate reports with root run contracts and step events.
-- Document corpus verification with generated fixtures plus optional pinned URL/SHA external samples.
+The current UI is a single screen, not a routed multi-page app. Details are in
+[docs/architecture/web.md](docs/architecture/web.md).
 
-## Runtime
-
-Requirements:
+## Requirements
 
 - Docker Desktop or compatible Docker Compose runtime.
 - Python 3.12 and `uv`.
 - Node.js 22.14+ and `pnpm`.
-- GNU Make when available; this Windows host may require direct `uv`, `pnpm` or `docker compose` equivalents.
+- GNU Make when available. On Windows, use direct `uv`, `pnpm` or `docker compose` equivalents if `make` is unavailable.
 
-Local URLs:
-
-- UI: `http://localhost:5173`
-- API health/readiness: `http://localhost:8000/health`, `http://localhost:8000/ready`
-- Model Gateway: `http://localhost:8081`
-- Mock provider: `http://localhost:8082`
-- Kiwix: `http://localhost:8083`
-- Metadata service: `http://localhost:8090`
-- Xberg: `http://localhost:8091`
-- Docling: `http://localhost:8092`
-- MinIO console: `http://localhost:9001`
-- OpenSearch: `http://localhost:9200`
-
-Start:
+## Quick Start
 
 ```bash
 cp .env.example .env
 make up
 ```
 
-If `make` is unavailable, inspect `Makefile` and run the equivalent command directly.
+If `make` is unavailable, inspect [Makefile](Makefile) and run the equivalent
+`docker compose` command directly.
 
-## Data And Ingestion
+With default local settings, sign in as `admin` / `admin`. These defaults are
+development-only.
 
-Place one real Russian Wikipedia ZIM file under ignored `zim/*.zim`. Kiwix serves the full archive; the worker imports a bounded canonical subset from the same file. Optional XML fallback dumps live under ignored `zip/`.
-
-Small ZIM import:
+For Wikipedia import, place a Russian Wikipedia ZIM file under ignored
+`zim/*.zim`, then run:
 
 ```bash
 make import-zim-small WIKI_LIMIT=10000
 ```
 
-Document upload is asynchronous and default-tenant scoped:
+## Local URLs
 
-```text
-POST /api/v1/uploads/sessions
-PUT  <upload_url>
-POST /api/v1/uploads/sessions/{upload_session_id}:complete
-GET  /api/v1/ingestion-jobs/{job_id}
-GET  /api/v1/documents/{document_id}
-GET  /api/v1/documents/{document_id}/versions
-POST /api/v1/documents/{document_id}:reprocess
-```
-
-Parser routing:
-
-- CSV, TSV, JSON and JSONL use app-owned local streaming adapters.
-- Xberg handles supported document formats first.
-- Docling is used for parser failure, low-quality/empty text, scanned PDF signals, layout/table/formula/read-order warnings or explicit `high_quality`.
-
-Parser containers receive bytes/temp files over HTTP only. They never receive MinIO credentials, raw object keys, arbitrary URLs, tenant authority, prompts or provider payloads.
-
-## Retrieval And Evaluation
-
-Normal answer path:
-
-```text
-query
--> BM25 + dense
--> RRF
--> rerank
--> dedup/page quota/parent expansion
--> token-budget context
--> answerability
--> grounded answer with citations
-```
-
-Debug retrieval without generation:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/search:debug
-```
-
-Provider-backed release gates require healthy API readiness and strict OpenRouter smoke. Do not rerun them while `/ready` is degraded.
-
-Eval answer/retrieval JSONL rows include deterministic `diagnosis` payloads and
-summaries include `root_cause_*_count` metrics. `eval-task-diagnostics --json`
-backfills the same diagnosis for older local artifacts when scores are present.
-
-
-Release-gate reports are immutable dated directories under:
-
-```text
-artifacts/eval/release-gates/<suite>/<YYYYMMDDTHHMMSSZ-suite-release-gate-short_id>/
-```
+- UI: <http://localhost:5173>
+- API health/readiness: <http://localhost:8000/health>, <http://localhost:8000/ready>
+- Model Gateway: <http://localhost:8081>
+- Mock provider: <http://localhost:8082>
+- Kiwix: <http://localhost:8083>
+- Metadata service: <http://localhost:8090>
+- Xberg: <http://localhost:8091>
+- Docling: <http://localhost:8092>
+- MinIO console: <http://localhost:9001>
+- OpenSearch: <http://localhost:9200>
 
 ## Validation Commands
 
-Preferred stable commands:
+Use the stable targets that match your change:
 
 ```bash
 make lint
@@ -139,27 +82,14 @@ make format-check
 make typecheck
 make test-unit
 make test-integration
-make test-e2e
 make smoke
-make eval
 make smoke-models PROVIDER=mock
 make verify-document-upload
 make verify-document-corpus
+make verify-cross-tenant-hardening
 ```
 
-Windows/direct equivalents:
-
-```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src tests
-uv run pytest tests/unit tests/integration
-uv run python -m wikipediarag.cli smoke-models --provider mock
-uv run python -m wikipediarag.cli verify-document-upload
-uv run python -m wikipediarag.cli verify-document-corpus --fixture-set standard
-```
-
-UI:
+UI checks:
 
 ```bash
 cd services/ui
@@ -168,65 +98,20 @@ pnpm typecheck
 pnpm build
 ```
 
-Document corpus verification:
+Docs-only changes do not require the full unit/integration/e2e suite unless
+the active task or CI policy says otherwise.
 
-```bash
-uv run python -m wikipediarag.cli verify-document-corpus --fixture-set standard
-uv run python -m wikipediarag.cli verify-document-corpus --fixture-set full
-uv run python -m wikipediarag.cli verify-document-corpus --fixture-set smoke --include-external --skip-compose
-```
+## Documentation Map
 
-External corpus bytes are downloaded to ignored `artifacts/corpora/document-corpus/`. Only URL, SHA256, license and expected assertions are tracked.
-
-## Configuration Notes
-
-ExecPlan 24 auth defaults:
-
-```env
-AUTH_MODE=local
-APP_SECRET_FILE=/run/secrets/app_secret
-BOOTSTRAP_ADMIN_USERNAME=admin
-BOOTSTRAP_ADMIN_EMAIL=
-BOOTSTRAP_ADMIN_PASSWORD_FILE=/run/secrets/bootstrap_admin_password
-SESSION_COOKIE_SECURE=true
-OIDC_SCOPE=openid profile email
-```
-
-Local login is enabled in `AUTH_MODE=local` and `AUTH_MODE=hybrid`, and disabled in strict `AUTH_MODE=oidc`. `AUTH_MODE=test` is accepted only when `APP_ENV=test`. If no platform administrator exists and the bootstrap password file is mounted, startup creates the bootstrap admin with `PLATFORM_ADMIN` and `password_change_required=true`; existing admin hashes are never reset. The browser receives only the opaque app session cookie. Use `GET /api/v1/auth/session` to receive the CSRF token required in `X-CSRF-Token` for unsafe cookie-authenticated auth methods.
-
-Keycloak smoke profile:
-
-```bash
-docker compose -f compose.yaml -f compose.keycloak.yaml --profile keycloak-smoke up -d keycloak
-```
-
-The profile uses pinned `quay.io/keycloak/keycloak:26.7.0` and imports `infra/keycloak/wikipediarag-realm.json`. The included smoke credentials and client secret are local deterministic fixtures only; production must mount real secrets. The host-side Authorization Code + PKCE smoke has passed against this profile.
-
-Real OpenRouter runs use local `.env` only:
-
-```env
-MODEL_PROVIDER=openrouter
-RETRIEVAL_PROFILE=sota_mvp
-OPENROUTER_API_KEY=...
-ZIM_DIR=/zim
-KIWIX_PUBLIC_BASE_URL=http://localhost:8083
-```
-
-`sota_mvp` must not silently fall back to mock aliases or hash embeddings. Model Gateway `/health` is liveness after startup; `/ready` reports dependency degradation. During slow startup smoke, both endpoints may be temporarily unreachable until application startup completes.
-
-Local `llama.cpp` remains an optional future target behind Model Gateway aliases:
-
-```bash
-docker compose -f compose.yaml -f compose.llamacpp.yaml --profile llamacpp up -d
-make smoke-models PROVIDER=llamacpp
-```
-
-## Main Risks And Next Work
-
-- ExecPlan 24 auth is implemented as an MVP; remaining hardening is a live browser OIDC pass through the Dockerized API plus a worker/cache/object-storage deletion audit before external deployment.
-- Document ingestion is local/default-tenant only and still needs malware scanning, retention/deletion policy, ACL mirroring, parser autoscaling and external deployment hardening.
-- Public multi-file batch creation is not exposed yet; the DB/job framework already supports independent job items.
-- Fast language/date extraction is deterministic and local but heuristic.
-- Warm retrieval p95 needs profiling and SLO work.
-- OpenRouter-backed gates depend on provider quota, credits, latency and model behavior.
-- Large/legal corpus expansion should stay manifest-driven and run outside ordinary CI unless explicitly approved.
+- [docs/STATUS.md](docs/STATUS.md) - active goal, implemented snapshot, validation, blockers and next approved task.
+- [docs/architecture.md](docs/architecture.md) - architecture overview and index.
+- [docs/architecture/web.md](docs/architecture/web.md) - actual web UI screens, browser state, cookies, CSRF and SSE behavior.
+- [docs/architecture/services.md](docs/architecture/services.md) - runtime component responsibilities.
+- [docs/architecture/data-and-storage.md](docs/architecture/data-and-storage.md) - data ownership, source-of-truth and backup boundaries.
+- [docs/architecture/flows.md](docs/architecture/flows.md) - login, upload, ingestion, retrieval, delete and readiness flows.
+- [docs/architecture/security-and-tenancy.md](docs/architecture/security-and-tenancy.md) - auth, roles, tenancy and access controls.
+- [docs/architecture/deployment-and-operations.md](docs/architecture/deployment-and-operations.md) - local Compose and external deployment requirements.
+- [AGENTS.md](AGENTS.md) - long-lived instructions for coding agents.
+- [docs/exec-plans/](docs/exec-plans/) - historical implementation plans.
+- [docs/history/STATUS-archive.md](docs/history/STATUS-archive.md) - compact archive of historical status details.
+- [docs/decisions/](docs/decisions/) - ADR guidance and template.

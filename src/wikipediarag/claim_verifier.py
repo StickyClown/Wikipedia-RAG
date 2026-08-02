@@ -87,6 +87,7 @@ async def verify_claims(
             result["provider"] = provider_payload.get("provider")
             result["provider_request_id"] = provider_payload.get("id")
             result["usage"] = dict(provider_payload.get("usage") or {})
+            result["model_gateway"] = dict(provider_payload.get("_gateway_metadata") or {})
             return result
         except Exception:
             if profile.requires_real_provider and policy.claim_verification_strict:

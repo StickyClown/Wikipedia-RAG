@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS knowledge_base_grants (
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (tenant_id, knowledge_base_id, subject_type, subject_id)
 );
+ALTER TABLE knowledge_base_grants ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS ix_knowledge_base_grants_subject
   ON knowledge_base_grants(tenant_id, subject_type, subject_id);
 
@@ -216,6 +217,14 @@ CREATE TABLE IF NOT EXISTS documents (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_documents_tenant ON documents(tenant_id, created_at DESC);
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS lifecycle_state text NOT NULL DEFAULT 'active';
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at timestamptz NULL;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS purge_after timestamptz NULL;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_by_user_id uuid NULL REFERENCES users(id);
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS deletion_reason text NULL;
+CREATE INDEX IF NOT EXISTS ix_documents_purge
+  ON documents(tenant_id, purge_after)
+  WHERE lifecycle_state IN ('deleting','purge_failed');
 
 CREATE TABLE IF NOT EXISTS knowledge_sources (
   id uuid PRIMARY KEY,
@@ -230,6 +239,63 @@ CREATE TABLE IF NOT EXISTS knowledge_sources (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_knowledge_sources_tenant ON knowledge_sources(tenant_id, knowledge_base_id, kind);
+ALTER TABLE knowledge_sources ADD COLUMN IF NOT EXISTS encrypted_credentials jsonb NOT NULL DEFAULT '{}';
+ALTER TABLE knowledge_sources ADD COLUMN IF NOT EXISTS refresh_interval_seconds int NULL;
+ALTER TABLE knowledge_sources ADD COLUMN IF NOT EXISTS sync_cursor jsonb NOT NULL DEFAULT '{}';
+ALTER TABLE knowledge_sources ADD COLUMN IF NOT EXISTS last_sync_run_id uuid NULL;
+ALTER TABLE knowledge_sources ADD COLUMN IF NOT EXISTS last_sync_status text NULL;
+ALTER TABLE knowledge_sources ADD COLUMN IF NOT EXISTS last_synced_at timestamptz NULL;
+ALTER TABLE knowledge_sources ADD COLUMN IF NOT EXISTS next_sync_at timestamptz NULL;
+CREATE INDEX IF NOT EXISTS ix_knowledge_sources_due
+  ON knowledge_sources(tenant_id, next_sync_at)
+  WHERE status = 'active' AND refresh_interval_seconds IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS source_sync_runs (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+  source_id uuid NOT NULL REFERENCES knowledge_sources(id),
+  job_id uuid NULL,
+  mode text NOT NULL CHECK (mode IN ('full','incremental','healthcheck')),
+  status text NOT NULL CHECK (status IN ('received','running','completed','failed','cancelled')),
+  cursor_before jsonb NOT NULL DEFAULT '{}',
+  cursor_after jsonb NOT NULL DEFAULT '{}',
+  checkpoint jsonb NOT NULL DEFAULT '{}',
+  stats jsonb NOT NULL DEFAULT '{}',
+  error_code text NULL,
+  error_message text NULL,
+  started_at timestamptz NULL,
+  completed_at timestamptz NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_source_sync_runs_source
+  ON source_sync_runs(tenant_id, knowledge_base_id, source_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS source_document_states (
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+  source_id uuid NOT NULL REFERENCES knowledge_sources(id),
+  external_id text NOT NULL,
+  source_uri text NOT NULL,
+  source_url text NOT NULL,
+  title text NOT NULL,
+  source_version text NOT NULL,
+  content_hash text NOT NULL,
+  document_id text NULL REFERENCES documents(id),
+  document_version_id text NULL,
+  last_sync_run_id uuid NULL REFERENCES source_sync_runs(id),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','deleted')),
+  metadata jsonb NOT NULL DEFAULT '{}',
+  first_seen_at timestamptz NOT NULL DEFAULT now(),
+  last_seen_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz NULL,
+  tombstone_version text NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, knowledge_base_id, source_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS ix_source_document_states_document
+  ON source_document_states(tenant_id, knowledge_base_id, document_id);
 
 CREATE TABLE IF NOT EXISTS upload_batches (
   id uuid PRIMARY KEY,
@@ -295,6 +361,11 @@ CREATE TABLE IF NOT EXISTS document_versions (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_document_versions_tenant ON document_versions(tenant_id, knowledge_base_id, document_id);
+ALTER TABLE document_versions ADD COLUMN IF NOT EXISTS lifecycle_state text NOT NULL DEFAULT 'active';
+ALTER TABLE document_versions ADD COLUMN IF NOT EXISTS deleted_at timestamptz NULL;
+ALTER TABLE document_versions ADD COLUMN IF NOT EXISTS purge_after timestamptz NULL;
+ALTER TABLE document_versions ADD COLUMN IF NOT EXISTS deleted_by_user_id uuid NULL REFERENCES users(id);
+ALTER TABLE document_versions ADD COLUMN IF NOT EXISTS deletion_reason text NULL;
 
 CREATE TABLE IF NOT EXISTS document_artifacts (
   id uuid PRIMARY KEY,
@@ -384,6 +455,30 @@ ALTER TABLE chunks ADD COLUMN IF NOT EXISTS document_version_id text NULL REFERE
 ALTER TABLE chunks ADD COLUMN IF NOT EXISTS chunk_ordinal int NULL;
 ALTER TABLE chunks ADD COLUMN IF NOT EXISTS locator jsonb NOT NULL DEFAULT '{}';
 ALTER TABLE chunks ADD COLUMN IF NOT EXISTS publication_status text NOT NULL DEFAULT 'published';
+
+CREATE TABLE IF NOT EXISTS document_sections (
+  section_id text NOT NULL,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+  document_id text NOT NULL REFERENCES documents(id),
+  document_version_id text NULL REFERENCES document_versions(id),
+  parent_section_id text NULL,
+  title text NOT NULL,
+  level int NOT NULL DEFAULT 1,
+  path text[] NOT NULL DEFAULT ARRAY[]::text[],
+  ordinal int NOT NULL DEFAULT 1,
+  locator jsonb NOT NULL DEFAULT '{}',
+  first_chunk_id text NULL REFERENCES chunks(id),
+  last_chunk_id text NULL REFERENCES chunks(id),
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, knowledge_base_id, document_id, section_id)
+);
+CREATE INDEX IF NOT EXISTS ix_document_sections_document
+  ON document_sections(tenant_id, knowledge_base_id, document_id, ordinal);
+CREATE INDEX IF NOT EXISTS ix_document_sections_version
+  ON document_sections(tenant_id, document_version_id, ordinal);
 
 CREATE TABLE IF NOT EXISTS query_runs (
   id uuid PRIMARY KEY,

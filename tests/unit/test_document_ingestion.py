@@ -9,6 +9,8 @@ from wikipediarag.document_ingestion import (
     NormalizedBlock,
     NormalizedDocument,
     UploadValidationError,
+    _document_from_text,
+    _next_parser_endpoint,
     chunks_for_normalized_document,
     detect_document_date,
     detect_language,
@@ -18,6 +20,7 @@ from wikipediarag.document_ingestion import (
     sha256_hex,
     validate_upload_bytes,
 )
+from wikipediarag.ingestion import _parser_runtime_progress
 
 
 def _settings(
@@ -165,6 +168,47 @@ def test_parser_quality_gate_routes_to_docling_for_low_quality_xberg_output() ->
     assert "expected_tables_missing" in reasons
 
 
+@pytest.mark.asyncio
+async def test_parser_endpoint_pool_round_robins_without_leaking_urls() -> None:
+    settings = Settings(
+        xberg_url="http://xberg-default:8000",
+        xberg_urls="http://xberg-a:8000, http://xberg-b:8000",
+        docling_url="http://docling-default:5001",
+        docling_urls="http://docling-a:5001",
+    )
+
+    first = await _next_parser_endpoint("xberg", settings)
+    second = await _next_parser_endpoint("xberg", settings)
+    third = await _next_parser_endpoint("xberg", settings)
+    docling = await _next_parser_endpoint("docling", settings)
+
+    assert first == ("http://xberg-a:8000", 0, 2)
+    assert second == ("http://xberg-b:8000", 1, 2)
+    assert third == ("http://xberg-a:8000", 0, 2)
+    assert docling == ("http://docling-a:5001", 0, 1)
+
+
+def test_parser_runtime_progress_uses_safe_numeric_fields_only() -> None:
+    document = _document()
+    document.parser_options = {
+        "profile": "standard",
+        "endpoint_index": 4,
+        "endpoint_pool_size": 3,
+        "queue_wait_ms": 12,
+        "parser_latency_ms": 345,
+        "endpoint_url": "http://internal-parser:8000",
+    }
+
+    progress = _parser_runtime_progress(document)
+
+    assert progress == {
+        "parser_queue_wait_ms": 12,
+        "parser_latency_ms": 345,
+        "parser_endpoint_pool_size": 3,
+    }
+    assert "endpoint_url" not in progress
+
+
 def test_normalized_hash_and_chunk_ids_are_deterministic() -> None:
     words = " ".join(f"слово{i}" for i in range(260))
     first = _document(words)
@@ -190,6 +234,34 @@ def test_normalized_hash_and_chunk_ids_are_deterministic() -> None:
     assert first_chunks[0].next_chunk_id == first_chunks[1].id
     assert first_chunks[1].prev_chunk_id == first_chunks[0].id
     assert first_chunks[0].metadata["locator"] == {"page": 1, "block_index": 1}
+
+
+def test_chunker_preserves_uploaded_document_headings_as_sections() -> None:
+    document = _document_from_text(
+        "# Overview\n\nIntro marker.\n\n## Details\n\nDeep section marker.",
+        title="Проверка",
+        metadata=DocumentMetadata(detected_language="ru", language_confidence=0.99),
+        parser_name="local_text_adapter",
+        parser_version="normalized_document_v1",
+        parser_route="local_text_adapter",
+        parser_options={},
+        source_metadata={},
+        warnings=[],
+    )
+
+    chunks = chunks_for_normalized_document(
+        document,
+        document_id="doc:test",
+        document_version_id="docv:test",
+        source_url="http://localhost/doc",
+        dimensions=4,
+    )
+
+    assert chunks
+    assert chunks[0].section_path == ("Проверка", "Overview")
+    assert chunks[0].parent_chunk_id
+    assert chunks[0].metadata["section_id"] == chunks[0].parent_chunk_id
+    assert chunks[0].metadata["chunk_ordinal"] == 1
 
 
 def test_public_metadata_does_not_leak_private_storage_or_parser_details() -> None:

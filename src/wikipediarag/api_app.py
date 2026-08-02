@@ -5,11 +5,11 @@ import json
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -56,37 +56,45 @@ from wikipediarag.diagnostics import (
     initial_route_decision,
     repair_route_decision,
 )
-from wikipediarag.document_ingestion import UploadValidationError, safe_upload_filename
+from wikipediarag.document_ingestion import UploadValidationError, safe_upload_filename, sha256_hex
 from wikipediarag.extended import run_extended_search, should_start_extended
 from wikipediarag.ids import stable_hash
 from wikipediarag.observability import content_policy, safe_error_code, safe_telemetry_payload
-from wikipediarag.oidc_service import complete_oidc_callback, oidc_login_enabled, start_oidc_flow
+from wikipediarag.oidc_service import complete_oidc_callback, encrypt_server_tokens, oidc_login_enabled, start_oidc_flow
 from wikipediarag.repository import (
     complete_query_run,
     create_document_deletion_job,
     create_document_upload_records,
     create_ingestion_job,
+    create_knowledge_source,
     create_query_run,
     create_reprocess_job,
+    create_source_sync_job,
     create_upload_batch,
     create_upload_session,
     fail_query_run,
+    fetch_document_context_chunks,
     get_document_lifecycle,
     get_document_public,
     get_knowledge_base,
+    get_knowledge_source,
+    get_source_sync_run_public,
     get_upload_batch_status,
     get_upload_session,
     insert_audit_event,
     insert_retrieval_event,
+    list_document_sections,
     list_document_versions_public,
     list_knowledge_bases,
+    list_knowledge_sources_public,
     load_effective_knowledge_base_role,
     load_index_version_by_read_alias,
     load_retrieval_events,
     request_cancel,
     request_resume,
-    search_public_chunks,
+    search_document_chunks,
     soft_delete_document,
+    update_knowledge_source,
     update_query_run_usage,
 )
 from wikipediarag.retrieval import retrieve, retrieve_multi
@@ -98,8 +106,15 @@ from wikipediarag.schemas import (
     AuthUserResponse,
     ChatRequest,
     DebugSearchRequest,
+    DocumentContextChunk,
+    DocumentContextResponse,
     DocumentDeleteResponse,
     DocumentReprocessResponse,
+    DocumentSearchRequest,
+    DocumentSearchResponse,
+    DocumentSearchResult,
+    DocumentSection,
+    DocumentStructureResponse,
     GroupCreate,
     GroupPatch,
     ImportRequest,
@@ -115,6 +130,13 @@ from wikipediarag.schemas import (
     SearchRequest,
     SearchResponse,
     SearchResult,
+    SourceCreate,
+    SourceHealthResponse,
+    SourcePatch,
+    SourceResponse,
+    SourceSyncRequest,
+    SourceSyncResponse,
+    SourceSyncRunResponse,
     SseEvent,
     TenantCreate,
     TenantPatch,
@@ -132,7 +154,9 @@ from wikipediarag.schemas import (
     ZimImportRequest,
 )
 from wikipediarag.search_index import READ_ALIAS, delete_document_chunks
-from wikipediarag.storage import create_presigned_put_url, head_object
+from wikipediarag.search_service import run_public_search
+from wikipediarag.source_connectors import ConnectorError, connector_for_kind
+from wikipediarag.storage import create_presigned_put_url, head_object, put_bytes
 
 app = FastAPI(title="WikipediaRag API")
 app.add_middleware(
@@ -999,6 +1023,188 @@ async def delete_kb_grant(kb_id: str, grant_id: str, request: Request) -> dict[s
     return {"status": "deleted"}
 
 
+@app.get("/api/v1/knowledge-bases/{kb_id}/sources")
+async def list_sources(kb_id: str, request: Request) -> dict[str, Any]:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
+        rows = await list_knowledge_sources_public(conn, tenant_id=tenant_id, knowledge_base_id=kb_id)
+    sources = [SourceResponse.model_validate(_source_public_payload(row)).model_dump(mode="json") for row in rows]
+    return {"sources": sources}
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/sources")
+async def create_source(kb_id: str, payload: SourceCreate, request: Request) -> SourceResponse:
+    settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    _reject_secrets_in_config(payload.config)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
+        if await get_knowledge_base(conn, tenant_id, kb_id) is None:
+            raise HTTPException(status_code=404, detail="knowledge base not found")
+        source_id = await create_knowledge_source(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            kind=payload.kind,
+            name=payload.name,
+            config=payload.config,
+            encrypted_credentials=encrypt_server_tokens(settings, payload.credentials) if payload.credentials else {},
+            metadata={**payload.metadata, "source_contract": "external_source_v1"},
+            refresh_interval_seconds=payload.refresh_interval_seconds,
+        )
+        row = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=str(source_id))
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="source.create",
+            target_type="knowledge_source",
+            target_id=str(source_id),
+            outcome="success",
+        )
+    if row is None:
+        raise HTTPException(status_code=500, detail="source was not created")
+    return SourceResponse.model_validate(_source_public_payload(row))
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/sources/{source_id}")
+async def get_source(kb_id: str, source_id: str, request: Request) -> SourceResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
+        row = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    return SourceResponse.model_validate(_source_public_payload(row))
+
+
+@app.patch("/api/v1/knowledge-bases/{kb_id}/sources/{source_id}")
+async def patch_source(kb_id: str, source_id: str, payload: SourcePatch, request: Request) -> SourceResponse:
+    settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    if payload.config is not None:
+        _reject_secrets_in_config(payload.config)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
+        existing = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="source not found")
+        await update_knowledge_source(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            source_id=source_id,
+            name=payload.name,
+            status=payload.status,
+            config=payload.config,
+            encrypted_credentials=encrypt_server_tokens(settings, payload.credentials)
+            if payload.credentials is not None
+            else None,
+            metadata=payload.metadata,
+            refresh_interval_seconds=payload.refresh_interval_seconds,
+            refresh_interval_supplied="refresh_interval_seconds" in payload.model_fields_set,
+        )
+        row = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="source.update",
+            target_type="knowledge_source",
+            target_id=source_id,
+            outcome="success",
+        )
+    if row is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    return SourceResponse.model_validate(_source_public_payload(row))
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/sources/{source_id}:healthcheck")
+async def healthcheck_source(kb_id: str, source_id: str, request: Request) -> SourceHealthResponse:
+    settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
+        row = await get_knowledge_source(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            source_id=source_id,
+            include_credentials=True,
+        )
+    if row is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    try:
+        connector = connector_for_kind(
+            str(row["kind"]),
+            dict(row.get("config") or {}),
+            _decrypt_api_credentials(settings, dict(row.get("encrypted_credentials") or {})),
+        )
+        result = await connector.healthcheck()
+    except ConnectorError as exc:
+        raise HTTPException(status_code=502, detail={"error": {"code": exc.code, "message": exc.safe_message}}) from exc
+    return SourceHealthResponse(source_id=source_id, status=result.status, details=result.details)
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/sources/{source_id}:sync")
+async def sync_source(
+    kb_id: str,
+    source_id: str,
+    payload: SourceSyncRequest,
+    request: Request,
+) -> SourceSyncResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
+        source = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="source not found")
+        job_id, run_id = await create_source_sync_job(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            source_id=source_id,
+            mode=payload.mode,
+            cursor_before=dict(source.get("sync_cursor") or {}),
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="source.sync",
+            target_type="knowledge_source",
+            target_id=source_id,
+            outcome="success",
+        )
+    return SourceSyncResponse(source_id=source_id, run_id=str(run_id), job_id=str(job_id), status="received")
+
+
+@app.get("/api/v1/source-sync-runs/{run_id}")
+async def get_source_sync_run(run_id: str, request: Request) -> SourceSyncRunResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        row = await get_source_sync_run_public(conn, tenant_id=tenant_id, run_id=run_id)
+        if row is not None:
+            await _require_kb_role(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_id=str(row["knowledge_base_id"]),
+                role=KnowledgeBaseRole.viewer,
+            )
+    if row is None:
+        raise HTTPException(status_code=404, detail="source sync run not found")
+    return SourceSyncRunResponse.model_validate(_sync_run_public_payload(row))
+
+
 @app.post("/api/v1/wikipedia/imports")
 async def create_wikipedia_import(payload: ImportRequest, request: Request) -> dict[str, str]:
     settings = get_settings()
@@ -1128,6 +1334,94 @@ async def resume_ingestion_job(job_id: str, request: Request) -> dict[str, str]:
         )
         await request_resume(conn, job_id)
     return {"status": "resume_requested"}
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/documents")
+async def upload_document_multipart(
+    kb_id: str,
+    request: Request,
+    file: Annotated[UploadFile, File()],
+    parser_profile: Annotated[str, Form()] = "standard",
+    metadata_json: Annotated[str, Form()] = "{}",
+) -> UploadCompleteResponse:
+    settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    try:
+        filename = safe_upload_filename(file.filename or "document")
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=422, detail={"error": {"code": exc.code, "message": exc.safe_message}}) from exc
+    try:
+        metadata = json.loads(metadata_json) if metadata_json else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "INVALID_METADATA_JSON", "message": "metadata_json must be valid JSON object"}},
+        ) from exc
+    if not isinstance(metadata, dict):
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "INVALID_METADATA_JSON", "message": "metadata_json must be valid JSON object"}},
+        )
+    data = await file.read()
+    if len(data) > settings.upload_max_bytes:
+        raise HTTPException(status_code=413, detail="uploaded file exceeds configured upload size limit")
+    checksum = sha256_hex(data)
+    content_type = file.content_type or "application/octet-stream"
+    object_key = f"uploads/{tenant_id}/{kb_id}/api/{stable_hash([filename, checksum], 16)}/{checksum}"
+    async with connect() as conn:
+        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
+        if await get_knowledge_base(conn, tenant_id, kb_id) is None:
+            raise HTTPException(status_code=404, detail="knowledge base not found")
+    await asyncio.to_thread(put_bytes, object_key, data, content_type=content_type, settings=settings)
+    async with connect() as conn:
+        session_id, _expires_at = await create_upload_session(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            filename=filename,
+            content_type=content_type,
+            size_bytes=len(data),
+            checksum_sha256=checksum,
+            object_key=object_key,
+            parser_profile=parser_profile,
+            metadata={**metadata, "api_multipart_upload": True},
+            ttl_seconds=settings.upload_session_ttl_seconds,
+        )
+        upload_session = await get_upload_session(conn, tenant_id=tenant_id, upload_session_id=str(session_id))
+        if upload_session is None:
+            raise HTTPException(status_code=500, detail="upload session was not created")
+        document_hash = stable_hash([tenant_id, kb_id, checksum, filename], 24)
+        document_id = f"doc:{document_hash}"
+        document_version_id = "docv:" + stable_hash(
+            [document_id, checksum, parser_profile, "normalized_document_v1"],
+            32,
+        )
+        job_id = await create_document_upload_records(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            upload_session=upload_session,
+            document_id=document_id,
+            document_version_id=document_version_id,
+            content_hash=checksum,
+            metadata={**metadata, "api_multipart_upload": True},
+        )
+        await _audit(
+            conn,
+            request=request,
+            actor=actor,
+            action="document.upload_multipart",
+            target_type="document",
+            target_id=document_id,
+            outcome="success",
+        )
+    return UploadCompleteResponse(
+        document_id=document_id,
+        document_version_id=document_version_id,
+        job_id=str(job_id),
+        status="received",
+    )
 
 
 @app.post("/api/v1/uploads/sessions")
@@ -1405,6 +1699,119 @@ async def get_document_versions(document_id: str, request: Request) -> dict[str,
     return {"document_id": document_id, "versions": _jsonable(versions)}
 
 
+@app.get("/api/v1/documents/{document_id}/structure")
+async def get_document_structure(document_id: str, request: Request) -> DocumentStructureResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        document = await _load_viewer_document(conn, actor=actor, tenant_id=tenant_id, document_id=document_id)
+        version_id = str(document["current_version_id"]) if document.get("current_version_id") else None
+        sections = await list_document_sections(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=str(document["knowledge_base_id"]),
+            document_id=document_id,
+            document_version_id=version_id,
+        )
+    metadata = dict(document.get("metadata") or {})
+    source_url = metadata.get("source_url")
+    return DocumentStructureResponse(
+        document_id=document_id,
+        document_version_id=version_id,
+        knowledge_base_id=str(document["knowledge_base_id"]),
+        title=str(document.get("title") or ""),
+        source_type=str(document.get("source_type") or ""),
+        source_url=str(source_url) if source_url else None,
+        sections=[_document_section(row) for row in sections],
+        public_metadata=dict(document.get("public_metadata") or {}),
+    )
+
+
+@app.get("/api/v1/documents/{document_id}/context")
+async def get_document_context(
+    document_id: str,
+    request: Request,
+    chunk_id: str | None = Query(default=None, max_length=240),
+    section_id: str | None = Query(default=None, max_length=240),
+    before: int = Query(default=2, ge=0, le=10),
+    after: int = Query(default=2, ge=0, le=10),
+    limit: int = Query(default=80, ge=1, le=200),
+    offset: int = Query(default=0, ge=0, le=500),
+) -> DocumentContextResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        document = await _load_viewer_document(conn, actor=actor, tenant_id=tenant_id, document_id=document_id)
+        version_id = str(document["current_version_id"]) if document.get("current_version_id") else None
+        section_path: list[str] | None = None
+        if section_id:
+            sections = await list_document_sections(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=str(document["knowledge_base_id"]),
+                document_id=document_id,
+                document_version_id=version_id,
+            )
+            for section in sections:
+                if str(section.get("section_id") or "") == section_id:
+                    section_path = [str(item) for item in section.get("path") or []]
+                    break
+            if section_path is None:
+                raise HTTPException(status_code=404, detail="section not found")
+        rows = await fetch_document_context_chunks(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=str(document["knowledge_base_id"]),
+            document_id=document_id,
+            document_version_id=version_id,
+            chunk_id=chunk_id,
+            section_path=section_path,
+            before=before,
+            after=after,
+            limit=limit,
+            offset=offset,
+        )
+    if chunk_id and not rows:
+        raise HTTPException(status_code=404, detail="chunk not found")
+    return DocumentContextResponse(
+        document_id=document_id,
+        document_version_id=version_id,
+        anchor_chunk_id=chunk_id,
+        section_id=section_id,
+        chunks=[_document_context_chunk(row, anchor_chunk_id=chunk_id) for row in rows],
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.post("/api/v1/documents/{document_id}/search")
+async def search_document(document_id: str, payload: DocumentSearchRequest, request: Request) -> DocumentSearchResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        document = await _load_viewer_document(conn, actor=actor, tenant_id=tenant_id, document_id=document_id)
+        version_id = str(document["current_version_id"]) if document.get("current_version_id") else None
+        rows = await search_document_chunks(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=str(document["knowledge_base_id"]),
+            document_id=document_id,
+            document_version_id=version_id,
+            query=payload.query,
+            limit=payload.limit,
+            offset=payload.offset,
+        )
+    has_more = len(rows) > payload.limit
+    return DocumentSearchResponse(
+        document_id=document_id,
+        document_version_id=version_id,
+        results=[_document_search_result(row, query=payload.query) for row in rows[: payload.limit]],
+        limit=payload.limit,
+        offset=payload.offset,
+        has_more=has_more,
+    )
+
+
 @app.delete("/api/v1/documents/{document_id}", status_code=202)
 async def delete_document(document_id: str, request: Request) -> DocumentDeleteResponse:
     settings = get_settings()
@@ -1513,24 +1920,16 @@ async def search(payload: SearchRequest, request: Request) -> SearchResponse:
                 role=KnowledgeBaseRole.viewer,
             )
             await _require_search_scope_ready(conn, tenant_id=tenant_id, kb_ids=kb_ids)
-            rows = await search_public_chunks(
+            return await run_public_search(
                 conn,
+                payload,
                 tenant_id=tenant_id,
                 knowledge_base_ids=kb_ids,
-                query=payload.query,
-                limit=payload.limit,
-                offset=payload.offset,
-                filters=payload.filters.model_dump(mode="json", exclude_none=True),
+                settings=settings,
             )
     except KnowledgeBaseNotReady as exc:
         raise _kb_not_ready_http(exc, actor.request_id) from exc
-    has_more = len(rows) > payload.limit
-    return SearchResponse(
-        results=[_search_result(row, query=payload.query) for row in rows[: payload.limit]],
-        limit=payload.limit,
-        offset=payload.offset,
-        has_more=has_more,
-    )
+    raise RuntimeError("search response was not returned")
 
 
 @app.post("/api/v1/chat")
@@ -2274,6 +2673,93 @@ async def _require_search_scope_ready(conn: Any, *, tenant_id: str, kb_ids: list
             )
 
 
+async def _load_viewer_document(conn: Any, *, actor: ActorContext, tenant_id: str, document_id: str) -> dict[str, Any]:
+    document = await get_document_public(conn, tenant_id, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    await _require_kb_role(
+        conn,
+        actor=actor,
+        tenant_id=tenant_id,
+        kb_id=str(document["knowledge_base_id"]),
+        role=KnowledgeBaseRole.viewer,
+    )
+    return document
+
+
+def _source_public_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "knowledge_base_id": str(row["knowledge_base_id"]),
+        "kind": str(row["kind"]),
+        "name": str(row["name"]),
+        "status": str(row["status"]),
+        "config": dict(row.get("config") or {}),
+        "metadata": dict(row.get("metadata") or {}),
+        "refresh_interval_seconds": row.get("refresh_interval_seconds"),
+        "last_sync_run_id": str(row["last_sync_run_id"]) if row.get("last_sync_run_id") is not None else None,
+        "last_sync_status": str(row["last_sync_status"]) if row.get("last_sync_status") is not None else None,
+        "last_synced_at": row.get("last_synced_at"),
+        "next_sync_at": row.get("next_sync_at"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def _sync_run_public_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "source_id": str(row["source_id"]),
+        "knowledge_base_id": str(row["knowledge_base_id"]),
+        "mode": str(row["mode"]),
+        "status": str(row["status"]),
+        "cursor_before": dict(row.get("cursor_before") or {}),
+        "cursor_after": dict(row.get("cursor_after") or {}),
+        "checkpoint": dict(row.get("checkpoint") or {}),
+        "stats": dict(row.get("stats") or {}),
+        "error_code": str(row["error_code"]) if row.get("error_code") is not None else None,
+        "error_message": str(row["error_message"]) if row.get("error_message") is not None else None,
+        "started_at": row.get("started_at"),
+        "completed_at": row.get("completed_at"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def _reject_secrets_in_config(config: dict[str, Any]) -> None:
+    secret_tokens = ("secret", "password", "token", "cookie", "credential")
+
+    def walk(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_text = str(key).casefold()
+                if any(token in key_text for token in secret_tokens):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": {
+                                "code": "SOURCE_CONFIG_SECRET_FIELD",
+                                "message": "connector secrets must be passed in credentials, not config",
+                                "details": {"path": f"{path}.{key}" if path else str(key)},
+                            }
+                        },
+                    )
+                walk(item, f"{path}.{key}" if path else str(key))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                walk(item, f"{path}[{index}]")
+
+    walk(config, "")
+
+
+def _decrypt_api_credentials(settings: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    if not payload:
+        return {}
+    from wikipediarag.oidc_service import decrypt_server_tokens
+
+    return decrypt_server_tokens(settings, {str(key): str(value) for key, value in payload.items()})
+
+
 def _search_result(row: dict[str, Any], *, query: str) -> SearchResult:
     chunk_metadata = dict(row.get("chunk_metadata") or {})
     locator = row.get("locator")
@@ -2281,6 +2767,7 @@ def _search_result(row: dict[str, Any], *, query: str) -> SearchResult:
         locator = chunk_metadata.get("locator")
     document_date = _parse_search_date(row.get("document_date"))
     return SearchResult(
+        chunk_id=str(row.get("chunk_id") or ""),
         document_id=str(row.get("document_id") or ""),
         document_version_id=str(row["document_version_id"]) if row.get("document_version_id") else None,
         knowledge_base_id=str(row.get("knowledge_base_id") or ""),
@@ -2293,6 +2780,63 @@ def _search_result(row: dict[str, Any], *, query: str) -> SearchResult:
         language=str(row["language"]) if row.get("language") else None,
         document_date=document_date,
         locator=cast(dict[str, Any], locator if isinstance(locator, dict) else {}),
+        score=float(row.get("score") or 0.0),
+        ranks=dict(row.get("ranks") or {}),
+    )
+
+
+def _document_section(row: dict[str, Any]) -> DocumentSection:
+    return DocumentSection(
+        section_id=str(row.get("section_id") or ""),
+        parent_section_id=str(row["parent_section_id"]) if row.get("parent_section_id") else None,
+        title=str(row.get("title") or ""),
+        level=int(row.get("level") or 1),
+        path=[str(item) for item in row.get("path") or []],
+        ordinal=int(row.get("ordinal") or 1),
+        locator=cast(dict[str, Any], row.get("locator") if isinstance(row.get("locator"), dict) else {}),
+        first_chunk_id=str(row["first_chunk_id"]) if row.get("first_chunk_id") else None,
+        last_chunk_id=str(row["last_chunk_id"]) if row.get("last_chunk_id") else None,
+        metadata=cast(dict[str, Any], row.get("metadata") if isinstance(row.get("metadata"), dict) else {}),
+    )
+
+
+def _document_context_chunk(row: dict[str, Any], *, anchor_chunk_id: str | None) -> DocumentContextChunk:
+    chunk_metadata = dict(row.get("chunk_metadata") or {})
+    locator = row.get("locator")
+    if not isinstance(locator, dict) or not locator:
+        locator = chunk_metadata.get("locator")
+    chunk_id = str(row.get("chunk_id") or "")
+    return DocumentContextChunk(
+        chunk_id=chunk_id,
+        document_id=str(row.get("document_id") or ""),
+        document_version_id=str(row["document_version_id"]) if row.get("document_version_id") else None,
+        knowledge_base_id=str(row.get("knowledge_base_id") or ""),
+        title=str(row.get("title") or ""),
+        section_path=[str(item) for item in row.get("section_path") or []],
+        content=str(row.get("content") or ""),
+        source_url=str(row.get("source_url") or ""),
+        locator=cast(dict[str, Any], locator if isinstance(locator, dict) else {}),
+        prev_chunk_id=str(row["prev_chunk_id"]) if row.get("prev_chunk_id") else None,
+        next_chunk_id=str(row["next_chunk_id"]) if row.get("next_chunk_id") else None,
+        chunk_ordinal=int(row["chunk_ordinal"]) if row.get("chunk_ordinal") is not None else None,
+        highlighted=bool(anchor_chunk_id and chunk_id == anchor_chunk_id),
+    )
+
+
+def _document_search_result(row: dict[str, Any], *, query: str) -> DocumentSearchResult:
+    context = _document_context_chunk(row, anchor_chunk_id=None)
+    return DocumentSearchResult(
+        chunk_id=context.chunk_id,
+        document_id=context.document_id,
+        document_version_id=context.document_version_id,
+        knowledge_base_id=context.knowledge_base_id,
+        title=context.title,
+        snippet=_search_snippet(context.content, query=query),
+        section_path=context.section_path,
+        source_url=context.source_url,
+        locator=context.locator,
+        prev_chunk_id=context.prev_chunk_id,
+        next_chunk_id=context.next_chunk_id,
         score=float(row.get("score") or 0.0),
         ranks=dict(row.get("ranks") or {}),
     )

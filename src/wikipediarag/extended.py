@@ -13,8 +13,8 @@ from wikipediarag.config import Settings
 from wikipediarag.db import json_dumps
 from wikipediarag.embedding import normalize_for_embedding
 from wikipediarag.ids import new_uuid, stable_hash
-from wikipediarag.repository import fetch_chunk_by_id
-from wikipediarag.retrieval import retrieve
+from wikipediarag.repository import fetch_chunk_by_id, insert_retrieval_event
+from wikipediarag.retrieval import make_query_context, query_ref_from_context, retrieve
 from wikipediarag.retrieval_profile import RetrievalProfile
 from wikipediarag.schemas import Evidence, RetrievalResult
 
@@ -135,9 +135,63 @@ async def run_extended_search(
     step_evidence_ids_by_step: list[list[str]] = []
     previous_coverage = 0.0
     stalled_steps = 0
-    events: list[dict[str, Any]] = []
+    normalized_query = " ".join(query.split())
+    primary_query_context = make_query_context(
+        query=normalized_query,
+        transform_id="tr.normalization.1",
+        subquery_id="sq.primary.1",
+        query_role="primary",
+        transform_type="normalization",
+    )
+    bridge_queries = _bridge_subqueries(query)
+    subquery_contexts = _subquery_contexts(state.subqueries, bridge_queries)
+    query_refs = [
+        query_ref_from_context(context, text=subquery, order=index)
+        for index, (subquery, context) in enumerate(zip(state.subqueries, subquery_contexts, strict=True), start=1)
+    ]
+    bridge_refs = [ref for ref in query_refs if ref.get("query_role") == "bridge"]
+    decomposition_refs = [ref for ref in query_refs if ref.get("query_role") == "decomposition"]
+    events: list[dict[str, Any]] = [
+        {
+            "stage": "query_transform",
+            "stable_stage": "query_transform",
+            "query_context": primary_query_context,
+            "original_query": query,
+            "normalized_query": normalized_query,
+            "transforms": [
+                {"order": 1, "type": "original", "transform_id": "tr.original.1", "text": query},
+                {
+                    "order": 2,
+                    "type": "normalization",
+                    "transform_id": "tr.normalization.1",
+                    "text": normalized_query,
+                    "changed": query != normalized_query,
+                },
+                {
+                    "order": 3,
+                    "type": "bridge_queries",
+                    "transform_id": "tr.bridge.1",
+                    "queries": bridge_queries,
+                    "query_refs": bridge_refs,
+                    "status": "performed" if bridge_queries else "skipped",
+                    "reason": "bridge_query_detector_v1" if bridge_queries else "no_bridge_query_detected",
+                },
+                {
+                    "order": 4,
+                    "type": "decomposition",
+                    "transform_id": "tr.decomposition.1",
+                    "queries": list(state.subqueries),
+                    "query_refs": decomposition_refs,
+                    "status": "performed" if state.subqueries else "skipped",
+                    "reason": "extended_search_subquery_builder_v1",
+                },
+            ],
+            "query_refs": query_refs,
+        }
+    ]
 
     for step, subquery in enumerate(state.subqueries[: budgets.max_steps], start=1):
+        query_context = subquery_contexts[step - 1]
         state.current_step = step
         if not _record_tool_call(state, "search", {"query": subquery, "profile": profile.name}):
             state.stop_reason = "duplicate_tool_call"
@@ -154,6 +208,7 @@ async def run_extended_search(
             top_k=profile.postprocess.final_evidence_max,
             profile=profile,
             profile_overrides=profile_overrides,
+            query_context=query_context,
         )
         tool_latency_ms = _elapsed_ms(tool_started)
         retrieval_timings = _extract_timings(result.events)
@@ -185,7 +240,7 @@ async def run_extended_search(
         state.coverage = coverage
         state.evidence_ledger.append(
             EvidenceLedgerItem(
-                subquery_id=f"q{step - 1}",
+                subquery_id=str(query_context["subquery_id"]),
                 text=subquery,
                 status=_ledger_status(inventory, result.evidence),
                 evidence_ids=[item.evidence_id for item in result.evidence],
@@ -194,11 +249,22 @@ async def run_extended_search(
         events.append(
             {
                 "stage": "harness_tool",
+                "stable_stage": "retrieval.extended",
                 "tool": "search",
                 "step": step,
                 "query": subquery,
+                "subquery_id": query_context["subquery_id"],
+                "transform_id": query_context["transform_id"],
+                "query_hash": query_context["query_hash"],
+                "query_context": query_context,
                 "new_evidence": new_count,
                 "new_neighbors": neighbor_count,
+                "retrieved_count": _retrieved_count(result.events),
+                "selected_count": len(result.evidence),
+                "max_bm25_score": _max_stage_score(result.events, "bm25"),
+                "max_dense_score": _max_stage_score(result.events, "dense"),
+                "max_fusion_score": _max_stage_score(result.events, "fusion"),
+                "max_rerank_score": _max_stage_score(result.events, "rerank"),
                 "coverage": coverage,
                 "coverage_inventory": [item.model_dump(mode="json") for item in inventory],
                 "latency_ms": tool_latency_ms,
@@ -239,6 +305,7 @@ async def run_extended_search(
             *events,
             {
                 "stage": "harness",
+                "stable_stage": "retrieval.extended",
                 "state": state.model_dump(),
                 "allowed_tools": sorted(ALLOWED_TOOLS),
                 "budgets": budgets.model_dump(),
@@ -247,7 +314,13 @@ async def run_extended_search(
             },
             {
                 "stage": "answerability",
-                "decision": answerability.model_dump(mode="json"),
+                "stable_stage": "answerability",
+                "query_context": primary_query_context,
+                "decision": {
+                    **answerability.model_dump(mode="json"),
+                    "reason_codes": [answerability.reason, f"status_{answerability.status.value.lower()}"],
+                },
+                "reason_codes": [answerability.reason, f"status_{answerability.status.value.lower()}"],
             },
         ],
         insufficient_evidence=is_insufficient(answerability),
@@ -256,6 +329,16 @@ async def run_extended_search(
         run_contract_id=_first_contract_id(events, "run_contract_id"),
     )
     await _persist_agent_run(conn, tenant_id=tenant_id, query_run_id=query_run_id, state=state, budgets=budgets)
+    for event in final.events:
+        await insert_retrieval_event(
+            conn,
+            tenant_id=tenant_id,
+            query_run_id=query_run_id,
+            trace_id=trace_id,
+            event_type="retrieval_stage",
+            stage=str(event["stage"]),
+            payload=event,
+        )
     return final
 
 
@@ -272,6 +355,60 @@ def _extract_timings(events: list[dict[str, Any]]) -> dict[str, int]:
                 if isinstance(value, int | float)
             }
     return {}
+
+
+def _subquery_contexts(subqueries: list[str], bridge_queries: list[str]) -> list[dict[str, Any]]:
+    bridge_keys = {normalize_for_embedding(query) for query in bridge_queries}
+    bridge_index = 0
+    decomposition_index = 0
+    contexts: list[dict[str, Any]] = []
+    for subquery in subqueries:
+        if normalize_for_embedding(subquery) in bridge_keys:
+            bridge_index += 1
+            contexts.append(
+                make_query_context(
+                    query=subquery,
+                    transform_id="tr.bridge.1",
+                    subquery_id=f"sq.bridge.{bridge_index}",
+                    query_role="bridge",
+                    transform_type="bridge_queries",
+                )
+            )
+        else:
+            decomposition_index += 1
+            contexts.append(
+                make_query_context(
+                    query=subquery,
+                    transform_id="tr.decomposition.1",
+                    subquery_id=f"sq.decomposition.{decomposition_index}",
+                    query_role="decomposition",
+                    transform_type="decomposition",
+                )
+            )
+    return contexts
+
+
+def _retrieved_count(events: list[dict[str, Any]]) -> int:
+    counts = [int(event["count"]) for event in events if isinstance(event.get("count"), int)]
+    return max(counts, default=0)
+
+
+def _max_stage_score(events: list[dict[str, Any]], score_key: str) -> float | None:
+    best: float | None = None
+    for event in events:
+        raw_candidates = event.get("candidates")
+        if not isinstance(raw_candidates, list):
+            continue
+        for candidate in raw_candidates:
+            if not isinstance(candidate, dict):
+                continue
+            scores = candidate.get("scores")
+            if not isinstance(scores, dict):
+                continue
+            value = scores.get(score_key)
+            if isinstance(value, int | float):
+                best = float(value) if best is None else max(best, float(value))
+    return best
 
 
 def _build_subqueries(query: str, limit: int) -> list[str]:
@@ -415,6 +552,7 @@ async def _expand_neighbors(
         events.append(
             {
                 "stage": "harness_tool",
+                "stable_stage": "retrieval.extended",
                 "tool": "get_neighbors",
                 "seed_chunk_id": seed.chunk_id,
                 "window": window,

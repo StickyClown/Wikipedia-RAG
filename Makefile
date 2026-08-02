@@ -4,7 +4,7 @@ TEST ?=
 PROVIDER ?= mock
 EVAL_COUNT ?= 150
 
-.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e smoke eval eval-smoke eval-generate eval-full check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload verify-document-corpus
+.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e smoke eval eval-smoke eval-generate eval-full check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload verify-document-corpus verify-cross-tenant-hardening
 
 bootstrap:
 	uv sync --all-groups
@@ -82,3 +82,6 @@ verify-document-upload:
 
 verify-document-corpus:
 	uv run python -m wikipediarag.cli verify-document-corpus $(DOCUMENT_CORPUS_ARGS)
+
+verify-cross-tenant-hardening:
+	uv run python -m wikipediarag.cli verify-cross-tenant-hardening $(CROSS_TENANT_HARDENING_ARGS)

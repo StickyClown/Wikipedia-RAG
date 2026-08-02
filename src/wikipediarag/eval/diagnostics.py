@@ -157,9 +157,7 @@ def _answer_signals(task: EvalTask | None, *, status: str, scores: TaskScores | 
     return signals
 
 
-def _retrieval_signals(
-    task: EvalTask | None, *, status: str, scores: RetrievalTaskScores | None
-) -> dict[str, Any]:
+def _retrieval_signals(task: EvalTask | None, *, status: str, scores: RetrievalTaskScores | None) -> dict[str, Any]:
     signals: dict[str, Any] = {
         "status": status,
         "task_family": str(task.task_family) if task else "",

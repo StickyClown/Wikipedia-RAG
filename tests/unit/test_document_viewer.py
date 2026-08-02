@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+from types import TracebackType
+from typing import Any
+
+import pytest
+from fastapi import HTTPException
+from starlette.requests import Request
+
+import wikipediarag.api_app as api_app
+from wikipediarag.auth import ActorContext, AuthenticationMethod, KnowledgeBaseRole, PlatformRole, TenantRole
+from wikipediarag.repository import (
+    fetch_document_context_chunks,
+    list_document_sections,
+    replace_document_sections_from_chunks,
+    search_document_chunks,
+)
+from wikipediarag.schemas import DocumentSearchRequest
+
+
+class _FakeConnectionContext:
+    async def __aenter__(self) -> object:
+        return object()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        return None
+
+
+def _request(path: str = "/api/v1/documents/doc:1/structure") -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "headers": [],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "client": ("testclient", 50000),
+        }
+    )
+
+
+def _actor() -> ActorContext:
+    return ActorContext(
+        user_id="22222222-2222-4222-8222-222222222222",
+        platform_role=PlatformRole.user,
+        active_tenant_id="11111111-1111-4111-8111-111111111111",
+        tenant_role=TenantRole.member,
+        session_id="44444444-4444-4444-8444-444444444444",
+        authentication_method=AuthenticationMethod.local,
+        request_id="33333333-3333-4333-8333-333333333333",
+        trace_id="trace",
+    )
+
+
+def _document() -> dict[str, Any]:
+    return {
+        "id": "doc:1",
+        "knowledge_base_id": "55555555-5555-4555-8555-555555555555",
+        "title": "Report",
+        "source_type": "upload_document",
+        "metadata": {"source_url": "http://localhost/doc"},
+        "current_version_id": "docv:1",
+        "public_metadata": {"filename": "report.md"},
+    }
+
+
+async def test_document_structure_uses_viewer_scope_and_safe_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    required_roles: list[tuple[str, KnowledgeBaseRole]] = []
+
+    async def require_actor(_request: Request) -> ActorContext:
+        return _actor()
+
+    async def get_document(_conn: object, tenant_id: str, document_id: str) -> dict[str, Any] | None:
+        assert tenant_id == "11111111-1111-4111-8111-111111111111"
+        assert document_id == "doc:1"
+        return _document()
+
+    async def require_role(_conn: object, **kwargs: Any) -> None:
+        required_roles.append((str(kwargs["kb_id"]), kwargs["role"]))
+
+    async def sections(_conn: object, **kwargs: Any) -> list[dict[str, Any]]:
+        assert kwargs["knowledge_base_id"] == "55555555-5555-4555-8555-555555555555"
+        return [
+            {
+                "section_id": "section:1",
+                "parent_section_id": None,
+                "title": "Report",
+                "level": 1,
+                "path": ["Report"],
+                "ordinal": 1,
+                "locator": {"page": 1},
+                "first_chunk_id": "chunk:1",
+                "last_chunk_id": "chunk:1",
+                "metadata": {"source": "chunks"},
+            }
+        ]
+
+    monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
+    monkeypatch.setattr(api_app, "_require_actor", require_actor)
+    monkeypatch.setattr(api_app, "get_document_public", get_document)
+    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+    monkeypatch.setattr(api_app, "list_document_sections", sections)
+
+    response = await api_app.get_document_structure("doc:1", _request())
+
+    assert required_roles == [("55555555-5555-4555-8555-555555555555", KnowledgeBaseRole.viewer)]
+    assert response.document_id == "doc:1"
+    assert response.sections[0].section_id == "section:1"
+    assert "object_key" not in response.public_metadata
+
+
+async def test_document_context_resolves_section_id_server_side(monkeypatch: pytest.MonkeyPatch) -> None:
+    context_calls: list[dict[str, Any]] = []
+
+    async def require_actor(_request: Request) -> ActorContext:
+        return _actor()
+
+    async def get_document(*_args: object) -> dict[str, Any]:
+        return _document()
+
+    async def require_role(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def sections(*_args: object, **_kwargs: object) -> list[dict[str, Any]]:
+        return [{"section_id": "section:1", "path": ["Report", "Details"]}]
+
+    async def context_chunks(_conn: object, **kwargs: Any) -> list[dict[str, Any]]:
+        context_calls.append(kwargs)
+        return [
+            {
+                "chunk_id": "chunk:2",
+                "document_id": "doc:1",
+                "document_version_id": "docv:1",
+                "knowledge_base_id": "55555555-5555-4555-8555-555555555555",
+                "title": "Report",
+                "section_path": ["Report", "Details"],
+                "content": "Deep marker.",
+                "source_url": "http://localhost/doc",
+                "locator": {"page": 1},
+                "prev_chunk_id": "chunk:1",
+                "next_chunk_id": None,
+                "chunk_ordinal": 2,
+            }
+        ]
+
+    monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
+    monkeypatch.setattr(api_app, "_require_actor", require_actor)
+    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+    monkeypatch.setattr(api_app, "get_document_public", get_document)
+    monkeypatch.setattr(api_app, "list_document_sections", sections)
+    monkeypatch.setattr(api_app, "fetch_document_context_chunks", context_chunks)
+
+    response = await api_app.get_document_context(
+        "doc:1",
+        _request(),
+        chunk_id=None,
+        section_id="section:1",
+        before=2,
+        after=2,
+        limit=80,
+        offset=0,
+    )
+
+    assert context_calls[0]["section_path"] == ["Report", "Details"]
+    assert response.chunks[0].chunk_id == "chunk:2"
+
+
+async def test_document_search_returns_safe_chunk_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def require_actor(_request: Request) -> ActorContext:
+        return _actor()
+
+    async def get_document(*_args: object) -> dict[str, Any]:
+        return _document()
+
+    async def require_role(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def search_chunks(_conn: object, **_kwargs: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "chunk_id": "chunk:1",
+                "document_id": "doc:1",
+                "document_version_id": "docv:1",
+                "knowledge_base_id": "55555555-5555-4555-8555-555555555555",
+                "title": "Report",
+                "section_path": ["Report"],
+                "content": "A report with verification marker.",
+                "source_url": "http://localhost/doc",
+                "locator": {"page": 1},
+                "prev_chunk_id": None,
+                "next_chunk_id": None,
+                "score": 1.0,
+                "ranks": {"document_search": 1},
+            }
+        ]
+
+    monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
+    monkeypatch.setattr(api_app, "_require_actor", require_actor)
+    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+    monkeypatch.setattr(api_app, "get_document_public", get_document)
+    monkeypatch.setattr(api_app, "search_document_chunks", search_chunks)
+
+    response = await api_app.search_document("doc:1", DocumentSearchRequest(query="verification"), _request())
+
+    assert response.results[0].chunk_id == "chunk:1"
+    assert response.results[0].snippet == "A report with verification marker."
+
+
+async def test_document_context_returns_404_for_unknown_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def require_actor(_request: Request) -> ActorContext:
+        return _actor()
+
+    async def get_document(*_args: object) -> dict[str, Any]:
+        return _document()
+
+    async def require_role(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def context_chunks(*_args: object, **_kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
+    monkeypatch.setattr(api_app, "_require_actor", require_actor)
+    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+    monkeypatch.setattr(api_app, "get_document_public", get_document)
+    monkeypatch.setattr(api_app, "fetch_document_context_chunks", context_chunks)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await api_app.get_document_context(
+            "doc:1",
+            _request(),
+            chunk_id="missing",
+            section_id=None,
+            before=2,
+            after=2,
+            limit=80,
+            offset=0,
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+def test_document_viewer_sql_is_tenant_scoped_and_published_only() -> None:
+    context_sql = str(fetch_document_context_chunks.__code__.co_consts)
+    search_sql = str(search_document_chunks.__code__.co_consts)
+
+    for sql in (context_sql, search_sql):
+        assert "c.tenant_id = :tenant_id" in sql
+        assert "c.knowledge_base_id = :kb_id" in sql
+        assert "c.document_id = :document_id" in sql
+        assert "c.publication_status = 'published'" in sql
+        assert "d.lifecycle_state = 'active'" in sql
+
+
+def test_document_sections_replace_casts_nullable_document_version_id() -> None:
+    sql = str(
+        (
+            replace_document_sections_from_chunks.__code__.co_consts,
+            list_document_sections.__code__.co_consts,
+            fetch_document_context_chunks.__code__.co_consts,
+            search_document_chunks.__code__.co_consts,
+        )
+    )
+
+    assert "CAST(:document_version_id AS text) IS NULL" in sql
+    assert "document_version_id = CAST(:document_version_id AS text)" in sql

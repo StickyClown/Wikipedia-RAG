@@ -8,6 +8,7 @@ import pytest
 
 import wikipediarag.api_app as api_app
 from wikipediarag.config import Settings
+from wikipediarag.observability import ModelGatewayError
 from wikipediarag.schemas import Evidence, RetrievalResult
 
 
@@ -125,6 +126,84 @@ def test_safe_failure_payload_preserves_stage_trace_and_chunk_ids() -> None:
     assert payload["trace_id"] == "trace"
     assert payload["retrieval"]["evidence"][0]["chunk_id"] == "c1"
     assert "content" not in payload["retrieval"]["evidence"][0]
+    assert payload["root_cause"]["code"] == "runtime_failure"
+    assert payload["answer_artifact"]["experimental"] is True
+    assert "secret document text" not in str(payload["answer_artifact"])
+
+
+def test_failure_stage_event_keeps_safe_model_metadata() -> None:
+    exc = ModelGatewayError(
+        "model gateway request failed",
+        metadata={
+            "operation": "chat",
+            "model_alias": "generator_main",
+            "latency_ms": 123,
+            "attempts": 3,
+            "retries": 2,
+            "safe_error_code": "provider_network_error",
+        },
+        cause=httpx.NetworkError("network down"),
+    )
+
+    payload = api_app._failure_stage_event(
+        exc,
+        stage="answer_generation",
+        last_successful_stage="retrieval",
+    )
+
+    assert payload["stage"] == "answer_generation"
+    assert payload["status"] == "failed"
+    assert payload["error"]["code"] == "provider_network_error"
+    assert payload["model_call"]["model_alias"] == "generator_main"
+    assert payload["model_call"]["attempts"] == 3
+    assert "provider_payload" not in payload
+    assert "prompt" not in payload
+
+
+def test_context_source_summary_groups_citations_by_subquery() -> None:
+    retrieval = RetrievalResult(
+        query="q",
+        trace_id="trace",
+        events=[],
+        evidence=[
+            Evidence(
+                evidence_id="S1",
+                chunk_id="c1",
+                title="A",
+                section_path=["A"],
+                content="alpha",
+                source_url="http://localhost/a",
+                metadata={"subquery_id": "sq.decomposition.1", "transform_id": "tr.decomposition.1"},
+            ),
+            Evidence(
+                evidence_id="S2",
+                chunk_id="c2",
+                title="B",
+                section_path=["B"],
+                content="beta",
+                source_url="http://localhost/b",
+                metadata={"subquery_id": "sq.decomposition.2", "transform_id": "tr.decomposition.1"},
+            ),
+        ],
+    )
+
+    summary = api_app._context_source_summary(retrieval, ["S2"])
+
+    assert summary == [
+        {
+            "subquery_id": "sq.decomposition.1",
+            "transform_id": "tr.decomposition.1",
+            "evidence_count": 1,
+            "citation_ids": [],
+        },
+        {
+            "subquery_id": "sq.decomposition.2",
+            "transform_id": "tr.decomposition.1",
+            "evidence_count": 1,
+            "citation_ids": ["S2"],
+        },
+    ]
+    assert "alpha" not in str(summary)
 
 
 def test_safe_validation_errors_do_not_echo_rejected_input() -> None:

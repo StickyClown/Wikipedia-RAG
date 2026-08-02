@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from wikipediarag.config import Settings, get_settings
+from wikipediarag.observability import ModelGatewayError, elapsed_ms, model_call_metadata, now_ms, safe_error_code
 
 MAX_PROVIDER_ATTEMPTS = 3
 TRANSIENT_PROVIDER_STATUS_CODES = {408, 429, 500, 502, 503, 504}
@@ -28,6 +29,8 @@ async def chat_completion(
         payload,
         timeout_seconds=120,
         max_attempts=max_provider_attempts,
+        operation="chat",
+        alias=alias,
     )
 
 
@@ -59,8 +62,12 @@ async def embeddings(
         f"{resolved.model_gateway_url.rstrip('/')}/v1/embeddings",
         request,
         timeout_seconds=150,
+        operation="embedding",
+        alias=alias,
     )
-    return [list(item["embedding"]) for item in payload["data"]], dict(payload.get("usage") or {})
+    usage = dict(payload.get("usage") or {})
+    usage["_gateway_metadata"] = dict(payload.get("_gateway_metadata") or {})
+    return [list(item["embedding"]) for item in payload["data"]], usage
 
 
 async def rerank(
@@ -76,6 +83,8 @@ async def rerank(
         f"{resolved.model_gateway_url.rstrip('/')}/v1/rerank",
         {"model": alias, "query": query, "documents": documents, "top_n": top_n or len(documents)},
         timeout_seconds=120,
+        operation="rerank",
+        alias=alias,
     )
 
 
@@ -85,20 +94,53 @@ async def _post_json(
     *,
     timeout_seconds: float,
     max_attempts: int = MAX_PROVIDER_ATTEMPTS,
+    operation: str,
+    alias: str,
 ) -> dict[str, Any]:
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
+    started = now_ms()
     for attempt in range(max_attempts):
         try:
             async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                 response = await client.post(url, json=payload)
             response.raise_for_status()
-            return dict(response.json())
-        except (httpx.NetworkError, httpx.TimeoutException):
+            result = dict(response.json())
+            result["_gateway_metadata"] = model_call_metadata(
+                operation=operation,
+                alias=alias,
+                payload=result,
+                latency_ms=elapsed_ms(started),
+                attempts=attempt + 1,
+            )
+            return result
+        except (httpx.NetworkError, httpx.TimeoutException) as exc:
             if attempt + 1 == max_attempts:
-                raise
+                raise ModelGatewayError(
+                    "model gateway request failed",
+                    metadata=model_call_metadata(
+                        operation=operation,
+                        alias=alias,
+                        payload=None,
+                        latency_ms=elapsed_ms(started),
+                        attempts=attempt + 1,
+                        safe_error_code=safe_error_code(exc),
+                    ),
+                    cause=exc,
+                ) from exc
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code not in TRANSIENT_PROVIDER_STATUS_CODES or attempt + 1 == max_attempts:
-                raise
+                raise ModelGatewayError(
+                    "model gateway request failed",
+                    metadata=model_call_metadata(
+                        operation=operation,
+                        alias=alias,
+                        payload=None,
+                        latency_ms=elapsed_ms(started),
+                        attempts=attempt + 1,
+                        safe_error_code=safe_error_code(exc),
+                    ),
+                    cause=exc,
+                ) from exc
         await asyncio.sleep(2**attempt)
     raise RuntimeError("unreachable provider retry state")
