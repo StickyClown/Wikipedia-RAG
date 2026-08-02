@@ -498,6 +498,92 @@ type DocumentSearchResponse = {
   has_more: boolean;
 };
 
+type ResearchRunSummary = {
+  id: string;
+  knowledge_base_id: string;
+  topic: string;
+  retrieval_profile: string;
+  status: string;
+  progress?: Record<string, unknown>;
+  stop_reason?: string | null;
+  error_code?: string | null;
+  active_job_id?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  completed_at?: string | null;
+};
+
+type ResearchQuestionRecord = {
+  id: string;
+  question: string;
+  ordinal: number;
+  kind: string;
+  status: string;
+};
+
+type ResearchCoverageRecord = {
+  id: string;
+  question_id: string;
+  status: string;
+  required_evidence_count: number;
+  linked_evidence_ids: string[];
+  reason: string;
+  metrics?: Record<string, unknown>;
+};
+
+type ResearchEvidenceRecord = {
+  id: string;
+  question_id?: string | null;
+  chunk_id: string;
+  document_id?: string | null;
+  evidence_ref: string;
+  title: string;
+  source_url: string;
+  section_path: string[];
+  content_abstract: string;
+  support_status: string;
+  score?: number | null;
+};
+
+type ResearchReflectionRecord = {
+  id: string;
+  episode_id?: string | null;
+  reflection_type: string;
+  body: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string | null;
+};
+
+type ResearchEpisodeRecord = {
+  id: string;
+  query_run_id?: string | null;
+  episode_index: number;
+  question_id?: string | null;
+  status: string;
+  stage: string;
+  context_summary?: Record<string, unknown>;
+  metrics?: Record<string, unknown>;
+};
+
+type ResearchRunDetail = {
+  run: ResearchRunSummary;
+  questions: ResearchQuestionRecord[];
+  coverage: ResearchCoverageRecord[];
+  evidence: ResearchEvidenceRecord[];
+  reflections: ResearchReflectionRecord[];
+  episodes: ResearchEpisodeRecord[];
+  final_report: {
+    markdown?: string;
+    coverage?: { covered: number; total: number };
+    latest_reflection?: string;
+    stop_reason?: string | null;
+  };
+};
+
+type ResearchRunListResponse = {
+  runs: ResearchRunSummary[];
+};
+
 export function App() {
   const [ready, setReady] = useState("checking");
   const [session, setSession] = useState<AuthSession>({
@@ -591,6 +677,14 @@ export function App() {
   const [viewerSearchBusy, setViewerSearchBusy] = useState(false);
   const [viewerAccessBusy, setViewerAccessBusy] = useState(false);
   const [viewerError, setViewerError] = useState("");
+  const [researchTopic, setResearchTopic] = useState(
+    "Сделай глубокое исследование по выбранной базе знаний",
+  );
+  const [researchRuns, setResearchRuns] = useState<ResearchRunSummary[]>([]);
+  const [researchDetail, setResearchDetail] =
+    useState<ResearchRunDetail | null>(null);
+  const [researchBusy, setResearchBusy] = useState(false);
+  const [researchError, setResearchError] = useState("");
 
   useEffect(() => {
     fetch(`${API_BASE}/ready`)
@@ -689,6 +783,31 @@ export function App() {
       cancelled = true;
     };
   }, [session.authenticated, selectedKnowledgeBaseId]);
+
+  useEffect(() => {
+    if (!session.authenticated) {
+      setResearchRuns([]);
+      setResearchDetail(null);
+      return;
+    }
+    let cancelled = false;
+    async function loadInitialResearchRuns() {
+      try {
+        const response = await fetch(`${API_BASE}/api/v1/research-runs`, {
+          credentials: "include",
+        });
+        if (!response.ok || cancelled) return;
+        const payload = (await response.json()) as ResearchRunListResponse;
+        if (!cancelled) setResearchRuns(payload.runs);
+      } catch {
+        if (!cancelled) setResearchRuns([]);
+      }
+    }
+    void loadInitialResearchRuns();
+    return () => {
+      cancelled = true;
+    };
+  }, [session.authenticated]);
 
   const imported = useMemo(() => job?.progress?.pages_imported ?? 0, [job]);
   const chunks = useMemo(() => job?.progress?.chunks_indexed ?? 0, [job]);
@@ -1116,6 +1235,115 @@ export function App() {
       setSearchError(error instanceof Error ? error.message : String(error));
     } finally {
       setSearchBusy(false);
+    }
+  }
+
+  async function loadResearchRuns() {
+    if (!session.authenticated) return;
+    setResearchError("");
+    try {
+      const response = await apiFetch("/api/v1/research-runs");
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as ResearchRunListResponse;
+      setResearchRuns(payload.runs);
+    } catch (error) {
+      setResearchError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function loadResearchRunDetail(runId: string) {
+    setResearchError("");
+    try {
+      const response = await apiFetch(
+        `/api/v1/research-runs/${encodeURIComponent(runId)}`,
+      );
+      if (!response.ok) throw new Error(await response.text());
+      const detail = (await response.json()) as ResearchRunDetail;
+      setResearchDetail(detail);
+      if (["received", "running"].includes(detail.run.status)) {
+        window.setTimeout(() => void loadResearchRunDetail(runId), 2000);
+      }
+    } catch (error) {
+      setResearchError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function submitResearchRun(event: FormEvent) {
+    event.preventDefault();
+    if (!researchTopic.trim() || !selectedKnowledgeBaseId) return;
+    setResearchBusy(true);
+    setResearchError("");
+    try {
+      const response = await apiFetch("/api/v1/research-runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          topic: researchTopic,
+          knowledge_base_id: selectedKnowledgeBaseId,
+          retrieval_profile: retrievalProfile,
+          retrieval_overrides: buildRetrievalOverrides({
+            bm25Enabled,
+            denseEnabled,
+            rerankEnabled,
+            fusionMode,
+            parentExpansion,
+            extendedSearchMode: "always",
+            topK: debugTopK,
+          }),
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const action = (await response.json()) as {
+        run_id: string;
+        job_id?: string | null;
+      };
+      await loadResearchRuns();
+      await loadResearchRunDetail(action.run_id);
+    } catch (error) {
+      setResearchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setResearchBusy(false);
+    }
+  }
+
+  async function researchRunAction(
+    runId: string,
+    action: "pause" | "resume" | "cancel",
+  ) {
+    setResearchBusy(true);
+    setResearchError("");
+    try {
+      const response = await apiFetch(
+        `/api/v1/research-runs/${encodeURIComponent(runId)}:${action}`,
+        { method: "POST" },
+      );
+      if (!response.ok) throw new Error(await response.text());
+      await loadResearchRuns();
+      await loadResearchRunDetail(runId);
+    } catch (error) {
+      setResearchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setResearchBusy(false);
+    }
+  }
+
+  async function openResearchDebugger(detail: ResearchRunDetail) {
+    setResearchError("");
+    try {
+      const latest = [...detail.episodes]
+        .reverse()
+        .find((episode) => episode.query_run_id);
+      if (!latest?.query_run_id) return;
+      setQueryRunId(latest.query_run_id);
+      const response = await apiFetch(
+        `/api/v1/query-runs/${latest.query_run_id}/retrieval`,
+      );
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      setDebuggerRun(data.run ?? null);
+      setEvents(data.events ?? []);
+    } catch (error) {
+      setResearchError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -2007,6 +2235,190 @@ export function App() {
                 }
               />
             )}
+          </section>
+
+          <section className="band research-panel">
+            <form className="research-create" onSubmit={submitResearchRun}>
+              <h2>
+                <Database size={18} /> Deep Research
+              </h2>
+              <textarea
+                value={researchTopic}
+                onChange={(event) => setResearchTopic(event.target.value)}
+                placeholder="Research topic for the selected knowledge base"
+              />
+              <div className="row">
+                <button
+                  type="submit"
+                  disabled={
+                    researchBusy ||
+                    !researchTopic.trim() ||
+                    !selectedKnowledgeBaseId
+                  }
+                >
+                  <Play size={16} /> Start research
+                </button>
+                <button type="button" onClick={loadResearchRuns}>
+                  <RotateCw size={16} /> Refresh
+                </button>
+                <span>
+                  Single KB:{" "}
+                  {knowledgeBases.find(
+                    (item) => item.id === selectedKnowledgeBaseId,
+                  )?.name ?? "not selected"}
+                </span>
+              </div>
+              {researchError && <p className="error">{researchError}</p>}
+            </form>
+
+            <div className="research-layout">
+              <div className="research-runs">
+                <h3>Runs</h3>
+                {researchRuns.length === 0 && <p>No research runs yet.</p>}
+                {researchRuns.map((run) => (
+                  <button
+                    type="button"
+                    key={run.id}
+                    className={
+                      researchDetail?.run.id === run.id ? "selected" : ""
+                    }
+                    onClick={() => void loadResearchRunDetail(run.id)}
+                  >
+                    <strong>{run.status}</strong>
+                    <span>{run.topic}</span>
+                    <code>{run.id.slice(0, 8)}</code>
+                  </button>
+                ))}
+              </div>
+
+              {researchDetail && (
+                <article className="research-detail">
+                  <div className="research-header">
+                    <div>
+                      <h3>{researchDetail.run.topic}</h3>
+                      <p>
+                        {researchDetail.run.status} ·{" "}
+                        {String(researchDetail.run.progress?.stage ?? "")}
+                      </p>
+                    </div>
+                    <div className="row">
+                      <button
+                        type="button"
+                        disabled={researchBusy}
+                        onClick={() =>
+                          void researchRunAction(researchDetail.run.id, "pause")
+                        }
+                      >
+                        Pause
+                      </button>
+                      <button
+                        type="button"
+                        disabled={researchBusy}
+                        onClick={() =>
+                          void researchRunAction(
+                            researchDetail.run.id,
+                            "resume",
+                          )
+                        }
+                      >
+                        Resume
+                      </button>
+                      <button
+                        type="button"
+                        disabled={researchBusy}
+                        onClick={() =>
+                          void researchRunAction(
+                            researchDetail.run.id,
+                            "cancel",
+                          )
+                        }
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        disabled={
+                          !researchDetail.episodes.some(
+                            (episode) => episode.query_run_id,
+                          )
+                        }
+                        onClick={() =>
+                          void openResearchDebugger(researchDetail)
+                        }
+                      >
+                        <Bug size={16} /> Debug
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="research-metrics">
+                    <span>
+                      Coverage{" "}
+                      {researchDetail.final_report.coverage?.covered ?? 0}/
+                      {researchDetail.final_report.coverage?.total ?? 0}
+                    </span>
+                    <span>{researchDetail.evidence.length} evidence</span>
+                    <span>{researchDetail.episodes.length} episodes</span>
+                  </div>
+
+                  <div className="research-columns">
+                    <section>
+                      <h4>Coverage</h4>
+                      {researchDetail.coverage.map((item) => {
+                        const question = researchDetail.questions.find(
+                          (row) => row.id === item.question_id,
+                        );
+                        return (
+                          <div className="research-card" key={item.id}>
+                            <strong>{item.status}</strong>
+                            <p>{question?.question ?? item.question_id}</p>
+                            <code>{item.reason}</code>
+                          </div>
+                        );
+                      })}
+                    </section>
+                    <section>
+                      <h4>Evidence Memory</h4>
+                      {researchDetail.evidence.slice(0, 8).map((item) => (
+                        <div className="research-card" key={item.id}>
+                          <strong>
+                            [{item.evidence_ref}] {item.title}
+                          </strong>
+                          <p>{item.content_abstract}</p>
+                          <a
+                            href={item.source_url}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Source
+                          </a>
+                        </div>
+                      ))}
+                    </section>
+                  </div>
+
+                  {researchDetail.reflections.length > 0 && (
+                    <section>
+                      <h4>Latest Reflection</h4>
+                      <p>
+                        {
+                          researchDetail.reflections[
+                            researchDetail.reflections.length - 1
+                          ].body
+                        }
+                      </p>
+                    </section>
+                  )}
+
+                  {researchDetail.final_report.markdown && (
+                    <section>
+                      <h4>Report</h4>
+                      <pre>{researchDetail.final_report.markdown}</pre>
+                    </section>
+                  )}
+                </article>
+              )}
+            </div>
           </section>
 
           <section className="band">

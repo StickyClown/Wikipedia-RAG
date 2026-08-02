@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from wikipediarag.db import SCHEMA_SQL
+from wikipediarag.schemas import ResearchRunStatus
 
 
 def test_auth_schema_tables_are_forward_only_ensure_schema_expansions() -> None:
@@ -31,3 +32,27 @@ def test_query_runs_and_audit_events_carry_scope_and_request_identity() -> None:
     assert "knowledge_base_id uuid NULL REFERENCES knowledge_bases(id)" in SCHEMA_SQL
     assert "request_id uuid NOT NULL" in SCHEMA_SQL
     assert "trace_id text NOT NULL" in SCHEMA_SQL
+
+
+def test_deep_research_schema_tracks_durable_lifecycle_and_typed_memory() -> None:
+    for table in (
+        "research_runs",
+        "research_episodes",
+        "research_questions",
+        "research_evidence_records",
+        "research_claim_records",
+        "research_coverage_records",
+        "research_reflections",
+    ):
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in SCHEMA_SQL
+
+    assert (
+        "status text NOT NULL CHECK (status IN ('received','running','paused','completed','failed','cancelled'))"
+        in SCHEMA_SQL
+    )
+    assert "context_policy jsonb NOT NULL DEFAULT '{}'" in SCHEMA_SQL
+    assert "final_report jsonb NOT NULL DEFAULT '{}'" in SCHEMA_SQL
+    assert "UNIQUE(research_run_id, chunk_id)" in SCHEMA_SQL
+    assert "UNIQUE(research_run_id, question_id)" in SCHEMA_SQL
+    assert "reflection_type text NOT NULL DEFAULT 'operational'" in SCHEMA_SQL
+    assert ResearchRunStatus.paused == "paused"

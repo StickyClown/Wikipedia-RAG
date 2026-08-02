@@ -192,8 +192,49 @@ sequenceDiagram
 
 Extended Search is implemented as single-KB in this slice. Multi-KB direct
 retrieval bypasses Extended Search. The persisted `agent_runs` ledger is a
-completed execution trace for diagnostics; it is not yet a resumable Deep
-Research run lifecycle with typed evidence memory and durable coverage records.
+completed execution trace for diagnostics; durable Deep Research uses separate
+`research_runs` and typed memory tables rather than treating `agent_runs` as a
+resumable lifecycle.
+
+## Deep Research V1
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as Web UI
+    participant API as API
+    participant DB as PostgreSQL
+    participant W as Worker
+    participant OS as OpenSearch
+    participant GW as Model Gateway
+
+    UI->>API: POST /api/v1/research-runs with topic and selected KB
+    API->>DB: Require VIEWER, validate active retrieval contract
+    API->>DB: Insert research_run, questions and deep_research ingestion_job
+    API-->>UI: run_id and job_id
+    W->>DB: Claim ingestion_job kind deep_research
+    loop One open question per episode
+        W->>DB: Create research_episode and query_run
+        W->>OS: Run Extended Search retrieval for the single KB
+        W->>GW: Use Model Gateway aliases through retrieval stack when configured
+        W->>DB: Persist retrieval_events on query_run
+        W->>DB: Upsert evidence, coverage, claim and reflection records
+        W->>DB: Complete episode and checkpoint run progress
+    end
+    W->>DB: Build final_report from typed visible evidence state
+    UI->>API: GET /api/v1/research-runs/{id}
+    API->>DB: Reapply current document ACL trimming
+    API-->>UI: Progress, coverage, evidence, reflections and report
+```
+
+Pause and cancel requests are cooperative. The API marks the run and active job
+as requested; the worker stops at an episode boundary and records the stop
+reason. Resume enqueues a new `deep_research` job that continues from open
+questions and existing typed memory.
+
+Failure boundary: missing KB role or incompatible active index fails before run
+creation. If the original run creator later loses `VIEWER`, worker execution
+fails safely and public reads remain limited to actors authorized on the run KB.
 
 ## Document Delete And Deferred Purge
 

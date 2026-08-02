@@ -1872,6 +1872,10 @@ async def process_job(job: dict[str, Any], settings: Settings | None = None) -> 
         await process_source_sync(job, settings)
     elif job["kind"] == "document_delete":
         await process_document_delete(job, settings)
+    elif job["kind"] == "deep_research":
+        from wikipediarag.deep_research import process_deep_research
+
+        await process_deep_research(job, settings)
     else:
         raise ValueError(f"unsupported ingestion job kind {job['kind']}")
 

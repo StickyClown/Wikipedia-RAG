@@ -11,7 +11,7 @@ Current project state and the next approved task are tracked in
 
 ## Main Capabilities
 
-- React/Vite web UI for login, knowledge-base selection, Wikipedia import, multi-file upload, chat and retrieval debugging.
+- React/Vite web UI for login, knowledge-base selection, Wikipedia import, multi-file upload, search, Deep Research, chat and retrieval debugging.
 - FastAPI API with local auth, OIDC foundation, opaque session cookies, CSRF and server-owned `ActorContext`.
 - Tenant and knowledge-base role enforcement for chat, debug search, uploads, imports, document reads, reprocess, deletion and sharing APIs.
 - Async Wikipedia import from local ZIM via Kiwix/libzim, with XML fallback for local regression paths.
@@ -19,6 +19,7 @@ Current project state and the next approved task are tracked in
 - Parser services for document formats: app-owned local adapters, Xberg default parser, Docling high-quality fallback and metadata-service language/date extraction.
 - Hybrid retrieval with BM25, dense vectors, RRF, rerank, parent expansion, answerability and citation validation.
 - Direct Multi-KB chat/debug retrieval with all-KB role and readiness checks; Extended Search remains single-KB.
+- Durable single-KB Deep Research V1 with worker episodes, typed evidence memory, coverage records, operational reflections, pause/resume/cancel and ACL-trimmed reports.
 - Local eval, document corpus verification, release-gate reports and cross-tenant hardening smoke commands.
 
 ## User Path
@@ -27,7 +28,8 @@ Current project state and the next approved task are tracked in
 2. Select an active knowledge base, or create one from the toolbar.
 3. Import a bounded Wikipedia ZIM subset or upload documents.
 4. Watch ingestion progress while the worker validates, parses and publishes chunks.
-5. Ask questions in chat, inspect cited sources, and open the retrieval debugger for a query run.
+5. Search documents, open exact chunks in the viewer, or start a Deep Research run for a selected KB.
+6. Ask questions in chat, inspect cited sources, and open the retrieval debugger for a query run.
 
 The current UI is a single screen, not a routed multi-page app. Details are in
 [docs/architecture/web.md](docs/architecture/web.md).
@@ -110,7 +112,7 @@ the active task or CI policy says otherwise.
 - [docs/architecture/data-and-storage.md](docs/architecture/data-and-storage.md) - data ownership, source-of-truth and backup boundaries.
 - [docs/architecture/flows.md](docs/architecture/flows.md) - login, upload, ingestion, retrieval, delete and readiness flows.
 - [docs/architecture/security-and-tenancy.md](docs/architecture/security-and-tenancy.md) - auth, roles, tenancy and access controls.
-- [docs/architecture/search-and-deep-research.md](docs/architecture/search-and-deep-research.md) - backend search, chat retrieval, Extended Search and future Deep Research contract.
+- [docs/architecture/search-and-deep-research.md](docs/architecture/search-and-deep-research.md) - backend search, chat retrieval, Extended Search and Deep Research contract.
 - [docs/architecture/deployment-and-operations.md](docs/architecture/deployment-and-operations.md) - local Compose and external deployment requirements.
 - [AGENTS.md](AGENTS.md) - long-lived instructions for coding agents.
 - [docs/exec-plans/](docs/exec-plans/) - historical implementation plans.

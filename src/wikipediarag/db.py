@@ -526,6 +526,140 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   completed_at timestamptz NULL
 );
 CREATE INDEX IF NOT EXISTS ix_agent_runs_tenant ON agent_runs(tenant_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_runs (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+  user_id uuid NULL REFERENCES users(id),
+  active_job_id uuid NULL REFERENCES ingestion_jobs(id),
+  topic text NOT NULL,
+  retrieval_profile text NOT NULL,
+  retrieval_overrides jsonb NOT NULL DEFAULT '{}',
+  status text NOT NULL CHECK (status IN ('received','running','paused','completed','failed','cancelled')),
+  progress jsonb NOT NULL DEFAULT '{}',
+  checkpoint jsonb NOT NULL DEFAULT '{}',
+  context_policy jsonb NOT NULL DEFAULT '{}',
+  final_report jsonb NOT NULL DEFAULT '{}',
+  stop_reason text NULL,
+  error_code text NULL,
+  error_message text NULL,
+  pause_requested boolean NOT NULL DEFAULT false,
+  cancel_requested boolean NOT NULL DEFAULT false,
+  started_at timestamptz NULL,
+  completed_at timestamptz NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_research_runs_tenant ON research_runs(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_research_runs_kb ON research_runs(tenant_id, knowledge_base_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_episodes (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  query_run_id uuid NULL REFERENCES query_runs(id),
+  episode_index int NOT NULL,
+  question_id uuid NULL,
+  status text NOT NULL CHECK (status IN ('received','running','completed','failed','cancelled')),
+  stage text NOT NULL DEFAULT 'received',
+  context_summary jsonb NOT NULL DEFAULT '{}',
+  metrics jsonb NOT NULL DEFAULT '{}',
+  error_code text NULL,
+  error_message text NULL,
+  started_at timestamptz NULL,
+  completed_at timestamptz NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(research_run_id, episode_index)
+);
+CREATE INDEX IF NOT EXISTS ix_research_episodes_run ON research_episodes(tenant_id, research_run_id, episode_index);
+
+CREATE TABLE IF NOT EXISTS research_questions (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  question text NOT NULL,
+  ordinal int NOT NULL,
+  kind text NOT NULL DEFAULT 'primary',
+  status text NOT NULL CHECK (status IN ('open','running','covered','partial','missing','conflicting')),
+  acceptance jsonb NOT NULL DEFAULT '{}',
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(research_run_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS ix_research_questions_run ON research_questions(tenant_id, research_run_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS research_evidence_records (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  question_id uuid NULL REFERENCES research_questions(id),
+  chunk_id text NOT NULL REFERENCES chunks(id),
+  document_id text NULL REFERENCES documents(id),
+  document_version_id text NULL REFERENCES document_versions(id),
+  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+  evidence_ref text NOT NULL,
+  title text NOT NULL,
+  source_url text NOT NULL,
+  section_path text[] NOT NULL DEFAULT ARRAY[]::text[],
+  content_abstract text NOT NULL,
+  support_status text NOT NULL CHECK (support_status IN ('supports','partial','contradicts','unknown')),
+  score double precision NULL,
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(research_run_id, chunk_id)
+);
+CREATE INDEX IF NOT EXISTS ix_research_evidence_run
+  ON research_evidence_records(tenant_id, research_run_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_research_evidence_chunk
+  ON research_evidence_records(tenant_id, chunk_id);
+
+CREATE TABLE IF NOT EXISTS research_claim_records (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  question_id uuid NULL REFERENCES research_questions(id),
+  claim_text text NOT NULL,
+  support_status text NOT NULL CHECK (support_status IN ('supported','partial','unsupported','conflicting')),
+  evidence_ids uuid[] NOT NULL DEFAULT ARRAY[]::uuid[],
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_research_claims_run ON research_claim_records(tenant_id, research_run_id, created_at);
+
+CREATE TABLE IF NOT EXISTS research_coverage_records (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  question_id uuid NOT NULL REFERENCES research_questions(id),
+  status text NOT NULL CHECK (status IN ('missing','partial','covered','conflicting')),
+  required_evidence_count int NOT NULL DEFAULT 1,
+  linked_evidence_ids uuid[] NOT NULL DEFAULT ARRAY[]::uuid[],
+  reason text NOT NULL,
+  metrics jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(research_run_id, question_id)
+);
+CREATE INDEX IF NOT EXISTS ix_research_coverage_run
+  ON research_coverage_records(tenant_id, research_run_id, status);
+
+CREATE TABLE IF NOT EXISTS research_reflections (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  episode_id uuid NULL REFERENCES research_episodes(id),
+  reflection_type text NOT NULL DEFAULT 'operational',
+  body text NOT NULL,
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_research_reflections_run
+  ON research_reflections(tenant_id, research_run_id, created_at DESC);
 """
 
 

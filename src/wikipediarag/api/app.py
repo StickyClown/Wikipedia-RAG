@@ -18,6 +18,7 @@ from wikipediarag.api.routers import (
     ingestion_jobs,
     knowledge_bases,
     query_runs,
+    research_runs,
     search,
     sources,
     uploads,
@@ -37,6 +38,7 @@ ROUTERS = (
     search.router,
     chat.router,
     query_runs.router,
+    research_runs.router,
 )
 
 

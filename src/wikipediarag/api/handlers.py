@@ -23,6 +23,7 @@ from wikipediarag.auth import (
     GroupType,
     KnowledgeBaseRole,
     PlatformRole,
+    has_kb_role,
     require_active_tenant,
     require_tenant_admin,
 )
@@ -47,6 +48,12 @@ from wikipediarag.auth_service import (
 )
 from wikipediarag.config import get_settings
 from wikipediarag.db import connect, ensure_schema
+from wikipediarag.deep_research import (
+    build_public_research_report,
+    build_research_questions,
+    context_policy_for_profile,
+    visible_research_evidence,
+)
 from wikipediarag.diagnostics import (
     build_answer_artifact,
     build_failure_artifact,
@@ -72,6 +79,8 @@ from wikipediarag.repository import (
     create_knowledge_source,
     create_query_run,
     create_reprocess_job,
+    create_research_resume_job,
+    create_research_run,
     create_source_sync_job,
     create_upload_batch,
     create_upload_session,
@@ -81,6 +90,7 @@ from wikipediarag.repository import (
     get_document_public,
     get_knowledge_base,
     get_knowledge_source,
+    get_research_run,
     get_source_sync_run_public,
     get_upload_batch_status,
     get_upload_session,
@@ -90,12 +100,16 @@ from wikipediarag.repository import (
     list_document_versions_public,
     list_knowledge_bases,
     list_knowledge_sources_public,
+    list_research_runs,
     list_source_active_document_refs,
     load_actor_document_access_scope,
     load_effective_knowledge_base_role,
     load_index_version_by_read_alias,
+    load_research_detail_records,
     load_retrieval_events,
     request_cancel,
+    request_research_cancel,
+    request_research_pause,
     request_resume,
     search_document_chunks,
     soft_delete_document,
@@ -136,6 +150,11 @@ from wikipediarag.schemas import (
     LocalPasswordChangeRequest,
     QueryRunEvaluationRequest,
     QueryRunFeedbackRequest,
+    ResearchRunActionResponse,
+    ResearchRunCreate,
+    ResearchRunDetail,
+    ResearchRunListResponse,
+    ResearchRunStatus,
     RetrievalResult,
     SearchRequest,
     SearchResponse,
@@ -2522,6 +2541,155 @@ async def query_run_evaluation(
     return {"query_run_id": query_run_id, "status": "recorded"}
 
 
+async def create_research_run_endpoint(payload: ResearchRunCreate, request: Request) -> ResearchRunActionResponse:
+    """Create a durable single-KB Deep Research run and enqueue worker execution."""
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    settings = get_settings()
+    request_id = _request_id(request)
+    kb_id = payload.knowledge_base_id or settings.default_kb_id
+    profile = get_retrieval_profile(payload.retrieval_profile, settings, payload.retrieval_overrides)
+    try:
+        async with connect() as conn:
+            await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
+            await validate_active_retrieval_contract(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                profile=profile,
+                retrieval_overrides=payload.retrieval_overrides,
+                settings=settings,
+            )
+            run_id, job_id = await create_research_run(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                user_id=actor.user_id,
+                topic=payload.topic,
+                retrieval_profile=profile.name,
+                retrieval_overrides=payload.retrieval_overrides,
+                context_policy=context_policy_for_profile(profile),
+                questions=build_research_questions(payload.topic),
+            )
+            await insert_audit_event(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                action="research_run.created",
+                target_type="research_run",
+                target_id=str(run_id),
+                outcome="success",
+                metadata={"knowledge_base_id": kb_id, "job_id": str(job_id)},
+            )
+    except KnowledgeBaseNotReady as exc:
+        raise _kb_not_ready_http(exc, request_id) from exc
+    return ResearchRunActionResponse(run_id=str(run_id), status=ResearchRunStatus.received, job_id=str(job_id))
+
+
+async def list_research_runs_endpoint(
+    request: Request, limit: Annotated[int, Query(ge=1, le=100)] = 50
+) -> ResearchRunListResponse:
+    """List research runs in the active tenant that are visible to the actor."""
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        rows = await list_research_runs(conn, tenant_id=tenant_id, limit=limit)
+        visible: list[dict[str, Any]] = []
+        for row in rows:
+            kb_role = await _load_kb_role_optional(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_id=str(row["knowledge_base_id"]),
+            )
+            is_creator = str(row.get("user_id") or "") == actor.user_id
+            if (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
+                kb_role, KnowledgeBaseRole.editor
+            ):
+                visible.append(_research_run_summary(row))
+    return ResearchRunListResponse.model_validate({"runs": _jsonable(visible)})
+
+
+async def get_research_run_endpoint(research_run_id: str, request: Request) -> ResearchRunDetail:
+    """Return a safe current-ACL view of a durable Deep Research run."""
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        run = await _load_research_run_or_404(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+        kb_role = await _authorize_research_run(conn, actor=actor, tenant_id=tenant_id, run=run, action="read")
+        access_scope = await load_actor_document_access_scope(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            knowledge_base_id=str(run["knowledge_base_id"]),
+            effective_kb_role=kb_role,
+        )
+        records = await load_research_detail_records(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+    detail = _research_detail(run, records=records, access_scope=access_scope)
+    return ResearchRunDetail.model_validate(_jsonable(detail))
+
+
+async def research_run_events(research_run_id: str, request: Request) -> dict[str, Any]:
+    """Return compact lifecycle events for a research run without raw source text."""
+    detail = await get_research_run_endpoint(research_run_id, request)
+    return {
+        "run_id": research_run_id,
+        "episodes": [item.model_dump(mode="json") for item in detail.episodes],
+        "coverage": [item.model_dump(mode="json") for item in detail.coverage],
+        "reflections": [item.model_dump(mode="json") for item in detail.reflections],
+    }
+
+
+async def pause_research_run(research_run_id: str, request: Request) -> ResearchRunActionResponse:
+    """Request pause; worker stops at the next episode boundary."""
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        run = await _load_research_run_or_404(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+        await _authorize_research_run(conn, actor=actor, tenant_id=tenant_id, run=run, action="control")
+        if str(run["status"]) in {"completed", "failed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="research run is already terminal")
+        await request_research_pause(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+    return ResearchRunActionResponse(
+        run_id=research_run_id,
+        status="pause_requested",
+        job_id=_optional_uuid(run, "active_job_id"),
+    )
+
+
+async def resume_research_run(research_run_id: str, request: Request) -> ResearchRunActionResponse:
+    """Resume a paused or failed research run by enqueueing a fresh worker job."""
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        run = await _load_research_run_or_404(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+        await _authorize_research_run(conn, actor=actor, tenant_id=tenant_id, run=run, action="control")
+        if str(run["status"]) in {"completed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="research run cannot be resumed")
+        job_id = await create_research_resume_job(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=str(run["knowledge_base_id"]),
+            research_run_id=research_run_id,
+        )
+    return ResearchRunActionResponse(run_id=research_run_id, status=ResearchRunStatus.received, job_id=str(job_id))
+
+
+async def cancel_research_run(research_run_id: str, request: Request) -> ResearchRunActionResponse:
+    """Request cancellation for a durable research run."""
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        run = await _load_research_run_or_404(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+        await _authorize_research_run(conn, actor=actor, tenant_id=tenant_id, run=run, action="control")
+        await request_research_cancel(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+    return ResearchRunActionResponse(
+        run_id=research_run_id,
+        status="cancel_requested",
+        job_id=_optional_uuid(run, "active_job_id"),
+    )
+
+
 async def run_debug_search(payload: DebugSearchRequest, request: Request) -> dict[str, Any]:
     """Run editor-only retrieval debugging and persist its diagnostic query run."""
     settings = get_settings()
@@ -3134,6 +3302,101 @@ def _query_run_summary(run: dict[str, Any]) -> dict[str, Any]:
         "completed_at": run.get("completed_at"),
         "created_at": run.get("created_at"),
     }
+
+
+def _research_run_summary(run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(run.get("id") or ""),
+        "knowledge_base_id": str(run.get("knowledge_base_id") or ""),
+        "user_id": str(run.get("user_id") or "") or None,
+        "topic": str(run.get("topic") or ""),
+        "retrieval_profile": str(run.get("retrieval_profile") or ""),
+        "status": str(run.get("status") or "received"),
+        "progress": run.get("progress") if isinstance(run.get("progress"), dict) else {},
+        "stop_reason": run.get("stop_reason"),
+        "error_code": run.get("error_code"),
+        "active_job_id": _optional_uuid(run, "active_job_id"),
+        "created_at": run.get("created_at"),
+        "updated_at": run.get("updated_at"),
+        "completed_at": run.get("completed_at"),
+    }
+
+
+async def _load_research_run_or_404(conn: Any, *, tenant_id: str, research_run_id: str) -> dict[str, Any]:
+    run = await get_research_run(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="research run not found")
+    return run
+
+
+async def _authorize_research_run(
+    conn: Any,
+    *,
+    actor: ActorContext,
+    tenant_id: str,
+    run: dict[str, Any],
+    action: str,
+) -> KnowledgeBaseRole:
+    kb_id = str(run["knowledge_base_id"])
+    kb_role = await _load_kb_role_optional(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id)
+    is_creator = str(run.get("user_id") or "") == actor.user_id
+    if action == "read":
+        if (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
+            kb_role, KnowledgeBaseRole.editor
+        ):
+            return cast(KnowledgeBaseRole, kb_role)
+    elif (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
+        kb_role, KnowledgeBaseRole.editor
+    ):
+        return cast(KnowledgeBaseRole, kb_role)
+    raise HTTPException(status_code=403, detail="research run access denied")
+
+
+def _research_detail(
+    run: dict[str, Any],
+    *,
+    records: dict[str, list[dict[str, Any]]],
+    access_scope: DocumentAccessScope,
+) -> dict[str, Any]:
+    evidence = visible_research_evidence(records["evidence"], access_scope)
+    visible_evidence_ids = {str(row.get("id")) for row in evidence}
+    claims = []
+    for row in records["claims"]:
+        evidence_ids = [str(item) for item in row.get("evidence_ids") or []]
+        if not evidence_ids or any(item in visible_evidence_ids for item in evidence_ids):
+            claims.append(row)
+    coverage = [
+        {
+            **row,
+            "linked_evidence_ids": [
+                str(item) for item in row.get("linked_evidence_ids") or [] if str(item) in visible_evidence_ids
+            ],
+        }
+        for row in records["coverage"]
+    ]
+    final_report = build_public_research_report(
+        run,
+        questions=records["questions"],
+        coverage=coverage,
+        evidence=evidence,
+        claims=claims,
+        reflections=records["reflections"],
+    )
+    return {
+        "run": _research_run_summary(run),
+        "questions": records["questions"],
+        "coverage": coverage,
+        "evidence": evidence,
+        "claims": claims,
+        "reflections": records["reflections"],
+        "episodes": records["episodes"],
+        "final_report": final_report,
+    }
+
+
+def _optional_uuid(row: dict[str, Any], key: str) -> str | None:
+    value = row.get(key)
+    return str(value) if value is not None else None
 
 
 async def _require_csrf(actor: ActorContext, csrf_token: str | None) -> None:

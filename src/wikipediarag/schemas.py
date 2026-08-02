@@ -231,6 +231,138 @@ class QueryRunEvaluationRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ResearchRunStatus(StrEnum):
+    received = "received"
+    running = "running"
+    paused = "paused"
+    completed = "completed"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class ResearchQuestionStatus(StrEnum):
+    open = "open"
+    running = "running"
+    covered = "covered"
+    partial = "partial"
+    missing = "missing"
+    conflicting = "conflicting"
+
+
+class ResearchRunCreate(BaseModel):
+    topic: str = Field(min_length=1, max_length=32000)
+    knowledge_base_id: str | None = None
+    retrieval_profile: str | None = Field(default=None, max_length=80)
+    retrieval_overrides: dict[str, Any] = Field(default_factory=dict)
+    client_request_id: str | None = Field(default=None, max_length=128)
+
+
+class ResearchRunSummary(BaseModel):
+    id: str
+    knowledge_base_id: str
+    user_id: str | None = None
+    topic: str
+    retrieval_profile: str
+    status: ResearchRunStatus
+    progress: dict[str, Any] = Field(default_factory=dict)
+    stop_reason: str | None = None
+    error_code: str | None = None
+    active_job_id: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class ResearchQuestionRecord(BaseModel):
+    id: str
+    question: str
+    ordinal: int
+    kind: str
+    status: ResearchQuestionStatus
+    acceptance: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchEvidenceRecord(BaseModel):
+    id: str
+    question_id: str | None = None
+    chunk_id: str
+    document_id: str | None = None
+    document_version_id: str | None = None
+    knowledge_base_id: str
+    evidence_ref: str
+    title: str
+    source_url: str
+    section_path: list[str] = Field(default_factory=list)
+    content_abstract: str
+    support_status: str
+    score: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchClaimRecord(BaseModel):
+    id: str
+    question_id: str | None = None
+    claim_text: str
+    support_status: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchCoverageRecord(BaseModel):
+    id: str
+    question_id: str
+    status: str
+    required_evidence_count: int
+    linked_evidence_ids: list[str] = Field(default_factory=list)
+    reason: str
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchReflectionRecord(BaseModel):
+    id: str
+    episode_id: str | None = None
+    reflection_type: str
+    body: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None
+
+
+class ResearchEpisodeRecord(BaseModel):
+    id: str
+    query_run_id: str | None = None
+    episode_index: int
+    question_id: str | None = None
+    status: str
+    stage: str
+    context_summary: dict[str, Any] = Field(default_factory=dict)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class ResearchRunDetail(BaseModel):
+    run: ResearchRunSummary
+    questions: list[ResearchQuestionRecord] = Field(default_factory=list)
+    coverage: list[ResearchCoverageRecord] = Field(default_factory=list)
+    evidence: list[ResearchEvidenceRecord] = Field(default_factory=list)
+    claims: list[ResearchClaimRecord] = Field(default_factory=list)
+    reflections: list[ResearchReflectionRecord] = Field(default_factory=list)
+    episodes: list[ResearchEpisodeRecord] = Field(default_factory=list)
+    final_report: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchRunListResponse(BaseModel):
+    runs: list[ResearchRunSummary] = Field(default_factory=list)
+
+
+class ResearchRunActionResponse(BaseModel):
+    run_id: str
+    status: ResearchRunStatus | str
+    job_id: str | None = None
+
+
 class ImportRequest(BaseModel):
     limit: int | None = Field(default=None, ge=1)
     xml_path: str | None = None

@@ -3194,6 +3194,658 @@ async def fail_query_run(conn: AsyncConnection, *, query_run_id: str, error_code
     )
 
 
+async def create_research_run(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    user_id: str,
+    topic: str,
+    retrieval_profile: str,
+    retrieval_overrides: dict[str, Any],
+    context_policy: dict[str, Any],
+    questions: list[str],
+) -> tuple[uuid.UUID, uuid.UUID]:
+    run_id = new_uuid()
+    job_id = new_uuid()
+    await conn.execute(
+        text(
+            """
+            INSERT INTO research_runs(
+              id, tenant_id, knowledge_base_id, user_id, active_job_id, topic, retrieval_profile,
+              retrieval_overrides, status, progress, checkpoint, context_policy
+            )
+            VALUES (
+              :id, :tenant_id, :kb_id, :user_id, :job_id, :topic, :profile,
+              CAST(:overrides AS jsonb), 'received', CAST(:progress AS jsonb),
+              CAST(:checkpoint AS jsonb), CAST(:context_policy AS jsonb)
+            )
+            """
+        ),
+        {
+            "id": str(run_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "user_id": user_id,
+            "job_id": str(job_id),
+            "topic": topic,
+            "profile": retrieval_profile,
+            "overrides": json_dumps(retrieval_overrides),
+            "progress": json_dumps({"stage": "received", "questions_total": len(questions)}),
+            "checkpoint": json_dumps({}),
+            "context_policy": json_dumps(context_policy),
+        },
+    )
+    for ordinal, question in enumerate(questions, start=1):
+        await conn.execute(
+            text(
+                """
+                INSERT INTO research_questions(
+                  id, tenant_id, research_run_id, question, ordinal, kind, status, acceptance, metadata
+                )
+                VALUES (
+                  :id, :tenant_id, :run_id, :question, :ordinal, :kind, 'open',
+                  CAST(:acceptance AS jsonb), CAST(:metadata AS jsonb)
+                )
+                """
+            ),
+            {
+                "id": str(new_uuid()),
+                "tenant_id": tenant_id,
+                "run_id": str(run_id),
+                "question": question,
+                "ordinal": ordinal,
+                "kind": "primary" if ordinal == 1 else "decomposition",
+                "acceptance": json_dumps({"requires_evidence": True}),
+                "metadata": json_dumps({}),
+            },
+        )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress)
+            VALUES (:id, :tenant_id, :kb_id, 'deep_research', 'received',
+                    CAST(:config AS jsonb), CAST(:progress AS jsonb))
+            """
+        ),
+        {
+            "id": str(job_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "config": json_dumps({"research_run_id": str(run_id)}),
+            "progress": json_dumps({"stage": "received", "research_run_id": str(run_id)}),
+        },
+    )
+    return run_id, job_id
+
+
+async def create_research_resume_job(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    research_run_id: str,
+) -> uuid.UUID:
+    existing = await conn.execute(
+        text(
+            """
+            SELECT id
+            FROM ingestion_jobs
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND kind = 'deep_research'
+              AND status IN ('received','running')
+              AND cancel_requested = false
+              AND config ->> 'research_run_id' = :run_id
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "run_id": research_run_id},
+    )
+    row = existing.mappings().first()
+    if row is not None:
+        return uuid.UUID(str(row["id"]))
+    job_id = new_uuid()
+    await conn.execute(
+        text(
+            """
+            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress)
+            VALUES (:id, :tenant_id, :kb_id, 'deep_research', 'received',
+                    CAST(:config AS jsonb), CAST(:progress AS jsonb))
+            """
+        ),
+        {
+            "id": str(job_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "config": json_dumps({"research_run_id": research_run_id}),
+            "progress": json_dumps({"stage": "resume_received", "research_run_id": research_run_id}),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE research_runs
+            SET active_job_id = :job_id,
+                status = 'received',
+                pause_requested = false,
+                cancel_requested = false,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND id = :run_id
+            """
+        ),
+        {"job_id": str(job_id), "tenant_id": tenant_id, "run_id": research_run_id},
+    )
+    return job_id
+
+
+async def list_research_runs(conn: AsyncConnection, *, tenant_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, tenant_id, knowledge_base_id, user_id, active_job_id, topic, retrieval_profile,
+                   status, progress, stop_reason, error_code, created_at, updated_at, completed_at
+            FROM research_runs
+            WHERE tenant_id = :tenant_id
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"tenant_id": tenant_id, "limit": limit},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def get_research_run(conn: AsyncConnection, *, tenant_id: str, research_run_id: str) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text("SELECT * FROM research_runs WHERE tenant_id = :tenant_id AND id = :id"),
+        {"tenant_id": tenant_id, "id": research_run_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def load_research_run_questions(
+    conn: AsyncConnection, *, tenant_id: str, research_run_id: str
+) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, question, ordinal, kind, status, acceptance, metadata, created_at, updated_at
+            FROM research_questions
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY ordinal
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def load_next_research_question(
+    conn: AsyncConnection, *, tenant_id: str, research_run_id: str
+) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text(
+            """
+            SELECT *
+            FROM research_questions
+            WHERE tenant_id = :tenant_id
+              AND research_run_id = :run_id
+              AND status IN ('open','running')
+            ORDER BY ordinal
+            LIMIT 1
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def update_research_run(
+    conn: AsyncConnection,
+    *,
+    research_run_id: str,
+    status: str | None = None,
+    progress: dict[str, Any] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+    final_report: dict[str, Any] | None = None,
+    stop_reason: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    pause_requested: bool | None = None,
+    cancel_requested: bool | None = None,
+) -> None:
+    assignments = ["updated_at = now()"]
+    params: dict[str, Any] = {"id": research_run_id}
+    if status is not None:
+        assignments.append("status = :status")
+        params["status"] = status
+        if status == "running":
+            assignments.append("started_at = COALESCE(started_at, now())")
+        if status in {"completed", "failed", "cancelled"}:
+            assignments.append("completed_at = now()")
+    for key, value in {
+        "progress": progress,
+        "checkpoint": checkpoint,
+        "final_report": final_report,
+    }.items():
+        if value is not None:
+            assignments.append(f"{key} = CAST(:{key} AS jsonb)")
+            params[key] = json_dumps(value)
+    if stop_reason is not None:
+        assignments.append("stop_reason = :stop_reason")
+        params["stop_reason"] = stop_reason[:120]
+    if error_code is not None:
+        assignments.append("error_code = :error_code")
+        params["error_code"] = error_code[:120]
+    if error_message is not None:
+        assignments.append("error_message = :error_message")
+        params["error_message"] = error_message[:1000]
+    if pause_requested is not None:
+        assignments.append("pause_requested = :pause_requested")
+        params["pause_requested"] = pause_requested
+    if cancel_requested is not None:
+        assignments.append("cancel_requested = :cancel_requested")
+        params["cancel_requested"] = cancel_requested
+    await conn.execute(
+        text(f"UPDATE research_runs SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
+        params,
+    )
+
+
+async def request_research_pause(conn: AsyncConnection, *, tenant_id: str, research_run_id: str) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE research_runs
+            SET pause_requested = true, updated_at = now()
+            WHERE tenant_id = :tenant_id AND id = :id AND status IN ('received','running')
+            """
+        ),
+        {"tenant_id": tenant_id, "id": research_run_id},
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE ingestion_jobs
+            SET cancel_requested = true, updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND kind = 'deep_research'
+              AND status IN ('received','running')
+              AND config ->> 'research_run_id' = :id
+            """
+        ),
+        {"tenant_id": tenant_id, "id": research_run_id},
+    )
+
+
+async def request_research_cancel(conn: AsyncConnection, *, tenant_id: str, research_run_id: str) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE research_runs
+            SET cancel_requested = true, pause_requested = false, updated_at = now()
+            WHERE tenant_id = :tenant_id AND id = :id
+            """
+        ),
+        {"tenant_id": tenant_id, "id": research_run_id},
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE ingestion_jobs
+            SET cancel_requested = true, updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND kind = 'deep_research'
+              AND status IN ('received','running')
+              AND config ->> 'research_run_id' = :id
+            """
+        ),
+        {"tenant_id": tenant_id, "id": research_run_id},
+    )
+
+
+async def create_research_episode(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    episode_index: int,
+    question_id: str | None,
+    query_run_id: str | None,
+    context_summary: dict[str, Any],
+) -> uuid.UUID:
+    episode_id = new_uuid()
+    await conn.execute(
+        text(
+            """
+            INSERT INTO research_episodes(
+              id, tenant_id, research_run_id, query_run_id, episode_index, question_id,
+              status, stage, context_summary, started_at
+            )
+            VALUES (
+              :id, :tenant_id, :run_id, :query_run_id, :episode_index, :question_id,
+              'running', 'retrieval', CAST(:context_summary AS jsonb), now()
+            )
+            """
+        ),
+        {
+            "id": str(episode_id),
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "query_run_id": query_run_id,
+            "episode_index": episode_index,
+            "question_id": question_id,
+            "context_summary": json_dumps(context_summary),
+        },
+    )
+    if question_id is not None:
+        await conn.execute(
+            text(
+                """
+                UPDATE research_questions
+                SET status = 'running', updated_at = now()
+                WHERE tenant_id = :tenant_id AND research_run_id = :run_id AND id = :question_id
+                """
+            ),
+            {"tenant_id": tenant_id, "run_id": research_run_id, "question_id": question_id},
+        )
+    return episode_id
+
+
+async def update_research_episode(
+    conn: AsyncConnection,
+    *,
+    episode_id: str,
+    status: str,
+    stage: str,
+    metrics: dict[str, Any] | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE research_episodes
+            SET status = :status,
+                stage = :stage,
+                metrics = CASE WHEN CAST(:metrics AS jsonb) = '{}'::jsonb THEN metrics ELSE CAST(:metrics AS jsonb) END,
+                error_code = :error_code,
+                error_message = :error_message,
+                completed_at = CASE WHEN :status IN ('completed','failed','cancelled') THEN now() ELSE completed_at END,
+                updated_at = now()
+            WHERE id = :id
+            """
+        ),
+        {
+            "id": episode_id,
+            "status": status,
+            "stage": stage,
+            "metrics": json_dumps(metrics or {}),
+            "error_code": error_code,
+            "error_message": error_message[:1000] if error_message else None,
+        },
+    )
+
+
+async def upsert_research_evidence_record(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    question_id: str | None,
+    chunk_id: str,
+    document_id: str | None,
+    document_version_id: str | None,
+    knowledge_base_id: str,
+    evidence_ref: str,
+    title: str,
+    source_url: str,
+    section_path: list[str],
+    content_abstract: str,
+    support_status: str,
+    score: float | None,
+    metadata: dict[str, Any],
+) -> uuid.UUID:
+    record_id = stable_uuid([research_run_id, chunk_id])
+    await conn.execute(
+        text(
+            """
+            INSERT INTO research_evidence_records(
+              id, tenant_id, research_run_id, question_id, chunk_id, document_id, document_version_id,
+              knowledge_base_id, evidence_ref, title, source_url, section_path, content_abstract,
+              support_status, score, metadata
+            )
+            VALUES (
+              :id, :tenant_id, :run_id, :question_id, :chunk_id, :document_id, :document_version_id,
+              :kb_id, :evidence_ref, :title, :source_url, :section_path, :abstract,
+              :support_status, :score, CAST(:metadata AS jsonb)
+            )
+            ON CONFLICT (research_run_id, chunk_id) DO UPDATE
+            SET question_id = COALESCE(research_evidence_records.question_id, EXCLUDED.question_id),
+                evidence_ref = EXCLUDED.evidence_ref,
+                title = EXCLUDED.title,
+                source_url = EXCLUDED.source_url,
+                section_path = EXCLUDED.section_path,
+                content_abstract = EXCLUDED.content_abstract,
+                support_status = EXCLUDED.support_status,
+                score = EXCLUDED.score,
+                metadata = EXCLUDED.metadata,
+                updated_at = now()
+            """
+        ),
+        {
+            "id": str(record_id),
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "question_id": question_id,
+            "chunk_id": chunk_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+            "kb_id": knowledge_base_id,
+            "evidence_ref": evidence_ref,
+            "title": title,
+            "source_url": source_url,
+            "section_path": section_path,
+            "abstract": content_abstract,
+            "support_status": support_status,
+            "score": score,
+            "metadata": json_dumps(metadata),
+        },
+    )
+    return record_id
+
+
+async def insert_research_claim_record(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    question_id: str | None,
+    claim_text: str,
+    support_status: str,
+    evidence_ids: list[str],
+    metadata: dict[str, Any],
+) -> uuid.UUID:
+    claim_id = stable_uuid([research_run_id, question_id or "", claim_text])
+    await conn.execute(
+        text(
+            """
+            INSERT INTO research_claim_records(
+              id, tenant_id, research_run_id, question_id, claim_text, support_status, evidence_ids, metadata
+            )
+            VALUES (
+              :id, :tenant_id, :run_id, :question_id, :claim_text, :support_status,
+              CAST(:evidence_ids AS uuid[]), CAST(:metadata AS jsonb)
+            )
+            ON CONFLICT (id) DO UPDATE
+            SET support_status = EXCLUDED.support_status,
+                evidence_ids = EXCLUDED.evidence_ids,
+                metadata = EXCLUDED.metadata,
+                updated_at = now()
+            """
+        ),
+        {
+            "id": str(claim_id),
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "question_id": question_id,
+            "claim_text": claim_text,
+            "support_status": support_status,
+            "evidence_ids": evidence_ids,
+            "metadata": json_dumps(metadata),
+        },
+    )
+    return claim_id
+
+
+async def upsert_research_coverage_record(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    question_id: str,
+    status: str,
+    required_evidence_count: int,
+    linked_evidence_ids: list[str],
+    reason: str,
+    metrics: dict[str, Any],
+) -> uuid.UUID:
+    coverage_id = stable_uuid([research_run_id, question_id, "coverage"])
+    await conn.execute(
+        text(
+            """
+            INSERT INTO research_coverage_records(
+              id, tenant_id, research_run_id, question_id, status, required_evidence_count,
+              linked_evidence_ids, reason, metrics
+            )
+            VALUES (
+              :id, :tenant_id, :run_id, :question_id, :status, :required_count,
+              CAST(:evidence_ids AS uuid[]), :reason, CAST(:metrics AS jsonb)
+            )
+            ON CONFLICT (research_run_id, question_id) DO UPDATE
+            SET status = EXCLUDED.status,
+                required_evidence_count = EXCLUDED.required_evidence_count,
+                linked_evidence_ids = EXCLUDED.linked_evidence_ids,
+                reason = EXCLUDED.reason,
+                metrics = EXCLUDED.metrics,
+                updated_at = now()
+            """
+        ),
+        {
+            "id": str(coverage_id),
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "question_id": question_id,
+            "status": status,
+            "required_count": required_evidence_count,
+            "evidence_ids": linked_evidence_ids,
+            "reason": reason,
+            "metrics": json_dumps(metrics),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE research_questions
+            SET status = :status, updated_at = now()
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id AND id = :question_id
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id, "question_id": question_id, "status": status},
+    )
+    return coverage_id
+
+
+async def insert_research_reflection(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    episode_id: str | None,
+    body: str,
+    metadata: dict[str, Any],
+    reflection_type: str = "operational",
+) -> uuid.UUID:
+    reflection_id = new_uuid()
+    await conn.execute(
+        text(
+            """
+            INSERT INTO research_reflections(
+              id, tenant_id, research_run_id, episode_id, reflection_type, body, metadata
+            )
+            VALUES (
+              :id, :tenant_id, :run_id, :episode_id, :reflection_type, :body, CAST(:metadata AS jsonb)
+            )
+            """
+        ),
+        {
+            "id": str(reflection_id),
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "episode_id": episode_id,
+            "reflection_type": reflection_type,
+            "body": body,
+            "metadata": json_dumps(metadata),
+        },
+    )
+    return reflection_id
+
+
+async def load_research_detail_records(
+    conn: AsyncConnection, *, tenant_id: str, research_run_id: str
+) -> dict[str, list[dict[str, Any]]]:
+    queries = {
+        "questions": """
+            SELECT id, question, ordinal, kind, status, acceptance, metadata
+            FROM research_questions
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY ordinal
+        """,
+        "episodes": """
+            SELECT id, query_run_id, episode_index, question_id, status, stage, context_summary,
+                   metrics, error_code, created_at, completed_at
+            FROM research_episodes
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY episode_index
+        """,
+        "evidence": """
+            SELECT id, question_id, chunk_id, document_id, document_version_id, knowledge_base_id,
+                   evidence_ref, title, source_url, section_path, content_abstract, support_status,
+                   score, metadata
+            FROM research_evidence_records
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY created_at, evidence_ref
+        """,
+        "claims": """
+            SELECT id, question_id, claim_text, support_status, evidence_ids, metadata
+            FROM research_claim_records
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY created_at
+        """,
+        "coverage": """
+            SELECT id, question_id, status, required_evidence_count, linked_evidence_ids, reason, metrics
+            FROM research_coverage_records
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY created_at
+        """,
+        "reflections": """
+            SELECT id, episode_id, reflection_type, body, metadata, created_at
+            FROM research_reflections
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY created_at
+        """,
+    }
+    records: dict[str, list[dict[str, Any]]] = {}
+    for key, sql in queries.items():
+        result = await conn.execute(text(sql), {"tenant_id": tenant_id, "run_id": research_run_id})
+        records[key] = [dict(row) for row in result.mappings()]
+    return records
+
+
 async def list_knowledge_bases(conn: AsyncConnection, tenant_id: str) -> list[dict[str, Any]]:
     result = await conn.execute(
         text(

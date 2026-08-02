@@ -1,8 +1,8 @@
 # Search And Deep Research Backend
 
 This document is the backend and product contract for ordinary search, debug
-search, chat retrieval, the current Extended Search harness and the planned
-durable Deep Research capability. It describes implemented behavior first, then
+search, chat retrieval, the current Extended Search harness and durable Deep
+Research V1. It describes implemented behavior first, then
 calls out limits and planned work.
 
 Active project state remains in [../STATUS.md](../STATUS.md). This document is
@@ -12,7 +12,7 @@ not an implementation plan for new retrieval algorithms.
 
 Use this document when deciding whether a backend change preserves the search
 contract, when explaining search behavior to product stakeholders, or when
-reviewing future Deep Research work.
+reviewing Deep Research changes.
 
 The document covers:
 
@@ -20,8 +20,7 @@ The document covers:
 - how the backend selects, retrieves, ranks and validates evidence;
 - which authorization and tenancy rules are required for every retrieval path;
 - what Extended Search can do now;
-- what durable Deep Research must add later before it can be treated as a
-  long-running research workflow.
+- what durable Deep Research V1 does now and what remains outside its scope.
 
 ## Current Capabilities
 
@@ -33,6 +32,7 @@ The document covers:
 | Query-run retrieval | `GET /api/v1/query-runs/{query_run_id}/retrieval` | `EDITOR` for the query-run KB scope | Returns stored retrieval events and a safe query-run summary. |
 | Query-run feedback | `POST /api/v1/query-runs/{query_run_id}/feedback` | `EDITOR` for the query-run KB scope | Appends sanitized user feedback as a retrieval event. |
 | Query-run evaluation | `POST /api/v1/query-runs/{query_run_id}/evaluation` | `EDITOR` for the query-run KB scope | Appends sanitized evaluator scores and reason codes as a retrieval event. |
+| Deep Research V1 | `POST/GET /api/v1/research-runs` and run action paths | Run creator with `VIEWER`, or `EDITOR` on the run KB | Creates durable single-KB research runs, executes bounded episodes through worker jobs, persists typed evidence/coverage/reflection records and returns an ACL-trimmed final report. |
 
 All retrieval paths are tenant-scoped by the API. The browser never supplies
 trusted `tenant_id`; the API resolves it from `ActorContext`.
@@ -247,30 +247,90 @@ What Extended Search cannot do today:
 - guarantee complete coverage for broad research topics;
 - replace document-level authorization controls.
 
-## Future Deep Research
+## Durable Deep Research V1
 
-Durable Deep Research is planned work. It should build on the current retrieval,
-query-run observability and Extended Search foundations, but it must not be
-described as implemented until it has its own durable lifecycle.
+Durable Deep Research V1 is implemented as a bounded single-KB research
+lifecycle. It deliberately reuses the existing retrieval stack instead of
+adding a large multi-agent runtime.
 
-Required future capabilities:
+API surface:
 
-- create a durable research run with status, owner, tenant, KB scope and
-  request metadata;
-- split a broad topic into typed research questions and subquestions;
-- maintain typed evidence memory with source, chunk, claim, coverage and
-  contradiction records;
-- persist coverage records separately from transient retrieval events;
-- support stop, resume and failure recovery;
-- preserve document-level ACL/security trimming before using mixed-permission
-  sources inside one KB;
-- produce a final report only from verified and authorized evidence;
-- expose progress, budgets, stop reasons and safe error states to clients;
-- define eval gates for coverage, citation precision, unsupported claims,
-  latency and access-control safety.
+- `POST /api/v1/research-runs`: create a run and enqueue an
+  `ingestion_jobs.kind='deep_research'` worker job.
+- `GET /api/v1/research-runs`: list visible runs in the active tenant.
+- `GET /api/v1/research-runs/{research_run_id}`: return the current
+  ACL-trimmed detail view.
+- `GET /api/v1/research-runs/{research_run_id}/events`: return compact
+  episodes, coverage and reflections.
+- `POST /api/v1/research-runs/{research_run_id}:pause`: request pause at the
+  next episode boundary.
+- `POST /api/v1/research-runs/{research_run_id}:resume`: enqueue a fresh
+  worker job for a paused or failed run.
+- `POST /api/v1/research-runs/{research_run_id}:cancel`: request cancellation.
 
-Until those capabilities exist, backend behavior should be called Extended
-Search, not durable Deep Research.
+Persistent state:
+
+- `research_runs`: owner, tenant, single KB, profile, retrieval overrides,
+  lifecycle status, checkpoint/progress, context policy and final report.
+- `research_questions`: deterministic bounded question decomposition.
+- `research_episodes`: one resumable episode per processed question, linked to
+  the `query_run_id` created for retrieval debugger compatibility.
+- `research_evidence_records`: deduplicated typed evidence memory by
+  `(research_run_id, chunk_id)`.
+- `research_claim_records`: minimal deterministic claim records linked to
+  evidence ids.
+- `research_coverage_records`: durable coverage state per question.
+- `research_reflections`: short operational notes that guide the next step but
+  are not treated as factual evidence.
+
+Execution model:
+
+1. The API resolves the actor, active tenant and single KB scope server-side.
+2. The API validates `VIEWER` access and active retrieval contract, then stores
+   a context policy derived from the retrieval profile's declared
+   `max_context_tokens`.
+3. The worker claims a normal PostgreSQL ingestion job and processes one open
+   research question per episode.
+4. Each episode creates a `query_runs` row with mode `deep_research`, invokes
+   Extended Search with the run profile/overrides and persists the linked
+   retrieval events.
+5. Episode output is compacted into evidence records, coverage records, a
+   minimal claim and an operational reflection.
+6. The worker checkpoints after every episode and rebuilds the public final
+   report from visible evidence, coverage, claims and reflections.
+
+Context strategy:
+
+- `productive_target = 45%`, `soft_limit = 55%`,
+  `hard_input_limit = 70%`, `output_reserve = 15%` and
+  `safety_reserve = 15%` of the declared profile context.
+- The packer builds only a current episode envelope: immutable rules, current
+  question, compact run progress, selected coverage gaps, compact evidence
+  abstracts and the latest operational reflection.
+- Full retrieval traces, retrieval event payloads, raw document chunks and
+  draft reports are not packed into the model context.
+- If the envelope exceeds the soft limit, older reflections are removed first,
+  then lower-value evidence abstracts are trimmed.
+- If the envelope remains above the hard input limit, the episode records a
+  compact over-budget signal and later work must compact or narrow evidence
+  breadth before generation-heavy use.
+
+Current Deep Research V1 limits:
+
+- single KB only;
+- no web browsing;
+- no GraphRAG, proposition index, ColBERT or learned sparse retrieval;
+- no multi-agent role swarm or self-optimizing prompt loop;
+- deterministic question splitting, evidence abstracts, claims and final
+  report synthesis;
+- contrarian/counter-evidence is represented through `conflicting` coverage
+  state, not as an always-on extra episode policy;
+- quality defaults still need fixture-based experiments before being treated as
+  tuned.
+
+Future work should focus on research quality fixtures, context packing
+experiments, runtime smoke coverage, richer claim verification and measured
+latency/coverage tradeoffs before adding broader orchestration.
 
 ## Security And Tenancy
 
@@ -283,6 +343,9 @@ Search and chat security rules:
   not trusted.
 - Ordinary search and chat require `VIEWER` on every requested KB.
 - Debug search and query-run retrieval require `EDITOR` on every query-run KB.
+- Deep Research creation requires `VIEWER` on the selected KB. Run reads and
+  controls are allowed for the run creator while they keep `VIEWER`, or any
+  actor with `EDITOR` on the run KB.
 - Tenant and KB filters are applied server-side for BM25, dense retrieval,
   delete and debug paths.
 - Unsafe cookie-authenticated requests require CSRF unless running in explicit
@@ -322,7 +385,7 @@ The backend is not expected to satisfy these requirements yet:
 - source-specific external ACL engines beyond the minimal trusted
   `document_access` metadata contract;
 - Multi-KB Extended Search;
-- resumable Deep Research;
+- Multi-KB Deep Research and tuned research quality gates;
 - production external deployment guarantees;
 - full dependency readiness checks for Redis/Valkey, MinIO and OpenSearch from
   API `/ready`;

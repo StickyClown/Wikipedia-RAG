@@ -19,14 +19,17 @@
 - поиск по нескольким базам знаний;
 - проверка цитат;
 - журнал шагов поиска;
-- экран отладки поиска.
+- экран отладки поиска;
 - обычный поиск через hybrid retrieval pipeline;
 - навигация по загруженным документам: оглавление, поиск внутри документа и контекст соседних фрагментов;
 - основы подключения внешних источников: source records, sync runs, changed/deleted source document handling и Stage 4 connector contract.
+- durable Deep Research V1: single-KB research runs, typed evidence memory,
+  coverage records, operational reflections, pause/resume/cancel и compact UI.
 
-Следующий approved task - durable Deep Research: управляемые research runs,
-typed evidence memory и coverage records. Минимальный document-level
-ACL/security trimming уже реализован поверх trusted `metadata.document_access`:
+Следующий Pareto-инкремент после Deep Research V1 - runtime smoke и
+исследовательские quality/context experiments для выбора дефолтов packing
+policy без ухудшения безопасности. Минимальный document-level ACL/security
+trimming уже реализован поверх trusted `metadata.document_access`:
 обычные документы остаются KB-visible, restricted-документы видят только
 админы/KB managers/owners или явно разрешённые users/groups.
 
@@ -133,6 +136,11 @@ trusted source sync metadata может.
 
 ## Этап 7. Сохранять путь к ответу
 
+Статус: реализовано V1. `query_runs`/`retrieval_events` сохраняют trace для
+чата, debug и Deep Research episode retrieval; `research_evidence_records`,
+`research_claim_records` и `research_coverage_records` сохраняют типизированную
+память и покрытие на уровне durable research run.
+
 Что сделать:
 
 - хранить не только итоговый ответ, но и то, как он был получен;
@@ -146,6 +154,12 @@ trusted source sync metadata может.
 - ответы можно будет проверять, сравнивать и разбирать без повторного запуска вопроса.
 
 ## Этап 8. Добавить глубокое исследование
+
+Статус: реализовано V1 как single-KB durable lifecycle. Runs создаются через
+`/api/v1/research-runs`, исполняются worker job `deep_research`, чекпойнтятся
+после каждого episode, поддерживают pause/resume/cancel и показываются в
+компактной UI-панели. Multi-KB, web browsing, meta-loop и тяжелый multi-agent
+runtime не входят в V1.
 
 Что сделать:
 
@@ -161,6 +175,11 @@ trusted source sync metadata может.
 - проект сможет готовить исследовательские отчёты, а не только короткие ответы.
 
 ## Этап 9. Улучшить проверки качества
+
+Статус: следующий фокус. Нужны fixtures и короткие эксперименты по context
+target ratios, raw/abstract evidence packing, episode granularity, reflection
+policy и contrarian policy перед тем, как считать текущие Deep Research
+дефолты оптимальными.
 
 Что сделать:
 

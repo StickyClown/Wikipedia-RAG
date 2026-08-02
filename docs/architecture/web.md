@@ -12,6 +12,10 @@ screen. No frontend router was found.
 - Upload: multi-file picker, batch upload status, per-file progress, retry for failed ingestion jobs and public metadata for the first completed document.
 - Search: ordinary viewer-scoped search with metadata filters, result snippets and a document viewer open action.
 - Document viewer: inline text viewer opened from search results, with document TOC, in-document search and chunk/section context.
+- Deep Research: compact single-KB research panel for starting durable runs,
+  listing runs, reading progress/coverage/evidence/reflections/report and
+  pausing, resuming, cancelling or opening the latest episode in the retrieval
+  debugger.
 - Chat: question input, mode selector, retrieval profile and advanced retrieval override controls.
 - Answer and sources: generated answer plus cited evidence returned by chat SSE events.
 - Retrieval Debugger: query-run retrieval events loaded after a chat run.
@@ -66,6 +70,28 @@ Handled chat events in the UI:
 Other SSE events are emitted by the backend but are not rendered by the current
 UI.
 
+## Deep Research Panel
+
+The Deep Research panel uses the selected primary KB, current retrieval profile
+and current retrieval override controls. Starting a run calls
+`POST /api/v1/research-runs`; listing/detail calls use
+`GET /api/v1/research-runs` and `GET /api/v1/research-runs/{id}`.
+
+The panel renders:
+
+- run status and compact progress stage;
+- coverage count and per-question coverage records;
+- the first visible evidence memory records;
+- latest operational reflection;
+- final report markdown when available;
+- pause/resume/cancel action buttons;
+- debugger shortcut that loads the newest episode `query_run_id` through the
+  existing query-run retrieval endpoint.
+
+Research status polling is lightweight client-side polling while a selected run
+is `received` or `running`; the backend remains the source of truth for
+pause/resume/cancel.
+
 ## Upload And Ingestion Progress
 
 The UI accepts multiple files, computes SHA-256 with `crypto.subtle.digest`,
@@ -103,8 +129,8 @@ actor and active document.
 State is held in React `useState` and `useMemo`. Confirmed state includes
 session, KB list, selected KB ids, import job, question, retrieval settings,
 answer, evidence, query run id, retrieval events, upload batch, upload items,
-upload document metadata, ordinary search results, document viewer state and
-errors.
+upload document metadata, ordinary search results, document viewer state,
+research runs, selected research detail and errors.
 
 No `localStorage`, `sessionStorage` or IndexedDB usage was found in the UI.
 Selected files exist only as browser `File` objects during the upload function.
@@ -150,6 +176,7 @@ Direct presigned MinIO `PUT` calls do not use the app API cookie or CSRF token.
 | Ordinary search | Search form | `POST /api/v1/search` with selected KB scope and filters | `searchResults`, `searchHasMore` | Response text in `searchError` |
 | Open document hit | Search result button | `GET /api/v1/documents/{document_id}/structure`, then context by `chunk_id` | `viewerStructure`, `viewerContext` | Response text in `viewerError` |
 | Search inside document | Document viewer form | `POST /api/v1/documents/{document_id}/search` | `viewerSearchResults` | Response text in `viewerError` |
+| Deep Research | Deep Research panel | `POST/GET /api/v1/research-runs`, action endpoints and latest episode debugger lookup | `researchRuns`, `researchDetail`, `researchError` | Response text in `researchError` |
 | Chat | Chat form | `POST /api/v1/chat` SSE; backend calls retrieval and Model Gateway | `answer`, `evidence`, `queryRunId` | Stream failure event not fully rendered |
 | Retrieval debug | Debug button | `GET /api/v1/query-runs/{query_run_id}/retrieval` | `events` | Not displayed when request fails |
 

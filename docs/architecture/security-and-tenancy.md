@@ -76,6 +76,9 @@ implemented. Document-level ACL/security trimming uses trusted
 | Delete document | KB `OWNER` | document delete endpoint |
 | Chat | Document visibility within requested KBs | `POST /api/v1/chat` |
 | Debug search | KB `EDITOR` on every requested KB | `POST /api/v1/search:debug` |
+| Create Deep Research run | KB `VIEWER` on selected KB | `POST /api/v1/research-runs` |
+| Read Deep Research run | Run creator with KB `VIEWER`, or KB `EDITOR` | research-run detail/events endpoints |
+| Pause/resume/cancel Deep Research run | Run creator with KB `VIEWER`, or KB `EDITOR` | research-run action endpoints |
 | Update source document access default | KB `MANAGER` | `PATCH /api/v1/knowledge-bases/{kb_id}/sources/{source_id}/access` |
 | Query-run retrieval events | KB `EDITOR` for query-run KB scope | query-run retrieval endpoint |
 
@@ -115,8 +118,8 @@ can be retrieved by an authenticated active-tenant actor without a KB grant.
 Debug retrieval remains KB `EDITOR` scoped. BM25, dense search, delete and
 debug paths apply `tenant_id` and `knowledge_base_id` filters server-side.
 
-Multi-KB direct retrieval is implemented for chat/debug. Extended Search remains
-single-KB in the current slice.
+Multi-KB direct retrieval is implemented for chat/debug. Extended Search and
+Deep Research V1 remain single-KB in the current slice.
 
 Search, chat, debug retrieval, Extended Search neighbor expansion and document
 viewer paths apply the same document visibility rule. `policy="kb"` is the
@@ -127,6 +130,12 @@ allowlisted users/groups, plus `PLATFORM_ADMIN`, `TENANT_ADMIN` and KB
 upload metadata cannot set document ACLs; ordinary uploads remain KB-visible.
 Source defaults live in `knowledge_sources.metadata.document_access_default`
 and can be applied to existing source documents by a KB manager.
+
+Deep Research run detail is rebuilt for the current actor before returning:
+evidence records are filtered through the same `DocumentAccessScope`, linked
+coverage evidence ids are trimmed to visible records and the public report is
+regenerated from visible evidence only. Reflections are operational notes; they
+do not bypass evidence or coverage authorization.
 
 ## Parser And Upload Boundaries
 
@@ -179,6 +188,8 @@ production auth.
 - Encrypted server-side provider token storage.
 - Tenant/KB filters in retrieval and delete-by-query paths.
 - Safe public document metadata and safe error envelopes.
+- ACL-trimmed Deep Research read surface and worker-side creator access
+  reconstruction before episode execution.
 
 ## Accepted Local MVP Risks
 

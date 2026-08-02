@@ -4,19 +4,14 @@ Last updated: 2026-08-02
 
 ## Current milestone
 
-Search Quality V2 foundations have been implemented on top of the Stage 4
-external source connection baseline. Ordinary user search now reuses the hybrid
-retrieval pipeline instead of PostgreSQL substring ranking, with minimal
-document-level ACL/security trimming for trusted source metadata.
+Deep Research V1 has been implemented on top of the Search Quality V2 and
+Extended Search baseline. It is a durable single-KB lifecycle with worker
+episodes, typed evidence memory, coverage records, operational reflections,
+pause/resume/cancel and an ACL-trimmed report surface.
 
-Completion criterion for the next increment: promote Extended Search into
-durable Deep Research runs with typed evidence memory and coverage records.
-
-Current Extended Search persists query runs, retrieval events and an
-`agent_runs` ledger for completed single-KB harness executions. That is
-execution trace durability, not the future Deep Research product lifecycle:
-there are not yet resumable research runs, typed evidence memory records or
-durable coverage records with their own public lifecycle.
+Completion criterion for the next increment: run a small runtime smoke and
+quality/context experiments to choose default packing policy by evidence
+quality, citation/coverage safety, context size and latency.
 
 ## Implemented now
 
@@ -66,15 +61,48 @@ durable coverage records with their own public lifecycle.
   applied to existing synced documents. The same scope is applied to ordinary
   search, chat/debug retrieval, Multi-KB retrieval, Extended Search neighbor
   expansion, DB dense fallback and document viewer paths.
+- Durable Deep Research V1: `research_runs`, episodes, questions, typed
+  evidence records, minimal claim records, coverage records and operational
+  reflections are persisted in PostgreSQL; API endpoints create/list/read runs,
+  expose compact events and request pause/resume/cancel; worker jobs with
+  `kind='deep_research'` process one bounded single-KB episode at a time,
+  checkpoint after every episode, link episode retrieval to `query_runs` for
+  debugger compatibility and synthesize the public report only from current
+  ACL-visible evidence. Context budgets are ratios of the retrieval profile's
+  declared max context: 45% productive target, 55% soft limit, 70% hard input
+  limit, 15% output reserve and 15% safety reserve.
 - Eval and validation tooling: local-auth eval client, release-gate provider preflight, warm retrieval profiling, MIRACL-RU adapter, document corpus verification and cross-tenant hardening smoke command.
 
 ## In progress
 
+- Deep Research runtime smoke plus quality/context experiments: compare context
+  target ratios, evidence packing variants, episode granularity, reflection
+  policy and low-confidence/conflicting counter-evidence policy before treating
+  V1 defaults as tuned.
 - Browser UI OIDC through Dockerized API after the public/internal Keycloak URL strategy is decided.
 - External deployment hardening remains planned, not supported production operation.
 
 ## Latest validation
 
+- Durable Deep Research V1 validation on 2026-08-02:
+  Added durable single-KB research lifecycle tables, repository operations,
+  `POST/GET /api/v1/research-runs`, detail/events and pause/resume/cancel
+  endpoints, worker execution via `ingestion_jobs.kind='deep_research'`,
+  context budget/packing policy, ACL-trimmed report rebuild, minimal React UI
+  panel and architecture/status docs. Validation:
+  `uv run ruff format src tests` -> exit 0, 126 files left unchanged;
+  `uv run ruff check .` -> exit 0;
+  `uv run ruff format --check src tests` -> exit 0, 126 files already
+  formatted;
+  `uv run mypy src tests` -> exit 0, no issues found in 126 source files;
+  `uv run pytest tests\unit -q` -> exit 0, 253 passed, 2 warnings;
+  `uv run pytest tests\integration -q` -> exit 0, 14 passed;
+  `pnpm lint` in `services/ui` -> exit 0;
+  `pnpm typecheck` in `services/ui` -> exit 0;
+  `pnpm build` in `services/ui` -> exit 0;
+  `pnpm format:check` in `services/ui` -> exit 0;
+  `docker compose config --quiet` -> exit 0;
+  `git diff --check` -> exit 0, with Git CRLF normalization warnings only.
 - Search Quality V2 ACL/security trimming validation on 2026-08-02:
   Extended trusted `metadata.document_access` trimming to `kb`, `tenant` and
   `restricted` policies with admin/manager bypass across public search,

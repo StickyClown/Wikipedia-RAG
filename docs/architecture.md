@@ -182,7 +182,8 @@ ADR guidance and template are in [decisions/](decisions/).
 
 - External deployment model, TLS/reverse proxy strategy and environment isolation.
 - Production identity provider, tenant onboarding and richer external ACL connector policy beyond JSON `document_access` trimming.
-- Durable Deep Research run lifecycle, typed evidence memory and coverage records.
+- Deep Research quality fixtures, context packing experiments and measured
+  default policies beyond the V1 durable single-KB lifecycle.
 - Malware scanning and parser isolation requirements beyond local Compose hardening.
 - Restore automation, restore drills and backup retention.
 - Observability backend, retention, alerting and ownership.

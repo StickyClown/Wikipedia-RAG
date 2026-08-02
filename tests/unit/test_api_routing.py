@@ -26,3 +26,10 @@ def test_api_app_includes_domain_router_paths() -> None:
     assert ("GET", "/api/v1/documents/{document_id}/context") in paths
     assert ("PATCH", "/api/v1/documents/{document_id}/access") in paths
     assert ("POST", "/api/v1/query-runs/{query_run_id}/feedback") in paths
+    assert ("POST", "/api/v1/research-runs") in paths
+    assert ("GET", "/api/v1/research-runs") in paths
+    assert ("GET", "/api/v1/research-runs/{research_run_id}") in paths
+    assert ("GET", "/api/v1/research-runs/{research_run_id}/events") in paths
+    assert ("POST", "/api/v1/research-runs/{research_run_id}:pause") in paths
+    assert ("POST", "/api/v1/research-runs/{research_run_id}:resume") in paths
+    assert ("POST", "/api/v1/research-runs/{research_run_id}:cancel") in paths
