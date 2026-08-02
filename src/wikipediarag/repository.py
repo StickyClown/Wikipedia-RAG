@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.auth import ActorContext, KnowledgeBaseRole, PlatformRole, TenantRole, effective_knowledge_base_role
 from wikipediarag.db import json_dumps
+from wikipediarag.document_access import DocumentAccessScope, document_access_bypass, normalize_document_access
 from wikipediarag.ids import new_uuid, stable_hash, stable_uuid
 from wikipediarag.schemas import JobStatus
 from wikipediarag.wiki_dump import Chunk, WikiPage
@@ -845,6 +846,63 @@ async def update_knowledge_source(
     )
 
 
+async def update_knowledge_source_document_access_default(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+    document_access: dict[str, Any],
+) -> None:
+    access = normalize_document_access(document_access)
+    await conn.execute(
+        text(
+            """
+            UPDATE knowledge_sources
+            SET metadata = metadata || jsonb_build_object('document_access_default', CAST(:document_access AS jsonb)),
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND id = :source_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "source_id": source_id,
+            "document_access": json_dumps(access),
+        },
+    )
+
+
+async def list_source_active_document_refs(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    source_id: str,
+) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT s.document_id, s.document_version_id
+            FROM source_document_states s
+            JOIN documents d
+              ON d.id = s.document_id
+             AND d.tenant_id = s.tenant_id
+             AND d.knowledge_base_id = s.knowledge_base_id
+            WHERE s.tenant_id = :tenant_id
+              AND s.knowledge_base_id = :kb_id
+              AND s.source_id = :source_id
+              AND s.status = 'active'
+              AND d.lifecycle_state = 'active'
+              AND s.document_id IS NOT NULL
+            ORDER BY s.updated_at DESC
+            """
+        ),
+        {"tenant_id": tenant_id, "kb_id": knowledge_base_id, "source_id": source_id},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
 async def get_source_sync_run_public(
     conn: AsyncConnection,
     *,
@@ -946,6 +1004,8 @@ async def create_source_document_ingestion_item(
         "source_uri": source_uri,
         "source_url": source_url,
     }
+    document_access = normalize_document_access(metadata.get("document_access"))
+    document_access_origin = str(metadata.get("document_access_origin") or "")
     await conn.execute(
         text(
             """
@@ -975,6 +1035,8 @@ async def create_source_document_ingestion_item(
                     "source_external_id": external_id,
                     "source_url": source_url,
                     "current_version_id": document_version_id,
+                    "document_access": document_access,
+                    "document_access_origin": document_access_origin,
                 }
             ),
         },
@@ -2178,6 +2240,64 @@ async def fetch_chunks_for_dense_scan(
     return [dict(row) for row in result.mappings()]
 
 
+async def update_document_access_metadata(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_version_id: str | None,
+    document_access: dict[str, Any],
+    origin: str | None = None,
+) -> None:
+    """Update DB-side document/chunk access metadata without changing content."""
+    access = normalize_document_access(document_access)
+    metadata_patch: dict[str, Any] = {"document_access": access}
+    if origin is not None:
+        metadata_patch["document_access_origin"] = origin
+    await conn.execute(
+        text(
+            """
+            UPDATE documents
+            SET metadata = metadata || CAST(:metadata_patch AS jsonb),
+                updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND id = :document_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "metadata_patch": json_dumps(metadata_patch),
+        },
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE chunks
+            SET metadata = metadata || CAST(:metadata_patch AS jsonb)
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = :kb_id
+              AND document_id = :document_id
+              AND (
+                (CAST(:document_version_id AS text) IS NULL AND document_version_id IS NULL)
+                OR document_version_id = CAST(:document_version_id AS text)
+                OR CAST(:document_version_id AS text) IS NULL
+              )
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+            "metadata_patch": json_dumps(metadata_patch),
+        },
+    )
+
+
 async def fetch_chunk_by_id(
     conn: AsyncConnection,
     *,
@@ -2877,6 +2997,54 @@ async def load_effective_knowledge_base_role(
         local_group_roles=local_group_roles,
         oidc_group_roles=oidc_group_roles,
     )
+
+
+async def load_actor_document_access_scope(
+    conn: AsyncConnection,
+    *,
+    actor: ActorContext,
+    tenant_id: str,
+    knowledge_base_id: str,
+    effective_kb_role: KnowledgeBaseRole | None = None,
+) -> DocumentAccessScope:
+    kb_role = effective_kb_role
+    if kb_role is None and actor.platform_role != PlatformRole.platform_admin:
+        kb_role = await load_effective_knowledge_base_role(
+            conn,
+            user_id=actor.user_id,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+        )
+    if document_access_bypass(
+        platform_role=actor.platform_role,
+        tenant_role=actor.tenant_role,
+        kb_role=kb_role,
+    ):
+        return DocumentAccessScope(bypass=True, tenant_id=tenant_id, user_id=actor.user_id, kb_role=kb_role)
+    return DocumentAccessScope(
+        bypass=False,
+        tenant_id=tenant_id,
+        user_id=actor.user_id,
+        kb_role=kb_role,
+        group_ids=frozenset(await load_actor_group_ids(conn, user_id=actor.user_id, tenant_id=tenant_id)),
+    )
+
+
+async def load_actor_group_ids(conn: AsyncConnection, *, user_id: str, tenant_id: str) -> list[str]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT gm.group_id::text AS group_id
+            FROM group_memberships gm
+            JOIN groups g ON g.id = gm.group_id
+            WHERE gm.user_id = :user_id
+              AND g.tenant_id = :tenant_id
+            ORDER BY gm.group_id::text
+            """
+        ),
+        {"user_id": user_id, "tenant_id": tenant_id},
+    )
+    return [str(row["group_id"]) for row in result.mappings()]
 
 
 async def load_platform_role(conn: AsyncConnection, *, user_id: str) -> PlatformRole | None:

@@ -39,8 +39,10 @@ Implemented roles:
 
 Effective KB role is the highest role from platform admin, tenant admin, direct
 user grants, local group grants and OIDC group grants. Platform admin maps to
-KB owner. Tenant admin maps to KB manager. Explicit deny rules and
-document-level ACLs are not implemented.
+KB owner. Tenant admin maps to KB manager. Explicit deny rules are not
+implemented. Document-level ACL/security trimming uses trusted
+`metadata.document_access` with three policies: `kb`, `tenant` and
+`restricted`.
 
 ## Permission Matrix
 
@@ -61,17 +63,20 @@ document-level ACLs are not implemented.
 | Grant viewer/editor/manager | KB `MANAGER` | grant create/update endpoints |
 | Grant owner | KB `OWNER` | grant create/update endpoints |
 | Delete KB grant | KB `MANAGER` | grant delete endpoint |
+| List ACL groups for a KB | KB `MANAGER` | `GET /api/v1/knowledge-bases/{kb_id}/access-groups` |
 | Wikipedia XML/ZIM import | KB `EDITOR` | import endpoints |
 | Create upload session or batch | KB `EDITOR` | upload endpoints |
 | Complete upload session | KB `EDITOR` | upload complete endpoint |
 | Read upload batch status | KB `EDITOR` | batch status endpoint |
 | Read ingestion job | Active tenant plus KB role through job load/control paths | job endpoints |
 | Cancel or resume ingestion job | KB `EDITOR` | job control endpoints |
-| Read document/version metadata | KB `VIEWER` | document endpoints |
+| Read document/version metadata | Document visibility | document endpoints |
+| Update document access | KB `MANAGER` | `PATCH /api/v1/documents/{document_id}/access` |
 | Reprocess document | KB `EDITOR` | reprocess endpoint |
 | Delete document | KB `OWNER` | document delete endpoint |
-| Chat | KB `VIEWER` on every requested KB | `POST /api/v1/chat` |
+| Chat | Document visibility within requested KBs | `POST /api/v1/chat` |
 | Debug search | KB `EDITOR` on every requested KB | `POST /api/v1/search:debug` |
+| Update source document access default | KB `MANAGER` | `PATCH /api/v1/knowledge-bases/{kb_id}/sources/{source_id}/access` |
 | Query-run retrieval events | KB `EDITOR` for query-run KB scope | query-run retrieval endpoint |
 
 ## Session Cookie And CSRF
@@ -103,13 +108,25 @@ local memberships.
 
 ## Retrieval Tenancy
 
-Chat and debug retrieval resolve a server-owned KB scope list. The API requires
-the appropriate role on every requested KB and checks each KB for an active
-compatible index before retrieval starts. BM25, dense search, delete and debug
-paths apply `tenant_id` and `knowledge_base_id` filters server-side.
+Search and chat resolve a server-owned KB scope list and check each requested
+KB for an active compatible index before retrieval starts. KB-only documents
+still require KB `VIEWER+`, but `tenant` and allowlisted `restricted` documents
+can be retrieved by an authenticated active-tenant actor without a KB grant.
+Debug retrieval remains KB `EDITOR` scoped. BM25, dense search, delete and
+debug paths apply `tenant_id` and `knowledge_base_id` filters server-side.
 
 Multi-KB direct retrieval is implemented for chat/debug. Extended Search remains
 single-KB in the current slice.
+
+Search, chat, debug retrieval, Extended Search neighbor expansion and document
+viewer paths apply the same document visibility rule. `policy="kb"` is the
+default and is visible to KB `VIEWER+`. `policy="tenant"` is visible to any
+authenticated actor in the active tenant. `policy="restricted"` is visible to
+allowlisted users/groups, plus `PLATFORM_ADMIN`, `TENANT_ADMIN` and KB
+`MANAGER`/`OWNER` bypass inside their existing tenant/KB scope. Direct client
+upload metadata cannot set document ACLs; ordinary uploads remain KB-visible.
+Source defaults live in `knowledge_sources.metadata.document_access_default`
+and can be applied to existing source documents by a KB manager.
 
 ## Parser And Upload Boundaries
 

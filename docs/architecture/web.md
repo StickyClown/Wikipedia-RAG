@@ -85,10 +85,14 @@ and metadata filters. Results include `chunk_id`, `document_id`,
 `section_path`, safe snippet metadata and locator data. The UI opens the inline
 document viewer by calling:
 
-- `GET /api/v1/documents/{document_id}/structure` for title, source metadata and TOC sections;
+- `GET /api/v1/documents/{document_id}/structure` for title, source metadata, document access summary and TOC sections;
 - `GET /api/v1/documents/{document_id}/context?chunk_id=...` for the precise hit plus neighboring chunks;
 - `GET /api/v1/documents/{document_id}/context?section_id=...` when the user selects a TOC entry;
 - `POST /api/v1/documents/{document_id}/search` for search within one active document.
+KB managers can update document/source visibility from the source panel or
+document viewer through the document access APIs. Group choices come from the
+manager-scoped `GET /api/v1/knowledge-bases/{kb_id}/access-groups` lookup,
+which omits group membership details.
 
 The viewer renders extracted text chunks, not native PDF/Office pages. The API
 continues to resolve tenant and KB authority server-side from the authenticated

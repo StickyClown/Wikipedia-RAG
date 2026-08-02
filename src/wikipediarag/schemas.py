@@ -157,6 +157,8 @@ class DocumentStructureResponse(BaseModel):
     source_url: str | None = None
     sections: list[DocumentSection] = Field(default_factory=list)
     public_metadata: dict[str, Any] = Field(default_factory=dict)
+    document_access: dict[str, Any] = Field(default_factory=dict)
+    document_access_origin: str | None = None
 
 
 class DocumentContextChunk(BaseModel):
@@ -408,6 +410,7 @@ class SourceCreate(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     credentials: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    document_access_default: dict[str, Any] | None = None
     refresh_interval_seconds: int | None = Field(default=None, ge=60)
 
 
@@ -428,6 +431,7 @@ class SourceResponse(BaseModel):
     status: str
     config: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    document_access_default: dict[str, Any] = Field(default_factory=dict)
     refresh_interval_seconds: int | None = None
     last_sync_run_id: str | None = None
     last_sync_status: str | None = None
@@ -435,6 +439,37 @@ class SourceResponse(BaseModel):
     next_sync_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class DocumentAccessPatch(BaseModel):
+    policy: str = Field(pattern=r"^(kb|tenant|restricted)$")
+    user_ids: list[str] = Field(default_factory=list, max_length=1000)
+    group_ids: list[str] = Field(default_factory=list, max_length=1000)
+
+
+class SourceAccessPatch(DocumentAccessPatch):
+    apply_to_existing: bool = True
+
+
+class DocumentAccessResponse(BaseModel):
+    document_id: str
+    knowledge_base_id: str
+    document_access: dict[str, Any]
+    document_access_origin: str
+
+
+class SourceAccessResponse(BaseModel):
+    source_id: str
+    knowledge_base_id: str
+    document_access_default: dict[str, Any]
+    updated_documents: int = 0
+
+
+class AccessGroupResponse(BaseModel):
+    id: str
+    name: str
+    group_type: str
+    external_id: str | None = None
 
 
 class SourceHealthResponse(BaseModel):

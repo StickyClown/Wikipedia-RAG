@@ -8,9 +8,10 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-import wikipediarag.api_app as api_app
+import wikipediarag.api.handlers as api_app
 from wikipediarag.auth import ActorContext, AuthenticationMethod, KnowledgeBaseRole, PlatformRole, TenantRole
 from wikipediarag.auth_service import AuthenticationError
+from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.repository import search_public_chunks
 from wikipediarag.schemas import SearchFilters, SearchRequest, SearchResponse, SearchResult
 
@@ -70,14 +71,22 @@ async def test_search_endpoint_requires_authenticated_actor(monkeypatch: pytest.
 
 
 async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeypatch: pytest.MonkeyPatch) -> None:
-    required_roles: list[tuple[str, KnowledgeBaseRole]] = []
+    loaded_roles: list[str] = []
     search_calls: list[dict[str, Any]] = []
 
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def require_role(_conn: object, **kwargs: Any) -> None:
-        required_roles.append((str(kwargs["kb_id"]), kwargs["role"]))
+    async def load_kb_role(_conn: object, **kwargs: Any) -> KnowledgeBaseRole:
+        loaded_roles.append(str(kwargs["kb_id"]))
+        return KnowledgeBaseRole.viewer
+
+    async def load_access_scope(_conn: object, **kwargs: Any) -> DocumentAccessScope:
+        return DocumentAccessScope(
+            tenant_id=kwargs["tenant_id"],
+            user_id="22222222-2222-4222-8222-222222222222",
+            kb_role=kwargs["effective_kb_role"],
+        )
 
     async def get_kb(_conn: object, _tenant_id: str, kb_id: str) -> dict[str, str]:
         return {"id": kb_id, "active_index": f"read-{kb_id}"}
@@ -119,7 +128,8 @@ async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeyp
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+    monkeypatch.setattr(api_app, "_load_kb_role_optional", load_kb_role)
+    monkeypatch.setattr(api_app, "load_actor_document_access_scope", load_access_scope)
     monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
     monkeypatch.setattr(api_app, "load_index_version_by_read_alias", load_index)
     monkeypatch.setattr(api_app, "run_public_search", run_search)
@@ -131,7 +141,14 @@ async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeyp
     )
     response = await api_app.search(payload, _request())
 
-    assert required_roles == [("33333333-3333-4333-8333-333333333333", KnowledgeBaseRole.viewer)]
+    assert loaded_roles == ["33333333-3333-4333-8333-333333333333"]
+    assert search_calls[0]["document_access_scopes"] == {
+        "33333333-3333-4333-8333-333333333333": DocumentAccessScope(
+            tenant_id="11111111-1111-4111-8111-111111111111",
+            user_id="22222222-2222-4222-8222-222222222222",
+            kb_role=KnowledgeBaseRole.viewer,
+        )
+    }
     assert search_calls[0]["filters"] == {"document_type": "pdf", "language": "ru"}
     result = response.results[0]
     assert result.chunk_id == "chunk:1"
@@ -146,7 +163,7 @@ async def test_search_endpoint_returns_safe_kb_not_ready(monkeypatch: pytest.Mon
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def require_role(*_args: object, **_kwargs: object) -> None:
+    async def load_kb_role(*_args: object, **_kwargs: object) -> None:
         return None
 
     async def get_kb(_conn: object, _tenant_id: str, kb_id: str) -> dict[str, str]:
@@ -154,7 +171,7 @@ async def test_search_endpoint_returns_safe_kb_not_ready(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+    monkeypatch.setattr(api_app, "_load_kb_role_optional", load_kb_role)
     monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
 
     with pytest.raises(HTTPException) as exc_info:

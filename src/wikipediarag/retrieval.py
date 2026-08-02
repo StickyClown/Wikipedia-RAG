@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.answerability import decide_answerability, is_insufficient
 from wikipediarag.config import Settings, get_settings
+from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.embedding import cosine, normalize_for_embedding
 from wikipediarag.ids import stable_hash
 from wikipediarag.model_client import embeddings
@@ -94,7 +95,7 @@ async def retrieve(
                     settings=resolved,
                     read_alias=read_alias,
                     strict=profile.requires_real_provider,
-                    filters=search_filters,
+                    filters=_filters_for_kb(search_filters, knowledge_base_id),
                 ),
             )
         )
@@ -110,7 +111,7 @@ async def retrieve(
                     profile,
                     top_k=profile.retrieval.dense_top_k,
                     read_alias=read_alias,
-                    filters=search_filters,
+                    filters=_filters_for_kb(search_filters, knowledge_base_id),
                 )
             )
         )
@@ -278,7 +279,7 @@ async def retrieve_multi(
                         settings=resolved,
                         read_alias=read_alias,
                         strict=active_profile.requires_real_provider,
-                        filters=search_filters,
+                        filters=_filters_for_kb(search_filters, kb_id),
                     )
                 )
             )
@@ -296,7 +297,7 @@ async def retrieve_multi(
                 active_profile,
                 top_k=active_profile.retrieval.dense_top_k,
                 read_alias=read_alias,
-                filters=search_filters,
+                filters=_filters_for_kb(search_filters, kb_id),
             )
         )
     result_sets: dict[str, list[dict[str, Any]]] = {}
@@ -598,7 +599,14 @@ async def dense_search_profile(
     except Exception:
         if profile.requires_real_provider:
             raise
-        candidates = await dense_search_db(conn, query_vector, tenant_id, knowledge_base_id, top_k=top_k)
+        candidates = await dense_search_db(
+            conn,
+            query_vector,
+            tenant_id,
+            knowledge_base_id,
+            top_k=top_k,
+            filters=filters,
+        )
     timings_ms["dense_search"] = _elapsed_ms(search_started)
     for rank, candidate in enumerate(candidates, start=1):
         candidate["ranks"]["dense"] = rank
@@ -612,10 +620,14 @@ async def dense_search_db(
     tenant_id: str,
     knowledge_base_id: str,
     top_k: int,
+    filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     rows = await fetch_chunks_for_dense_scan(conn, tenant_id, knowledge_base_id, limit=50000)
+    access_scope = _document_access_scope_from_filters(filters)
     candidates: list[dict[str, Any]] = []
     for row in rows:
+        if not is_document_visible(dict(row.get("metadata") or {}), access_scope):
+            continue
         embedding = row["embedding"]
         if not isinstance(embedding, list):
             continue
@@ -642,6 +654,25 @@ async def dense_search_db(
         )
     candidates.sort(key=lambda item: item["scores"]["dense"], reverse=True)
     return candidates[:top_k]
+
+
+def _filters_for_kb(filters: dict[str, Any] | None, knowledge_base_id: str) -> dict[str, Any] | None:
+    if not filters:
+        return None
+    scoped = {key: value for key, value in filters.items() if key != "document_access_scopes"}
+    scopes = filters.get("document_access_scopes")
+    if isinstance(scopes, dict):
+        scope = scopes.get(knowledge_base_id)
+        if scope is not None:
+            scoped["document_access_scope"] = scope
+    return scoped
+
+
+def _document_access_scope_from_filters(filters: dict[str, Any] | None) -> DocumentAccessScope | None:
+    if not filters:
+        return None
+    scope = filters.get("document_access_scope")
+    return scope if isinstance(scope, DocumentAccessScope) else None
 
 
 def rrf_fuse(result_sets: dict[str, list[dict[str, Any]]], top_k: int, k: int = 60) -> list[dict[str, Any]]:

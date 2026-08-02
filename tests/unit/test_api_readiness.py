@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
-import wikipediarag.api_app as api_app
+import wikipediarag.api.handlers as api_app
 from wikipediarag.config import Settings
 from wikipediarag.observability import ModelGatewayError
 from wikipediarag.schemas import Evidence, RetrievalResult

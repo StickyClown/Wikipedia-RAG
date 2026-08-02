@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import wikipediarag.api_app as api_app
+import wikipediarag.api.handlers as api_app
 from wikipediarag.auth import ActorContext, AuthenticationMethod, GrantSubjectType, KnowledgeBaseRole, PlatformRole
 from wikipediarag.db import SCHEMA_SQL
 

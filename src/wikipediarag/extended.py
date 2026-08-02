@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from wikipediarag.answerability import decide_answerability, is_insufficient
 from wikipediarag.config import Settings
 from wikipediarag.db import json_dumps
+from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.embedding import normalize_for_embedding
 from wikipediarag.ids import new_uuid, stable_hash
 from wikipediarag.repository import fetch_chunk_by_id, insert_retrieval_event
@@ -121,6 +122,7 @@ async def run_extended_search(
     settings: Settings,
     profile: RetrievalProfile,
     profile_overrides: dict[str, Any] | None = None,
+    search_filters: dict[str, Any] | None = None,
 ) -> RetrievalResult:
     extended_started = time.perf_counter()
     budgets = HarnessBudgets(max_context_tokens=profile.postprocess.max_context_tokens)
@@ -209,6 +211,7 @@ async def run_extended_search(
             profile=profile,
             profile_overrides=profile_overrides,
             query_context=query_context,
+            search_filters=search_filters,
         )
         tool_latency_ms = _elapsed_ms(tool_started)
         retrieval_timings = _extract_timings(result.events)
@@ -233,6 +236,7 @@ async def run_extended_search(
             tenant_id=tenant_id,
             knowledge_base_id=knowledge_base_id,
             window=1,
+            filters=search_filters,
         )
         inventory = _coverage_inventory(query, list(combined.values()), profile)
         state.coverage_inventory = inventory
@@ -529,6 +533,7 @@ async def _expand_neighbors(
     tenant_id: str,
     knowledge_base_id: str,
     window: int,
+    filters: dict[str, Any] | None = None,
 ) -> int:
     added = 0
     for seed in seeds:
@@ -542,6 +547,7 @@ async def _expand_neighbors(
             tenant_id=tenant_id,
             knowledge_base_id=knowledge_base_id,
             window=window,
+            filters=filters,
         )
         new_ids: list[str] = []
         for neighbor in neighbors:
@@ -571,14 +577,16 @@ async def get_neighbors(
     tenant_id: str,
     knowledge_base_id: str,
     window: int = 1,
+    filters: dict[str, Any] | None = None,
 ) -> list[Evidence]:
+    access_scope = _document_access_scope_from_filters(filters, knowledge_base_id)
     center = await fetch_chunk_by_id(
         conn,
         tenant_id=tenant_id,
         knowledge_base_id=knowledge_base_id,
         chunk_id=chunk_id,
     )
-    if center is None:
+    if center is None or not is_document_visible(dict(center.get("metadata") or {}), access_scope):
         return []
     rows: list[dict[str, Any]] = []
     previous_id = center.get("prev_chunk_id")
@@ -593,7 +601,8 @@ async def get_neighbors(
         )
         if row is None:
             break
-        rows.insert(0, row)
+        if is_document_visible(dict(row.get("metadata") or {}), access_scope):
+            rows.insert(0, row)
         previous_id = row.get("prev_chunk_id")
     next_id = center.get("next_chunk_id")
     for _ in range(window):
@@ -607,9 +616,26 @@ async def get_neighbors(
         )
         if row is None:
             break
-        rows.append(row)
+        if is_document_visible(dict(row.get("metadata") or {}), access_scope):
+            rows.append(row)
         next_id = row.get("next_chunk_id")
     return [_evidence_from_chunk_row(row) for row in rows]
+
+
+def _document_access_scope_from_filters(
+    filters: dict[str, Any] | None,
+    knowledge_base_id: str,
+) -> DocumentAccessScope | None:
+    if not filters:
+        return None
+    direct = filters.get("document_access_scope")
+    if isinstance(direct, DocumentAccessScope):
+        return direct
+    scopes = filters.get("document_access_scopes")
+    if isinstance(scopes, dict):
+        scope = scopes.get(knowledge_base_id)
+        return scope if isinstance(scope, DocumentAccessScope) else None
+    return None
 
 
 def _coverage_inventory(query: str, evidence: list[Evidence], profile: RetrievalProfile) -> list[CoverageItem]:

@@ -7,6 +7,7 @@ from opensearchpy import OpenSearch
 from opensearchpy.helpers import bulk
 
 from wikipediarag.config import Settings, get_settings
+from wikipediarag.document_access import document_access_filter
 from wikipediarag.ids import stable_hash
 from wikipediarag.wiki_dump import Chunk
 
@@ -268,6 +269,48 @@ def delete_document_version_chunks(
     return int(response.get("deleted") or 0)
 
 
+def update_document_access(
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_access: dict[str, Any],
+    origin: str | None = None,
+    settings: Settings | None = None,
+    read_alias: str = READ_ALIAS,
+) -> int:
+    resolved = settings or get_settings()
+    client = get_client(resolved)
+    script_source = "if (ctx._source.metadata == null) { ctx._source.metadata = new HashMap(); } "
+    script_source += "ctx._source.metadata.document_access = params.document_access;"
+    params: dict[str, Any] = {"document_access": document_access}
+    if origin is not None:
+        script_source += "ctx._source.metadata.document_access_origin = params.origin;"
+        params["origin"] = origin
+    response = client.update_by_query(
+        index=read_alias,
+        body={
+            "script": {
+                "source": script_source,
+                "lang": "painless",
+                "params": params,
+            },
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"tenant_id": tenant_id}},
+                        {"term": {"knowledge_base_id": knowledge_base_id}},
+                        {"term": {"document_id": document_id}},
+                    ]
+                }
+            },
+        },
+        conflicts="proceed",
+        refresh=True,
+    )
+    return int(response.get("updated") or 0)
+
+
 def _public_filter_clauses(filters: dict[str, Any]) -> list[dict[str, Any]]:
     clauses: list[dict[str, Any]] = []
     document_type = _optional_text(filters.get("document_type"))
@@ -329,6 +372,7 @@ def _public_filter_clauses(filters: dict[str, Any]) -> list[dict[str, Any]]:
         clauses.append({"term": {"document_id": document_id}})
     if title:
         clauses.append({"match_phrase": {"title": title}})
+    clauses.extend(document_access_filter(filters.get("document_access_scope")))
     return clauses
 
 

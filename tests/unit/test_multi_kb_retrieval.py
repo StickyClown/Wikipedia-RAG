@@ -7,9 +7,10 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-import wikipediarag.api_app as api_app
+import wikipediarag.api.handlers as api_app
 from wikipediarag.auth import ActorContext, AuthenticationMethod, KnowledgeBaseRole, PlatformRole, TenantRole
 from wikipediarag.config import Settings
+from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.retrieval import apply_knowledge_base_cap, build_stage_events, rrf_fuse
 from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import DebugSearchRequest, Evidence, RetrievalResult
@@ -60,17 +61,29 @@ async def test_search_debug_accepts_multi_kb_scope_and_returns_kb_citations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     required_roles: list[tuple[str, KnowledgeBaseRole]] = []
+    access_calls: list[tuple[str, KnowledgeBaseRole]] = []
     retrieval_events: list[dict[str, Any]] = []
+    scopes = {
+        "kb-a": DocumentAccessScope(user_id="22222222-2222-4222-8222-222222222222"),
+        "kb-b": DocumentAccessScope(bypass=True, user_id="22222222-2222-4222-8222-222222222222"),
+    }
 
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def require_role(_conn: object, **kwargs: Any) -> None:
+    async def require_role(_conn: object, **kwargs: Any) -> KnowledgeBaseRole:
         required_roles.append((str(kwargs["kb_id"]), kwargs["role"]))
+        return KnowledgeBaseRole.manager if str(kwargs["kb_id"]) == "kb-b" else KnowledgeBaseRole.editor
+
+    async def load_access_scope(_conn: object, **kwargs: Any) -> DocumentAccessScope:
+        kb_id = str(kwargs["knowledge_base_id"])
+        access_calls.append((kb_id, kwargs["effective_kb_role"]))
+        return scopes[kb_id]
 
     async def retrieve_multi(_conn: object, _query: str, **kwargs: Any) -> RetrievalResult:
         assert kwargs["knowledge_base_ids"] == ["kb-a", "kb-b"]
         assert kwargs["query_run_id"] == "44444444-4444-4444-8444-444444444444"
+        assert kwargs["search_filters"] == {"document_access_scopes": scopes}
         return RetrievalResult(
             query="query",
             trace_id="trace",
@@ -100,6 +113,7 @@ async def test_search_debug_accepts_multi_kb_scope_and_returns_kb_citations(
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
     monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+    monkeypatch.setattr(api_app, "load_actor_document_access_scope", load_access_scope)
     monkeypatch.setattr(api_app, "create_query_run", create_query_run)
     monkeypatch.setattr(api_app, "insert_retrieval_event", insert_retrieval_event)
     monkeypatch.setattr(api_app, "complete_query_run", complete_query_run)
@@ -109,6 +123,7 @@ async def test_search_debug_accepts_multi_kb_scope_and_returns_kb_citations(
     output = await api_app.search_debug(payload, _request())
 
     assert required_roles == [("kb-a", KnowledgeBaseRole.editor), ("kb-b", KnowledgeBaseRole.editor)]
+    assert access_calls == [("kb-a", KnowledgeBaseRole.editor), ("kb-b", KnowledgeBaseRole.manager)]
     assert output["query_run_id"] == "44444444-4444-4444-8444-444444444444"
     assert output["evidence"][0]["knowledge_base_id"] == "kb-b"
     assert output["search_plan"]["knowledge_base_ids"] == ["kb-a", "kb-b"]

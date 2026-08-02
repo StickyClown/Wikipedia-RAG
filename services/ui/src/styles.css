@@ -242,6 +242,23 @@ textarea {
   align-items: center;
 }
 
+.access-editor {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 10px;
+}
+
+.access-editor select[multiple] {
+  min-height: 76px;
+  padding: 8px 10px;
+}
+
+.access-editor button {
+  min-width: 144px;
+}
+
 .progress {
   display: grid;
   gap: 6px;

@@ -110,6 +110,7 @@ the active task or CI policy says otherwise.
 - [docs/architecture/data-and-storage.md](docs/architecture/data-and-storage.md) - data ownership, source-of-truth and backup boundaries.
 - [docs/architecture/flows.md](docs/architecture/flows.md) - login, upload, ingestion, retrieval, delete and readiness flows.
 - [docs/architecture/security-and-tenancy.md](docs/architecture/security-and-tenancy.md) - auth, roles, tenancy and access controls.
+- [docs/architecture/search-and-deep-research.md](docs/architecture/search-and-deep-research.md) - backend search, chat retrieval, Extended Search and future Deep Research contract.
 - [docs/architecture/deployment-and-operations.md](docs/architecture/deployment-and-operations.md) - local Compose and external deployment requirements.
 - [AGENTS.md](AGENTS.md) - long-lived instructions for coding agents.
 - [docs/exec-plans/](docs/exec-plans/) - historical implementation plans.

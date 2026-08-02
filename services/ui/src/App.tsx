@@ -20,6 +20,12 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
+const DEFAULT_DOCUMENT_ACCESS: DocumentAccess = {
+  policy: "kb",
+  user_ids: [],
+  group_ids: [],
+};
+
 const SOURCE_KINDS = [
   "confluence_dc",
   "jira_dc",
@@ -279,6 +285,35 @@ type KnowledgeBase = {
   name: string;
 };
 
+type DocumentAccessPolicy = "kb" | "tenant" | "restricted";
+
+type DocumentAccess = {
+  policy: DocumentAccessPolicy;
+  user_ids: string[];
+  group_ids: string[];
+};
+
+type AccessGroup = {
+  id: string;
+  name: string;
+  group_type: string;
+  external_id?: string | null;
+};
+
+type DocumentAccessResponse = {
+  document_id: string;
+  knowledge_base_id: string;
+  document_access: DocumentAccess;
+  document_access_origin: string;
+};
+
+type SourceAccessResponse = {
+  source_id: string;
+  knowledge_base_id: string;
+  document_access_default: DocumentAccess;
+  updated_documents: number;
+};
+
 type SourceResponse = {
   id: string;
   knowledge_base_id: string;
@@ -287,6 +322,7 @@ type SourceResponse = {
   status: string;
   config: Record<string, unknown>;
   metadata: Record<string, unknown>;
+  document_access_default: DocumentAccess;
   refresh_interval_seconds?: number | null;
   last_sync_run_id?: string | null;
   last_sync_status?: string | null;
@@ -407,6 +443,8 @@ type DocumentStructure = {
   source_url?: string | null;
   sections: DocumentSection[];
   public_metadata?: Record<string, unknown>;
+  document_access: DocumentAccess;
+  document_access_origin?: string | null;
 };
 
 type DocumentContextChunk = {
@@ -510,6 +548,11 @@ export function App() {
   const [sourcesError, setSourcesError] = useState("");
   const [sourceStatus, setSourceStatus] = useState("");
   const [sourceBusy, setSourceBusy] = useState<Record<string, boolean>>({});
+  const [accessGroups, setAccessGroups] = useState<AccessGroup[]>([]);
+  const [canManageAccess, setCanManageAccess] = useState(false);
+  const [sourceAccess, setSourceAccess] = useState<DocumentAccess>(
+    DEFAULT_DOCUMENT_ACCESS,
+  );
   const [sourceRuns, setSourceRuns] = useState<
     Record<string, SourceSyncRunResponse>
   >({});
@@ -546,6 +589,7 @@ export function App() {
   >([]);
   const [viewerBusy, setViewerBusy] = useState(false);
   const [viewerSearchBusy, setViewerSearchBusy] = useState(false);
+  const [viewerAccessBusy, setViewerAccessBusy] = useState(false);
   const [viewerError, setViewerError] = useState("");
 
   useEffect(() => {
@@ -585,6 +629,8 @@ export function App() {
   useEffect(() => {
     if (!session.authenticated || !selectedKnowledgeBaseId) {
       setSources([]);
+      setAccessGroups([]);
+      setCanManageAccess(false);
       setSourcesLoading(false);
       setSourcesError("");
       return;
@@ -611,7 +657,34 @@ export function App() {
         if (!cancelled) setSourcesLoading(false);
       }
     }
+    async function loadSelectedAccessGroups() {
+      try {
+        const response = await fetch(
+          `${API_BASE}/api/v1/knowledge-bases/${encodeURIComponent(selectedKnowledgeBaseId)}/access-groups`,
+          { credentials: "include" },
+        );
+        if (response.status === 403) {
+          if (!cancelled) {
+            setAccessGroups([]);
+            setCanManageAccess(false);
+          }
+          return;
+        }
+        if (!response.ok) throw new Error(await response.text());
+        const payload = (await response.json()) as AccessGroup[];
+        if (!cancelled) {
+          setAccessGroups(payload);
+          setCanManageAccess(true);
+        }
+      } catch {
+        if (!cancelled) {
+          setAccessGroups([]);
+          setCanManageAccess(false);
+        }
+      }
+    }
     void loadSelectedSources();
+    void loadSelectedAccessGroups();
     return () => {
       cancelled = true;
     };
@@ -782,6 +855,7 @@ export function App() {
             config: parseJsonObject("config", sourceConfigText),
             credentials: parseJsonObject("credentials", sourceCredentialsText),
             refresh_interval_seconds: refreshInterval,
+            document_access_default: sourceAccess,
             metadata: { ui_created: true },
           }),
         },
@@ -864,6 +938,34 @@ export function App() {
       setSourcesError(error instanceof Error ? error.message : String(error));
     } finally {
       setSourceBusy((busy) => ({ ...busy, [source.id]: false }));
+    }
+  }
+
+  async function patchSourceAccess(
+    source: SourceResponse,
+    documentAccess: DocumentAccess,
+  ) {
+    setSourceBusy((busy) => ({ ...busy, [`${source.id}:access`]: true }));
+    setSourcesError("");
+    try {
+      const response = await apiFetch(
+        `/api/v1/knowledge-bases/${encodeURIComponent(source.knowledge_base_id)}/sources/${encodeURIComponent(source.id)}/access`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...documentAccess, apply_to_existing: true }),
+        },
+      );
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as SourceAccessResponse;
+      setSourceStatus(
+        `${source.name}: access updated for ${payload.updated_documents} documents`,
+      );
+      await loadSources(source.knowledge_base_id);
+    } catch (error) {
+      setSourcesError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSourceBusy((busy) => ({ ...busy, [`${source.id}:access`]: false }));
     }
   }
 
@@ -1084,6 +1186,33 @@ export function App() {
       setViewerError(error instanceof Error ? error.message : String(error));
     } finally {
       setViewerSearchBusy(false);
+    }
+  }
+
+  async function patchViewerAccess(documentAccess: DocumentAccess) {
+    if (!viewerStructure) return;
+    setViewerAccessBusy(true);
+    setViewerError("");
+    try {
+      const response = await apiFetch(
+        `/api/v1/documents/${encodeURIComponent(viewerStructure.document_id)}/access`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(documentAccess),
+        },
+      );
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as DocumentAccessResponse;
+      setViewerStructure({
+        ...viewerStructure,
+        document_access: payload.document_access,
+        document_access_origin: payload.document_access_origin,
+      });
+    } catch (error) {
+      setViewerError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setViewerAccessBusy(false);
     }
   }
 
@@ -1561,6 +1690,16 @@ export function App() {
                     spellCheck={false}
                   />
                 </label>
+                {canManageAccess && (
+                  <div className="source-wide">
+                    <AccessEditor
+                      value={sourceAccess}
+                      groups={accessGroups}
+                      disabled={sourceBusy.create}
+                      onChange={setSourceAccess}
+                    />
+                  </div>
+                )}
                 <div className="source-wide row">
                   <button
                     type="submit"
@@ -1598,6 +1737,9 @@ export function App() {
                             <span>{sourceKindLabel(source.kind)}</span>
                             <span>{source.status}</span>
                             <span>
+                              {accessLabel(source.document_access_default)}
+                            </span>
+                            <span>
                               {source.refresh_interval_seconds
                                 ? `${source.refresh_interval_seconds}s`
                                 : "manual"}
@@ -1624,6 +1766,19 @@ export function App() {
                           </dd>
                         </div>
                       </dl>
+                      {canManageAccess && (
+                        <AccessEditor
+                          value={normalizeDocumentAccess(
+                            source.document_access_default,
+                          )}
+                          groups={accessGroups}
+                          disabled={sourceBusy[`${source.id}:access`]}
+                          saveLabel="Apply Access"
+                          onSave={(access) =>
+                            void patchSourceAccess(source, access)
+                          }
+                        />
+                      )}
                       {run && (
                         <div className="source-run">
                           <ShieldCheck size={15} />
@@ -1833,7 +1988,11 @@ export function App() {
                 busy={viewerBusy}
                 searchBusy={viewerSearchBusy}
                 error={viewerError}
+                accessGroups={accessGroups}
+                canManageAccess={canManageAccess}
+                accessBusy={viewerAccessBusy}
                 onClose={closeDocumentViewer}
+                onUpdateAccess={(access) => void patchViewerAccess(access)}
                 onSearchQueryChange={setViewerSearchQuery}
                 onSearch={submitDocumentSearch}
                 onOpenChunk={(chunkId) =>
@@ -2165,6 +2324,168 @@ function sourceKindLabel(kind: string) {
     : kind;
 }
 
+function normalizeDocumentAccess(raw: unknown): DocumentAccess {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return DEFAULT_DOCUMENT_ACCESS;
+  }
+  const value = raw as Record<string, unknown>;
+  const policy =
+    value.policy === "tenant" || value.policy === "restricted"
+      ? value.policy
+      : "kb";
+  return {
+    policy,
+    user_ids: stringList(value.user_ids),
+    group_ids: stringList(value.group_ids),
+  };
+}
+
+function stringList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item) => String(item).trim()).filter(Boolean);
+}
+
+function parseIdList(text: string): string[] {
+  return text
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function accessLabel(access: DocumentAccess | undefined) {
+  const normalized = normalizeDocumentAccess(access);
+  if (normalized.policy === "tenant") return "Tenant";
+  if (normalized.policy === "restricted") return "Restricted";
+  return "KB";
+}
+
+function AccessEditor({
+  value,
+  groups,
+  disabled,
+  saveLabel,
+  onChange,
+  onSave,
+}: {
+  value: DocumentAccess;
+  groups: AccessGroup[];
+  disabled?: boolean;
+  saveLabel?: string;
+  onChange?: (access: DocumentAccess) => void;
+  onSave?: (access: DocumentAccess) => void;
+}) {
+  const [policy, setPolicy] = useState<DocumentAccessPolicy>(
+    normalizeDocumentAccess(value).policy,
+  );
+  const [userIdsText, setUserIdsText] = useState(
+    normalizeDocumentAccess(value).user_ids.join(", "),
+  );
+  const [groupIds, setGroupIds] = useState<string[]>(
+    normalizeDocumentAccess(value).group_ids,
+  );
+
+  useEffect(() => {
+    const normalized = normalizeDocumentAccess(value);
+    setPolicy(normalized.policy);
+    setUserIdsText(normalized.user_ids.join(", "));
+    setGroupIds(normalized.group_ids);
+  }, [value]);
+
+  const currentAccess = (): DocumentAccess => {
+    if (policy !== "restricted") {
+      return { policy, user_ids: [], group_ids: [] };
+    }
+    return {
+      policy,
+      user_ids: parseIdList(userIdsText),
+      group_ids: groupIds,
+    };
+  };
+
+  function emit(
+    nextPolicy: DocumentAccessPolicy,
+    nextUserIdsText = userIdsText,
+    nextGroupIds = groupIds,
+  ) {
+    const nextAccess =
+      nextPolicy === "restricted"
+        ? {
+            policy: nextPolicy,
+            user_ids: parseIdList(nextUserIdsText),
+            group_ids: nextGroupIds,
+          }
+        : { policy: nextPolicy, user_ids: [], group_ids: [] };
+    onChange?.(nextAccess);
+  }
+
+  return (
+    <div className="access-editor">
+      <label>
+        Visibility
+        <select
+          value={policy}
+          disabled={disabled}
+          onChange={(event) => {
+            const nextPolicy = event.target.value as DocumentAccessPolicy;
+            setPolicy(nextPolicy);
+            emit(nextPolicy);
+          }}
+        >
+          <option value="kb">KB</option>
+          <option value="tenant">Tenant</option>
+          <option value="restricted">Restricted</option>
+        </select>
+      </label>
+      {policy === "restricted" && (
+        <>
+          <label>
+            Groups
+            <select
+              multiple
+              value={groupIds}
+              disabled={disabled}
+              onChange={(event) => {
+                const nextGroupIds = Array.from(
+                  event.currentTarget.selectedOptions,
+                ).map((option) => option.value);
+                setGroupIds(nextGroupIds);
+                emit(policy, userIdsText, nextGroupIds);
+              }}
+            >
+              {groups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.name} ({group.group_type})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            User IDs
+            <input
+              value={userIdsText}
+              disabled={disabled}
+              onChange={(event) => {
+                setUserIdsText(event.target.value);
+                emit(policy, event.target.value, groupIds);
+              }}
+              placeholder="user-id, another-user-id"
+            />
+          </label>
+        </>
+      )}
+      {onSave && (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => onSave(currentAccess())}
+        >
+          <ShieldCheck size={15} /> {saveLabel ?? "Save Access"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function DocumentViewer({
   structure,
   context,
@@ -2173,7 +2494,11 @@ function DocumentViewer({
   busy,
   searchBusy,
   error,
+  accessGroups,
+  canManageAccess,
+  accessBusy,
   onClose,
+  onUpdateAccess,
   onSearchQueryChange,
   onSearch,
   onOpenChunk,
@@ -2186,7 +2511,11 @@ function DocumentViewer({
   busy: boolean;
   searchBusy: boolean;
   error: string;
+  accessGroups: AccessGroup[];
+  canManageAccess: boolean;
+  accessBusy: boolean;
   onClose: () => void;
+  onUpdateAccess: (access: DocumentAccess) => void;
   onSearchQueryChange: (value: string) => void;
   onSearch: (event: FormEvent) => void;
   onOpenChunk: (chunkId: string) => void;
@@ -2205,6 +2534,10 @@ function DocumentViewer({
             {structure.document_version_id && (
               <span>{structure.document_version_id}</span>
             )}
+            <span>{accessLabel(structure.document_access)}</span>
+            {structure.document_access_origin && (
+              <span>{structure.document_access_origin}</span>
+            )}
           </div>
         </div>
         <div className="row">
@@ -2218,6 +2551,15 @@ function DocumentViewer({
           </button>
         </div>
       </div>
+      {canManageAccess && (
+        <AccessEditor
+          value={normalizeDocumentAccess(structure.document_access)}
+          groups={accessGroups}
+          disabled={accessBusy}
+          saveLabel="Save Document Access"
+          onSave={onUpdateAccess}
+        />
+      )}
       {error && <p className="error">{error}</p>}
       <div className="document-viewer-grid">
         <nav className="document-toc">

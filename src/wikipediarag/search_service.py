@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.config import Settings, get_settings
+from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.ids import stable_hash
 from wikipediarag.repository import get_knowledge_base, load_index_version_by_read_alias
 from wikipediarag.retrieval import retrieve, retrieve_multi
@@ -49,6 +50,7 @@ async def run_public_search(
     tenant_id: str,
     knowledge_base_ids: list[str],
     settings: Settings | None = None,
+    document_access_scopes: dict[str, DocumentAccessScope] | None = None,
 ) -> SearchResponse:
     resolved = settings or get_settings()
     offset = _cursor_offset(payload.cursor) if payload.cursor else payload.offset
@@ -62,6 +64,8 @@ async def run_public_search(
         knowledge_base_ids=knowledge_base_ids,
     )
     search_filters = _opensearch_filter_payload(payload)
+    if document_access_scopes:
+        search_filters["document_access_scopes"] = document_access_scopes
     trace_id = stable_hash([tenant_id, *knowledge_base_ids, payload.query, offset, window], 32)
     if len(knowledge_base_ids) > 1:
         retrieval = await retrieve_multi(
@@ -93,7 +97,11 @@ async def run_public_search(
             search_filters=search_filters,
             persist_events=False,
         )
-    filtered = [item for item in retrieval.evidence if _matches_request(item, payload)]
+    filtered = [
+        item
+        for item in retrieval.evidence
+        if _matches_document_access(item, document_access_scopes) and _matches_request(item, payload)
+    ]
     page = filtered[offset : offset + payload.limit + 1]
     has_more = len(page) > payload.limit
     results = [
@@ -197,6 +205,12 @@ def _matches_request(evidence: Evidence, payload: SearchRequest) -> bool:
     if simple.source_id and simple.source_id.casefold() != _field_value(evidence, "source_id").casefold():
         return False
     return all(_matches_expression(evidence, expression) for expression in payload.filter_expressions)
+
+
+def _matches_document_access(evidence: Evidence, scopes: dict[str, DocumentAccessScope] | None) -> bool:
+    if not scopes:
+        return True
+    return is_document_visible(dict(evidence.metadata or {}), scopes.get(evidence.knowledge_base_id))
 
 
 def _matches_expression(evidence: Evidence, expression: FilterExpression) -> bool:

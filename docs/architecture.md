@@ -8,12 +8,14 @@ in [STATUS.md](STATUS.md).
 ## Scope
 
 WikipediaRag is a local production-shaped RAG platform for Russian Wikipedia
-and uploaded document knowledge bases. It covers:
+and uploaded document knowledge bases, with implemented foundations for
+external source connections. It covers:
 
 - browser-based local operation;
 - application auth and tenant/KB authorization;
 - asynchronous Wikipedia and document ingestion;
 - object-storage-first document handling;
+- external source connectors for local/corporate source synchronization;
 - tenant-scoped hybrid retrieval and grounded answer generation;
 - local validation, eval and release-gate workflows.
 
@@ -27,7 +29,11 @@ deployment.
 - Operators and coding agents: run Compose, validation commands, eval gates and runtime smokes.
 - Identity provider: optional OIDC provider, with a local Keycloak smoke profile.
 - Model providers: OpenRouter and mock provider through the Model Gateway alias contract; local llama.cpp is an optional future profile.
-- Source archives: local ZIM files served by Kiwix; XML multistream dumps are a fallback path.
+- Source archives and connectors: local ZIM files served by Kiwix; XML
+  multistream dumps are a fallback path; Confluence Data Center, Jira Data
+  Center, GitLab Self-Managed, local folder, internal crawler, Kiwix/ZIM
+  source-version tracking and deterministic Sunduk/DocSmart mocks share the
+  source connector contract.
 
 ## Architecture Principles
 
@@ -59,6 +65,7 @@ flowchart LR
     IdP["OIDC Provider or Local Auth"]
     Models["Model Providers"]
     Kiwix["Kiwix ZIM Server"]
+    Sources["External Source Connectors"]
     Stores["PostgreSQL, MinIO, OpenSearch"]
     Eval["Validation and Eval Artifacts"]
 
@@ -68,6 +75,8 @@ flowchart LR
     API -->|"enqueue and inspect jobs"| Stores
     Worker -->|"claim jobs and publish chunks"| Stores
     Worker -->|"read Wikipedia pages"| Kiwix
+    Worker -->|"sync changed/deleted source docs"| Sources
+    Sources -->|"source documents and tombstones"| Worker
     API -->|"retrieval and generation calls"| Models
     Worker -->|"embedding calls"| Models
     Operator -->|"compose, smoke, eval"| API
@@ -118,8 +127,8 @@ flowchart LR
 ## Runtime Components
 
 - Web UI: one React/Vite screen for auth, KB selection, import, upload, chat and retrieval debugging.
-- API: FastAPI service for auth, admin APIs, KBs, upload sessions, document lifecycle, chat SSE, debug search, readiness and safe errors.
-- Worker: Python loop that claims PostgreSQL jobs, imports Wikipedia, processes document uploads and handles deferred document purge.
+- API: FastAPI service for auth, admin APIs, KBs, source management, upload sessions, document lifecycle, chat SSE, debug search, readiness and safe errors.
+- Worker: Python loop that claims PostgreSQL jobs, imports Wikipedia, syncs external sources, processes document uploads and handles deferred document purge.
 - PostgreSQL: control-plane source of truth and durable job state.
 - MinIO: original uploads and normalized/parser artifacts.
 - OpenSearch: derived BM25/vector search representation.
@@ -134,6 +143,7 @@ flowchart LR
 | Data | Authoritative location | Derived or transient copies |
 | --- | --- | --- |
 | Tenants, users, sessions, groups, KB grants, audit events | PostgreSQL | None |
+| Knowledge sources, sync runs and source document states | PostgreSQL | Connector responses and source snapshots |
 | Upload sessions, batches, ingestion jobs, job items | PostgreSQL | UI memory polling state |
 | Original uploaded bytes | MinIO, referenced by PostgreSQL metadata | Browser selected `File` objects before upload |
 | Normalized documents and parser reports | MinIO, referenced by PostgreSQL metadata | Worker memory during processing |
@@ -153,6 +163,7 @@ authoritative storage matrix.
 - [Data and storage](architecture/data-and-storage.md)
 - [Main flows](architecture/flows.md)
 - [Security and tenancy](architecture/security-and-tenancy.md)
+- [Search and Deep Research backend](architecture/search-and-deep-research.md)
 - [Deployment and operations](architecture/deployment-and-operations.md)
 
 ## Key Decisions
@@ -170,7 +181,8 @@ ADR guidance and template are in [decisions/](decisions/).
 ## Open Architecture Questions
 
 - External deployment model, TLS/reverse proxy strategy and environment isolation.
-- Production identity provider, tenant onboarding and external ACL connector policy.
+- Production identity provider, tenant onboarding and richer external ACL connector policy beyond JSON `document_access` trimming.
+- Durable Deep Research run lifecycle, typed evidence memory and coverage records.
 - Malware scanning and parser isolation requirements beyond local Compose hardening.
 - Restore automation, restore drills and backup retention.
 - Observability backend, retention, alerting and ownership.
@@ -180,7 +192,7 @@ ADR guidance and template are in [decisions/](decisions/).
 ## Non-Goals
 
 - Production external hosting support in the current local MVP.
-- Document-level ACLs.
+- Explicit deny rules and source-specific ACL engines beyond JSON `document_access`.
 - Multi-KB Extended Search.
 - GraphRAG, multi-agent swarm retrieval, ColBERT, learned sparse retrieval or proposition indexing.
 - Direct provider calls from business logic.

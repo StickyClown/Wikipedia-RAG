@@ -4,7 +4,9 @@ from typing import Any, cast
 
 import pytest
 
+from wikipediarag.auth import KnowledgeBaseRole
 from wikipediarag.config import Settings
+from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.schemas import Evidence, FilterExpression, SearchFilters, SearchRequest
 from wikipediarag.search_service import _opensearch_filter_payload, run_public_search
 
@@ -18,7 +20,19 @@ def _evidence(
     score: float = 0.9,
     language: str = "ru",
     document_type: str = "application/pdf",
+    document_access: dict[str, Any] | None = None,
 ) -> Evidence:
+    metadata = {
+        "document_id": document_id,
+        "document_version_id": f"{document_id}:v1",
+        "source_type": "upload_document",
+        "content_type": document_type,
+        "language": language,
+        "document_date": "2026-07-29",
+        "locator": {"page": 1},
+    }
+    if document_access is not None:
+        metadata["document_access"] = document_access
     return Evidence(
         evidence_id=chunk_id,
         chunk_id=chunk_id,
@@ -29,15 +43,7 @@ def _evidence(
         source_url="http://localhost/doc",
         scores={"rerank": score, "fusion": score / 2},
         ranks={"rerank": 1},
-        metadata={
-            "document_id": document_id,
-            "document_version_id": f"{document_id}:v1",
-            "source_type": "upload_document",
-            "content_type": document_type,
-            "language": language,
-            "document_date": "2026-07-29",
-            "locator": {"page": 1},
-        },
+        metadata=metadata,
     )
 
 
@@ -161,6 +167,137 @@ async def test_public_search_applies_simple_and_typed_filters(monkeypatch: pytes
     )
 
     assert [item.chunk_id for item in response.results] == ["chunk:ru"]
+
+
+@pytest.mark.asyncio
+async def test_public_search_trims_restricted_documents_for_unauthorized_viewer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_retrieve(*_args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        from wikipediarag.schemas import RetrievalResult
+
+        return RetrievalResult(
+            query="verification",
+            trace_id="trace",
+            evidence=[
+                _evidence("chunk:open", document_id="doc:open"),
+                _evidence(
+                    "chunk:restricted",
+                    document_id="doc:restricted",
+                    document_access={"policy": "restricted", "user_ids": ["other-user"], "group_ids": []},
+                ),
+            ],
+            events=[],
+        )
+
+    monkeypatch.setattr("wikipediarag.search_service.retrieve", fake_retrieve)
+    scope = DocumentAccessScope(user_id="viewer-user", kb_role=KnowledgeBaseRole.viewer, group_ids=frozenset())
+
+    response = await run_public_search(
+        cast(Any, object()),
+        SearchRequest(
+            query="verification",
+            knowledge_base_ids=["33333333-3333-4333-8333-333333333333"],
+            ranking_profile="upload_sota_mvp",
+        ),
+        tenant_id="11111111-1111-4111-8111-111111111111",
+        knowledge_base_ids=["33333333-3333-4333-8333-333333333333"],
+        settings=Settings(),
+        document_access_scopes={"33333333-3333-4333-8333-333333333333": scope},
+    )
+
+    assert calls[0]["search_filters"]["document_access_scopes"] == {"33333333-3333-4333-8333-333333333333": scope}
+    assert [item.chunk_id for item in response.results] == ["chunk:open"]
+
+
+@pytest.mark.asyncio
+async def test_public_search_allows_tenant_document_without_kb_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_retrieve(*_args: Any, **_kwargs: Any) -> Any:
+        from wikipediarag.schemas import RetrievalResult
+
+        return RetrievalResult(
+            query="verification",
+            trace_id="trace",
+            evidence=[
+                _evidence("chunk:kb", document_id="doc:kb"),
+                _evidence(
+                    "chunk:tenant",
+                    document_id="doc:tenant",
+                    document_access={"policy": "tenant", "user_ids": [], "group_ids": []},
+                ),
+            ],
+            events=[],
+        )
+
+    monkeypatch.setattr("wikipediarag.search_service.retrieve", fake_retrieve)
+
+    response = await run_public_search(
+        cast(Any, object()),
+        SearchRequest(
+            query="verification",
+            knowledge_base_ids=["33333333-3333-4333-8333-333333333333"],
+            ranking_profile="upload_sota_mvp",
+        ),
+        tenant_id="11111111-1111-4111-8111-111111111111",
+        knowledge_base_ids=["33333333-3333-4333-8333-333333333333"],
+        settings=Settings(),
+        document_access_scopes={
+            "33333333-3333-4333-8333-333333333333": DocumentAccessScope(
+                tenant_id="11111111-1111-4111-8111-111111111111",
+                user_id="viewer-user",
+            )
+        },
+    )
+
+    assert [item.chunk_id for item in response.results] == ["chunk:tenant"]
+
+
+@pytest.mark.asyncio
+async def test_public_search_allows_restricted_documents_for_matching_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_retrieve(*_args: Any, **_kwargs: Any) -> Any:
+        from wikipediarag.schemas import RetrievalResult
+
+        return RetrievalResult(
+            query="verification",
+            trace_id="trace",
+            evidence=[
+                _evidence(
+                    "chunk:restricted",
+                    document_id="doc:restricted",
+                    document_access={"policy": "restricted", "user_ids": [], "group_ids": ["group:1"]},
+                ),
+            ],
+            events=[],
+        )
+
+    monkeypatch.setattr("wikipediarag.search_service.retrieve", fake_retrieve)
+
+    response = await run_public_search(
+        cast(Any, object()),
+        SearchRequest(
+            query="verification",
+            knowledge_base_ids=["33333333-3333-4333-8333-333333333333"],
+            ranking_profile="upload_sota_mvp",
+        ),
+        tenant_id="11111111-1111-4111-8111-111111111111",
+        knowledge_base_ids=["33333333-3333-4333-8333-333333333333"],
+        settings=Settings(),
+        document_access_scopes={
+            "33333333-3333-4333-8333-333333333333": DocumentAccessScope(
+                user_id="viewer-user",
+                group_ids=frozenset({"group:1"}),
+            )
+        },
+    )
+
+    assert [item.chunk_id for item in response.results] == ["chunk:restricted"]
 
 
 def test_filter_ast_compiles_supported_fields_to_opensearch_payload() -> None:

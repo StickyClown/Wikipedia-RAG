@@ -6,12 +6,17 @@ Last updated: 2026-08-02
 
 Search Quality V2 foundations have been implemented on top of the Stage 4
 external source connection baseline. Ordinary user search now reuses the hybrid
-retrieval pipeline instead of PostgreSQL substring ranking, while keeping the
-existing KB-level authorization model and published-document readiness checks.
+retrieval pipeline instead of PostgreSQL substring ranking, with minimal
+document-level ACL/security trimming for trusted source metadata.
 
-Completion criterion for the next increment: harden document-level ACL/security
-trimming and then promote Extended Search into durable Deep Research runs with
-typed evidence memory and coverage records.
+Completion criterion for the next increment: promote Extended Search into
+durable Deep Research runs with typed evidence memory and coverage records.
+
+Current Extended Search persists query runs, retrieval events and an
+`agent_runs` ledger for completed single-KB harness executions. That is
+execution trace durability, not the future Deep Research product lifecycle:
+there are not yet resumable research runs, typed evidence memory records or
+durable coverage records with their own public lifecycle.
 
 ## Implemented now
 
@@ -24,8 +29,8 @@ typed evidence memory and coverage records.
 - Parser runtime hardening in Compose: Xberg, Docling and metadata-service with sandbox settings, separate concurrency limiters and safe parser progress metadata.
 - Retrieval: BM25, dense vectors, RRF, rerank, dedup/page quota, parent expansion, answerability, citation validation and experimental safe diagnostics.
 - Direct Multi-KB chat/debug retrieval with all-KB role validation and all-KB readiness preflight. Extended Search remains single-KB.
-- Ordinary user search: viewer-scoped `POST /api/v1/search` now runs through
-  the hybrid retrieval pipeline with OpenSearch BM25/vector search, RRF,
+- Ordinary user search: document-visibility-scoped `POST /api/v1/search` now
+  runs through the hybrid retrieval pipeline with OpenSearch BM25/vector search, RRF,
   optional rerank, typed filter expressions, cursor pagination, optional
   highlights, facets and document grouping while preserving safe
   `KB_NOT_READY` handling and exact document-viewer open action by `chunk_id`.
@@ -52,6 +57,15 @@ typed evidence memory and coverage records.
   and async worker ingestion path as UI drag-and-drop uploads.
 - Query-run observability V1: chat/debug queries persist protected query runs and retrieval events with stable stage names, query transforms, candidate rank movement, decision reasons, answerability reason codes, Model Gateway safe metadata, feedback/evaluation event endpoints and an updated Retrieval Debugger. PostgreSQL remains the source of truth; OpenTelemetry export is optional/no-op when packages are absent.
 - Retrieval observability now carries explicit per-run `transform_id`/`subquery_id` query context through direct, extended and Multi-KB stage events, candidate debug payloads, extended harness search yield metrics and answer context source summaries.
+- Search Quality V2 ACL/security trimming: documents are KB-visible by default,
+  can be tenant-visible for all active-tenant actors, or restricted through
+  trusted `metadata.document_access`; platform admins, tenant admins and KB
+  managers/owners bypass document trimming, while restricted documents also
+  support matching user/group allowlists. KB managers can update document access
+  and source document access defaults through API/UI, and source defaults can be
+  applied to existing synced documents. The same scope is applied to ordinary
+  search, chat/debug retrieval, Multi-KB retrieval, Extended Search neighbor
+  expansion, DB dense fallback and document viewer paths.
 - Eval and validation tooling: local-auth eval client, release-gate provider preflight, warm retrieval profiling, MIRACL-RU adapter, document corpus verification and cross-tenant hardening smoke command.
 
 ## In progress
@@ -61,6 +75,53 @@ typed evidence memory and coverage records.
 
 ## Latest validation
 
+- Search Quality V2 ACL/security trimming validation on 2026-08-02:
+  Extended trusted `metadata.document_access` trimming to `kb`, `tenant` and
+  `restricted` policies with admin/manager bypass across public search,
+  chat/direct retrieval, Multi-KB retrieval, Extended Search neighbor
+  expansion, debug search and document viewer paths. KB managers can update
+  document access and source document access defaults through API/UI; source
+  defaults can be applied to existing synced documents and inherited by future
+  source syncs. Direct client upload metadata is normalized back to KB-visible
+  access unless it comes from trusted source sync. Validation:
+  `uv run ruff format src tests` -> exit 0, 7 files reformatted;
+  `uv run ruff format --check src tests` -> exit 0, 123 files already
+  formatted;
+  `uv run ruff check .` -> exit 0;
+  `uv run mypy src tests` -> exit 0, no issues found in 123 source files;
+  `uv run pytest tests\unit -q` -> exit 0, 245 passed, 2 warnings;
+  `uv run pytest tests\integration -q` -> exit 0, 14 passed;
+  `pnpm lint` in `services/ui` -> exit 0;
+  `pnpm typecheck` in `services/ui` -> exit 0;
+  `pnpm build` in `services/ui` -> exit 0;
+  `docker compose config --quiet` -> exit 0;
+  `git diff --check` -> exit 0, with Git CRLF normalization warnings only.
+- Backend search and Deep Research documentation validation on 2026-08-02:
+  Added `docs/architecture/search-and-deep-research.md` as the canonical
+  backend/product contract for ordinary search, debug search, chat retrieval,
+  current single-KB Extended Search and planned durable Deep Research.
+  Documentation indexes were updated in `README.md` and
+  `docs/architecture.md`. Claims were checked against
+  `src/wikipediarag/search_service.py`, `src/wikipediarag/retrieval.py`,
+  `src/wikipediarag/extended.py`, `src/wikipediarag/api/handlers.py`,
+  `src/wikipediarag/retrieval_contract.py`, `src/wikipediarag/schemas.py` and
+  `config/retrieval.yaml`. Validation:
+  `rg -n "search-and-deep-research|Detailed Architecture|Documentation Map" README.md docs`
+  -> exit 0.
+- Backend API refactoring validation on 2026-08-02:
+  API routes were split into domain `APIRouter` modules under
+  `src/wikipediarag/api/`, while `wikipediarag.api_app:app` remains the public
+  service entrypoint. Chat and debug-search orchestration now have explicit
+  service entry functions, and endpoint/large-helper docstrings were added
+  without changing public routes, schemas, auth/CSRF checks, SSE event names or
+  retrieval behavior. Validation:
+  `uv run ruff check .` -> exit 0;
+  `uv run ruff format --check src tests` -> exit 0, 122 files already
+  formatted;
+  `uv run mypy src tests` -> exit 0, no issues found in 122 source files;
+  `uv run pytest tests\unit -q` -> exit 0, 229 passed, 2 warnings;
+  `uv run pytest tests\integration -q` -> exit 0, 14 passed;
+  `docker compose config --quiet` -> exit 0.
 - Search/deep-research runtime validation on 2026-08-02:
   `docker compose up -d --build api worker ui` -> exit 0;
   authenticated API smoke created KB `82d4f568-cb38-408b-bcea-dfb3f7e9ff2a`,
@@ -388,9 +449,11 @@ typed evidence memory and coverage records.
 
 ## Next approved task
 
-No new implementation task is approved. The next roadmap item is Stage 4:
-external source connection foundations, regular refresh and changed/deleted
-source document handling.
+Promote the current single-KB Extended Search harness into durable Deep
+Research runs with typed evidence memory, explicit coverage records and a
+managed run lifecycle. Stage 4 external source connection foundations and the
+minimal Search Quality V2 ACL/security trimming baseline are already
+implemented and should be treated as prerequisites for this increment.
 
 ## Related artifacts
 

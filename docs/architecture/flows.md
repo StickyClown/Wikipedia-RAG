@@ -176,21 +176,24 @@ sequenceDiagram
     autonumber
     participant API as API
     participant OS as OpenSearch
-    participant GW as Model Gateway
     participant DB as PostgreSQL
 
     API-->>API: Initial retrieval is PARTIAL or UNANSWERABLE
     API-->>API: Confirm profile policy allows Extended Search
-    API->>GW: Generate bounded follow-up queries
+    API-->>API: Build bounded subqueries and harness budgets
     loop Bounded subqueries
         API->>OS: Retrieve additional evidence for the primary KB
+        API-->>API: Update evidence ledger and coverage inventory
     end
     API-->>API: Select final evidence and answerability
-    API->>DB: Persist retrieval events and diagnostics
+    API->>DB: Persist retrieval events
+    API->>DB: Persist completed agent_runs ledger for the query_run
 ```
 
 Extended Search is implemented as single-KB in this slice. Multi-KB direct
-retrieval bypasses Extended Search.
+retrieval bypasses Extended Search. The persisted `agent_runs` ledger is a
+completed execution trace for diagnostics; it is not yet a resumable Deep
+Research run lifecycle with typed evidence memory and durable coverage records.
 
 ## Document Delete And Deferred Purge
 

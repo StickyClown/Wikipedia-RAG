@@ -4,7 +4,9 @@ from typing import cast
 
 import pytest
 
+from wikipediarag.auth import KnowledgeBaseRole
 from wikipediarag.config import Settings
+from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.extended import (
     HarnessState,
     _build_subqueries,
@@ -246,3 +248,64 @@ async def test_get_neighbors_uses_tenant_scoped_chunk_lookup(monkeypatch: pytest
 
     assert [item.chunk_id for item in neighbors] == ["c0", "c2"]
     assert all(call["tenant_id"] == "tenant" and call["knowledge_base_id"] == "kb" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_get_neighbors_trims_restricted_neighbor_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = {
+        "c1": {
+            "id": "c1",
+            "title": "Center",
+            "section_path": ["Doc"],
+            "content": "center",
+            "source_url": "http://source/center",
+            "page_id": 1,
+            "document_id": "doc",
+            "parent_chunk_id": None,
+            "prev_chunk_id": "c0",
+            "next_chunk_id": "c2",
+            "metadata": {},
+        },
+        "c0": {
+            "id": "c0",
+            "title": "Restricted Prev",
+            "section_path": ["Doc"],
+            "content": "prev",
+            "source_url": "http://source/prev",
+            "page_id": 1,
+            "document_id": "doc:restricted",
+            "parent_chunk_id": None,
+            "prev_chunk_id": None,
+            "next_chunk_id": "c1",
+            "metadata": {"document_access": {"policy": "restricted", "user_ids": ["other"], "group_ids": []}},
+        },
+        "c2": {
+            "id": "c2",
+            "title": "Open Next",
+            "section_path": ["Doc"],
+            "content": "next",
+            "source_url": "http://source/next",
+            "page_id": 1,
+            "document_id": "doc:open",
+            "parent_chunk_id": None,
+            "prev_chunk_id": "c1",
+            "next_chunk_id": None,
+            "metadata": {},
+        },
+    }
+
+    async def fake_fetch_chunk_by_id(_conn: object, **kwargs: object) -> dict[str, object] | None:
+        return rows.get(str(kwargs["chunk_id"]))
+
+    monkeypatch.setattr("wikipediarag.extended.fetch_chunk_by_id", fake_fetch_chunk_by_id)
+
+    neighbors = await get_neighbors(
+        object(),  # type: ignore[arg-type]
+        "c1",
+        tenant_id="tenant",
+        knowledge_base_id="kb",
+        window=1,
+        filters={"document_access_scope": DocumentAccessScope(user_id="viewer", kb_role=KnowledgeBaseRole.viewer)},
+    )
+
+    assert [item.chunk_id for item in neighbors] == ["c2"]

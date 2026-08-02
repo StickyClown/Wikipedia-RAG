@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from starlette.requests import Request
 
-import wikipediarag.api_app as api_app
+import wikipediarag.api.handlers as api_app
 from wikipediarag.auth import AuthenticationMethod, PlatformRole, TenantRole
 from wikipediarag.auth_service import AuthenticatedUser, AuthenticationError, auth_disabled_actor
 from wikipediarag.config import Settings

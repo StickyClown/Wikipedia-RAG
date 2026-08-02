@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncConnection
 from starlette.requests import Request
 
-import wikipediarag.api_app as api_app
+import wikipediarag.api.handlers as api_app
 from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole, TenantRole
 from wikipediarag.config import Settings
 from wikipediarag.repository import create_document_upload_records
