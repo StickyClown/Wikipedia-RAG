@@ -777,6 +777,7 @@ export function App() {
     controller?: AbortController;
     runId?: string;
   }>({});
+  const chatControllerRef = useRef<AbortController | null>(null);
   const [researchPlans, setResearchPlans] = useState<ResearchPlanSummary[]>([]);
   const [researchPlanDetail, setResearchPlanDetail] =
     useState<ResearchPlanDetail | null>(null);
@@ -799,6 +800,7 @@ export function App() {
 
   useEffect(
     () => () => {
+      chatControllerRef.current?.abort();
       researchPollRef.current.controller?.abort();
       if (researchPollRef.current.timer)
         window.clearTimeout(researchPollRef.current.timer);
@@ -1325,7 +1327,7 @@ export function App() {
     setChatError("");
     setChatBusy(true);
     const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 120_000);
+    chatControllerRef.current = controller;
     try {
       const response = await apiFetch("/api/v1/chat", {
         method: "POST",
@@ -1398,14 +1400,20 @@ export function App() {
       if (!terminalEvent) setChatError(t("chat_incomplete"));
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
-        setChatError(t("chat_timeout"));
+        setChatError(t("chat_stopped"));
       } else {
         setChatError(error instanceof Error ? error.message : t("chat_failed"));
       }
     } finally {
-      window.clearTimeout(timeoutId);
+      if (chatControllerRef.current === controller) {
+        chatControllerRef.current = null;
+      }
       setChatBusy(false);
     }
+  }
+
+  function stopChat() {
+    chatControllerRef.current?.abort();
   }
 
   async function submitSearch(event: FormEvent) {
@@ -3575,6 +3583,11 @@ export function App() {
                   <button type="submit" disabled={chatBusy}>
                     <Search size={16} /> {chatBusy ? t("loading") : t("ask")}
                   </button>
+                  {chatBusy && (
+                    <button type="button" onClick={stopChat}>
+                      <X size={16} /> {t("chat_stop")}
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={loadDebugger}
