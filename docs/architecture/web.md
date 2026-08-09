@@ -1,21 +1,29 @@
 # Web Architecture
 
-The web UI is implemented in `services/ui/src/App.tsx` as a single React/Vite
-screen. No frontend router was found.
+The web UI is implemented in `services/ui/src/App.tsx` as a React/Vite app
+shell with client-side workspace tabs. It intentionally has no frontend
+router: Chat, Search, Research and Knowledge Base panels remain mounted and
+are hidden with the native `hidden` attribute so upload/research state and
+drafts survive tab changes.
 
 ## Screens And Entry Points
 
-- Header: product name, API readiness status, current session user and logout.
+- Header: product name, API readiness status, current session user, locale
+  switcher and logout.
+- Workspace tabs: Chat, Search, Research and Knowledge Base. Chat is the
+  default when at least one KB is available; Knowledge Base is the default for
+  an authenticated tenant with no KBs.
 - Sign in: local username/password form and OIDC start button.
-- Knowledge-base toolbar: primary KB selector, retrieval-scope checkboxes and create-KB form.
+- Knowledge-base context bar: primary KB selector and collapsible retrieval
+  scope; create-KB form is shown in the Knowledge Base workspace.
 - Wikipedia Import: bounded ZIM import trigger and polled ingestion job progress.
 - Upload: multi-file picker, batch upload status, per-file progress, retry for failed ingestion jobs and public metadata for the first completed document.
 - Search: ordinary viewer-scoped search with metadata filters, result snippets and a document viewer open action.
 - Document viewer: inline text viewer opened from search results, with document TOC, in-document search and chunk/section context.
-- Deep Research: compact single-KB research panel for starting durable runs,
-  listing runs, reading progress/coverage/evidence/reflections/report and
-  pausing, resuming, cancelling or opening the latest episode in the retrieval
-  debugger.
+- Deep Research: compact one-to-three-KB research workspace for starting durable runs,
+  listing runs, reading progress, coverage, evidence, reflections and report,
+  and pausing, resuming, cancelling or opening the latest episode in the
+  retrieval debugger.
 - Chat: question input, mode selector, retrieval profile and advanced retrieval override controls.
 - Answer and sources: generated answer plus cited evidence returned by chat SSE events.
 - Retrieval Debugger: query-run retrieval events loaded after a chat run.
@@ -92,6 +100,12 @@ Research status polling is lightweight client-side polling while a selected run
 is `received` or `running`; the backend remains the source of truth for
 pause/resume/cancel.
 
+The API detail includes public-safe tool-call metadata and derived-question
+state, but the current panel does not render a separate tool-call ledger or
+planner trace. It also does not expose the API/CLI context-policy override
+controls. Raw tool queries, planner prompts, provider payloads and storage keys
+are never displayed.
+
 ## Upload And Ingestion Progress
 
 The UI accepts multiple files, computes SHA-256 with `crypto.subtle.digest`,
@@ -132,8 +146,9 @@ answer, evidence, query run id, retrieval events, upload batch, upload items,
 upload document metadata, ordinary search results, document viewer state,
 research runs, selected research detail and errors.
 
-No `localStorage`, `sessionStorage` or IndexedDB usage was found in the UI.
-Selected files exist only as browser `File` objects during the upload function.
+The only persistent browser preference is the UI locale under the
+`wikipediarag.locale` localStorage key. Selected files exist only as browser
+`File` objects during the upload function.
 
 ## API Client Behavior
 

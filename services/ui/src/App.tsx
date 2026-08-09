@@ -16,7 +16,15 @@ import {
   SlidersHorizontal,
   X,
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import {
+  FormEvent,
+  KeyboardEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { interpolate, Locale, useLocale } from "./i18n";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
@@ -178,10 +186,14 @@ type QueryRunSummary = {
 };
 
 type SsePayload = {
-  query_run_id: string;
-  data: {
+  query_run_id?: string;
+  data?: {
     text?: string;
     evidence?: Evidence[];
+    answer?: string;
+    code?: string;
+    safe_message?: string;
+    [key: string]: unknown;
   };
 };
 
@@ -501,6 +513,7 @@ type DocumentSearchResponse = {
 type ResearchRunSummary = {
   id: string;
   knowledge_base_id: string;
+  knowledge_base_ids?: string[];
   topic: string;
   retrieval_profile: string;
   status: string;
@@ -511,6 +524,40 @@ type ResearchRunSummary = {
   created_at?: string | null;
   updated_at?: string | null;
   completed_at?: string | null;
+};
+
+type ResearchPlanQuestion = {
+  question: string;
+  ordinal: number;
+  kind: string;
+};
+
+type ResearchPlanSummary = {
+  id: string;
+  knowledge_base_id: string;
+  knowledge_base_ids: string[];
+  user_id?: string | null;
+  topic: string;
+  retrieval_profile: string;
+  tool_mode: string;
+  status: string;
+  notes: string;
+  question_count: number;
+  approved_run_id?: string | null;
+  approved_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+type ResearchPlanDetail = {
+  plan: ResearchPlanSummary;
+  questions: ResearchPlanQuestion[];
+  retrieval_overrides: Record<string, unknown>;
+  context_policy: Record<string, unknown>;
+};
+
+type ResearchPlanListResponse = {
+  plans: ResearchPlanSummary[];
 };
 
 type ResearchQuestionRecord = {
@@ -577,6 +624,24 @@ type ResearchRunDetail = {
     coverage?: { covered: number; total: number };
     latest_reflection?: string;
     stop_reason?: string | null;
+    partial_terminal?: boolean;
+    failure_taxonomy?: Record<string, unknown>;
+    report_format_version?: string;
+    sections?: {
+      confirmed_findings?: Array<{
+        text: string;
+        status?: string;
+        evidence_refs?: string[];
+      }>;
+      partial_conflicting_findings?: Array<{
+        text: string;
+        status?: string;
+        evidence_refs?: string[];
+      }>;
+      unresolved_questions?: string[];
+      used_evidence?: ResearchEvidenceRecord[];
+      limitations?: string[];
+    };
   };
 };
 
@@ -584,7 +649,29 @@ type ResearchRunListResponse = {
   runs: ResearchRunSummary[];
 };
 
+type WorkspaceTab = "chat" | "search" | "research" | "knowledge";
+
+function HelpTooltip({ text }: { text: string }) {
+  return (
+    <span className="help-tooltip">
+      <span
+        className="help-tooltip-trigger"
+        role="img"
+        tabIndex={0}
+        aria-label={text}
+      >
+        ?
+      </span>
+      <span className="help-tooltip-content" role="tooltip">
+        {text}
+      </span>
+    </span>
+  );
+}
+
 export function App() {
+  const { locale, setLocale, t } = useLocale();
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>("chat");
   const [ready, setReady] = useState("checking");
   const [session, setSession] = useState<AuthSession>({
     authenticated: false,
@@ -618,6 +705,8 @@ export function App() {
   const [answer, setAnswer] = useState("");
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [queryRunId, setQueryRunId] = useState("");
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatError, setChatError] = useState("");
   const [events, setEvents] = useState<RetrievalEvent[]>([]);
   const [debuggerRun, setDebuggerRun] = useState<QueryRunSummary | null>(null);
   const [uploadStatus, setUploadStatus] = useState("");
@@ -680,6 +769,21 @@ export function App() {
   const [researchTopic, setResearchTopic] = useState(
     "Сделай глубокое исследование по выбранной базе знаний",
   );
+  const [researchKnowledgeBaseIds, setResearchKnowledgeBaseIds] = useState<
+    string[]
+  >([]);
+  const researchPollRef = useRef<{
+    timer?: number;
+    controller?: AbortController;
+    runId?: string;
+  }>({});
+  const [researchPlans, setResearchPlans] = useState<ResearchPlanSummary[]>([]);
+  const [researchPlanDetail, setResearchPlanDetail] =
+    useState<ResearchPlanDetail | null>(null);
+  const [researchPlanTopicDraft, setResearchPlanTopicDraft] = useState("");
+  const [researchPlanNotesDraft, setResearchPlanNotesDraft] = useState("");
+  const [researchPlanQuestionsDraft, setResearchPlanQuestionsDraft] =
+    useState("");
   const [researchRuns, setResearchRuns] = useState<ResearchRunSummary[]>([]);
   const [researchDetail, setResearchDetail] =
     useState<ResearchRunDetail | null>(null);
@@ -692,6 +796,15 @@ export function App() {
       .then((data) => setReady(data.status))
       .catch(() => setReady("offline"));
   }, []);
+
+  useEffect(
+    () => () => {
+      researchPollRef.current.controller?.abort();
+      if (researchPollRef.current.timer)
+        window.clearTimeout(researchPollRef.current.timer);
+    },
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -712,6 +825,10 @@ export function App() {
       if (items[0]) {
         setSelectedKnowledgeBaseId(items[0].id);
         setSelectedRetrievalKnowledgeBaseIds([items[0].id]);
+        setResearchKnowledgeBaseIds([items[0].id]);
+        setActiveTab("chat");
+      } else {
+        setActiveTab("knowledge");
       }
     }
     void loadInitialSession();
@@ -786,28 +903,63 @@ export function App() {
 
   useEffect(() => {
     if (!session.authenticated) {
+      setResearchPlans([]);
+      setResearchPlanDetail(null);
       setResearchRuns([]);
       setResearchDetail(null);
       return;
     }
     let cancelled = false;
-    async function loadInitialResearchRuns() {
+    async function loadInitialResearchState() {
       try {
-        const response = await fetch(`${API_BASE}/api/v1/research-runs`, {
-          credentials: "include",
-        });
-        if (!response.ok || cancelled) return;
-        const payload = (await response.json()) as ResearchRunListResponse;
-        if (!cancelled) setResearchRuns(payload.runs);
+        const [plansResponse, runsResponse] = await Promise.all([
+          fetch(`${API_BASE}/api/v1/research-plans`, {
+            credentials: "include",
+          }),
+          fetch(`${API_BASE}/api/v1/research-runs`, {
+            credentials: "include",
+          }),
+        ]);
+        if (!plansResponse.ok || !runsResponse.ok || cancelled) return;
+        const plansPayload =
+          (await plansResponse.json()) as ResearchPlanListResponse;
+        const runsPayload =
+          (await runsResponse.json()) as ResearchRunListResponse;
+        if (!cancelled) {
+          setResearchPlans(plansPayload.plans);
+          setResearchRuns(runsPayload.runs);
+        }
       } catch {
-        if (!cancelled) setResearchRuns([]);
+        if (!cancelled) {
+          setResearchPlans([]);
+          setResearchRuns([]);
+        }
       }
     }
-    void loadInitialResearchRuns();
+    void loadInitialResearchState();
     return () => {
       cancelled = true;
     };
   }, [session.authenticated]);
+
+  async function loadResearchPlans() {
+    if (!session.authenticated) return;
+    setResearchError("");
+    try {
+      const response = await apiFetch("/api/v1/research-plans", {
+        credentials: "include",
+      });
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "research_not_ready"),
+        );
+      }
+      const payload = (await response.json()) as ResearchPlanListResponse;
+      setResearchPlans(payload.plans);
+    } catch (error) {
+      setResearchError(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   const imported = useMemo(() => job?.progress?.pages_imported ?? 0, [job]);
   const chunks = useMemo(() => job?.progress?.chunks_indexed ?? 0, [job]);
@@ -817,6 +969,31 @@ export function App() {
       : selectedKnowledgeBaseId
         ? [selectedKnowledgeBaseId]
         : [];
+
+  const workspaceTabs: Array<{ id: WorkspaceTab; label: string }> = [
+    { id: "chat", label: t("chat") },
+    { id: "search", label: t("search") },
+    { id: "research", label: t("research") },
+    { id: "knowledge", label: t("knowledge_base") },
+  ];
+
+  function handleWorkspaceKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    const currentIndex = workspaceTabs.findIndex((tab) => tab.id === activeTab);
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight")
+      nextIndex = (currentIndex + 1) % workspaceTabs.length;
+    if (event.key === "ArrowLeft")
+      nextIndex =
+        (currentIndex - 1 + workspaceTabs.length) % workspaceTabs.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = workspaceTabs.length - 1;
+    if (nextIndex === currentIndex) return;
+    event.preventDefault();
+    setActiveTab(workspaceTabs[nextIndex].id);
+    requestAnimationFrame(() => {
+      document.getElementById(`tab-${workspaceTabs[nextIndex].id}`)?.focus();
+    });
+  }
 
   async function apiFetch(path: string, init: RequestInit = {}) {
     const method = init.method?.toUpperCase() ?? "GET";
@@ -885,6 +1062,7 @@ export function App() {
       setKnowledgeBases([]);
       setSelectedKnowledgeBaseId("");
       setSelectedRetrievalKnowledgeBaseIds([]);
+      setResearchKnowledgeBaseIds([]);
       setSources([]);
       setSourceRuns({});
       setSearchResults([]);
@@ -897,12 +1075,16 @@ export function App() {
     if (!response.ok) return;
     const items = (await response.json()) as KnowledgeBase[];
     setKnowledgeBases(items);
+    if (items.length === 0) setActiveTab("knowledge");
     if (!selectedKnowledgeBaseId && items[0]) {
       setSelectedKnowledgeBaseId(items[0].id);
+      setActiveTab("chat");
     }
     if (selectedRetrievalKnowledgeBaseIds.length === 0 && items[0]) {
       setSelectedRetrievalKnowledgeBaseIds([items[0].id]);
     }
+    if (researchKnowledgeBaseIds.length === 0 && items[0])
+      setResearchKnowledgeBaseIds([items[0].id]);
   }
 
   async function loadSources(kbId = selectedKnowledgeBaseId) {
@@ -913,7 +1095,11 @@ export function App() {
       const response = await apiFetch(
         `/api/v1/knowledge-bases/${encodeURIComponent(kbId)}/sources`,
       );
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
       const payload = (await response.json()) as SourceListResponse;
       setSources(payload.sources);
     } catch (error) {
@@ -1127,56 +1313,98 @@ export function App() {
 
   async function submitChat(event: FormEvent) {
     event.preventDefault();
+    if (!question.trim()) {
+      setChatError(t("chat_empty"));
+      return;
+    }
     setAnswer("");
     setEvidence([]);
+    setQueryRunId("");
     setEvents([]);
     setDebuggerRun(null);
-    const response = await apiFetch("/api/v1/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: question,
-        knowledge_base_ids:
-          selectedRetrievalKnowledgeBaseIds.length > 0
-            ? selectedRetrievalKnowledgeBaseIds
-            : selectedKnowledgeBaseId
-              ? [selectedKnowledgeBaseId]
-              : [],
-        mode,
-        stream: true,
-        retrieval_profile: retrievalProfile,
-        retrieval_overrides: buildRetrievalOverrides({
-          bm25Enabled,
-          denseEnabled,
-          rerankEnabled,
-          fusionMode,
-          parentExpansion,
-          extendedSearchMode,
-          topK: debugTopK,
+    setChatError("");
+    setChatBusy(true);
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 120_000);
+    try {
+      const response = await apiFetch("/api/v1/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          message: question,
+          knowledge_base_ids:
+            selectedRetrievalKnowledgeBaseIds.length > 0
+              ? selectedRetrievalKnowledgeBaseIds
+              : selectedKnowledgeBaseId
+                ? [selectedKnowledgeBaseId]
+                : [],
+          mode,
+          stream: true,
+          retrieval_profile: retrievalProfile,
+          retrieval_overrides: buildRetrievalOverrides({
+            bm25Enabled,
+            denseEnabled,
+            rerankEnabled,
+            fusionMode,
+            parentExpansion,
+            extendedSearchMode,
+            topK: debugTopK,
+          }),
         }),
-      }),
-    });
-    const reader = response.body?.getReader();
-    if (!reader) return;
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() ?? "";
-      for (const part of parts) {
-        const parsed = parseSse(part);
-        if (parsed?.event === "message.delta") {
-          setAnswer(parsed.data.data.text ?? "");
-          setEvidence(parsed.data.data.evidence ?? []);
-          setQueryRunId(parsed.data.query_run_id);
-        }
-        if (parsed?.event === "run.completed") {
-          setQueryRunId(parsed.data.query_run_id);
+      });
+      if (!response.ok) {
+        throw new Error(await responseErrorMessage(response, t, "chat_failed"));
+      }
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error(t("chat_stream_unavailable"));
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let terminalEvent = false;
+      let hasAnswer = false;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+        for (const part of parts) {
+          const parsed = parseSse(part);
+          if (!parsed) continue;
+          if (parsed.event === "message.delta") {
+            setAnswer(parsed.data.data?.text ?? "");
+            setEvidence(parsed.data.data?.evidence ?? []);
+            hasAnswer = true;
+            if (parsed.data.query_run_id)
+              setQueryRunId(parsed.data.query_run_id);
+          }
+          if (parsed.event === "run.failed") {
+            terminalEvent = true;
+            if (parsed.data.query_run_id)
+              setQueryRunId(parsed.data.query_run_id);
+            setChatError(sseFailureMessage(parsed.data, t));
+          }
+          if (parsed.event === "run.completed") {
+            terminalEvent = true;
+            if (parsed.data.query_run_id)
+              setQueryRunId(parsed.data.query_run_id);
+            const completedAnswer = parsed.data.data?.answer;
+            if (typeof completedAnswer === "string" && !hasAnswer) {
+              setAnswer(completedAnswer);
+            }
+          }
         }
       }
+      if (!terminalEvent) setChatError(t("chat_incomplete"));
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setChatError(t("chat_timeout"));
+      } else {
+        setChatError(error instanceof Error ? error.message : t("chat_failed"));
+      }
+    } finally {
+      window.clearTimeout(timeoutId);
+      setChatBusy(false);
     }
   }
 
@@ -1223,7 +1451,11 @@ export function App() {
           filters,
         }),
       });
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "search_not_ready"),
+        );
+      }
       const payload = (await response.json()) as SearchResponse;
       setSearchResults((items) =>
         offset === 0 ? payload.results : [...items, ...payload.results],
@@ -1243,7 +1475,11 @@ export function App() {
     setResearchError("");
     try {
       const response = await apiFetch("/api/v1/research-runs");
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
       const payload = (await response.json()) as ResearchRunListResponse;
       setResearchRuns(payload.runs);
     } catch (error) {
@@ -1251,20 +1487,173 @@ export function App() {
     }
   }
 
+  async function loadResearchPlanDetail(planId: string) {
+    setResearchError("");
+    try {
+      const response = await apiFetch(
+        `/api/v1/research-plans/${encodeURIComponent(planId)}`,
+      );
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "research_not_ready"),
+        );
+      }
+      const detail = (await response.json()) as ResearchPlanDetail;
+      setResearchPlanDetail(detail);
+      setResearchPlanTopicDraft(detail.plan.topic);
+      setResearchPlanNotesDraft(detail.plan.notes);
+      setResearchPlanQuestionsDraft(
+        detail.questions
+          .slice()
+          .sort((left, right) => left.ordinal - right.ordinal)
+          .map((item) => item.question)
+          .join("\n"),
+      );
+    } catch (error) {
+      setResearchError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async function loadResearchRunDetail(runId: string) {
+    if (researchPollRef.current.runId !== runId) {
+      researchPollRef.current.controller?.abort();
+      if (researchPollRef.current.timer)
+        window.clearTimeout(researchPollRef.current.timer);
+      researchPollRef.current = { runId, controller: new AbortController() };
+    }
+    const poll = researchPollRef.current;
     setResearchError("");
     try {
       const response = await apiFetch(
         `/api/v1/research-runs/${encodeURIComponent(runId)}`,
+        { signal: poll.controller?.signal },
       );
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
       const detail = (await response.json()) as ResearchRunDetail;
+      if (researchPollRef.current.runId !== runId) return;
       setResearchDetail(detail);
       if (["received", "running"].includes(detail.run.status)) {
-        window.setTimeout(() => void loadResearchRunDetail(runId), 2000);
+        poll.timer = window.setTimeout(
+          () => void loadResearchRunDetail(runId),
+          2000,
+        );
+      } else {
+        poll.controller?.abort();
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      setResearchError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function createResearchPlanFromDraft() {
+    if (!researchTopic.trim() || !selectedKnowledgeBaseId) return;
+    setResearchBusy(true);
+    setResearchError("");
+    try {
+      const response = await apiFetch("/api/v1/research-plans", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          topic: researchTopic,
+          knowledge_base_id: selectedKnowledgeBaseId,
+          knowledge_base_ids: researchKnowledgeBaseIds.slice(0, 3),
+          retrieval_profile: retrievalProfile,
+          retrieval_overrides: buildRetrievalOverrides({
+            bm25Enabled,
+            denseEnabled,
+            rerankEnabled,
+            fusionMode,
+            parentExpansion,
+            extendedSearchMode: "always",
+            topK: debugTopK,
+          }),
+          notes: "",
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "research_not_ready"),
+        );
+      }
+      const action = (await response.json()) as { plan_id: string };
+      await loadResearchPlans();
+      await loadResearchPlanDetail(action.plan_id);
+    } catch (error) {
+      setResearchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setResearchBusy(false);
+    }
+  }
+
+  async function saveResearchPlan() {
+    if (!researchPlanDetail) return;
+    setResearchBusy(true);
+    setResearchError("");
+    try {
+      const questions = researchPlanQuestionsDraft
+        .split("\n")
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map((question, index) => ({
+          question,
+          ordinal: index + 1,
+          kind: index === 0 ? "primary" : "derived",
+        }));
+      const response = await apiFetch(
+        `/api/v1/research-plans/${encodeURIComponent(researchPlanDetail.plan.id)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            topic: researchPlanTopicDraft,
+            notes: researchPlanNotesDraft,
+            questions,
+          }),
+        },
+      );
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
+      await loadResearchPlans();
+      await loadResearchPlanDetail(researchPlanDetail.plan.id);
+    } catch (error) {
+      setResearchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setResearchBusy(false);
+    }
+  }
+
+  async function approveResearchPlan(planId: string) {
+    setResearchBusy(true);
+    setResearchError("");
+    try {
+      const response = await apiFetch(
+        `/api/v1/research-plans/${encodeURIComponent(planId)}:approve`,
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
+      const action = (await response.json()) as { run_id?: string | null };
+      await loadResearchPlans();
+      await loadResearchRuns();
+      await loadResearchPlanDetail(planId);
+      if (action.run_id) {
+        await loadResearchRunDetail(action.run_id);
       }
     } catch (error) {
       setResearchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setResearchBusy(false);
     }
   }
 
@@ -1280,6 +1669,7 @@ export function App() {
         body: JSON.stringify({
           topic: researchTopic,
           knowledge_base_id: selectedKnowledgeBaseId,
+          knowledge_base_ids: researchKnowledgeBaseIds.slice(0, 3),
           retrieval_profile: retrievalProfile,
           retrieval_overrides: buildRetrievalOverrides({
             bm25Enabled,
@@ -1292,7 +1682,11 @@ export function App() {
           }),
         }),
       });
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "research_not_ready"),
+        );
+      }
       const action = (await response.json()) as {
         run_id: string;
         job_id?: string | null;
@@ -1317,7 +1711,11 @@ export function App() {
         `/api/v1/research-runs/${encodeURIComponent(runId)}:${action}`,
         { method: "POST" },
       );
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
       await loadResearchRuns();
       await loadResearchRunDetail(runId);
     } catch (error) {
@@ -1338,13 +1736,102 @@ export function App() {
       const response = await apiFetch(
         `/api/v1/query-runs/${latest.query_run_id}/retrieval`,
       );
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
       const data = await response.json();
       setDebuggerRun(data.run ?? null);
       setEvents(data.events ?? []);
     } catch (error) {
       setResearchError(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  async function downloadResearchFile(kind: "markdown" | "csv" | "docx") {
+    if (!researchDetail) return;
+    const report = researchDetail.final_report;
+    const sections = report.sections;
+    const slug =
+      researchDetail.run.topic
+        .toLowerCase()
+        .replace(/[^a-z0-9а-яё]+/gi, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 48) || "research";
+    let body = report.markdown ?? "";
+    let mime = "text/markdown;charset=utf-8";
+    let extension = "md";
+    if (kind === "csv") {
+      const rows = [
+        [
+          "section",
+          "status",
+          "text",
+          "evidence_refs",
+          "evidence_title",
+          "source_url",
+        ],
+      ];
+      for (const [section, items] of Object.entries({
+        confirmed: sections?.confirmed_findings ?? [],
+        partial: sections?.partial_conflicting_findings ?? [],
+      })) {
+        for (const item of items)
+          rows.push([
+            section,
+            item.status ?? "",
+            item.text,
+            (item.evidence_refs ?? []).join(" "),
+            "",
+            "",
+          ]);
+      }
+      body =
+        "\ufeff" +
+        rows
+          .map((row) =>
+            row
+              .map((value) => `"${String(value).replaceAll('"', '""')}"`)
+              .join(","),
+          )
+          .join("\n");
+      mime = "text/csv;charset=utf-8";
+      extension = "csv";
+    } else if (kind === "docx") {
+      const { Document, HeadingLevel, Packer, Paragraph } = await import(
+        "docx"
+      );
+      const doc = new Document({
+        sections: [
+          {
+            children: [
+              new Paragraph({
+                text: researchDetail.run.topic,
+                heading: HeadingLevel.TITLE,
+              }),
+              ...(report.markdown ?? "")
+                .split("\n")
+                .map((line) => new Paragraph({ text: line })),
+            ],
+          },
+        ],
+      });
+      const blob = await Packer.toBlob(doc);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${slug}-${researchDetail.run.id.slice(0, 8)}.docx`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([body], { type: mime }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${slug}-${researchDetail.run.id.slice(0, 8)}.${extension}`;
+    anchor.click();
+    URL.revokeObjectURL(url);
   }
 
   async function openDocumentViewer(item: SearchResult) {
@@ -1356,8 +1843,11 @@ export function App() {
       const structureResponse = await apiFetch(
         `/api/v1/documents/${encodeURIComponent(item.document_id)}/structure`,
       );
-      if (!structureResponse.ok)
-        throw new Error(await structureResponse.text());
+      if (!structureResponse.ok) {
+        throw new Error(
+          await responseErrorMessage(structureResponse, t, "request_failed"),
+        );
+      }
       const structure = (await structureResponse.json()) as DocumentStructure;
       setViewerStructure(structure);
       await loadDocumentContext(item.document_id, { chunkId: item.chunk_id });
@@ -1383,7 +1873,11 @@ export function App() {
       const response = await apiFetch(
         `/api/v1/documents/${encodeURIComponent(documentId)}/context?${params.toString()}`,
       );
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
       setViewerContext((await response.json()) as DocumentContextResponse);
     } catch (error) {
       setViewerError(error instanceof Error ? error.message : String(error));
@@ -1407,7 +1901,11 @@ export function App() {
           body: JSON.stringify({ query, limit: 10, offset: 0 }),
         },
       );
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
       const payload = (await response.json()) as DocumentSearchResponse;
       setViewerSearchResults(payload.results);
     } catch (error) {
@@ -1430,7 +1928,11 @@ export function App() {
           body: JSON.stringify(documentAccess),
         },
       );
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      }
       const payload = (await response.json()) as DocumentAccessResponse;
       setViewerStructure({
         ...viewerStructure,
@@ -1641,24 +2143,69 @@ export function App() {
 
   return (
     <main>
-      <header>
+      <header className="app-header">
         <div>
           <h1>WikipediaRag</h1>
-          <p>Local Russian Wikipedia RAG MVP</p>
+          <p>{t("product_tagline")}</p>
         </div>
         <div className="header-actions">
-          <span className={`status ${ready}`}>{ready}</span>
+          <span
+            className={`status ${ready}`}
+            title={t("tooltip_readiness")}
+            aria-label={`${t("status")}: ${ready}`}
+          >
+            <span className="status-dot" aria-hidden="true" />
+            {ready === "ok"
+              ? t("ready_ok")
+              : ready === "offline"
+                ? t("ready_offline")
+                : t("ready_checking")}
+            <HelpTooltip text={t("tooltip_readiness")} />
+          </span>
           {session.authenticated ? (
             <>
-              <span className="session-pill">
+              <span className="session-label">
                 {session.user?.username ?? session.user?.id}
                 {session.active_tenant_id ? "" : " · no tenant"}
               </span>
+              <div
+                className="locale-switch"
+                aria-label={locale === "ru" ? "Язык" : "Language"}
+              >
+                {(["en", "ru"] as Locale[]).map((option) => (
+                  <button
+                    type="button"
+                    key={option}
+                    className={locale === option ? "selected" : ""}
+                    aria-pressed={locale === option}
+                    onClick={() => setLocale(option)}
+                  >
+                    {option.toUpperCase()}
+                  </button>
+                ))}
+              </div>
               <button type="button" onClick={logout}>
-                <LogOut size={16} /> Logout
+                <LogOut size={16} /> {t("logout")}
               </button>
             </>
-          ) : null}
+          ) : (
+            <div
+              className="locale-switch"
+              aria-label={locale === "ru" ? "Язык" : "Language"}
+            >
+              {(["en", "ru"] as Locale[]).map((option) => (
+                <button
+                  type="button"
+                  key={option}
+                  className={locale === option ? "selected" : ""}
+                  aria-pressed={locale === option}
+                  onClick={() => setLocale(option)}
+                >
+                  {option.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </header>
 
@@ -1666,937 +2213,1428 @@ export function App() {
         <section className="band auth-band">
           <form className="auth-panel" onSubmit={localLogin}>
             <h2>
-              <KeyRound size={18} /> Sign in
+              <KeyRound size={18} /> {t("sign_in")}
             </h2>
-            <input
-              value={authUsername}
-              onChange={(event) => setAuthUsername(event.target.value)}
-              placeholder="Username"
-              autoComplete="username"
-            />
-            <input
-              value={authPassword}
-              onChange={(event) => setAuthPassword(event.target.value)}
-              placeholder="Password"
-              type="password"
-              autoComplete="current-password"
-            />
+            <label>
+              {t("username")}
+              <input
+                value={authUsername}
+                onChange={(event) => setAuthUsername(event.target.value)}
+                placeholder={t("username")}
+                autoComplete="username"
+              />
+            </label>
+            <label>
+              {t("password")}
+              <input
+                value={authPassword}
+                onChange={(event) => setAuthPassword(event.target.value)}
+                placeholder={t("password")}
+                type="password"
+                autoComplete="current-password"
+              />
+            </label>
             <div className="row">
               <button type="submit">
-                <LogIn size={16} /> Local
+                <LogIn size={16} /> {t("local")}
               </button>
               <button type="button" onClick={oidcLogin}>
-                <KeyRound size={16} /> OIDC
+                <KeyRound size={16} /> {t("oidc")}
               </button>
             </div>
-            {authError && <p className="error">{authError}</p>}
-          </form>
-        </section>
-      )}
-
-      {session.authenticated && (
-        <section className="band kb-toolbar">
-          <label>
-            Primary knowledge base
-            <select
-              value={selectedKnowledgeBaseId}
-              onChange={(event) =>
-                setSelectedKnowledgeBaseId(event.target.value)
-              }
-            >
-              {knowledgeBases.map((kb) => (
-                <option key={kb.id} value={kb.id}>
-                  {kb.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <fieldset className="kb-scope">
-            <legend>Retrieval scope</legend>
-            {knowledgeBases.map((kb) => (
-              <label key={kb.id}>
-                <input
-                  type="checkbox"
-                  checked={selectedRetrievalKnowledgeBaseIds.includes(kb.id)}
-                  onChange={() => toggleRetrievalKnowledgeBase(kb.id)}
-                />
-                <span>{kb.name}</span>
-              </label>
-            ))}
-          </fieldset>
-          <form className="row" onSubmit={createKnowledgeBase}>
-            <input
-              value={newKnowledgeBaseName}
-              onChange={(event) => setNewKnowledgeBaseName(event.target.value)}
-              placeholder="New KB name"
-            />
-            <button type="submit">
-              <Database size={16} /> Create
-            </button>
+            {authError && (
+              <p className="error" role="alert">
+                {authError}
+              </p>
+            )}
           </form>
         </section>
       )}
 
       {session.authenticated && (
         <>
-          <section className="band grid">
-            <div className="panel">
-              <h2>
-                <Database size={18} /> Wikipedia Import
-              </h2>
-              <div className="row">
+          <nav
+            className="workspace-tabs"
+            aria-label={locale === "ru" ? "Рабочая область" : "Workspace"}
+            role="tablist"
+          >
+            {workspaceTabs.map((tab) => (
+              <button
+                key={tab.id}
+                id={`tab-${tab.id}`}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.id}
+                aria-controls={`panel-${tab.id}`}
+                tabIndex={activeTab === tab.id ? 0 : -1}
+                className={activeTab === tab.id ? "selected" : ""}
+                onClick={() => setActiveTab(tab.id)}
+                onKeyDown={handleWorkspaceKeyDown}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </nav>
+          <section className="band kb-toolbar">
+            <label>
+              {t("primary_kb")}
+              <select
+                aria-label={t("primary_kb")}
+                value={selectedKnowledgeBaseId}
+                onChange={(event) =>
+                  setSelectedKnowledgeBaseId(event.target.value)
+                }
+              >
+                {knowledgeBases.map((kb) => (
+                  <option key={kb.id} value={kb.id}>
+                    {kb.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <details className="scope-details">
+              <summary>
+                {interpolate(t("scope_summary"), {
+                  count: selectedRetrievalKnowledgeBaseIds.length,
+                })}
+                <HelpTooltip text={t("tooltip_scope")} />
+              </summary>
+              <fieldset className="kb-scope">
+                <legend>{t("retrieval_scope")}</legend>
+                {knowledgeBases.map((kb) => (
+                  <label key={kb.id}>
+                    <input
+                      type="checkbox"
+                      aria-label={kb.name}
+                      checked={selectedRetrievalKnowledgeBaseIds.includes(
+                        kb.id,
+                      )}
+                      onChange={() => toggleRetrievalKnowledgeBase(kb.id)}
+                    />
+                    <span>{kb.name}</span>
+                  </label>
+                ))}
+              </fieldset>
+            </details>
+            {activeTab === "knowledge" && (
+              <form className="row kb-create" onSubmit={createKnowledgeBase}>
                 <input
-                  type="number"
-                  min={1}
-                  max={10000}
-                  value={limit}
-                  onChange={(event) => setLimit(Number(event.target.value))}
+                  value={newKnowledgeBaseName}
+                  onChange={(event) =>
+                    setNewKnowledgeBaseName(event.target.value)
+                  }
+                  placeholder={t("new_kb_name")}
+                  aria-label={t("new_kb_name")}
                 />
-                <button onClick={startImport}>
-                  <Play size={16} /> Start
+                <button type="submit">
+                  <Database size={16} /> {t("create")}
                 </button>
-              </div>
-              {job && (
-                <div className="progress">
-                  <strong>{job.status}</strong>
-                  <span>{imported} pages</span>
-                  <span>{chunks} chunks</span>
-                  {job.error_message && (
-                    <span className="error">{job.error_message}</span>
-                  )}
-                </div>
-              )}
-            </div>
+              </form>
+            )}
+          </section>
+        </>
+      )}
 
-            <div className="panel">
-              <h2>
-                <FileUp size={18} /> Upload
-              </h2>
-              <input
-                type="file"
-                accept=".txt,.md,.markdown,.html,.htm,.csv,.tsv,.json,.jsonl,.pdf,.docx,.pptx,.xlsx"
-                multiple
-                onChange={uploadFile}
-                disabled={uploadBusy}
-              />
-              {uploadStatus && <p className="upload-status">{uploadStatus}</p>}
-              {uploadBatch && (
-                <div className="progress upload-progress">
-                  <strong>{uploadBatch.status}</strong>
-                  <span>{uploadBatch.total_items} files</span>
-                  <span>{uploadBatch.completed_items} completed</span>
-                  <span>{uploadBatch.failed_items} failed</span>
-                  <span>{uploadBatch.pending_items} pending</span>
-                </div>
-              )}
-              {uploadItems.length > 0 && (
-                <div className="upload-items">
-                  {uploadItems.map((item) => (
-                    <article key={item.id} className="upload-item">
-                      <div>
-                        <strong>{item.filename}</strong>
-                        <span>{item.size_bytes} bytes</span>
-                      </div>
-                      <div>
-                        <span>{item.status}</span>
-                        <span>{item.progress?.stage ?? "waiting"}</span>
-                        <span>
-                          {item.progress?.parser_route ?? "parser pending"}
-                        </span>
-                        <span>
-                          {item.progress?.chunks_published ?? 0} published
-                        </span>
-                      </div>
-                      {(item.error_code || item.error_message) && (
-                        <p className="error">
-                          {item.error_code ?? item.error_message}
-                        </p>
-                      )}
-                      {item.status === "failed" && item.job_id && (
-                        <button
-                          type="button"
-                          onClick={() => void retryUploadItem(item)}
-                        >
-                          <RotateCw size={16} /> Retry
-                        </button>
-                      )}
-                    </article>
-                  ))}
-                </div>
-              )}
-              {uploadDocument && (
-                <dl className="upload-meta">
-                  <div>
-                    <dt>Title</dt>
-                    <dd>{uploadDocument.title}</dd>
-                  </div>
-                  <div>
-                    <dt>Status</dt>
-                    <dd>{uploadDocument.status ?? "published"}</dd>
-                  </div>
-                  <div>
-                    <dt>Language</dt>
-                    <dd>
-                      {metadataValue(uploadDocument, "detected_language")}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Document Date</dt>
-                    <dd>{metadataValue(uploadDocument, "document_date")}</dd>
-                  </div>
-                  <div>
-                    <dt>Parser</dt>
-                    <dd>{uploadDocument.parser_route ?? "unknown"}</dd>
-                  </div>
-                  <div>
-                    <dt>Uploaded</dt>
-                    <dd>{formatTimestamp(uploadDocument.uploaded_at)}</dd>
-                  </div>
-                </dl>
-              )}
-              {uploadError && <p className="error">{uploadError}</p>}
-            </div>
-
-            <div className="panel source-panel">
-              <h2>
-                <Plug size={18} /> External Sources
-              </h2>
-              <form className="source-form" onSubmit={createSource}>
-                <label>
-                  Connector
-                  <select
-                    value={sourceKind}
-                    onChange={(event) =>
-                      selectSourceKind(event.target.value as SourceKind)
-                    }
-                  >
-                    {SOURCE_KINDS.map((kind) => (
-                      <option key={kind} value={kind}>
-                        {SOURCE_TEMPLATES[kind].label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  Name
-                  <input
-                    value={sourceName}
-                    onChange={(event) => setSourceName(event.target.value)}
-                    placeholder="Source name"
-                  />
-                </label>
-                <label>
-                  Refresh seconds
+      {session.authenticated && (
+        <>
+          <div
+            id="panel-knowledge"
+            className="tab-panel is-active"
+            role="tabpanel"
+            aria-labelledby="tab-knowledge"
+            hidden={activeTab !== "knowledge"}
+          >
+            <section className="band grid">
+              <div className="panel">
+                <h2>
+                  <Database size={18} /> {t("wikipedia_import")}
+                </h2>
+                <div className="row">
                   <input
                     type="number"
-                    min={60}
-                    value={sourceRefreshInterval}
-                    onChange={(event) =>
-                      setSourceRefreshInterval(event.target.value)
-                    }
+                    min={1}
+                    max={10000}
+                    value={limit}
+                    onChange={(event) => setLimit(Number(event.target.value))}
+                    aria-label={t("import_limit")}
+                    title={t("import_limit")}
                   />
-                </label>
-                <label className="source-wide">
-                  Config JSON
-                  <textarea
-                    className="source-json"
-                    value={sourceConfigText}
-                    onChange={(event) =>
-                      setSourceConfigText(event.target.value)
-                    }
-                    spellCheck={false}
-                  />
-                </label>
-                <label className="source-wide">
-                  Credentials JSON
-                  <textarea
-                    className="source-json"
-                    value={sourceCredentialsText}
-                    onChange={(event) =>
-                      setSourceCredentialsText(event.target.value)
-                    }
-                    spellCheck={false}
-                  />
-                </label>
-                {canManageAccess && (
-                  <div className="source-wide">
-                    <AccessEditor
-                      value={sourceAccess}
-                      groups={accessGroups}
-                      disabled={sourceBusy.create}
-                      onChange={setSourceAccess}
-                    />
-                  </div>
-                )}
-                <div className="source-wide row">
-                  <button
-                    type="submit"
-                    disabled={!selectedKnowledgeBaseId || sourceBusy.create}
-                  >
-                    <Plug size={16} /> Add Source
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void loadSources()}
-                    disabled={!selectedKnowledgeBaseId || sourcesLoading}
-                  >
-                    <RotateCw size={16} /> Refresh
+                  <button onClick={startImport}>
+                    <Play size={16} /> {t("start_import")}
                   </button>
                 </div>
-              </form>
-              {(sourceStatus || sourcesLoading) && (
-                <p className="upload-status">
-                  {sourcesLoading ? "Loading sources" : sourceStatus}
-                </p>
-              )}
-              {sourcesError && <p className="error">{sourcesError}</p>}
-              <div className="source-list">
-                {sources.length === 0 && !sourcesLoading && (
-                  <p className="empty-state">No external sources</p>
-                )}
-                {sources.map((source) => {
-                  const run = sourceRuns[source.id];
-                  return (
-                    <article key={source.id} className="source-item">
-                      <div className="source-item-header">
-                        <div>
-                          <h3>{source.name}</h3>
-                          <div className="search-meta">
-                            <span>{sourceKindLabel(source.kind)}</span>
-                            <span>{source.status}</span>
-                            <span>
-                              {accessLabel(source.document_access_default)}
-                            </span>
-                            <span>
-                              {source.refresh_interval_seconds
-                                ? `${source.refresh_interval_seconds}s`
-                                : "manual"}
-                            </span>
-                          </div>
-                        </div>
-                        <span className={`source-badge ${source.status}`}>
-                          {source.last_sync_status ?? source.status}
-                        </span>
-                      </div>
-                      <dl className="source-meta">
-                        <div>
-                          <dt>Last Sync</dt>
-                          <dd>{formatTimestamp(source.last_synced_at)}</dd>
-                        </div>
-                        <div>
-                          <dt>Next Sync</dt>
-                          <dd>{formatTimestamp(source.next_sync_at)}</dd>
-                        </div>
-                        <div>
-                          <dt>Config</dt>
-                          <dd>
-                            {formatCompactJson(redactSensitive(source.config))}
-                          </dd>
-                        </div>
-                      </dl>
-                      {canManageAccess && (
-                        <AccessEditor
-                          value={normalizeDocumentAccess(
-                            source.document_access_default,
-                          )}
-                          groups={accessGroups}
-                          disabled={sourceBusy[`${source.id}:access`]}
-                          saveLabel="Apply Access"
-                          onSave={(access) =>
-                            void patchSourceAccess(source, access)
-                          }
-                        />
-                      )}
-                      {run && (
-                        <div className="source-run">
-                          <ShieldCheck size={15} />
-                          <span>{run.mode}</span>
-                          <span>{run.status}</span>
-                          <span>{formatCompactJson(run.stats)}</span>
-                          {run.error_code && (
-                            <span className="error">{run.error_code}</span>
-                          )}
-                        </div>
-                      )}
-                      <div className="source-actions">
-                        <button
-                          type="button"
-                          onClick={() => void healthcheckSource(source)}
-                          disabled={sourceBusy[source.id]}
-                        >
-                          <ShieldCheck size={15} /> Health
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void syncSource(source, "incremental")}
-                          disabled={
-                            sourceBusy[source.id] ||
-                            source.status === "disabled"
-                          }
-                        >
-                          <RotateCw size={15} /> Sync
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void syncSource(source, "full")}
-                          disabled={
-                            sourceBusy[source.id] ||
-                            source.status === "disabled"
-                          }
-                        >
-                          <RotateCw size={15} /> Full
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void patchSourceStatus(source)}
-                          disabled={sourceBusy[source.id]}
-                        >
-                          {source.status === "disabled" ? "Enable" : "Disable"}
-                        </button>
-                      </div>
-                    </article>
-                  );
-                })}
-              </div>
-            </div>
-          </section>
-
-          <section className="band">
-            <form className="search-panel" onSubmit={submitSearch}>
-              <h2>
-                <Search size={18} /> Search
-              </h2>
-              <div className="search-query">
-                <input
-                  value={searchQuery}
-                  onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder="Search documents"
-                />
-                <button
-                  type="submit"
-                  disabled={
-                    searchBusy ||
-                    !searchQuery.trim() ||
-                    searchKnowledgeBaseIds.length === 0
-                  }
-                >
-                  <Search size={16} /> Search
-                </button>
-              </div>
-              <div className="search-filters">
-                <label>
-                  Document type
-                  <input
-                    value={searchDocumentType}
-                    onChange={(event) =>
-                      setSearchDocumentType(event.target.value)
-                    }
-                    placeholder="pdf, text, html"
-                  />
-                </label>
-                <label>
-                  Language
-                  <input
-                    value={searchLanguage}
-                    onChange={(event) => setSearchLanguage(event.target.value)}
-                    placeholder="ru"
-                  />
-                </label>
-                <label>
-                  Date from
-                  <input
-                    type="date"
-                    value={searchDateFrom}
-                    onChange={(event) => setSearchDateFrom(event.target.value)}
-                  />
-                </label>
-                <label>
-                  Date to
-                  <input
-                    type="date"
-                    value={searchDateTo}
-                    onChange={(event) => setSearchDateTo(event.target.value)}
-                  />
-                </label>
-                <label>
-                  Source
-                  <input
-                    value={searchSource}
-                    onChange={(event) => setSearchSource(event.target.value)}
-                    placeholder="upload, wikipedia, url"
-                  />
-                </label>
-              </div>
-            </form>
-
-            <div className="search-results">
-              {searchError && <p className="error">{searchError}</p>}
-              {searchFacets.length > 0 && (
-                <div className="search-facets">
-                  {searchFacets.map((facet) => (
-                    <div key={facet.field}>
-                      <strong>{formatFacetName(facet.field)}</strong>
-                      <span>
-                        {facet.buckets
-                          .slice(0, 4)
-                          .map((bucket) => `${bucket.value} (${bucket.count})`)
-                          .join(", ")}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {!searchBusy &&
-                !searchError &&
-                searchQuery &&
-                searchResults.length === 0 && (
-                  <p className="empty-state">No results</p>
-                )}
-              {searchResults.map((item, index) => (
-                <article
-                  key={`${item.chunk_id}-${index}`}
-                  className="search-result"
-                >
-                  <div>
-                    <h3>{item.title}</h3>
-                    <p>
-                      {item.highlights?.[0]?.fragments?.[0] ?? item.snippet}
-                    </p>
-                  </div>
-                  <div className="search-meta">
-                    <span>
-                      {knowledgeBaseName(
-                        knowledgeBases,
-                        item.knowledge_base_id,
-                      )}
-                    </span>
-                    <span>{item.section_path.join(" / ") || "No section"}</span>
-                    <span>{item.document_date ?? "No date"}</span>
-                    <span>{item.document_type ?? item.source_type}</span>
-                    <span>{item.language ?? "No language"}</span>
-                    <span>{formatScore(item.score)}</span>
-                  </div>
-                  <div className="search-actions">
-                    <button
-                      type="button"
-                      onClick={() => void openDocumentViewer(item)}
-                    >
-                      <BookOpen size={15} /> Open in viewer
-                    </button>
-                    {item.source_url ? (
-                      <a
-                        href={item.source_url}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        <ExternalLink size={15} /> Source
-                      </a>
-                    ) : (
-                      <span>Document {item.document_id}</span>
+                {job && (
+                  <div className="progress">
+                    <strong>{statusLabel(job.status, locale)}</strong>
+                    <span>{imported} pages</span>
+                    <span>{chunks} chunks</span>
+                    {job.error_message && (
+                      <span className="error">{job.error_message}</span>
                     )}
                   </div>
-                </article>
-              ))}
-              {searchHasMore && (
-                <button
-                  type="button"
-                  onClick={loadMoreSearch}
-                  disabled={searchBusy}
-                >
-                  {searchBusy ? "Loading" : "Load more"}
-                </button>
-              )}
-            </div>
-            {viewerStructure && (
-              <DocumentViewer
-                structure={viewerStructure}
-                context={viewerContext}
-                searchQuery={viewerSearchQuery}
-                searchResults={viewerSearchResults}
-                busy={viewerBusy}
-                searchBusy={viewerSearchBusy}
-                error={viewerError}
-                accessGroups={accessGroups}
-                canManageAccess={canManageAccess}
-                accessBusy={viewerAccessBusy}
-                onClose={closeDocumentViewer}
-                onUpdateAccess={(access) => void patchViewerAccess(access)}
-                onSearchQueryChange={setViewerSearchQuery}
-                onSearch={submitDocumentSearch}
-                onOpenChunk={(chunkId) =>
-                  void loadDocumentContext(viewerStructure.document_id, {
-                    chunkId,
-                  })
-                }
-                onOpenSection={(sectionId) =>
-                  void loadDocumentContext(viewerStructure.document_id, {
-                    sectionId,
-                  })
-                }
-              />
-            )}
-          </section>
-
-          <section className="band research-panel">
-            <form className="research-create" onSubmit={submitResearchRun}>
-              <h2>
-                <Database size={18} /> Deep Research
-              </h2>
-              <textarea
-                value={researchTopic}
-                onChange={(event) => setResearchTopic(event.target.value)}
-                placeholder="Research topic for the selected knowledge base"
-              />
-              <div className="row">
-                <button
-                  type="submit"
-                  disabled={
-                    researchBusy ||
-                    !researchTopic.trim() ||
-                    !selectedKnowledgeBaseId
-                  }
-                >
-                  <Play size={16} /> Start research
-                </button>
-                <button type="button" onClick={loadResearchRuns}>
-                  <RotateCw size={16} /> Refresh
-                </button>
-                <span>
-                  Single KB:{" "}
-                  {knowledgeBases.find(
-                    (item) => item.id === selectedKnowledgeBaseId,
-                  )?.name ?? "not selected"}
-                </span>
+                )}
               </div>
-              {researchError && <p className="error">{researchError}</p>}
-            </form>
 
-            <div className="research-layout">
-              <div className="research-runs">
-                <h3>Runs</h3>
-                {researchRuns.length === 0 && <p>No research runs yet.</p>}
-                {researchRuns.map((run) => (
+              <div className="panel">
+                <h2>
+                  <FileUp size={18} /> {t("upload")}
+                </h2>
+                <input
+                  type="file"
+                  accept=".txt,.md,.markdown,.html,.htm,.csv,.tsv,.json,.jsonl,.pdf,.docx,.pptx,.xlsx"
+                  multiple
+                  onChange={uploadFile}
+                  disabled={uploadBusy}
+                  aria-label={t("choose_files")}
+                />
+                {uploadStatus && (
+                  <p className="upload-status">{uploadStatus}</p>
+                )}
+                {uploadBatch && (
+                  <div className="progress upload-progress">
+                    <strong>{uploadBatch.status}</strong>
+                    <span>{uploadBatch.total_items} files</span>
+                    <span>{uploadBatch.completed_items} completed</span>
+                    <span>{uploadBatch.failed_items} failed</span>
+                    <span>{uploadBatch.pending_items} pending</span>
+                  </div>
+                )}
+                {uploadItems.length > 0 && (
+                  <div className="upload-items">
+                    {uploadItems.map((item) => (
+                      <article key={item.id} className="upload-item">
+                        <div>
+                          <strong>{item.filename}</strong>
+                          <span>{item.size_bytes} bytes</span>
+                        </div>
+                        <div>
+                          <span>{statusLabel(item.status, locale)}</span>
+                          <span>{item.progress?.stage ?? "waiting"}</span>
+                          <span>
+                            {item.progress?.parser_route ?? "parser pending"}
+                          </span>
+                          <span>
+                            {item.progress?.chunks_published ?? 0} published
+                          </span>
+                        </div>
+                        {(item.error_code || item.error_message) && (
+                          <p className="error">
+                            {item.error_code ?? item.error_message}
+                          </p>
+                        )}
+                        {item.status === "failed" && item.job_id && (
+                          <button
+                            type="button"
+                            onClick={() => void retryUploadItem(item)}
+                          >
+                            <RotateCw size={16} /> Retry
+                          </button>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                )}
+                {uploadDocument && (
+                  <dl className="upload-meta">
+                    <div>
+                      <dt>Title</dt>
+                      <dd>{uploadDocument.title}</dd>
+                    </div>
+                    <div>
+                      <dt>Status</dt>
+                      <dd>{uploadDocument.status ?? "published"}</dd>
+                    </div>
+                    <div>
+                      <dt>Language</dt>
+                      <dd>
+                        {metadataValue(uploadDocument, "detected_language")}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Document Date</dt>
+                      <dd>{metadataValue(uploadDocument, "document_date")}</dd>
+                    </div>
+                    <div>
+                      <dt>Parser</dt>
+                      <dd>{uploadDocument.parser_route ?? "unknown"}</dd>
+                    </div>
+                    <div>
+                      <dt>Uploaded</dt>
+                      <dd>
+                        {formatTimestamp(uploadDocument.uploaded_at, locale)}
+                      </dd>
+                    </div>
+                  </dl>
+                )}
+                {uploadError && <p className="error">{uploadError}</p>}
+              </div>
+
+              <div className="panel source-panel">
+                <h2>
+                  <Plug size={18} /> {t("sources")}
+                </h2>
+                <details className="source-create-details">
+                  <summary>
+                    <Plug size={15} /> {t("add_source")}
+                  </summary>
+                  <form className="source-form" onSubmit={createSource}>
+                    <label>
+                      {t("connector")}
+                      <select
+                        value={sourceKind}
+                        onChange={(event) =>
+                          selectSourceKind(event.target.value as SourceKind)
+                        }
+                      >
+                        {SOURCE_KINDS.map((kind) => (
+                          <option key={kind} value={kind}>
+                            {sourceKindLabel(kind, locale)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      {t("source_name")}
+                      <input
+                        value={sourceName}
+                        onChange={(event) => setSourceName(event.target.value)}
+                        placeholder={t("source_name")}
+                      />
+                    </label>
+                    <label>
+                      {t("refresh_seconds")}
+                      <input
+                        type="number"
+                        min={60}
+                        value={sourceRefreshInterval}
+                        onChange={(event) =>
+                          setSourceRefreshInterval(event.target.value)
+                        }
+                      />
+                    </label>
+                    <details className="source-advanced source-wide">
+                      <summary>{t("advanced_configuration")}</summary>
+                      <label>
+                        {t("config")}
+                        <textarea
+                          className="source-json"
+                          value={sourceConfigText}
+                          onChange={(event) =>
+                            setSourceConfigText(event.target.value)
+                          }
+                          spellCheck={false}
+                        />
+                      </label>
+                      <label>
+                        {t("credentials")}
+                        <textarea
+                          className="source-json"
+                          value={sourceCredentialsText}
+                          onChange={(event) =>
+                            setSourceCredentialsText(event.target.value)
+                          }
+                          spellCheck={false}
+                        />
+                      </label>
+                    </details>
+                    {canManageAccess && (
+                      <details className="source-permissions source-wide">
+                        <summary>{t("permissions")}</summary>
+                        <AccessEditor
+                          value={sourceAccess}
+                          groups={accessGroups}
+                          locale={locale}
+                          disabled={sourceBusy.create}
+                          onChange={setSourceAccess}
+                        />
+                      </details>
+                    )}
+                    <div className="source-wide row">
+                      <button
+                        type="submit"
+                        disabled={!selectedKnowledgeBaseId || sourceBusy.create}
+                      >
+                        <Plug size={16} /> {t("add_source")}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void loadSources()}
+                        disabled={!selectedKnowledgeBaseId || sourcesLoading}
+                      >
+                        <RotateCw size={16} /> {t("refresh")}
+                      </button>
+                    </div>
+                  </form>
+                </details>
+                {(sourceStatus || sourcesLoading) && (
+                  <p className="upload-status">
+                    {sourcesLoading ? t("loading") : sourceStatus}
+                  </p>
+                )}
+                {sourcesError && (
+                  <p className="error" role="alert">
+                    {sourcesError}
+                  </p>
+                )}
+                <div className="source-list">
+                  {sources.length === 0 && !sourcesLoading && (
+                    <p className="empty-state">{t("no_sources")}</p>
+                  )}
+                  {sources.map((source) => {
+                    const run = sourceRuns[source.id];
+                    return (
+                      <article key={source.id} className="source-item">
+                        <div className="source-item-header">
+                          <div>
+                            <h3>{source.name}</h3>
+                            <div className="search-meta">
+                              <span>
+                                {sourceKindLabel(source.kind, locale)}
+                              </span>
+                              <span>{statusLabel(source.status, locale)}</span>
+                              <span>
+                                {accessLabel(
+                                  source.document_access_default,
+                                  locale,
+                                )}
+                              </span>
+                              <span>
+                                {source.refresh_interval_seconds
+                                  ? `${source.refresh_interval_seconds}s`
+                                  : "manual"}
+                              </span>
+                            </div>
+                          </div>
+                          <span className={`source-badge ${source.status}`}>
+                            {statusLabel(
+                              source.last_sync_status ?? source.status,
+                              locale,
+                            )}
+                          </span>
+                        </div>
+                        <dl className="source-meta">
+                          <div>
+                            <dt>{t("last_sync")}</dt>
+                            <dd>
+                              {formatTimestamp(source.last_synced_at, locale)}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>{t("next_sync")}</dt>
+                            <dd>
+                              {formatTimestamp(source.next_sync_at, locale)}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>{t("config")}</dt>
+                            <dd>
+                              {formatCompactJson(
+                                redactSensitive(source.config),
+                              )}
+                            </dd>
+                          </div>
+                        </dl>
+                        {canManageAccess && (
+                          <details className="source-permissions">
+                            <summary>{t("permissions")}</summary>
+                            <AccessEditor
+                              value={normalizeDocumentAccess(
+                                source.document_access_default,
+                              )}
+                              groups={accessGroups}
+                              locale={locale}
+                              disabled={sourceBusy[`${source.id}:access`]}
+                              saveLabel={t("apply_access")}
+                              onSave={(access) =>
+                                void patchSourceAccess(source, access)
+                              }
+                            />
+                          </details>
+                        )}
+                        {run && (
+                          <div className="source-run">
+                            <ShieldCheck size={15} />
+                            <span>{run.mode}</span>
+                            <span>{statusLabel(run.status, locale)}</span>
+                            <span>{formatCompactJson(run.stats)}</span>
+                            {run.error_code && (
+                              <span className="error">{run.error_code}</span>
+                            )}
+                          </div>
+                        )}
+                        <div className="source-actions">
+                          <button
+                            type="button"
+                            title={t("tooltip_health")}
+                            onClick={() => void healthcheckSource(source)}
+                            disabled={sourceBusy[source.id]}
+                          >
+                            <ShieldCheck size={15} /> {t("health")}
+                          </button>
+                          <button
+                            type="button"
+                            title={t("tooltip_sync")}
+                            onClick={() =>
+                              void syncSource(source, "incremental")
+                            }
+                            disabled={
+                              sourceBusy[source.id] ||
+                              source.status === "disabled"
+                            }
+                          >
+                            <RotateCw size={15} /> {t("sync")}
+                          </button>
+                          <button
+                            type="button"
+                            title={t("tooltip_full_sync")}
+                            onClick={() => void syncSource(source, "full")}
+                            disabled={
+                              sourceBusy[source.id] ||
+                              source.status === "disabled"
+                            }
+                          >
+                            <RotateCw size={15} /> {t("full_sync")}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void patchSourceStatus(source)}
+                            disabled={sourceBusy[source.id]}
+                          >
+                            {source.status === "disabled"
+                              ? t("enable")
+                              : t("disable")}
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div
+            id="panel-search"
+            className="tab-panel"
+            role="tabpanel"
+            aria-labelledby="tab-search"
+            hidden={activeTab !== "search"}
+          >
+            <section className="band">
+              <form className="search-panel" onSubmit={submitSearch}>
+                <h2>
+                  <Search size={18} /> {t("search")}
+                </h2>
+                <div className="search-query">
+                  <input
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                    placeholder={t("search_documents")}
+                    aria-label={t("search_documents")}
+                  />
+                  <button
+                    type="submit"
+                    disabled={
+                      searchBusy ||
+                      !searchQuery.trim() ||
+                      searchKnowledgeBaseIds.length === 0
+                    }
+                  >
+                    <Search size={16} /> {t("search")}
+                  </button>
+                </div>
+                <details className="filter-details">
+                  <summary>{t("filters")}</summary>
+                  <div className="search-filters">
+                    <label>
+                      {t("document_type")}
+                      <input
+                        value={searchDocumentType}
+                        onChange={(event) =>
+                          setSearchDocumentType(event.target.value)
+                        }
+                        placeholder="pdf, text, html"
+                      />
+                    </label>
+                    <label>
+                      {t("language")}
+                      <input
+                        value={searchLanguage}
+                        onChange={(event) =>
+                          setSearchLanguage(event.target.value)
+                        }
+                        placeholder="ru"
+                      />
+                    </label>
+                    <label>
+                      {t("date_from")}
+                      <input
+                        type="date"
+                        value={searchDateFrom}
+                        onChange={(event) =>
+                          setSearchDateFrom(event.target.value)
+                        }
+                      />
+                    </label>
+                    <label>
+                      {t("date_to")}
+                      <input
+                        type="date"
+                        value={searchDateTo}
+                        onChange={(event) =>
+                          setSearchDateTo(event.target.value)
+                        }
+                      />
+                    </label>
+                    <label>
+                      {t("source")}
+                      <input
+                        value={searchSource}
+                        onChange={(event) =>
+                          setSearchSource(event.target.value)
+                        }
+                        placeholder="upload, wikipedia, url"
+                      />
+                    </label>
+                  </div>
+                </details>
+              </form>
+
+              <div className="search-results">
+                {searchError && (
+                  <p className="error" role="alert">
+                    {searchError}
+                  </p>
+                )}
+                {searchFacets.length > 0 && (
+                  <div className="search-facets">
+                    {searchFacets.map((facet) => (
+                      <div key={facet.field}>
+                        <strong>{formatFacetName(facet.field)}</strong>
+                        <span>
+                          {facet.buckets
+                            .slice(0, 4)
+                            .map(
+                              (bucket) => `${bucket.value} (${bucket.count})`,
+                            )
+                            .join(", ")}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!searchBusy &&
+                  !searchError &&
+                  searchQuery &&
+                  searchResults.length === 0 && (
+                    <p className="empty-state">{t("no_results")}</p>
+                  )}
+                {searchResults.map((item, index) => (
+                  <article
+                    key={`${item.chunk_id}-${index}`}
+                    className="search-result"
+                  >
+                    <div>
+                      <h3>{item.title}</h3>
+                      <p>
+                        {item.highlights?.[0]?.fragments?.[0] ?? item.snippet}
+                      </p>
+                    </div>
+                    <div className="search-meta">
+                      <span>
+                        {knowledgeBaseName(
+                          knowledgeBases,
+                          item.knowledge_base_id,
+                        )}
+                      </span>
+                      <span>
+                        {item.section_path.join(" / ") || "No section"}
+                      </span>
+                      <span>{item.document_date ?? "No date"}</span>
+                      <span>{item.document_type ?? item.source_type}</span>
+                      <span>{item.language ?? "No language"}</span>
+                      <span>{formatScore(item.score)}</span>
+                    </div>
+                    <div className="search-actions">
+                      <button
+                        type="button"
+                        onClick={() => void openDocumentViewer(item)}
+                      >
+                        <BookOpen size={15} />{" "}
+                        {locale === "ru"
+                          ? "Открыть просмотр"
+                          : "Open in viewer"}
+                      </button>
+                      {item.source_url ? (
+                        <a
+                          href={item.source_url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          <ExternalLink size={15} /> {t("source")}
+                        </a>
+                      ) : (
+                        <span>Document {item.document_id}</span>
+                      )}
+                    </div>
+                  </article>
+                ))}
+                {searchHasMore && (
                   <button
                     type="button"
-                    key={run.id}
-                    className={
-                      researchDetail?.run.id === run.id ? "selected" : ""
-                    }
-                    onClick={() => void loadResearchRunDetail(run.id)}
+                    onClick={loadMoreSearch}
+                    disabled={searchBusy}
                   >
-                    <strong>{run.status}</strong>
-                    <span>{run.topic}</span>
-                    <code>{run.id.slice(0, 8)}</code>
+                    {searchBusy
+                      ? t("loading")
+                      : locale === "ru"
+                        ? "Загрузить ещё"
+                        : "Load more"}
                   </button>
-                ))}
+                )}
               </div>
-
-              {researchDetail && (
-                <article className="research-detail">
-                  <div className="research-header">
-                    <div>
-                      <h3>{researchDetail.run.topic}</h3>
-                      <p>
-                        {researchDetail.run.status} ·{" "}
-                        {String(researchDetail.run.progress?.stage ?? "")}
-                      </p>
-                    </div>
-                    <div className="row">
-                      <button
-                        type="button"
-                        disabled={researchBusy}
-                        onClick={() =>
-                          void researchRunAction(researchDetail.run.id, "pause")
-                        }
-                      >
-                        Pause
-                      </button>
-                      <button
-                        type="button"
-                        disabled={researchBusy}
-                        onClick={() =>
-                          void researchRunAction(
-                            researchDetail.run.id,
-                            "resume",
-                          )
-                        }
-                      >
-                        Resume
-                      </button>
-                      <button
-                        type="button"
-                        disabled={researchBusy}
-                        onClick={() =>
-                          void researchRunAction(
-                            researchDetail.run.id,
-                            "cancel",
-                          )
-                        }
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        disabled={
-                          !researchDetail.episodes.some(
-                            (episode) => episode.query_run_id,
-                          )
-                        }
-                        onClick={() =>
-                          void openResearchDebugger(researchDetail)
-                        }
-                      >
-                        <Bug size={16} /> Debug
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="research-metrics">
-                    <span>
-                      Coverage{" "}
-                      {researchDetail.final_report.coverage?.covered ?? 0}/
-                      {researchDetail.final_report.coverage?.total ?? 0}
-                    </span>
-                    <span>{researchDetail.evidence.length} evidence</span>
-                    <span>{researchDetail.episodes.length} episodes</span>
-                  </div>
-
-                  <div className="research-columns">
-                    <section>
-                      <h4>Coverage</h4>
-                      {researchDetail.coverage.map((item) => {
-                        const question = researchDetail.questions.find(
-                          (row) => row.id === item.question_id,
-                        );
-                        return (
-                          <div className="research-card" key={item.id}>
-                            <strong>{item.status}</strong>
-                            <p>{question?.question ?? item.question_id}</p>
-                            <code>{item.reason}</code>
-                          </div>
-                        );
-                      })}
-                    </section>
-                    <section>
-                      <h4>Evidence Memory</h4>
-                      {researchDetail.evidence.slice(0, 8).map((item) => (
-                        <div className="research-card" key={item.id}>
-                          <strong>
-                            [{item.evidence_ref}] {item.title}
-                          </strong>
-                          <p>{item.content_abstract}</p>
-                          <a
-                            href={item.source_url}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            Source
-                          </a>
-                        </div>
-                      ))}
-                    </section>
-                  </div>
-
-                  {researchDetail.reflections.length > 0 && (
-                    <section>
-                      <h4>Latest Reflection</h4>
-                      <p>
-                        {
-                          researchDetail.reflections[
-                            researchDetail.reflections.length - 1
-                          ].body
-                        }
-                      </p>
-                    </section>
-                  )}
-
-                  {researchDetail.final_report.markdown && (
-                    <section>
-                      <h4>Report</h4>
-                      <pre>{researchDetail.final_report.markdown}</pre>
-                    </section>
-                  )}
-                </article>
-              )}
-            </div>
-          </section>
-
-          <section className="band">
-            <form className="chat" onSubmit={submitChat}>
-              <h2>
-                <MessageSquare size={18} /> Chat
-              </h2>
-              <textarea
-                value={question}
-                onChange={(event) => setQuestion(event.target.value)}
-              />
-              <details className="advanced">
-                <summary>
-                  <SlidersHorizontal size={16} /> Advanced retrieval settings
-                </summary>
-                <div className="advanced-grid">
-                  <label>
-                    Profile
-                    <select
-                      value={retrievalProfile}
-                      onChange={(event) =>
-                        setRetrievalProfile(event.target.value)
-                      }
-                    >
-                      <option value="sota_mvp">sota_mvp</option>
-                      <option value="test_mock">test_mock</option>
-                      <option value="upload_mock">upload_mock</option>
-                      <option value="upload_sota_mvp">upload_sota_mvp</option>
-                      <option value="bm25_only">bm25_only</option>
-                      <option value="rewrite_off">rewrite_off</option>
-                      <option value="parent_expansion_off">
-                        parent_expansion_off
-                      </option>
-                    </select>
-                  </label>
-                  <label>
-                    Top K
-                    <input
-                      type="number"
-                      min={1}
-                      max={50}
-                      value={debugTopK}
-                      onChange={(event) =>
-                        setDebugTopK(Number(event.target.value))
-                      }
-                    />
-                  </label>
-                  <label className="checkbox">
-                    <input
-                      type="checkbox"
-                      checked={bm25Enabled}
-                      onChange={(event) => setBm25Enabled(event.target.checked)}
-                    />
-                    BM25
-                  </label>
-                  <label className="checkbox">
-                    <input
-                      type="checkbox"
-                      checked={denseEnabled}
-                      onChange={(event) =>
-                        setDenseEnabled(event.target.checked)
-                      }
-                    />
-                    Dense
-                  </label>
-                  <label className="checkbox">
-                    <input
-                      type="checkbox"
-                      checked={rerankEnabled}
-                      onChange={(event) =>
-                        setRerankEnabled(event.target.checked)
-                      }
-                    />
-                    Rerank
-                  </label>
-                  <label>
-                    Fusion
-                    <select
-                      value={fusionMode}
-                      onChange={(event) =>
-                        setFusionMode(event.target.value as "rrf" | "none")
-                      }
-                    >
-                      <option value="rrf">rrf</option>
-                      <option value="none">none</option>
-                    </select>
-                  </label>
-                  <label>
-                    Parent expansion
-                    <select
-                      value={parentExpansion}
-                      onChange={(event) =>
-                        setParentExpansion(
-                          event.target.value as "off" | "selective" | "always",
-                        )
-                      }
-                    >
-                      <option value="selective">selective</option>
-                      <option value="off">off</option>
-                      <option value="always">always</option>
-                    </select>
-                  </label>
-                  <label>
-                    Extended Search
-                    <select
-                      value={extendedSearchMode}
-                      onChange={(event) =>
-                        setExtendedSearchMode(
-                          event.target.value as
-                            | "off"
-                            | "conditional"
-                            | "always",
-                        )
-                      }
-                    >
-                      <option value="conditional">conditional</option>
-                      <option value="off">off</option>
-                      <option value="always">always</option>
-                    </select>
-                  </label>
-                </div>
-              </details>
-              <div className="row">
-                <select
-                  value={mode}
-                  onChange={(event) =>
-                    setMode(event.target.value as "normal" | "extended")
+              {viewerStructure && (
+                <DocumentViewer
+                  structure={viewerStructure}
+                  locale={locale}
+                  context={viewerContext}
+                  searchQuery={viewerSearchQuery}
+                  searchResults={viewerSearchResults}
+                  busy={viewerBusy}
+                  searchBusy={viewerSearchBusy}
+                  error={viewerError}
+                  accessGroups={accessGroups}
+                  canManageAccess={canManageAccess}
+                  accessBusy={viewerAccessBusy}
+                  onClose={closeDocumentViewer}
+                  onUpdateAccess={(access) => void patchViewerAccess(access)}
+                  onSearchQueryChange={setViewerSearchQuery}
+                  onSearch={submitDocumentSearch}
+                  onOpenChunk={(chunkId) =>
+                    void loadDocumentContext(viewerStructure.document_id, {
+                      chunkId,
+                    })
                   }
-                >
-                  <option value="normal">Normal</option>
-                  <option value="extended">Extended</option>
-                </select>
-                <button type="submit">
-                  <Search size={16} /> Ask
-                </button>
-                <button
-                  type="button"
-                  onClick={loadDebugger}
-                  disabled={!queryRunId}
-                >
-                  <Bug size={16} /> Debug
-                </button>
-                <button type="button" onClick={() => window.location.reload()}>
-                  <RotateCw size={16} />
-                </button>
-              </div>
-            </form>
+                  onOpenSection={(sectionId) =>
+                    void loadDocumentContext(viewerStructure.document_id, {
+                      sectionId,
+                    })
+                  }
+                />
+              )}
+            </section>
+          </div>
 
-            {answer && (
-              <div className="answer">
-                <h2>Answer</h2>
-                <p>{answer}</p>
-                <h3>Sources</h3>
-                <div className="sources">
-                  {evidence.map((item) => (
-                    <article key={item.evidence_id}>
-                      <a
-                        href={item.source_url}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        [{item.evidence_id}] {item.title}
-                      </a>
-                      <span>{item.section_path.join(" / ")}</span>
-                      <p>{item.content}</p>
-                    </article>
+          <div
+            id="panel-research"
+            className="tab-panel"
+            role="tabpanel"
+            aria-labelledby="tab-research"
+            hidden={activeTab !== "research"}
+          >
+            <section className="band research-panel">
+              <form className="research-create" onSubmit={submitResearchRun}>
+                <h2>
+                  <Database size={18} /> {t("deep_research")}
+                </h2>
+                <textarea
+                  value={researchTopic}
+                  onChange={(event) => setResearchTopic(event.target.value)}
+                  placeholder={t("research_topic")}
+                  aria-label={t("research_topic")}
+                />
+                <fieldset className="research-kb-scope">
+                  <legend>Knowledge bases (up to 3)</legend>
+                  {knowledgeBases.map((item) => (
+                    <label key={item.id}>
+                      <input
+                        type="checkbox"
+                        checked={researchKnowledgeBaseIds.includes(item.id)}
+                        onChange={() =>
+                          setResearchKnowledgeBaseIds((current) =>
+                            current.includes(item.id)
+                              ? current.filter((id) => id !== item.id)
+                              : current.length < 3
+                                ? [...current, item.id]
+                                : current,
+                          )
+                        }
+                      />
+                      {item.name}
+                    </label>
                   ))}
+                </fieldset>
+                <div className="row">
+                  <button
+                    type="submit"
+                    disabled={
+                      researchBusy ||
+                      !researchTopic.trim() ||
+                      !selectedKnowledgeBaseId
+                    }
+                  >
+                    <Play size={16} /> {t("quick_run")}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={
+                      researchBusy ||
+                      !researchTopic.trim() ||
+                      !selectedKnowledgeBaseId
+                    }
+                    onClick={() => void createResearchPlanFromDraft()}
+                  >
+                    <Database size={16} /> {t("create_plan")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void loadResearchPlans();
+                      void loadResearchRuns();
+                    }}
+                  >
+                    <RotateCw size={16} /> {t("refresh")}
+                  </button>
+                  <span>
+                    {t("single_kb")}:{" "}
+                    {knowledgeBases.find(
+                      (item) => item.id === selectedKnowledgeBaseId,
+                    )?.name ?? t("not_selected")}
+                  </span>
                 </div>
-              </div>
-            )}
+                {researchError && (
+                  <p className="error" role="alert">
+                    {researchError}
+                  </p>
+                )}
+              </form>
 
-            {events.length > 0 && (
-              <div className="debugger">
-                <h2>Retrieval Debugger</h2>
-                <RetrievalDebugger run={debuggerRun} events={events} />
+              <div className="research-layout">
+                <aside className="research-sidebar">
+                  <div className="research-runs">
+                    <h3>{t("plans")}</h3>
+                    {researchPlans.length === 0 && <p>{t("no_plans")}</p>}
+                    {researchPlans.map((plan) => (
+                      <button
+                        type="button"
+                        key={plan.id}
+                        className={
+                          researchPlanDetail?.plan.id === plan.id
+                            ? "selected"
+                            : ""
+                        }
+                        onClick={() => void loadResearchPlanDetail(plan.id)}
+                      >
+                        <strong>{statusLabel(plan.status, locale)}</strong>
+                        <span>{plan.topic}</span>
+                        <code>{plan.id.slice(0, 8)}</code>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="research-runs">
+                    <h3>{t("runs")}</h3>
+                    {researchRuns.length === 0 && <p>{t("no_runs")}</p>}
+                    {researchRuns.map((run) => (
+                      <button
+                        type="button"
+                        key={run.id}
+                        className={
+                          researchDetail?.run.id === run.id ? "selected" : ""
+                        }
+                        onClick={() => void loadResearchRunDetail(run.id)}
+                      >
+                        <strong>{statusLabel(run.status, locale)}</strong>
+                        <span>{run.topic}</span>
+                        <code>{run.id.slice(0, 8)}</code>
+                      </button>
+                    ))}
+                  </div>
+                </aside>
+
+                {researchPlanDetail && (
+                  <article className="research-detail">
+                    <div className="research-header">
+                      <div>
+                        <h3>{researchPlanDetail.plan.topic}</h3>
+                        <p>
+                          {statusLabel(researchPlanDetail.plan.status, locale)}{" "}
+                          · {researchPlanDetail.plan.retrieval_profile}
+                        </p>
+                      </div>
+                      <div className="row">
+                        <button
+                          type="button"
+                          disabled={
+                            researchBusy ||
+                            researchPlanDetail.plan.status !== "draft"
+                          }
+                          onClick={() => void saveResearchPlan()}
+                        >
+                          {t("save_plan")}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            researchBusy ||
+                            researchPlanDetail.plan.status !== "draft"
+                          }
+                          onClick={() =>
+                            void approveResearchPlan(researchPlanDetail.plan.id)
+                          }
+                        >
+                          {t("approve_run")}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="research-metrics">
+                      <span>
+                        {researchPlanDetail.questions.length} {t("questions")}
+                      </span>
+                      <span>{researchPlanDetail.plan.tool_mode}</span>
+                      {researchPlanDetail.plan.approved_run_id && (
+                        <span>
+                          {t("runs")}{" "}
+                          {researchPlanDetail.plan.approved_run_id.slice(0, 8)}
+                        </span>
+                      )}
+                    </div>
+                    <section>
+                      <label
+                        className="field-label"
+                        htmlFor="research-plan-topic"
+                      >
+                        {t("plan_topic")}
+                      </label>
+                      <textarea
+                        id="research-plan-topic"
+                        value={researchPlanTopicDraft}
+                        aria-label={t("plan_topic")}
+                        disabled={researchPlanDetail.plan.status !== "draft"}
+                        onChange={(event) =>
+                          setResearchPlanTopicDraft(event.target.value)
+                        }
+                      />
+                    </section>
+                    <section>
+                      <label
+                        className="field-label"
+                        htmlFor="research-plan-questions"
+                      >
+                        {t("plan_questions")}
+                      </label>
+                      <textarea
+                        id="research-plan-questions"
+                        value={researchPlanQuestionsDraft}
+                        aria-label={t("plan_questions")}
+                        disabled={researchPlanDetail.plan.status !== "draft"}
+                        onChange={(event) =>
+                          setResearchPlanQuestionsDraft(event.target.value)
+                        }
+                      />
+                    </section>
+                    <section>
+                      <label
+                        className="field-label"
+                        htmlFor="research-plan-notes"
+                      >
+                        {t("notes")}
+                      </label>
+                      <textarea
+                        id="research-plan-notes"
+                        value={researchPlanNotesDraft}
+                        aria-label={t("notes")}
+                        disabled={researchPlanDetail.plan.status !== "draft"}
+                        onChange={(event) =>
+                          setResearchPlanNotesDraft(event.target.value)
+                        }
+                      />
+                    </section>
+                  </article>
+                )}
+
+                {researchDetail && (
+                  <article className="research-detail">
+                    <div className="research-header">
+                      <div>
+                        <h3>{researchDetail.run.topic}</h3>
+                        <p>
+                          {statusLabel(researchDetail.run.status, locale)} ·{" "}
+                          {String(researchDetail.run.progress?.stage ?? "")}
+                        </p>
+                      </div>
+                      <div className="row">
+                        <button
+                          type="button"
+                          disabled={
+                            researchBusy ||
+                            !["received", "running"].includes(
+                              researchDetail.run.status,
+                            )
+                          }
+                          onClick={() =>
+                            void researchRunAction(
+                              researchDetail.run.id,
+                              "pause",
+                            )
+                          }
+                        >
+                          {t("pause")}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            researchBusy ||
+                            researchDetail.run.status !== "paused"
+                          }
+                          onClick={() =>
+                            void researchRunAction(
+                              researchDetail.run.id,
+                              "resume",
+                            )
+                          }
+                        >
+                          {t("resume")}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            researchBusy ||
+                            !["received", "running", "paused"].includes(
+                              researchDetail.run.status,
+                            )
+                          }
+                          onClick={() =>
+                            void researchRunAction(
+                              researchDetail.run.id,
+                              "cancel",
+                            )
+                          }
+                        >
+                          {t("cancel")}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            !researchDetail.episodes.some(
+                              (episode) => episode.query_run_id,
+                            )
+                          }
+                          onClick={() =>
+                            void openResearchDebugger(researchDetail)
+                          }
+                        >
+                          <Bug size={16} /> {t("debug")}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="research-metrics">
+                      <span>
+                        {t("coverage")}{" "}
+                        {researchDetail.final_report.coverage?.covered ?? 0}/
+                        {researchDetail.final_report.coverage?.total ?? 0}
+                      </span>
+                      <span>
+                        {researchDetail.evidence.length} {t("evidence_memory")}
+                      </span>
+                      <span>
+                        {researchDetail.episodes.length} {t("episodes")}
+                      </span>
+                      {researchDetail.final_report.partial_terminal && (
+                        <span>{t("partial_terminal")}</span>
+                      )}
+                    </div>
+
+                    <div className="research-columns">
+                      <section>
+                        <h4>{t("coverage")}</h4>
+                        {researchDetail.coverage.map((item) => {
+                          const question = researchDetail.questions.find(
+                            (row) => row.id === item.question_id,
+                          );
+                          return (
+                            <div className="research-card" key={item.id}>
+                              <strong>
+                                {statusLabel(item.status, locale)}
+                              </strong>
+                              <p>{question?.question ?? item.question_id}</p>
+                              <code>{item.reason}</code>
+                            </div>
+                          );
+                        })}
+                      </section>
+                      <section>
+                        <h4>{t("evidence_memory")}</h4>
+                        {researchDetail.evidence.slice(0, 8).map((item) => (
+                          <div
+                            className="research-card"
+                            id={`evidence-${item.evidence_ref}`}
+                            key={item.id}
+                          >
+                            <strong>
+                              [{item.evidence_ref}] {item.title}
+                            </strong>
+                            <p>{item.content_abstract}</p>
+                            <a
+                              href={item.source_url}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Source
+                            </a>
+                          </div>
+                        ))}
+                      </section>
+                    </div>
+
+                    {researchDetail.reflections.length > 0 && (
+                      <section>
+                        <h4>{t("latest_reflection")}</h4>
+                        <p>
+                          {
+                            researchDetail.reflections[
+                              researchDetail.reflections.length - 1
+                            ].body
+                          }
+                        </p>
+                      </section>
+                    )}
+
+                    {researchDetail.final_report.failure_taxonomy && (
+                      <section>
+                        <h4>{t("failure_taxonomy")}</h4>
+                        <pre>
+                          {JSON.stringify(
+                            researchDetail.final_report.failure_taxonomy,
+                            null,
+                            2,
+                          )}
+                        </pre>
+                      </section>
+                    )}
+
+                    {researchDetail.final_report.markdown && (
+                      <section>
+                        <h4>{t("report")}</h4>
+                        <div className="research-report-actions">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void downloadResearchFile("markdown")
+                            }
+                          >
+                            Markdown
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void downloadResearchFile("docx")}
+                          >
+                            Word
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void downloadResearchFile("csv")}
+                          >
+                            CSV
+                          </button>
+                        </div>
+                        {researchDetail.final_report.sections ? (
+                          <div className="structured-report">
+                            {(
+                              [
+                                "confirmed_findings",
+                                "partial_conflicting_findings",
+                              ] as const
+                            ).map((key) => (
+                              <section key={key}>
+                                <h5>
+                                  {key === "confirmed_findings"
+                                    ? "Confirmed findings"
+                                    : "Partial / conflicting findings"}
+                                </h5>
+                                {(
+                                  researchDetail.final_report.sections?.[key] ??
+                                  []
+                                ).map((finding, index) => (
+                                  <p key={`${key}-${index}`}>
+                                    {finding.text}{" "}
+                                    {(finding.evidence_refs ?? []).map(
+                                      (ref) => (
+                                        <button
+                                          type="button"
+                                          className="citation-button"
+                                          key={ref}
+                                          onClick={() =>
+                                            document
+                                              .getElementById(`evidence-${ref}`)
+                                              ?.scrollIntoView({
+                                                behavior: "smooth",
+                                                block: "center",
+                                              })
+                                          }
+                                        >
+                                          {ref}
+                                        </button>
+                                      ),
+                                    )}
+                                  </p>
+                                ))}
+                              </section>
+                            ))}
+                            <section>
+                              <h5>Unresolved questions</h5>
+                              {(
+                                researchDetail.final_report.sections
+                                  .unresolved_questions ?? []
+                              ).map((item) => (
+                                <p key={item}>{item}</p>
+                              ))}
+                            </section>
+                            <section>
+                              <h5>Limitations</h5>
+                              {(
+                                researchDetail.final_report.sections
+                                  .limitations ?? []
+                              ).map((item) => (
+                                <p key={item}>{item}</p>
+                              ))}
+                            </section>
+                          </div>
+                        ) : (
+                          <pre>{researchDetail.final_report.markdown}</pre>
+                        )}
+                      </section>
+                    )}
+                  </article>
+                )}
               </div>
-            )}
-          </section>
+            </section>
+          </div>
+
+          <div
+            id="panel-chat"
+            className="tab-panel"
+            role="tabpanel"
+            aria-labelledby="tab-chat"
+            hidden={activeTab !== "chat"}
+          >
+            <section className="band">
+              <form className="chat" onSubmit={submitChat}>
+                <h2>
+                  <MessageSquare size={18} /> {t("chat")}
+                </h2>
+                <textarea
+                  value={question}
+                  onChange={(event) => setQuestion(event.target.value)}
+                  aria-label={t("chat")}
+                />
+                <details className="advanced">
+                  <summary>
+                    <SlidersHorizontal size={16} /> {t("advanced_retrieval")}
+                  </summary>
+                  <div className="advanced-grid">
+                    <label>
+                      {t("profile")}
+                      <HelpTooltip text={t("tooltip_profile")} />
+                      <select
+                        aria-label={t("profile")}
+                        value={retrievalProfile}
+                        onChange={(event) =>
+                          setRetrievalProfile(event.target.value)
+                        }
+                      >
+                        <option value="sota_mvp">sota_mvp</option>
+                        <option value="test_mock">test_mock</option>
+                        <option value="upload_mock">upload_mock</option>
+                        <option value="upload_sota_mvp">upload_sota_mvp</option>
+                        <option value="bm25_only">bm25_only</option>
+                        <option value="rewrite_off">rewrite_off</option>
+                        <option value="parent_expansion_off">
+                          parent_expansion_off
+                        </option>
+                      </select>
+                    </label>
+                    <label>
+                      {t("top_k")}
+                      <HelpTooltip text={t("tooltip_top_k")} />
+                      <input
+                        type="number"
+                        min={1}
+                        max={50}
+                        value={debugTopK}
+                        aria-label={t("top_k")}
+                        onChange={(event) =>
+                          setDebugTopK(Number(event.target.value))
+                        }
+                      />
+                    </label>
+                    <label className="checkbox">
+                      <input
+                        type="checkbox"
+                        aria-label={t("bm25")}
+                        checked={bm25Enabled}
+                        onChange={(event) =>
+                          setBm25Enabled(event.target.checked)
+                        }
+                      />
+                      {t("bm25")}
+                    </label>
+                    <label className="checkbox">
+                      <input
+                        type="checkbox"
+                        aria-label={t("dense")}
+                        checked={denseEnabled}
+                        onChange={(event) =>
+                          setDenseEnabled(event.target.checked)
+                        }
+                      />
+                      {t("dense")}
+                    </label>
+                    <label className="checkbox">
+                      <input
+                        type="checkbox"
+                        aria-label={t("rerank")}
+                        checked={rerankEnabled}
+                        onChange={(event) =>
+                          setRerankEnabled(event.target.checked)
+                        }
+                      />
+                      {t("rerank")}
+                    </label>
+                    <label>
+                      {t("fusion")}
+                      <HelpTooltip text={t("tooltip_fusion")} />
+                      <select
+                        aria-label={t("fusion")}
+                        value={fusionMode}
+                        onChange={(event) =>
+                          setFusionMode(event.target.value as "rrf" | "none")
+                        }
+                      >
+                        <option value="rrf">rrf</option>
+                        <option value="none">none</option>
+                      </select>
+                    </label>
+                    <label>
+                      {t("parent_expansion")}
+                      <HelpTooltip text={t("tooltip_parent")} />
+                      <select
+                        aria-label={t("parent_expansion")}
+                        value={parentExpansion}
+                        onChange={(event) =>
+                          setParentExpansion(
+                            event.target.value as
+                              | "off"
+                              | "selective"
+                              | "always",
+                          )
+                        }
+                      >
+                        <option value="selective">selective</option>
+                        <option value="off">off</option>
+                        <option value="always">always</option>
+                      </select>
+                    </label>
+                    <label>
+                      {t("extended_search")}
+                      <HelpTooltip text={t("tooltip_extended")} />
+                      <select
+                        aria-label={t("extended_search")}
+                        value={extendedSearchMode}
+                        onChange={(event) =>
+                          setExtendedSearchMode(
+                            event.target.value as
+                              | "off"
+                              | "conditional"
+                              | "always",
+                          )
+                        }
+                      >
+                        <option value="conditional">conditional</option>
+                        <option value="off">off</option>
+                        <option value="always">always</option>
+                      </select>
+                    </label>
+                  </div>
+                </details>
+                <div className="row">
+                  <label className="compact-field">
+                    {t("mode")}
+                    <select
+                      aria-label={t("mode")}
+                      value={mode}
+                      onChange={(event) =>
+                        setMode(event.target.value as "normal" | "extended")
+                      }
+                    >
+                      <option value="normal">{t("normal")}</option>
+                      <option value="extended">{t("extended")}</option>
+                    </select>
+                  </label>
+                  <button type="submit" disabled={chatBusy}>
+                    <Search size={16} /> {chatBusy ? t("loading") : t("ask")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={loadDebugger}
+                    disabled={!queryRunId}
+                    title={t("tooltip_debug")}
+                  >
+                    <Bug size={16} /> {t("debug")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => window.location.reload()}
+                    aria-label={t("reset_app")}
+                    title={t("tooltip_reload")}
+                  >
+                    <RotateCw size={16} />
+                  </button>
+                </div>
+                {chatBusy && (
+                  <p className="status" role="status" aria-live="polite">
+                    {t("chat_waiting")}
+                  </p>
+                )}
+                {chatError && (
+                  <p className="error" role="alert" aria-live="assertive">
+                    {chatError}
+                  </p>
+                )}
+              </form>
+
+              {answer && (
+                <div className="answer">
+                  <h2>{t("answer")}</h2>
+                  <p>{answer}</p>
+                  <h3>{t("sources")}</h3>
+                  <div className="sources">
+                    {evidence.map((item) => (
+                      <article key={item.evidence_id}>
+                        <a
+                          href={item.source_url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          [{item.evidence_id}] {item.title}
+                        </a>
+                        <span>{item.section_path.join(" / ")}</span>
+                        <p>{item.content}</p>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {events.length > 0 && (
+                <div className="debugger">
+                  <h2>{t("debug")} · Retrieval</h2>
+                  <RetrievalDebugger run={debuggerRun} events={events} />
+                </div>
+              )}
+            </section>
+          </div>
         </>
       )}
     </main>
@@ -2652,6 +3690,66 @@ function knowledgeBaseName(
   return knowledgeBases.find((kb) => kb.id === id)?.name ?? id;
 }
 
+type Translate = (key: string, fallback?: string) => string;
+
+function safeErrorCodePayload(raw: string): { code?: string } {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    const root = parsed as Record<string, unknown>;
+    const direct = root.error;
+    const detail = root.detail;
+    const envelope =
+      direct && typeof direct === "object"
+        ? direct
+        : detail && typeof detail === "object"
+          ? (detail as Record<string, unknown>).error
+          : undefined;
+    if (!envelope || typeof envelope !== "object") return {};
+    const code = (envelope as Record<string, unknown>).code;
+    return typeof code === "string" && code ? { code } : {};
+  } catch {
+    return {};
+  }
+}
+
+function localizedError(
+  code: string | undefined,
+  translate: Translate,
+  fallbackKey: string,
+): string {
+  const key =
+    code === "KB_NOT_READY"
+      ? fallbackKey
+      : code === "CONFLICT"
+        ? "conflict"
+        : code === "REQUEST_VALIDATION_FAILED"
+          ? "request_validation_failed"
+          : fallbackKey;
+  const message = translate(key);
+  if (!code) return message;
+  return `${message} (${translate("error_code")}: ${code})`;
+}
+
+async function responseErrorMessage(
+  response: Response,
+  translate: Translate,
+  fallbackKey: string,
+): Promise<string> {
+  const raw = await response.text();
+  const { code } = safeErrorCodePayload(raw);
+  return localizedError(code, translate, fallbackKey);
+}
+
+function sseFailureMessage(payload: SsePayload, translate: Translate): string {
+  const code = payload.data?.code;
+  return localizedError(
+    typeof code === "string" ? code : undefined,
+    translate,
+    "chat_failed",
+  );
+}
+
 function formatFacetName(field: string) {
   const labels: Record<string, string> = {
     source_type: "Source",
@@ -2685,9 +3783,12 @@ function metadataValue(document: DocumentPublicMetadata, key: string) {
   return "";
 }
 
-function formatTimestamp(value?: string | null) {
+function formatTimestamp(
+  value: string | null | undefined,
+  locale: Locale = "en",
+) {
   if (!value) return "";
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(locale === "ru" ? "ru-RU" : "en-US", {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
@@ -2730,10 +3831,43 @@ function parseJsonObject(label: string, text: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function sourceKindLabel(kind: string) {
-  return SOURCE_KINDS.includes(kind as SourceKind)
-    ? SOURCE_TEMPLATES[kind as SourceKind].label
-    : kind;
+function sourceKindLabel(kind: string, locale: Locale = "en") {
+  if (!SOURCE_KINDS.includes(kind as SourceKind)) return kind;
+  if (locale === "ru") {
+    const labels: Record<SourceKind, string> = {
+      confluence_dc: "Confluence DC",
+      jira_dc: "Jira DC",
+      gitlab_self_managed: "GitLab Self-Managed",
+      kiwix_zim: "Kiwix/ZIM",
+      local_folder: "Локальная папка",
+      internal_crawler: "Внутренний crawler",
+      sunduk_mock: "Sunduk Mock",
+      docsmart_mock: "DocSmart Mock",
+    };
+    return labels[kind as SourceKind];
+  }
+  return SOURCE_TEMPLATES[kind as SourceKind].label;
+}
+
+function statusLabel(value: string | null | undefined, locale: Locale = "en") {
+  const status = value ?? "";
+  if (locale !== "ru") return status;
+  const labels: Record<string, string> = {
+    active: "активен",
+    approved: "утверждён",
+    cancelled: "отменён",
+    completed: "завершён",
+    completed_partial: "завершён частично",
+    disabled: "отключён",
+    failed: "ошибка",
+    paused: "на паузе",
+    queued: "в очереди",
+    received: "получен",
+    running: "выполняется",
+    pending: "ожидает",
+    partial: "частично",
+  };
+  return labels[status] ?? status;
 }
 
 function normalizeDocumentAccess(raw: unknown): DocumentAccess {
@@ -2764,16 +3898,22 @@ function parseIdList(text: string): string[] {
     .filter(Boolean);
 }
 
-function accessLabel(access: DocumentAccess | undefined) {
+function accessLabel(
+  access: DocumentAccess | undefined,
+  locale: Locale = "en",
+) {
   const normalized = normalizeDocumentAccess(access);
-  if (normalized.policy === "tenant") return "Tenant";
-  if (normalized.policy === "restricted") return "Restricted";
-  return "KB";
+  if (normalized.policy === "tenant")
+    return locale === "ru" ? "Тенант" : "Tenant";
+  if (normalized.policy === "restricted")
+    return locale === "ru" ? "Ограниченный" : "Restricted";
+  return locale === "ru" ? "База" : "KB";
 }
 
 function AccessEditor({
   value,
   groups,
+  locale = "en",
   disabled,
   saveLabel,
   onChange,
@@ -2781,6 +3921,7 @@ function AccessEditor({
 }: {
   value: DocumentAccess;
   groups: AccessGroup[];
+  locale?: Locale;
   disabled?: boolean;
   saveLabel?: string;
   onChange?: (access: DocumentAccess) => void;
@@ -2833,7 +3974,7 @@ function AccessEditor({
   return (
     <div className="access-editor">
       <label>
-        Visibility
+        {locale === "ru" ? "Видимость" : "Visibility"}
         <select
           value={policy}
           disabled={disabled}
@@ -2844,14 +3985,18 @@ function AccessEditor({
           }}
         >
           <option value="kb">KB</option>
-          <option value="tenant">Tenant</option>
-          <option value="restricted">Restricted</option>
+          <option value="tenant">
+            {locale === "ru" ? "Тенант" : "Tenant"}
+          </option>
+          <option value="restricted">
+            {locale === "ru" ? "Ограниченный" : "Restricted"}
+          </option>
         </select>
       </label>
       {policy === "restricted" && (
         <>
           <label>
-            Groups
+            {locale === "ru" ? "Группы" : "Groups"}
             <select
               multiple
               value={groupIds}
@@ -2872,7 +4017,7 @@ function AccessEditor({
             </select>
           </label>
           <label>
-            User IDs
+            {locale === "ru" ? "ID пользователей" : "User IDs"}
             <input
               value={userIdsText}
               disabled={disabled}
@@ -2880,7 +4025,11 @@ function AccessEditor({
                 setUserIdsText(event.target.value);
                 emit(policy, event.target.value, groupIds);
               }}
-              placeholder="user-id, another-user-id"
+              placeholder={
+                locale === "ru"
+                  ? "user-id, другой-user-id"
+                  : "user-id, another-user-id"
+              }
             />
           </label>
         </>
@@ -2891,7 +4040,8 @@ function AccessEditor({
           disabled={disabled}
           onClick={() => onSave(currentAccess())}
         >
-          <ShieldCheck size={15} /> {saveLabel ?? "Save Access"}
+          <ShieldCheck size={15} />{" "}
+          {saveLabel ?? (locale === "ru" ? "Сохранить доступ" : "Save access")}
         </button>
       )}
     </div>
@@ -2900,6 +4050,7 @@ function AccessEditor({
 
 function DocumentViewer({
   structure,
+  locale,
   context,
   searchQuery,
   searchResults,
@@ -2917,6 +4068,7 @@ function DocumentViewer({
   onOpenSection,
 }: {
   structure: DocumentStructure;
+  locale: Locale;
   context: DocumentContextResponse | null;
   searchQuery: string;
   searchResults: DocumentSearchResult[];
@@ -2942,11 +4094,14 @@ function DocumentViewer({
           </h2>
           <div className="search-meta">
             <span>{structure.source_type}</span>
-            <span>{structure.sections.length} sections</span>
+            <span>
+              {structure.sections.length}{" "}
+              {locale === "ru" ? "разделов" : "sections"}
+            </span>
             {structure.document_version_id && (
               <span>{structure.document_version_id}</span>
             )}
-            <span>{accessLabel(structure.document_access)}</span>
+            <span>{accessLabel(structure.document_access, locale)}</span>
             {structure.document_access_origin && (
               <span>{structure.document_access_origin}</span>
             )}
@@ -2955,11 +4110,12 @@ function DocumentViewer({
         <div className="row">
           {structure.source_url && (
             <a href={structure.source_url} target="_blank" rel="noreferrer">
-              <ExternalLink size={15} /> Source
+              <ExternalLink size={15} />{" "}
+              {locale === "ru" ? "Источник" : "Source"}
             </a>
           )}
           <button type="button" onClick={onClose}>
-            <X size={16} /> Close
+            <X size={16} /> {locale === "ru" ? "Закрыть" : "Close"}
           </button>
         </div>
       </div>
@@ -2967,12 +4123,21 @@ function DocumentViewer({
         <AccessEditor
           value={normalizeDocumentAccess(structure.document_access)}
           groups={accessGroups}
+          locale={locale}
           disabled={accessBusy}
-          saveLabel="Save Document Access"
+          saveLabel={
+            locale === "ru"
+              ? "Сохранить доступ к документу"
+              : "Save document access"
+          }
           onSave={onUpdateAccess}
         />
       )}
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
       <div className="document-viewer-grid">
         <nav className="document-toc">
           {structure.sections.map((section) => (
@@ -2993,10 +4158,19 @@ function DocumentViewer({
             <input
               value={searchQuery}
               onChange={(event) => onSearchQueryChange(event.target.value)}
-              placeholder="Search inside this document"
+              placeholder={
+                locale === "ru"
+                  ? "Поиск внутри этого документа"
+                  : "Search inside this document"
+              }
+              aria-label={
+                locale === "ru"
+                  ? "Поиск внутри этого документа"
+                  : "Search inside this document"
+              }
             />
             <button type="submit" disabled={searchBusy || !searchQuery.trim()}>
-              <Search size={15} /> Search
+              <Search size={15} /> {locale === "ru" ? "Поиск" : "Search"}
             </button>
           </form>
           {searchResults.length > 0 && (
@@ -3013,9 +4187,17 @@ function DocumentViewer({
               ))}
             </div>
           )}
-          {busy && <p className="empty-state">Loading</p>}
+          {busy && (
+            <p className="empty-state" role="status" aria-live="polite">
+              {locale === "ru" ? "Загрузка контекста…" : "Loading context…"}
+            </p>
+          )}
           {context && context.chunks.length === 0 && !busy && (
-            <p className="empty-state">No text context</p>
+            <p className="empty-state">
+              {locale === "ru"
+                ? "Текстовый контекст отсутствует"
+                : "No text context"}
+            </p>
           )}
           {context && context.chunks.length > 0 && (
             <div className="document-context">

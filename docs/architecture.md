@@ -17,6 +17,9 @@ external source connections. It covers:
 - object-storage-first document handling;
 - external source connectors for local/corporate source synchronization;
 - tenant-scoped hybrid retrieval and grounded answer generation;
+- durable local-first Deep Research over private KB evidence, with a
+  server-owned one-to-three-KB scope, bounded planner/tool episodes, verified
+  claims and ACL-trimmed reports;
 - local validation, eval and release-gate workflows.
 
 External production operation is planned work. The repository contains Compose
@@ -25,7 +28,7 @@ deployment.
 
 ## Users And External Systems
 
-- End users: sign in, select knowledge bases, upload documents, import Wikipedia subsets, ask questions and inspect citations.
+- End users: sign in, select knowledge bases, upload documents, import Wikipedia subsets, ask questions, run bounded Deep Research and inspect citations.
 - Operators and coding agents: run Compose, validation commands, eval gates and runtime smokes.
 - Identity provider: optional OIDC provider, with a local Keycloak smoke profile.
 - Model providers: OpenRouter and mock provider through the Model Gateway alias contract; local llama.cpp is an optional future profile.
@@ -45,6 +48,8 @@ deployment.
 - Failed or cancelled ingestion jobs must not publish searchable chunks.
 - Physical search indices are versioned and published through KB active-index metadata and aliases.
 - Model calls go through Model Gateway aliases; business code does not call providers directly.
+- Deep Research is local-private and server-scoped; document text is evidence,
+  never executable planner instruction.
 - Normal logs and reports must redact secrets, prompts, provider payloads, raw document text, parser stderr and storage object keys.
 - Background transitions must be idempotent and resumable.
 - ZIM/libzim + Kiwix is the primary local Wikipedia path.
@@ -52,6 +57,11 @@ deployment.
 - XML fallback parser offsets must remain monotonic non-decreasing offsets.
 - Retrieval readiness failures use the safe `KB_NOT_READY` contract.
 - Retrieval responses expose `index_contract_id`; indexed documents carry `metadata.index_contract_id`.
+- Retrieval Correctness V3 uses scoped entity identity `(tenant, knowledge base,
+  source, snapshot, native id)`, immutable read-path index publication,
+  provenance-preserving content units and sequence-ordered safe retrieval
+  events. Native source identifiers remain resolvable only through a scoped
+  legacy mapping.
 
 ## System Context
 
@@ -69,7 +79,7 @@ flowchart LR
     Stores["PostgreSQL, MinIO, OpenSearch"]
     Eval["Validation and Eval Artifacts"]
 
-    User -->|"sign in, upload, chat, debug"| UI
+    User -->|"sign in, upload, search, research, chat, debug"| UI
     UI -->|"cookie, CSRF, JSON and SSE"| API
     API -->|"auth start and callback"| IdP
     API -->|"enqueue and inspect jobs"| Stores
@@ -110,7 +120,7 @@ flowchart LR
     API -->|"presigned upload URLs"| MinIO
     API -->|"BM25 and vector search"| Search
     API -->|"chat, embeddings, rerank aliases"| Gateway
-    API -. "configured dependency, usage not confirmed in src" .-> Redis
+    API -->|"search pagination windows"| Redis
     Worker -->|"claim jobs and write state"| Postgres
     Worker -->|"read originals and write artifacts"| MinIO
     Worker -->|"publish chunks and delete derived docs"| Search
@@ -126,13 +136,13 @@ flowchart LR
 
 ## Runtime Components
 
-- Web UI: one React/Vite screen for auth, KB selection, import, upload, chat and retrieval debugging.
-- API: FastAPI service for auth, admin APIs, KBs, source management, upload sessions, document lifecycle, chat SSE, debug search, readiness and safe errors.
-- Worker: Python loop that claims PostgreSQL jobs, imports Wikipedia, syncs external sources, processes document uploads and handles deferred document purge.
-- PostgreSQL: control-plane source of truth and durable job state.
+- Web UI: one React/Vite screen for auth, KB selection, import, upload, search, Deep Research, chat and retrieval debugging.
+- API: FastAPI service for auth, admin APIs, KBs, source management, upload sessions, document lifecycle, Deep Research lifecycle, chat SSE, debug search, readiness and safe errors.
+- Worker: Python loop that claims PostgreSQL jobs, imports Wikipedia, syncs external sources, processes document uploads, runs bounded Deep Research episodes and handles deferred document purge.
+- PostgreSQL: control-plane source of truth, durable job state and Deep Research lifecycle/memory.
 - MinIO: original uploads and normalized/parser artifacts.
 - OpenSearch: derived BM25/vector search representation.
-- Redis/Valkey: configured Compose dependency; no Redis client usage was confirmed in `src/`.
+- Redis/Valkey: tenant-scoped search-window cache with bounded pooled clients; failures fall back to uncached search.
 - Kiwix: read-only local ZIM serving.
 - Model Gateway: provider boundary for chat, embedding and rerank aliases.
 - Parser services: Xberg, Docling and metadata-service.
@@ -150,6 +160,7 @@ flowchart LR
 | Document metadata, versions and lifecycle | PostgreSQL | UI public metadata |
 | Chunks and publication state | PostgreSQL for durable metadata; OpenSearch for search | OpenSearch documents |
 | Query runs and retrieval events | PostgreSQL | Chat SSE payloads and debug responses |
+| Deep Research runs, questions, episodes, tool metadata, evidence, claims, coverage and reflections | PostgreSQL | ACL-trimmed API detail and deterministic report |
 | ZIM archive | Local ignored `zim/` files served by Kiwix | Imported chunks and source URLs |
 | Eval and validation reports | Ignored `artifacts/` paths | `docs/STATUS.md` latest pointers |
 
@@ -173,7 +184,7 @@ authoritative storage matrix.
 - Use Model Gateway aliases for model-provider access.
 - Resolve tenant and KB access server-side through `ActorContext`.
 - Use async object-storage-first document ingestion, not synchronous large-file ingestion inside API requests.
-- Keep Extended Search single-KB until a separate Multi-KB Extended Search design is approved.
+- Keep Extended Search bounded and server-scoped; Multi-KB runs use the same ActorContext/DocumentAccessScope for every KB.
 - Use ExecPlans for implementation history and ADRs for durable architecture decisions going forward.
 
 ADR guidance and template are in [decisions/](decisions/).
@@ -182,8 +193,12 @@ ADR guidance and template are in [decisions/](decisions/).
 
 - External deployment model, TLS/reverse proxy strategy and environment isolation.
 - Production identity provider, tenant onboarding and richer external ACL connector policy beyond JSON `document_access` trimming.
-- Deep Research runtime policy override and local-Qwen validation beyond the
-  already implemented fixtures, mock smoke and offline context-packer matrix.
+- Diagnose the post-episode/provider terminal stall in the isolated
+  OpenRouter/Qwen hard gate before treating it as a quality or context-policy
+  result. The 45% default remains until a clean 35%/45%/55% comparison passes.
+- Measure the new five-tool Deep Research registry and 80k stage profiles on a
+  fresh runtime matrix before changing default budgets or adding broader
+  orchestration.
 - Malware scanning and parser isolation requirements beyond local Compose hardening.
 - Restore automation, restore drills and backup retention.
 - Observability backend, retention, alerting and ownership.
@@ -194,7 +209,6 @@ ADR guidance and template are in [decisions/](decisions/).
 
 - Production external hosting support in the current local MVP.
 - Explicit deny rules and source-specific ACL engines beyond JSON `document_access`.
-- Multi-KB Extended Search.
 - GraphRAG, multi-agent swarm retrieval, ColBERT, learned sparse retrieval or proposition indexing.
 - Direct provider calls from business logic.
 - Synchronous ingestion of large files inside HTTP requests.

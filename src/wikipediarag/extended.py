@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from typing import Any, Literal
@@ -10,14 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.answerability import decide_answerability, is_insufficient
 from wikipediarag.config import Settings
-from wikipediarag.db import json_dumps
+from wikipediarag.db import connect_autocommit, json_dumps
 from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.embedding import normalize_for_embedding
 from wikipediarag.ids import new_uuid, stable_hash
 from wikipediarag.repository import fetch_chunk_by_id, insert_retrieval_event
-from wikipediarag.retrieval import make_query_context, query_ref_from_context, retrieve
+from wikipediarag.retrieval import make_query_context, query_ref_from_context, retrieve, retrieve_multi
 from wikipediarag.retrieval_profile import RetrievalProfile
-from wikipediarag.schemas import Evidence, RetrievalResult
+from wikipediarag.schemas import AnswerabilityStatus, Evidence, RetrievalResult
 
 StopReason = Literal[
     "evidence_sufficient",
@@ -117,23 +118,31 @@ async def run_extended_search(
     *,
     tenant_id: str,
     knowledge_base_id: str,
+    knowledge_base_ids: list[str] | None = None,
     query_run_id: str,
     trace_id: str,
     settings: Settings,
     profile: RetrievalProfile,
     profile_overrides: dict[str, Any] | None = None,
     search_filters: dict[str, Any] | None = None,
+    seed_result: RetrievalResult | None = None,
 ) -> RetrievalResult:
     extended_started = time.perf_counter()
     budgets = HarnessBudgets(max_context_tokens=profile.postprocess.max_context_tokens)
     state = HarnessState(
         original_query=query,
         intent=_classify_intent(query),
-        subqueries=_build_subqueries(query, budgets.max_subqueries),
+        # Reserve one bounded slot for an evidence-gap repair query. This
+        # keeps the total within max_subqueries while ensuring PARTIAL does
+        # not silently exhaust the queue before repair can be scheduled.
+        subqueries=_build_subqueries(query, max(1, budgets.max_subqueries - 1)),
         retrieval_profile=profile.name,
     )
     minimum_search_steps = 2 if _looks_like_bridge_query(query.casefold()) else 1
     combined: dict[str, Evidence] = {}
+    if seed_result is not None:
+        for evidence in seed_result.evidence:
+            combined[f"{evidence.knowledge_base_id}:{evidence.chunk_id}"] = evidence
     step_evidence_ids_by_step: list[list[str]] = []
     previous_coverage = 0.0
     stalled_steps = 0
@@ -158,22 +167,27 @@ async def run_extended_search(
             "stage": "query_transform",
             "stable_stage": "query_transform",
             "query_context": primary_query_context,
-            "original_query": query,
-            "normalized_query": normalized_query,
+            "original_query_hash": stable_hash(["retrieval_query", query], 32),
+            "normalized_query_hash": stable_hash(["retrieval_query", normalized_query], 32),
             "transforms": [
-                {"order": 1, "type": "original", "transform_id": "tr.original.1", "text": query},
+                {
+                    "order": 1,
+                    "type": "original",
+                    "transform_id": "tr.original.1",
+                    "hash": stable_hash(["retrieval_query", query], 32),
+                },
                 {
                     "order": 2,
                     "type": "normalization",
                     "transform_id": "tr.normalization.1",
-                    "text": normalized_query,
+                    "hash": stable_hash(["retrieval_query", normalized_query], 32),
                     "changed": query != normalized_query,
                 },
                 {
                     "order": 3,
                     "type": "bridge_queries",
                     "transform_id": "tr.bridge.1",
-                    "queries": bridge_queries,
+                    "query_hashes": [stable_hash(["retrieval_query", item], 32) for item in bridge_queries],
                     "query_refs": bridge_refs,
                     "status": "performed" if bridge_queries else "skipped",
                     "reason": "bridge_query_detector_v1" if bridge_queries else "no_bridge_query_detected",
@@ -182,7 +196,7 @@ async def run_extended_search(
                     "order": 4,
                     "type": "decomposition",
                     "transform_id": "tr.decomposition.1",
-                    "queries": list(state.subqueries),
+                    "query_hashes": [stable_hash(["retrieval_query", item], 32) for item in state.subqueries],
                     "query_refs": decomposition_refs,
                     "status": "performed" if state.subqueries else "skipped",
                     "reason": "extended_search_subquery_builder_v1",
@@ -192,34 +206,147 @@ async def run_extended_search(
         }
     ]
 
-    for step, subquery in enumerate(state.subqueries[: budgets.max_steps], start=1):
-        query_context = subquery_contexts[step - 1]
+    # A direct retrieval can seed the harness. The original query is already
+    # represented in the ledger and must not be searched a second time.
+    subquery_index = 0
+    if seed_result is not None:
+        original_key = normalize_for_embedding(query)
+        for index, candidate in enumerate(state.subqueries):
+            if normalize_for_embedding(candidate) == original_key:
+                state.subqueries.pop(index)
+                break
+    if seed_result is not None:
+        state.evidence_ledger.append(
+            EvidenceLedgerItem(
+                subquery_id="sq.primary.1",
+                text=query,
+                status="covered" if seed_result.evidence else "missing",
+                evidence_ids=[item.evidence_id for item in seed_result.evidence],
+            )
+        )
+    # Execute the first independent wave concurrently.  Each retrieval gets
+    # its own autocommit connection; the controller connection is reserved for
+    # deterministic ledger/event persistence below.
+    prefetched: dict[str, RetrievalResult] = {}
+    initial_wave = state.subqueries[: min(budgets.max_parallel_tool_calls, len(state.subqueries))]
+
+    async def run_prefetched(item: str, item_context: dict[str, Any]) -> tuple[str, RetrievalResult]:
+        async def call(retrieval_conn: AsyncConnection) -> RetrievalResult:
+            if len(knowledge_base_ids or [knowledge_base_id]) > 1:
+                return await retrieve_multi(
+                    retrieval_conn,
+                    item,
+                    tenant_id=tenant_id,
+                    knowledge_base_ids=list(knowledge_base_ids or []),
+                    query_run_id=query_run_id,
+                    trace_id=trace_id,
+                    settings=settings,
+                    top_k=profile.postprocess.final_evidence_max,
+                    profile=profile,
+                    profile_overrides=profile_overrides,
+                    query_context=item_context,
+                    search_filters=search_filters,
+                    persist_events=False,
+                    apply_query_transforms=False,
+                )
+            return await retrieve(
+                retrieval_conn,
+                item,
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                query_run_id=query_run_id,
+                trace_id=trace_id,
+                settings=settings,
+                top_k=profile.postprocess.final_evidence_max,
+                profile=profile,
+                profile_overrides=profile_overrides,
+                query_context=item_context,
+                search_filters=search_filters,
+                persist_events=False,
+                apply_query_transforms=False,
+            )
+
+        try:
+            async with connect_autocommit(settings) as retrieval_conn:
+                result = await call(retrieval_conn)
+        except OSError:
+            # Unit/in-process callers may supply a lightweight fake connection.
+            result = await call(conn)
+        return item, result
+
+    if initial_wave and len(knowledge_base_ids or [knowledge_base_id]) > 1:
+        prefetched = dict(
+            await _gather_ordered(
+                [run_prefetched(item, subquery_contexts[index]) for index, item in enumerate(initial_wave)]
+            )
+        )
+    step = 0
+    while subquery_index < len(state.subqueries) and step < budgets.max_steps:
+        if time.perf_counter() - extended_started >= budgets.max_wall_time_seconds:
+            state.stop_reason = "budget_reached"
+            break
+        subquery = state.subqueries[subquery_index]
+        subquery_index += 1
+        step += 1
+        if subquery_index <= len(subquery_contexts):
+            query_context = subquery_contexts[subquery_index - 1]
+        else:
+            query_context = make_query_context(
+                query=subquery,
+                transform_id=f"tr.gap.{step}",
+                subquery_id=f"sq.gap.{step}",
+                query_role="repair",
+                transform_type="evidence_gap_repair",
+            )
         state.current_step = step
         if not _record_tool_call(state, "search", {"query": subquery, "profile": profile.name}):
             state.stop_reason = "duplicate_tool_call"
             break
         tool_started = time.perf_counter()
-        result = await retrieve(
-            conn,
-            subquery,
-            tenant_id=tenant_id,
-            knowledge_base_id=knowledge_base_id,
-            query_run_id=query_run_id,
-            trace_id=trace_id,
-            settings=settings,
-            top_k=profile.postprocess.final_evidence_max,
-            profile=profile,
-            profile_overrides=profile_overrides,
-            query_context=query_context,
-            search_filters=search_filters,
-        )
+        if subquery in prefetched:
+            result = prefetched.pop(subquery)
+        elif len(knowledge_base_ids or [knowledge_base_id]) > 1:
+            result = await retrieve_multi(
+                conn,
+                subquery,
+                tenant_id=tenant_id,
+                knowledge_base_ids=list(knowledge_base_ids or []),
+                query_run_id=query_run_id,
+                trace_id=trace_id,
+                settings=settings,
+                top_k=profile.postprocess.final_evidence_max,
+                profile=profile,
+                profile_overrides=profile_overrides,
+                query_context=query_context,
+                search_filters=search_filters,
+                persist_events=False,
+                apply_query_transforms=False,
+            )
+        else:
+            result = await retrieve(
+                conn,
+                subquery,
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                query_run_id=query_run_id,
+                trace_id=trace_id,
+                settings=settings,
+                top_k=profile.postprocess.final_evidence_max,
+                profile=profile,
+                profile_overrides=profile_overrides,
+                query_context=query_context,
+                search_filters=search_filters,
+                persist_events=False,
+                apply_query_transforms=False,
+            )
         tool_latency_ms = _elapsed_ms(tool_started)
         retrieval_timings = _extract_timings(result.events)
         new_count = 0
         step_evidence_ids: list[str] = []
         for evidence in result.evidence:
-            if evidence.chunk_id not in combined:
-                combined[evidence.chunk_id] = evidence
+            evidence_key = f"{evidence.knowledge_base_id}:{evidence.chunk_id}"
+            if evidence_key not in combined:
+                combined[evidence_key] = evidence
                 new_count += 1
                 step_evidence_ids.append(evidence.chunk_id)
             page = str(evidence.metadata.get("zim_entry_path") or evidence.title)
@@ -242,6 +369,16 @@ async def run_extended_search(
         state.coverage_inventory = inventory
         coverage = _coverage_ratio(inventory)
         state.coverage = coverage
+        provisional_evidence = _renumber_evidence(
+            _select_final_evidence(
+                combined,
+                step_evidence_ids_by_step,
+                profile.postprocess.final_evidence_max,
+            )
+        )
+        progress_answerability = decide_answerability(query, provisional_evidence, profile)
+        missing_answer_terms = progress_answerability.signals.get("missing_answer_bearing_terms", [])
+        gap_queries_added = 0
         state.evidence_ledger.append(
             EvidenceLedgerItem(
                 subquery_id=str(query_context["subquery_id"]),
@@ -256,7 +393,8 @@ async def run_extended_search(
                 "stable_stage": "retrieval.extended",
                 "tool": "search",
                 "step": step,
-                "query": subquery,
+                "query_text_hash": stable_hash(["retrieval_query", subquery], 32),
+                "query_length_chars": len(subquery),
                 "subquery_id": query_context["subquery_id"],
                 "transform_id": query_context["transform_id"],
                 "query_hash": query_context["query_hash"],
@@ -271,23 +409,46 @@ async def run_extended_search(
                 "max_rerank_score": _max_stage_score(result.events, "rerank"),
                 "coverage": coverage,
                 "coverage_inventory": [item.model_dump(mode="json") for item in inventory],
+                "answerability_progress": progress_answerability.model_dump(mode="json"),
                 "latency_ms": tool_latency_ms,
                 "retrieval_timings_ms": retrieval_timings,
                 "index_contract_id": result.index_contract_id,
                 "run_contract_id": result.run_contract_id,
             }
         )
-        if coverage >= 1.0 and step >= minimum_search_steps:
+        if (
+            progress_answerability.status == AnswerabilityStatus.answerable
+            and not progress_answerability.missing_parts
+            and not missing_answer_terms
+            and not progress_answerability.signals.get("conflict_marker")
+            and step >= minimum_search_steps
+        ):
             state.stop_reason = "evidence_sufficient"
             break
-        if new_count == 0 and neighbor_count == 0:
-            state.stop_reason = "no_new_evidence"
+        if progress_answerability.status in {AnswerabilityStatus.partial, AnswerabilityStatus.conflicting}:
+            for repair_query in _gap_repair_queries(
+                query,
+                progress_answerability,
+                provisional_evidence,
+                existing=state.subqueries,
+                limit=budgets.max_subqueries - len(state.subqueries),
+            ):
+                state.subqueries.append(repair_query)
+                gap_queries_added += 1
+        events[-1]["gap_queries_added"] = gap_queries_added
+        if new_count == 0 and neighbor_count == 0 and subquery_index >= len(state.subqueries):
+            state.stop_reason = (
+                "conflict_unresolved"
+                if progress_answerability.status == AnswerabilityStatus.conflicting
+                else "no_new_evidence"
+            )
             break
         stalled_steps = stalled_steps + 1 if coverage <= previous_coverage else 0
         previous_coverage = coverage
         if stalled_steps >= 2:
-            state.stop_reason = "coverage_stalled"
-            break
+            if subquery_index >= len(state.subqueries):
+                state.stop_reason = "coverage_stalled"
+                break
         if (
             len(combined) >= budgets.max_total_retrieved_chunks
             or len(state.visited_pages) >= budgets.max_unique_documents
@@ -301,6 +462,13 @@ async def run_extended_search(
         _select_final_evidence(combined, step_evidence_ids_by_step, profile.postprocess.final_evidence_max)
     )
     answerability = decide_answerability(query, final_evidence, profile)
+    if answerability.status == AnswerabilityStatus.conflicting and state.stop_reason in {
+        None,
+        "budget_reached",
+        "coverage_stalled",
+        "no_new_evidence",
+    }:
+        state.stop_reason = "conflict_unresolved"
     final = RetrievalResult(
         query=query,
         trace_id=trace_id,
@@ -361,6 +529,11 @@ def _extract_timings(events: list[dict[str, Any]]) -> dict[str, int]:
     return {}
 
 
+async def _gather_ordered(awaitables: list[Any]) -> list[Any]:
+    """Gather a bounded wave while preserving input order."""
+    return list(await asyncio.gather(*awaitables))
+
+
 def _subquery_contexts(subqueries: list[str], bridge_queries: list[str]) -> list[dict[str, Any]]:
     bridge_keys = {normalize_for_embedding(query) for query in bridge_queries}
     bridge_index = 0
@@ -416,7 +589,10 @@ def _max_stage_score(events: list[dict[str, Any]], score_key: str) -> float | No
 
 
 def _build_subqueries(query: str, limit: int) -> list[str]:
-    parts = [part.strip(" ?") for part in query.replace(" и ", "?").split("?") if part.strip()]
+    # Keep conjunctions intact: splitting on every "и" destroys entities and
+    # attributes (e.g. "владелец и срок хранения"). Decomposition is handled
+    # by the typed answerability gaps below.
+    parts = [part.strip(" ?") for part in re.split(r"\?|;|\bvs\b|\bversus\b", query, flags=re.I) if part.strip()]
     if not parts:
         parts = [query]
     if query not in parts:
@@ -444,6 +620,57 @@ def _query_variants(query: str) -> list[str]:
     if any(marker in compact.casefold() for marker in ("сравни", "сравнение", "отличается", "между")):
         variants.append(compact.replace("сравни", "").replace("Сравни", "").strip())
     return [variant for variant in variants if variant]
+
+
+def _gap_repair_queries(
+    query: str,
+    decision: Any,
+    evidence: list[Evidence],
+    *,
+    existing: list[str],
+    limit: int,
+) -> list[str]:
+    """Create deterministic, bounded queries for requirements still missing from evidence."""
+    if limit <= 0:
+        return []
+    missing = [
+        str(part).strip()
+        for part in [
+            *(decision.missing_parts or []),
+            *(decision.signals.get("missing_answer_bearing_terms", []) or []),
+        ]
+        if str(part).strip()
+    ]
+    anchors = _bridge_anchors(evidence)
+    query_terms = normalize_for_embedding(query)
+    additions = [item for item in [*missing, *anchors] if normalize_for_embedding(item) not in query_terms]
+    if not additions:
+        return []
+    candidate = " ".join([" ".join(query.split()), *additions[:8]]).strip()
+    candidate = " ".join(candidate.split())[:500]
+    existing_keys = {normalize_for_embedding(item) for item in existing}
+    return [candidate] if normalize_for_embedding(candidate) not in existing_keys else []
+
+
+def _bridge_anchors(evidence: list[Evidence]) -> list[str]:
+    """Extract stable entity/code anchors without exposing provider or storage identifiers."""
+    text = " ".join(f"{item.title} {' '.join(item.section_path)} {item.content}" for item in evidence)
+    patterns = [
+        r"\b[A-ZА-Я]{2,}[A-ZА-Я0-9]*[-_]\d+[A-ZА-Я0-9]*\b",
+        r"\b[A-ZА-Я][A-Za-zА-Яа-я0-9-]{3,}(?:\s+[A-ZА-Я][A-Za-zА-Яа-я0-9-]{3,}){0,2}\b",
+    ]
+    anchors: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.findall(pattern, text):
+            value = " ".join(str(match).split())
+            key = normalize_for_embedding(value)
+            if key and key not in seen:
+                anchors.append(value)
+                seen.add(key)
+            if len(anchors) >= 4:
+                return anchors
+    return anchors
 
 
 def _looks_like_bridge_query(normalized_query: str) -> bool:
@@ -545,15 +772,16 @@ async def _expand_neighbors(
             conn,
             seed.chunk_id,
             tenant_id=tenant_id,
-            knowledge_base_id=knowledge_base_id,
+            knowledge_base_id=seed.knowledge_base_id,
             window=window,
             filters=filters,
         )
         new_ids: list[str] = []
         for neighbor in neighbors:
-            if neighbor.chunk_id not in combined:
-                combined[neighbor.chunk_id] = neighbor
-                new_ids.append(neighbor.chunk_id)
+            evidence_key = f"{neighbor.knowledge_base_id}:{neighbor.chunk_id}"
+            if evidence_key not in combined:
+                combined[evidence_key] = neighbor
+                new_ids.append(evidence_key)
                 added += 1
         events.append(
             {
@@ -693,6 +921,7 @@ def _renumber_evidence(evidence: list[Evidence]) -> list[Evidence]:
         Evidence(
             evidence_id=f"S{index}",
             chunk_id=item.chunk_id,
+            knowledge_base_id=item.knowledge_base_id,
             title=item.title,
             section_path=item.section_path,
             content=item.content,
@@ -700,6 +929,10 @@ def _renumber_evidence(evidence: list[Evidence]) -> list[Evidence]:
             scores=item.scores,
             ranks=item.ranks,
             metadata=item.metadata,
+            document_id=item.document_id,
+            content_unit_id=item.content_unit_id,
+            supporting_chunk_ids=item.supporting_chunk_ids,
+            provenance_refs=item.provenance_refs,
         )
         for index, item in enumerate(evidence, start=1)
     ]
@@ -714,6 +947,7 @@ def _select_final_evidence(
         return list(combined.values())[:limit]
     selected_ids: list[str] = []
     seen: set[str] = set()
+    priority: dict[str, int] = {}
     max_step_len = max((len(ids) for ids in step_evidence_ids_by_step), default=0)
     for offset in range(max_step_len):
         for step_ids in step_evidence_ids_by_step:
@@ -721,16 +955,27 @@ def _select_final_evidence(
                 continue
             chunk_id = step_ids[offset]
             if chunk_id in combined and chunk_id not in seen:
-                selected_ids.append(chunk_id)
-                seen.add(chunk_id)
-                if len(selected_ids) >= limit:
-                    return [combined[item] for item in selected_ids]
+                priority.setdefault(chunk_id, len(priority))
     for chunk_id in combined:
-        if chunk_id not in seen:
-            selected_ids.append(chunk_id)
-            seen.add(chunk_id)
-            if len(selected_ids) >= limit:
-                break
+        priority.setdefault(chunk_id, len(priority) + 1000)
+    ordered = sorted(
+        combined,
+        key=lambda chunk_id: (
+            priority[chunk_id],
+            -float(combined[chunk_id].scores.get("rerank", combined[chunk_id].scores.get("neighbor", 0.0))),
+            str(combined[chunk_id].knowledge_base_id),
+            str(combined[chunk_id].document_id),
+            chunk_id,
+        ),
+    )
+    for chunk_id in ordered:
+        unit = combined[chunk_id].content_unit_id or str(combined[chunk_id].metadata.get("content_unit_id") or chunk_id)
+        if unit in seen:
+            continue
+        selected_ids.append(chunk_id)
+        seen.add(unit)
+        if len(selected_ids) >= limit:
+            break
     return [combined[item] for item in selected_ids]
 
 
@@ -751,6 +996,11 @@ def _evidence_from_chunk_row(row: dict[str, Any]) -> Evidence:
         section_path=list(row.get("section_path") or []),
         content=str(row.get("content") or ""),
         source_url=str(row.get("source_url") or ""),
+        knowledge_base_id=str(row.get("knowledge_base_id") or ""),
+        document_id=str(row.get("document_id") or ""),
+        content_unit_id=str(metadata.get("content_unit_id") or ""),
+        supporting_chunk_ids=[str(row["id"])],
+        provenance_refs=[str(row["id"])],
         scores={"neighbor": 1.0},
         ranks={},
         metadata=metadata,

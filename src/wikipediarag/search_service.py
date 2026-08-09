@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from datetime import date
 from typing import Any
 
+from redis import asyncio as redis_async
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.config import Settings, get_settings
@@ -27,7 +28,10 @@ from wikipediarag.schemas import (
     SearchResult,
 )
 
-SEARCH_MAX_WINDOW = 250
+SEARCH_MAX_WINDOW = 1000
+SEARCH_INITIAL_WINDOW = 50
+SEARCH_CACHE_TTL_SECONDS = 120
+_REDIS_CLIENT: redis_async.Redis | None = None
 FACET_FIELDS = ("source_type", "document_type", "language", "knowledge_base_id")
 FILTER_FIELDS = {
     "document_type",
@@ -53,10 +57,18 @@ async def run_public_search(
     document_access_scopes: dict[str, DocumentAccessScope] | None = None,
 ) -> SearchResponse:
     resolved = settings or get_settings()
-    offset = _cursor_offset(payload.cursor) if payload.cursor else payload.offset
+    fingerprint = _search_fingerprint(
+        payload,
+        tenant_id=tenant_id,
+        knowledge_base_ids=knowledge_base_ids,
+        document_access_scopes=document_access_scopes,
+    )
+    offset, cursor_fingerprint = _decode_cursor(payload.cursor) if payload.cursor else (payload.offset, None)
+    if cursor_fingerprint is not None and cursor_fingerprint != fingerprint:
+        return SearchResponse(results=[], limit=payload.limit, offset=offset, has_more=False)
     if offset >= SEARCH_MAX_WINDOW:
         return SearchResponse(results=[], limit=payload.limit, offset=offset, has_more=False)
-    window = min(SEARCH_MAX_WINDOW, max(offset + payload.limit + 1, payload.limit + 1, 20))
+    window = min(SEARCH_MAX_WINDOW, _cache_window(offset + payload.limit + 1))
     profile_overrides = _search_profile_overrides(window)
     ranking_profile = payload.ranking_profile or await _infer_ranking_profile(
         conn,
@@ -67,6 +79,24 @@ async def run_public_search(
     if document_access_scopes:
         search_filters["document_access_scopes"] = document_access_scopes
     trace_id = stable_hash([tenant_id, *knowledge_base_ids, payload.query, offset, window], 32)
+    cache_key = _redis_key(tenant_id, fingerprint)
+    cached_payload = await _redis_get(cache_key, resolved)
+    if cached_payload is not None and len(cached_payload.get("results", [])) >= window:
+        cached_results = [SearchResult.model_validate(item) for item in cached_payload["results"]]
+        page = cached_results[offset : offset + payload.limit + 1]
+        has_more = len(page) > payload.limit
+        return SearchResponse(
+            results=page[: payload.limit],
+            limit=payload.limit,
+            offset=offset,
+            has_more=has_more,
+            next_cursor=_encode_cursor(offset + payload.limit, fingerprint) if has_more else None,
+            facets=[SearchFacet.model_validate(item) for item in cached_payload.get("facets", [])]
+            if payload.include_facets
+            else [],
+            groups=_document_groups(page[: payload.limit]) if payload.group_by_document else [],
+            facet_scope="lexical_filtered_corpus",
+        )
     if len(knowledge_base_ids) > 1:
         retrieval = await retrieve_multi(
             conn,
@@ -97,28 +127,70 @@ async def run_public_search(
             search_filters=search_filters,
             persist_events=False,
         )
-    filtered = [
-        item
-        for item in retrieval.evidence
-        if _matches_document_access(item, document_access_scopes) and _matches_request(item, payload)
+    if retrieval is not None:
+        filtered = [
+            item
+            for item in retrieval.evidence
+            if _matches_document_access(item, document_access_scopes) and _matches_request(item, payload)
+        ]
+    search_results = [
+        _search_result(item, query=payload.query, include_highlights=payload.include_highlights) for item in filtered
     ]
-    page = filtered[offset : offset + payload.limit + 1]
-    has_more = len(page) > payload.limit
-    results = [
-        _search_result(item, query=payload.query, include_highlights=payload.include_highlights)
-        for item in page[: payload.limit]
-    ]
-    groups = _document_groups(results) if payload.group_by_document else []
     facets = _facets(filtered) if payload.include_facets else []
+    await _redis_set(
+        cache_key,
+        {
+            "results": [item.model_dump(mode="json") for item in search_results],
+            "facets": [item.model_dump(mode="json") for item in facets],
+        },
+        resolved,
+    )
+    page = search_results[offset : offset + payload.limit + 1]
+    has_more = len(page) > payload.limit
+    results = page[: payload.limit]
+    groups = _document_groups(results) if payload.group_by_document else []
     return SearchResponse(
         results=results,
         limit=payload.limit,
         offset=offset,
         has_more=has_more,
-        next_cursor=_encode_cursor(offset + payload.limit) if has_more else None,
+        next_cursor=_encode_cursor(offset + payload.limit, fingerprint) if has_more else None,
         facets=facets,
         groups=groups,
+        facet_scope="lexical_filtered_corpus",
     )
+
+
+def _cache_window(required: int) -> int:
+    window = SEARCH_INITIAL_WINDOW
+    while window < required and window < SEARCH_MAX_WINDOW:
+        window = min(SEARCH_MAX_WINDOW, window * 2)
+    return window
+
+
+def _redis_key(tenant_id: str, fingerprint: str) -> str:
+    return f"wikipediarag:search:{stable_hash([tenant_id, fingerprint], 32)}"
+
+
+async def _redis_get(key: str, settings: Settings) -> dict[str, Any] | None:
+    global _REDIS_CLIENT
+    try:
+        if _REDIS_CLIENT is None:
+            _REDIS_CLIENT = redis_async.from_url(settings.redis_url, decode_responses=True, max_connections=20)
+        raw = await _REDIS_CLIENT.get(key)
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+async def _redis_set(key: str, value: dict[str, Any], settings: Settings) -> None:
+    global _REDIS_CLIENT
+    try:
+        if _REDIS_CLIENT is None:
+            _REDIS_CLIENT = redis_async.from_url(settings.redis_url, decode_responses=True, max_connections=20)
+        await _REDIS_CLIENT.set(key, json.dumps(value, ensure_ascii=False), ex=SEARCH_CACHE_TTL_SECONDS)
+    except Exception:
+        return
 
 
 async def _infer_ranking_profile(
@@ -385,9 +457,12 @@ def _parse_date(value: Any) -> date | None:
         return None
 
 
-def _encode_cursor(offset: int) -> str:
-    payload = json.dumps({"offset": offset}, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+def _encode_cursor(offset: int, fingerprint: str | None = None) -> str:
+    payload: dict[str, Any] = {"offset": offset}
+    if fingerprint:
+        payload.update({"version": 2, "fingerprint": fingerprint})
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
 
 
 def _cursor_offset(cursor: str | None) -> int:
@@ -403,3 +478,53 @@ def _cursor_offset(cursor: str | None) -> int:
         return max(0, min(SEARCH_MAX_WINDOW, int(value or 0)))
     except (TypeError, ValueError):
         return 0
+
+
+def _decode_cursor(cursor: str | None) -> tuple[int, str | None]:
+    if not cursor:
+        return 0, None
+    padded = cursor + "=" * (-len(cursor) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except (ValueError, json.JSONDecodeError):
+        return 0, None
+    if not isinstance(payload, dict):
+        return 0, None
+    try:
+        offset = max(0, min(SEARCH_MAX_WINDOW, int(payload.get("offset") or 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    return offset, str(payload.get("fingerprint")) if payload.get("version") == 2 else None
+
+
+def _search_fingerprint(
+    payload: SearchRequest,
+    *,
+    tenant_id: str,
+    knowledge_base_ids: list[str],
+    document_access_scopes: dict[str, DocumentAccessScope] | None,
+) -> str:
+    scope_payload = {
+        str(kb_id): {
+            "bypass": bool(scope.bypass),
+            "tenant": stable_hash([scope.tenant_id], 16),
+            "user": stable_hash([scope.user_id], 16),
+            "role": str(scope.kb_role or ""),
+            "groups": sorted(stable_hash([item], 16) for item in scope.group_ids),
+        }
+        for kb_id, scope in (document_access_scopes or {}).items()
+    }
+    scope_hash = stable_hash([json.dumps(scope_payload, sort_keys=True)], 32)
+    return stable_hash(
+        [
+            "search_cursor_v2",
+            tenant_id,
+            *sorted(knowledge_base_ids),
+            " ".join(payload.query.split()).casefold(),
+            json.dumps(payload.filters.model_dump(mode="json"), sort_keys=True),
+            json.dumps([item.model_dump(mode="json") for item in payload.filter_expressions], sort_keys=True),
+            payload.ranking_profile or "",
+            scope_hash,
+        ],
+        32,
+    )

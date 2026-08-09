@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -24,7 +25,7 @@ from wikipediarag.document_ingestion import (
     sha256_hex,
     validate_upload_bytes,
 )
-from wikipediarag.ids import stable_hash
+from wikipediarag.ids import scoped_id, stable_hash
 from wikipediarag.model_client import embeddings
 from wikipediarag.model_registry import get_model_registry
 from wikipediarag.repository import (
@@ -65,9 +66,7 @@ from wikipediarag.retrieval_contract import build_index_contract, index_contract
 from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profile
 from wikipediarag.schemas import JobStatus
 from wikipediarag.search_index import (
-    PHYSICAL_INDEX,
     READ_ALIAS,
-    WRITE_ALIAS,
     build_index_names,
     bulk_index_chunks,
     delete_document_chunks,
@@ -114,13 +113,22 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
         profile = get_retrieval_profile(str(config.get("retrieval_profile") or resolved.retrieval_profile), resolved)
         embed_alias = profile.model_aliases.embed
         dimensions = profile.embedding_dimensions(resolved.embedding_dimensions)
-        index_version_id = f"wikipedia_xml:{snapshot_id}:{profile.name}:{embed_alias}:{dimensions}"
+        index_names = build_index_names(
+            source_type="wikipedia_xml",
+            snapshot_id=snapshot_id,
+            retrieval_profile=profile.name,
+            embedding_alias=embed_alias,
+            embedding_dimensions=dimensions,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+        )
+        index_version_id = index_names["version_id"]
         index_contract = build_index_contract(
             index_version=index_version_id,
             source_type="wikipedia_xml",
             snapshot_id=snapshot_id,
-            physical_index=PHYSICAL_INDEX,
-            read_alias=READ_ALIAS,
+            physical_index=index_names["physical"],
+            read_alias=index_names["read_alias"],
             embedding_alias=embed_alias,
             embedding_dimensions=dimensions,
             profile=profile,
@@ -132,7 +140,14 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
             checkpoint["index_validated"] = True
             checkpoint["index_stats"] = stats
             await _save_progress(job_id, pages_seen, pages_imported, chunks_indexed, checkpoint)
-        await asyncio.to_thread(ensure_index, resolved)
+        await asyncio.to_thread(
+            ensure_index,
+            resolved,
+            physical_index=index_names["physical"],
+            read_alias=index_names["read_alias"],
+            write_alias=index_names["write_alias"],
+            dimensions=dimensions,
+        )
         async with connect() as conn:
             await save_index_version(
                 conn,
@@ -144,9 +159,9 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
                 retrieval_profile=profile.name,
                 embedding_alias=embed_alias,
                 embedding_dimensions=dimensions,
-                physical_index=PHYSICAL_INDEX,
-                read_alias=READ_ALIAS,
-                write_alias=WRITE_ALIAS,
+                physical_index=index_names["physical"],
+                read_alias=index_names["read_alias"],
+                write_alias=index_names["write_alias"],
                 metadata=index_contract_metadata(index_contract),
             )
 
@@ -165,7 +180,13 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
                     pages_seen += 1
                     if page.namespace != 0:
                         continue
-                    chunks = chunks_for_page(page, snapshot_id, resolved.embedding_dimensions)
+                    chunks = chunks_for_page(
+                        page,
+                        snapshot_id,
+                        resolved.embedding_dimensions,
+                        tenant_id=tenant_id,
+                        knowledge_base_id=kb_id,
+                    )
                     await upsert_wiki_page_and_chunks(
                         conn,
                         tenant_id=tenant_id,
@@ -204,6 +225,9 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
                 tenant_id=tenant_id,
                 knowledge_base_id=kb_id,
                 settings=resolved,
+                write_alias=index_names["write_alias"],
+                physical_index=index_names["physical"],
+                read_alias=index_names["read_alias"],
             )
             if stream_artifacts:
                 await asyncio.to_thread(
@@ -223,7 +247,7 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
                 conn,
                 tenant_id=tenant_id,
                 knowledge_base_id=kb_id,
-                active_index=READ_ALIAS,
+                active_index=index_names["read_alias"],
             )
             await update_job(
                 conn,
@@ -297,6 +321,8 @@ async def process_zim_import(job: dict[str, Any], settings: Settings | None = No
             retrieval_profile=profile.name,
             embedding_alias=embed_alias,
             embedding_dimensions=dimensions,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
         )
         index_contract = build_index_contract(
             index_version=index_names["version_id"],
@@ -528,6 +554,8 @@ async def _flush_zim_batch(
                 child_tokens_max=profile.chunking.child_tokens_max,
                 parent_tokens_min=profile.chunking.parent_tokens_min,
                 parent_tokens_max=profile.chunking.parent_tokens_max,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
             ),
         )
         for page in pages
@@ -542,9 +570,20 @@ async def _flush_zim_batch(
         offset = next_offset
 
     all_chunks: list[Chunk] = []
+    aliases_by_target: dict[str, list[str]] = {}
+    for redirect in redirects:
+        aliases_by_target.setdefault(redirect.redirect_target, []).append(redirect.title)
     async with connect() as conn:
         for redirect in redirects:
-            document_id = f"zim-redirect:{snapshot_id}:{stable_zim_id(redirect.zim_entry_path)}"
+            native_redirect_id = f"zim-redirect:{snapshot_id}:{stable_zim_id(redirect.zim_entry_path)}"
+            document_id = scoped_id(
+                "zim-redirect-document",
+                native_redirect_id,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                source_type="wikipedia_zim_redirect",
+                snapshot_id=snapshot_id,
+            )
             await upsert_document(
                 conn,
                 document_id=document_id,
@@ -557,6 +596,7 @@ async def _flush_zim_batch(
                     "zim_entry_path": redirect.zim_entry_path,
                     "redirect_target": redirect.redirect_target,
                     "snapshot_id": snapshot_id,
+                    "source_document_id": native_redirect_id,
                     "entry_index": redirect.entry_index,
                 },
             )
@@ -564,7 +604,14 @@ async def _flush_zim_batch(
             document_id = (
                 embedded_page_chunks[0].document_id
                 if embedded_page_chunks
-                else f"zim:{snapshot_id}:{stable_zim_id(page.zim_entry_path)}"
+                else scoped_id(
+                    "zim-document",
+                    f"zim:{snapshot_id}:{stable_zim_id(page.zim_entry_path)}",
+                    tenant_id=tenant_id,
+                    knowledge_base_id=kb_id,
+                    source_type="zim",
+                    snapshot_id=snapshot_id,
+                )
             )
             await upsert_document(
                 conn,
@@ -576,11 +623,13 @@ async def _flush_zim_batch(
                 source_uri=f"zim://{snapshot_id}/{page.zim_entry_path}",
                 metadata={
                     **page.metadata,
+                    "aliases": sorted(set(aliases_by_target.get(page.title, []))),
                     "redirect_target": page.redirect_target,
                     "source_url": page.source_url,
                 },
             )
             for chunk in embedded_page_chunks:
+                chunk.metadata["aliases"] = sorted(set(aliases_by_target.get(page.title, [])))
                 await upsert_chunk(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, chunk=chunk)
             await replace_document_sections_from_chunks(
                 conn,
@@ -1041,9 +1090,7 @@ async def _resolve_upload_index_target(tenant_id: str, kb_id: str, settings: Set
                 "write_alias": str(row["write_alias"]),
             }
 
-        profile_name = (
-            "upload_sota_mvp" if settings.retrieval_profile in {"sota_mvp", "sota_mvp_verified"} else "upload_mock"
-        )
+        profile_name = _upload_profile_name_for_settings(settings)
         profile = get_retrieval_profile(profile_name, settings)
         embed_alias = profile.model_aliases.embed
         dimensions = profile.embedding_dimensions(settings.embedding_dimensions)
@@ -1094,6 +1141,12 @@ async def _resolve_upload_index_target(tenant_id: str, kb_id: str, settings: Set
             "read_alias": index_names["read_alias"],
             "write_alias": index_names["write_alias"],
         }
+
+
+def _upload_profile_name_for_settings(settings: Settings) -> str:
+    if settings.retrieval_profile in {"sota_mvp", "sota_mvp_verified", "upload_sota_mvp"}:
+        return "upload_sota_mvp"
+    return "upload_mock"
 
 
 async def _load_required_document_version(tenant_id: str, document_version_id: str) -> dict[str, Any]:
@@ -1880,12 +1933,82 @@ async def process_job(job: dict[str, Any], settings: Settings | None = None) -> 
         raise ValueError(f"unsupported ingestion job kind {job['kind']}")
 
 
-async def claim_and_process_once(settings: Settings | None = None) -> bool:
-    from wikipediarag.repository import claim_next_job
+async def claim_and_process_once(
+    settings: Settings | None = None,
+    *,
+    allowed_kinds: list[str] | tuple[str, ...] | None = None,
+    lease_id: str | None = None,
+) -> bool:
+    from wikipediarag.repository import (
+        StaleWorkerLeaseError,
+        claim_next_job,
+        heartbeat_job_lease,
+        reset_worker_lease_context,
+        set_worker_lease_context,
+    )
 
-    async with connect() as conn:
-        job = await claim_next_job(conn)
+    resolved = settings or get_settings()
+    lease_id = lease_id or str(uuid.uuid4())
+    async with connect(resolved) as conn:
+        job = await claim_next_job(
+            conn,
+            lease_id=lease_id,
+            allowed_kinds=allowed_kinds,
+            lease_seconds=resolved.worker_job_lease_seconds,
+        )
     if job is None:
         return False
-    await process_job(job, settings)
+    job_id = str(job["id"])
+    heartbeat_lost = asyncio.Event()
+    lease_lost = asyncio.Event()
+
+    async def heartbeat_loop() -> None:
+        try:
+            while True:
+                await asyncio.sleep(max(resolved.worker_job_heartbeat_seconds, 1))
+                async with connect(resolved) as heartbeat_conn:
+                    alive = await heartbeat_job_lease(
+                        heartbeat_conn,
+                        job_id=job_id,
+                        lease_id=lease_id,
+                        lease_seconds=resolved.worker_job_lease_seconds,
+                    )
+                if not alive:
+                    heartbeat_lost.set()
+                    lease_lost.set()
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            heartbeat_lost.set()
+            lease_lost.set()
+
+    heartbeat_task = asyncio.create_task(heartbeat_loop())
+    job_task: asyncio.Task[None] | None = None
+    context_token = set_worker_lease_context(lease_id)
+    try:
+
+        async def run_job() -> None:
+            await process_job(job, resolved)
+
+        job_task = asyncio.create_task(run_job())
+        done, _ = await asyncio.wait({job_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED)
+        if lease_lost.is_set() and not job_task.done():
+            job_task.cancel()
+            await asyncio.gather(job_task, return_exceptions=True)
+            raise StaleWorkerLeaseError(f"job lease lost: {job_id}")
+        if job_task in done:
+            await job_task
+            if lease_lost.is_set():
+                raise StaleWorkerLeaseError(f"job lease lost: {job_id}")
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        if job_task is not None and not job_task.done():
+            job_task.cancel()
+            await asyncio.gather(job_task, return_exceptions=True)
+        reset_worker_lease_context(context_token)
     return True

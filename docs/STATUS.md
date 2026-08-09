@@ -1,22 +1,28 @@
 # Project Status
 
-Last updated: 2026-08-02
+Last updated: 2026-08-09
 
 ## Current milestone
 
-Deep Research V1 has been implemented on top of the Search Quality V2 and
-Extended Search baseline. It is a durable single-KB lifecycle with worker
-episodes, typed evidence memory, coverage records, operational reflections,
-pause/resume/cancel and an ACL-trimmed report surface.
+Deep Research has moved from the initial V1 single-KB slice to a local-first
+stage-profile runtime: durable episodes, typed evidence/claim/decision memory,
+pause/resume/cancel, heartbeat recovery, verified synthesis and an
+ACL-trimmed report surface.
 
-The latest increment ran the mock-provider Deep Research runtime smoke and
-offline quality/context matrix. Runtime default packing remains 45% productive
-target until a true runtime policy override or local-Qwen experiment confirms a
-safe improvement.
+The latest increments add the approved local-first SOTA foundations:
+stage-specific Deep Research context windows through Model Gateway metadata and
+tokenizer contract, `80k` planner/synthesis profiles with a separate `24k`
+verifier, a closed five-tool local-private registry, Multi-KB scoped research
+runs for one to three KBs in the same tenant, durable claim relations and
+decision records, and report rebuild from current ACL-visible verified claims.
+Ordinary Search and the chat Extended Search harness keep their existing
+smaller normal-search context profile. The runtime default productive target
+remains `45%` until a fresh real-model/local-model matrix safely beats it.
 
 ## Implemented now
 
 - Local production-shaped RAG MVP with FastAPI API, worker, Model Gateway, React/Vite UI and Docker Compose dependencies.
+- Web UI UX pass: desktop app shell with Chat/Search/Research/Knowledge Base tabs, compact KB context controls, structured Deep Research findings with clickable evidence refs, multi-KB scope selection (up to three), cancellable polling and Markdown/Word/CSV exports.
 - Local auth and OIDC foundation: Argon2id local passwords, opaque HttpOnly session cookie, CSRF, OIDC Authorization Code + PKCE, server-side encrypted provider tokens and `ActorContext`.
 - Tenant and KB authorization foundation: platform, tenant and KB roles; local/OIDC groups; KB grants; route-level server-owned tenant/KB enforcement; safe error envelopes.
 - Wikipedia ingestion from local ZIM/libzim with Kiwix source URLs, deterministic chunks, redirects as provenance and versioned OpenSearch publication; XML multistream fallback remains available.
@@ -24,12 +30,14 @@ safe improvement.
 - Document lifecycle hardening: KB-owner soft delete, immediate retrieval removal and deferred idempotent purge after the configured retention window.
 - Parser runtime hardening in Compose: Xberg, Docling and metadata-service with sandbox settings, separate concurrency limiters and safe parser progress metadata.
 - Retrieval: BM25, dense vectors, RRF, rerank, dedup/page quota, parent expansion, answerability, citation validation and experimental safe diagnostics.
-- Direct Multi-KB chat/debug retrieval with all-KB role validation and all-KB readiness preflight. Extended Search remains single-KB.
+- Direct and Extended Multi-KB chat/debug retrieval with all-KB role validation, bounded extended-search waves, composite `(knowledge_base_id, chunk_id)` evidence identity and KB-correct neighbour expansion.
 - Ordinary user search: document-visibility-scoped `POST /api/v1/search` now
   runs through the hybrid retrieval pipeline with OpenSearch BM25/vector search, RRF,
   optional rerank, typed filter expressions, cursor pagination, optional
   highlights, facets and document grouping while preserving safe
   `KB_NOT_READY` handling and exact document-viewer open action by `chunk_id`.
+- Search pagination uses Redis-backed tenant-scoped windows with v1/v2 cursor compatibility, power-of-two window growth and Redis-failure fallback to uncached retrieval.
+- Worker job updates are lease-fenced; heartbeat loss cancels stale processors. Deep Research retrieval uses real deterministic query variants, one embedding batch and one global rerank, and chat emits stage progress events without holding a database transaction across external calls.
 - Document navigation: `document_sections` persisted from published chunks,
   section-aware uploaded-document chunking, deterministic Wikipedia/ZIM chunk
   ordinals/locators, viewer-safe document structure/context/in-document search
@@ -62,28 +70,380 @@ safe improvement.
   applied to existing synced documents. The same scope is applied to ordinary
   search, chat/debug retrieval, Multi-KB retrieval, Extended Search neighbor
   expansion, DB dense fallback and document viewer paths.
-- Durable Deep Research V1: `research_runs`, episodes, questions, typed
-  evidence records, minimal claim records, coverage records and operational
+- Durable Deep Research: `research_runs`, `research_run_scopes`, episodes,
+  questions, typed evidence records, verified claim records, claim relations,
+  coverage records, public-safe tool calls, decisions and operational
   reflections are persisted in PostgreSQL; API endpoints create/list/read runs,
   expose compact events and request pause/resume/cancel; worker jobs with
-  `kind='deep_research'` process one bounded single-KB episode at a time,
-  checkpoint after every episode, link episode retrieval to `query_runs` for
-  debugger compatibility and synthesize the public report only from current
-  ACL-visible evidence. Context budgets are ratios of the retrieval profile's
-  declared max context: 45% productive target, 55% soft limit, 70% hard input
-  limit, 15% output reserve and 15% safety reserve.
+  `kind='deep_research'` process one bounded episode at a time, checkpoint
+  after every planner/tool transition, maintain heartbeat/stalled recovery and
+  synthesize the public report only from current ACL-visible verified claims.
+  Deep Research now supports one to three KBs in the same tenant through a
+  server-owned scope snapshot: broad retrieval uses the existing retrieval
+  stack, while document tools resolve only from already-visible evidence
+  handles. Stage budgets default to `45%` productive target, `55%` soft limit,
+  `70%` hard input limit, `15%` output reserve and `15%` safety reserve, with
+  planner/reflection and synthesis on `80k` declared context, verifier on `24k`
+  input/`2k` output, and ordinary Search/Extended Search unchanged.
+- Deep Research operator/product surface: `research_plans` are now persisted as
+  draft/approved records with questions, scope, retrieval profile, tool mode,
+  context policy and notes; API endpoints create/list/read/patch/approve plans,
+  approved plans can launch runs through `research_plan_id`, the worker now
+  reports explicit `plan -> retrieve -> evaluate -> verify_claims ->
+  synthesize -> quality_gate` progress stages, and broad `extended_search`
+  keeps the original query while adding at most two bounded rewrites that stay
+  inside the current tenant/KB scope and merge back through the existing
+  retrieval stack.
 - Eval and validation tooling: local-auth eval client, release-gate provider preflight, warm retrieval profiling, MIRACL-RU adapter, document corpus verification, cross-tenant hardening smoke command and Deep Research complex fixture/evaluator/runtime smoke harness.
+- Deep Research hard target fixtures: `tests/fixtures/deep_research/research_tasks_hard.json`
+  covers alias resolution, multi-source bridge chains, policy exceptions, CSV
+  evidence and contradiction-after-bridge cases. The fixtures now declare
+  trajectory expectations for completed `extended_search` calls, durable
+  derived questions and forbidden public raw-query/provider/storage leaks;
+  `make deep-research-hard-gate` runs the hard OpenRouter/Qwen proxy runtime
+  gate in a unique isolated Compose project, while `make deep-research-hard-smoke`
+  is a compatibility alias. It uses fresh project-scoped PostgreSQL, MinIO and
+  OpenSearch state so interrupted shared-stack jobs cannot affect a result.
 
 ## In progress
 
-- Deep Research policy tuning beyond V1: add a runtime policy override and run
-  optional local Qwen/qwen3.6-27b validation before changing the default 45%
-  productive context target.
+- Retrieval Correctness V3 implementation is now present in the shared retrieval
+  contract. New ingestion writes scoped document/chunk/index identities, keeps
+  native IDs in metadata and legacy mappings, and publishes tenant/KB-scoped
+  OpenSearch names. Read-only BM25 no longer creates an index. Context
+  selection uses stable ties, canonical content units, provenance-preserving
+  parent deduplication, tokenizer-like budgeting and soft page-quota repair.
+  Answerability now uses rank confidence, full title/alias matching and
+  unsolicited divergent-value conflict detection. Retrieval telemetry is an
+  allowlisted projection with a 256 KiB database cap and monotonic event
+  sequence. Eval recall is fractional Recall@K and generated hard-negative /
+  unanswerable labels are disjoint and measurable.
+- Deterministic validation after Retrieval Correctness V3 changes:
+  `uv run pytest tests/unit -q` -> 360 passed; `uv run ruff check src` ->
+  passed; `uv run mypy src` -> passed; PostgreSQL schema application -> passed;
+  `WIKIPEDIARAG_INTEGRATION_DATABASE_URL=... uv run pytest
+  tests/integration/test_deep_research_persistence.py -q` -> 1 passed.
+  Full `mypy src tests` and repository-wide format check still include
+  pre-existing test/handler issues outside this increment and are tracked as
+  validation debt.
+- The bootstrap now records additive migration
+  `001_retrieval_correctness_v3`; repeated startup remains idempotent and the
+  new identity/event columns have a durable schema version marker.
+- A one-task reviewed retrieval smoke was attempted against the already-running
+  Compose API, but the container image predates this source checkout and
+  returned an opaque 500 (`NotSupportedError`). Rebuilding `api`/`worker` was
+  attempted and exceeded the bounded 120-second build window; no containers or
+  volumes were removed. This smoke result is therefore not evidence against
+  the source implementation and must be rerun after a successful image build.
+
+- Deep Research policy tuning on the new stage-aware runtime: rerun the
+  real-model/local-model matrix for `35%`, `45%` and `55%` productive targets
+  against the `80k` planner/synthesis profile; change the default only if
+  unsupported claims and ACL safety stay flat while coverage/recall improve.
+- Deep Research quality tuning beyond the new runtime foundation: measure the
+  five-tool registry on hard trajectories and validate the deterministic
+  controller against real-provider latency and coverage.
+- The retrieval/control defect identified in the focused real-provider run is
+  implemented in the common retrieval contract: page quota keys are now
+  `(knowledge_base_id, document_id, page_discriminator)`, document tools use a
+  deterministic ACL-trimmed source router with persisted private routing
+  history, and Extended Search stops only on an `ANSWERABLE` provisional final
+  evidence set. `PARTIAL`/`CONFLICTING` results schedule bounded gap repair or
+  end as `conflict_unresolved`; they cannot emit `evidence_sufficient`.
+  A focused real-provider acceptance pass is still required before closing the
+  quality blocker. Detailed analysis and implementation rationale:
+  `docs/research/deep-research-controller-error-analysis-2026-08-06.md`.
 - Browser UI OIDC through Dockerized API after the public/internal Keycloak URL strategy is decided.
 - External deployment hardening remains planned, not supported production operation.
 
 ## Latest validation
 
+- Web UI UX pass on 2026-08-07: `services/ui` `pnpm lint`, `pnpm typecheck`,
+  `pnpm build` and `pnpm format:check` all passed. Browser smoke against a
+  disposable read-only local API fixture passed at 1440x900 and 1024x768:
+  tab switching and keyboard navigation, hidden-panel state preservation,
+  EN/RU persistence, source/research layouts and zero horizontal overflow.
+  Full API action flow was not exercised because the Compose stack was not
+  running during this UI-only pass.
+
+- UI QA follow-up on 2026-08-08: Chat now renders busy, timeout and terminal
+  SSE failure states; Search/Research errors use safe localized envelopes;
+  terminal Research actions are disabled; Research plan fields and the
+  document viewer have accessible/localized labels. Research plan creation
+  maps `KnowledgeBaseNotReady` to the existing public `409 KB_NOT_READY`
+  envelope without changing routes or payloads. `pnpm lint`, `pnpm typecheck`,
+  `pnpm build`, `pnpm format:check`, targeted backend tests (`5 passed`) and
+  `git diff --check` passed.
+
+- Final deterministic controller validation on 2026-08-07:
+  PostgreSQL persistence integration passed (`1 passed`) for idempotent query
+  run/episode/tool/evidence/coverage/claim writes and deadline partial
+  finalization. The focused mock hard gate passed with
+  `coverage_score=1.0`, `evidence_recall=1.0`,
+  `unsupported_claim_count=0`, `acl_safety=true`, six completed tool calls,
+  and zero open required questions (`artifacts/validation/deep-research-hard-gate/20260807T150333Z/report.json`).
+  The first preserved real-provider diagnostic isolated and fixed two
+  PostgreSQL heartbeat type failures: nullable lease comparison without an
+  explicit cast, then an incorrect UUID cast against the `text` lease column.
+  The subsequent real-provider run completed with no controller/SQL failure,
+  all questions `done`, `coverage_score=1.0`,
+  `unsupported_claim_count=0`, `acl_safety=true`, but
+  `evidence_recall=0.667` because the runbook marker was not retrieved
+  (`artifacts/validation/deep-research-hard-gate/20260807T152545Z/report.json`).
+  The full hard matrix was not run.
+
+- Retrieval/evidence-control refactor on 2026-08-07: unit coverage now checks
+  document-scoped page identity, quota accounting after token-budget drops,
+  deterministic unseen-source routing and bounded partial repair. The focused
+  mock suite passes. The focused real-provider acceptance pass also passed with
+  `run_status=completed`, `coverage_score=1.0`, `evidence_recall=1.0`,
+  `unsupported_claim_count=0`, `acl_safety=true`, zero open required questions
+  and no raw query/provider/storage leaks. Its detail shows all three fixture
+  sources and deterministic source rotation; the isolated Compose project and
+  volumes were removed after log/report inspection. Report:
+  `artifacts/validation/deep-research-hard-gate/20260807T165245Z/report.json`.
+
+- Retrieval baseline locked on 2026-08-07 for dataset hash
+  `a01d97a88620f5650601cc0a9ffe30165bb3f984048db0ca057a5b881d6a502a`
+  (`generated-wikipedia-v1`, snapshot `5e698f31...`). The canonical release-gate
+  configuration is `sota_mvp_normal`; it is **not** the same configuration as
+  `hybrid_rerank`: both use the same hybrid/rerank retrieval core, but
+  `sota_mvp_normal` keeps conditional Extended Search while `hybrid_rerank`
+  disables it. In the completed 150-task run, both produced identical retrieval
+  quality (`page_recall_at_10=0.896`, `chunk_recall_at_20=0.904`,
+  `mrr_at_10=0.817`, `nDCG_at_10=0.787456`, 16 gold-miss tasks and zero
+  execution errors); this equivalence is dataset/run evidence, not a contract
+  alias. The retrieval settings are unchanged from the previous baseline, but
+  the config hash moved from
+  `b6508422a73bddd5ec4d3a669e4dad9fe63e9f89a1ec280333d0e8129b27041d` to
+  `3c8ddf7024fa92da06f7f8257fc49593fc649112851d7d4fa276e873974f672c` because the
+  answerability/evaluation and RunContract policies were versioned; this run
+  is the new canonical baseline. Do not rerun it only to re-confirm equality.
+  Rerun when the dataset or snapshot, index/run contract, retrieval
+  profile/overrides, model aliases, or retrieval/evidence-control code changes.
+  The authoritative report is
+  `artifacts/eval/retrieval-reports/generated-wikipedia-v1-a01d97a88620-retrieval.md`.
+
+- Deterministic Deep Research controller implementation on 2026-08-06:
+  lifecycle state is split into `execution_state` and `outcome`; required,
+  bridge and normal questions use a stable selector; duplicate evidence
+  fingerprints consume per-question attempts; planner schema failures fall
+  back to the immutable question; tool branches use the transient/permanent/
+  security/controller-bug taxonomy; deadline terminalization builds a
+  deterministic partial report. Unit/static checks passed after the final
+  controller edits: `uv run ruff check ...` exit 0, `uv run ruff format
+  --check ...` exit 0, targeted `uv run mypy ...` exit 0, and
+  `uv run pytest tests/unit -q` exit 0 with 331 passed and 2 existing
+  FastAPI deprecation warnings. The first focused post-change run exposed and
+  fixed a PostgreSQL `ON CONFLICT` syntax error in evidence persistence; the
+  next run reached Compose readiness and uploads but ended with
+  `DEEP_RESEARCH_SUITE_DEADLINE_EXHAUSTED` before a terminal run report
+  (`artifacts/validation/deep-research-hard-gate/20260806T153336Z/report.json`).
+  A final focused run with an earlier report reserve produced a terminal
+  detail and metrics `coverage_score=0.75`, `evidence_recall=1.0`,
+  `unsupported_claim_count=0`, `acl_safety=true`, raw leak `false`, and no
+  suite deadline exhaustion; `RB-17` and `Night Harbor` were
+  `done/covered`. It still failed on a later bridge question after recording
+  one attempt but before persisting its episode/tool call, so this is not an
+  accepted hard-gate pass. The exact worker stack trace was lost on teardown;
+  the error analysis is recorded in
+  `docs/research/deep-research-controller-error-analysis-2026-08-06.md`.
+  Report: `artifacts/validation/deep-research-hard-gate/20260806T161804Z/report.json`.
+  The full hard matrix was not run.
+
+- Deep Research planner/retrieval controller follow-up on 2026-08-05: bounded
+  planner calls now classify timeout, empty content and malformed provider
+  envelopes; recoverable planner failures use a deterministic safe fallback,
+  the original research question is always retained in the tool query, new
+  evidence rather than repeated evidence resets no-progress, and tool
+  execution has a 180-second bounded timeout with safe code
+  `research_tool_timeout`. Validation:
+  `uv run ruff check src/wikipediarag/deep_research.py src/wikipediarag/retrieval_profile.py tests/unit/test_retrieval_profile.py`
+  -> exit 0;
+  `uv run mypy src/wikipediarag/deep_research.py src/wikipediarag/retrieval_profile.py`
+  -> exit 0;
+  `uv run pytest tests/unit/test_retrieval_profile.py tests/unit/test_deep_research.py tests/unit/test_answerability.py -q`
+  -> exit 0, 48 passed.
+  Focused real-provider hard runs reached terminal `completed_partial` with
+  no planner/provider/ACL error and evidence recall `1.0`, but exited 1 at the
+  evaluator because the first saturation window left expected questions open.
+  Reports:
+  `artifacts/validation/deep-research-hard-gate/20260805T195245Z/report.json`
+  and `artifacts/validation/deep-research-hard-gate/20260805T201606Z/report.json`.
+  The default `45%` context policy remains unchanged.
+
+- Deep Research plan/product surface validation on 2026-08-05: persisted
+  ResearchPlan CRUD/approve flow, run creation from approved plans, bounded
+  original-query-plus-rewrites retrieval, explicit runtime stage reporting and
+  UI type coverage are implemented without changing the default `45%` context
+  policy. Validation:
+  `uv run ruff check src/wikipediarag/schemas.py src/wikipediarag/db.py src/wikipediarag/repository.py src/wikipediarag/api/handlers.py src/wikipediarag/api/app.py src/wikipediarag/api/routers/research_plans.py src/wikipediarag/research_tools.py src/wikipediarag/deep_research.py tests/unit/test_deep_research.py`
+  -> exit 0;
+  `uv run pytest tests/unit/test_deep_research.py -q`
+  -> exit 0, 32 passed;
+  `pnpm typecheck` in `services/ui`
+  -> exit 0.
+  This pass validates the new contracts, storage/API surface and UI typings
+  only; it does not replace the pending focused real-provider reruns for
+  `within_doc_exception_clause` and `section_alias_owner_chain`.
+
+- Deep Research bounded runtime rerun on 2026-08-05: the stabilized code path
+  passed the isolated mock hard gate and still exposed a real-provider baseline
+  blocker without raw payload leakage. Validation:
+  `uv run python -m wikipediarag.cli deep-research-hard-gate --compose-model-provider mock --retrieval-profile upload_mock --max-tasks 1 --timeout-seconds 480`
+  -> exit 0, `passed=true`; `alias_reformulation_chain` completed in isolated
+  Compose with coverage score 1.0, evidence recall 1.0, 10 completed hashed
+  tool calls, 7 derived questions, zero unsupported claims and ACL safety.
+  Report:
+  `artifacts/validation/deep-research-hard-gate/20260804T204840Z/report.json`.
+  `uv run python -m wikipediarag.cli deep-research-hard-gate --task-id alias_reformulation_chain --max-tasks 1 --timeout-seconds 480`
+  -> exit 1; isolated Compose, upload, auth and run creation all succeeded
+  against OpenRouter, but the single real-provider fixture spent most of the
+  shared deadline in `planner_failed` with safe code `planner_invalid_schema`,
+  later reached one `episode_completed`, and still ended with
+  `DEEP_RESEARCH_SUITE_DEADLINE_EXHAUSTED`. Report:
+  `artifacts/validation/deep-research-hard-gate/20260805T042043Z/report.json`.
+  The default `45%` context policy remains unchanged; the remaining blocker is
+  real-provider planner structured-output conformance and/or latency under the
+  current OpenRouter-backed Qwen alias, not isolated-stack startup. Proving
+  model quality as the sole cause would require an A/B rerun against another
+  model/provider alias, which is outside this documentation pass.
+
+- Deep Research runtime stabilization validation on 2026-08-04: planner
+  JSON/schema handling, runtime no-progress saturation, partial-terminal
+  completion, OpenRouter gateway/provider retry semantics and hard-gate
+  deadline reporting were hardened without changing the `45%` context default.
+  Planner JSON recovery now extracts the outer JSON object span instead of
+  accepting nested inner objects, document-tool arg rules are aligned between
+  schema and validation, document-tool requests outside the current mode stop as
+  `mode_insufficient_tools`, late planner/provider failures preserve an
+  ACL-trimmed partial report with safe `stop_reason`/`error_code`, OpenRouter
+  alias config can require structured-output parameters through Model Gateway,
+  `Retry-After` is honored for transient `429/503` retries, and tool-matrix
+  runs now write incremental `report.partial.json` snapshots. Validation:
+  `uv run ruff check src/wikipediarag/deep_research.py src/wikipediarag/research_planner.py src/wikipediarag/model_client.py src/wikipediarag/gateway_app.py src/wikipediarag/cli.py src/wikipediarag/model_registry.py tests/unit/test_deep_research.py tests/unit/test_deep_research_eval.py tests/unit/test_gateway_app.py tests/unit/test_model_client_observability.py`
+  -> exit 0;
+  `uv run ruff format --check src/wikipediarag/deep_research.py src/wikipediarag/research_planner.py src/wikipediarag/model_client.py src/wikipediarag/gateway_app.py src/wikipediarag/cli.py src/wikipediarag/model_registry.py tests/unit/test_deep_research.py tests/unit/test_deep_research_eval.py tests/unit/test_gateway_app.py tests/unit/test_model_client_observability.py`
+  -> exit 0, 10 files already formatted;
+  `uv run mypy src/wikipediarag/research_planner.py src/wikipediarag/deep_research.py src/wikipediarag/model_client.py src/wikipediarag/gateway_app.py src/wikipediarag/cli.py src/wikipediarag/model_registry.py`
+  -> exit 0;
+  `uv run pytest tests/unit/test_deep_research.py tests/unit/test_deep_research_eval.py tests/unit/test_model_client_observability.py tests/unit/test_gateway_app.py tests/unit/test_retrieval_profile.py -q`
+  -> exit 0, 85 passed, 2 FastAPI deprecation warnings.
+  This pass validates the control-plane fixes only; no real-provider rerun has
+  been accepted yet, so the default `45%` policy remains unchanged.
+
+- Local-first SOTA Deep Research implementation validation on 2026-08-03:
+  stage-aware context budgets, Model Gateway tokenizer exposure, Multi-KB
+  Deep Research scope persistence, retrieve-multi tool dispatch, claim-relation
+  detail surface and ACL-trimmed Multi-KB evidence filtering are now covered by
+  deterministic tests. Validation:
+  `uv run pytest tests/unit/test_deep_research.py tests/unit/test_auth_schema.py tests/unit/test_retrieval_profile.py tests/unit/test_gateway_app.py tests/unit/test_model_client_observability.py tests/unit/test_multi_kb_retrieval.py -q`
+  -> exit 0, 54 passed, 2 FastAPI deprecation warnings;
+  `uv run ruff check src/wikipediarag/api/handlers.py src/wikipediarag/deep_research.py src/wikipediarag/research_tools.py src/wikipediarag/repository.py src/wikipediarag/schemas.py tests/unit/test_deep_research.py tests/unit/test_auth_schema.py tests/unit/test_retrieval_profile.py tests/unit/test_gateway_app.py tests/unit/test_model_client_observability.py tests/unit/test_multi_kb_retrieval.py`
+  -> exit 0;
+  `uv run mypy src/wikipediarag/api/handlers.py src/wikipediarag/deep_research.py src/wikipediarag/research_tools.py src/wikipediarag/repository.py src/wikipediarag/schemas.py`
+  -> exit 0.
+  This pass validates the new contracts and storage/API surfaces only; it does
+  not replace a fresh runtime hard-gate or local-model matrix.
+
+- Documentation sync on 2026-08-03: active README and architecture documents
+  now distinguish the demonstrated isolated mock alias-chain trajectory from
+  the unpassed full OpenRouter/Qwen hard pack. The latter is a provider/runtime
+  baseline failure, not evidence for changing planner logic or the 45% context
+  default. Historical plans and status archive remain historical records.
+
+- Deep Research isolated hard-gate implementation on 2026-08-02: added
+  `compose.deep-research-gate.yaml` and a unique per-run Compose project with
+  loopback-only API, MinIO and PostgreSQL endpoints. The CLI passes those
+  endpoints through upload, auth and ACL-viewer setup, records only safe project
+  metadata, stops isolated containers without deleting volumes, and retries
+  Compose startup at most three times only for a detected port conflict. The
+  hard fixtures are Markdown/CSV, so this profile omits Xberg, Docling and
+  metadata-service while retaining API, worker, PostgreSQL, MinIO, OpenSearch
+  and Model Gateway. `--skip-compose` retains the external API mode. The hard
+  gate timeout is one post-readiness deadline shared by all fixtures and
+  pause/resume/cancel actions, not a fresh 900-second timeout for each wait.
+  Runtime preflight:
+  `uv run python -m wikipediarag.cli deep-research-hard-gate
+  --compose-model-provider mock --retrieval-profile upload_mock --max-tasks 1
+  --timeout-seconds 480` -> exit 0, `passed=true`; isolated upload, ingestion,
+  worker run and trajectory evaluation passed for `alias_reformulation_chain`
+  with evidence recall 1.0, 9 completed hashed tool calls, 7 derived questions,
+  zero unsupported claims and ACL safety. Report:
+  `artifacts/validation/deep-research-hard-gate/20260802T201703Z/report.json`.
+  The completed OpenRouter/Qwen default-45% baseline exited 1 after the shared
+  900-second deadline: all four hard fixtures failed, two partly traversed the
+  tool loop, ACL safety stayed true and unsupported claims stayed at zero, but
+  coverage/recall were insufficient. Its isolated containers were removed and
+  volumes retained. No 35% candidate run was made and the 45% default remains.
+  A post-run regression fix makes research and ingestion terminal-timeout
+  errors fixed safe messages/codes rather than serializing the last API payload
+  into an artifact; this behavior is covered by deterministic tests.
+- Deep Research hard runtime gate implementation validation on 2026-08-02:
+  added `deep-research-hard-gate` with default fixture
+  `tests/fixtures/deep_research/research_tasks_hard.json`, default profile
+  `upload_sota_mvp`, default Compose provider `openrouter`, 900 second timeout,
+  per-task detail artifacts under
+  `artifacts/validation/deep-research-hard-gate/<timestamp>/`, OpenRouter key
+  resolution from `OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_FILE` or `.env`
+  through the shared Settings path before Compose startup, Qwen alias usage
+  through Model Gateway only,
+  trajectory metrics in `evaluate_research_detail` and hard fixture
+  expectations for required derived terms/tool-call hashes/no raw query leaks.
+  `upload_sota_mvp` now participates in real-provider readiness semantics, and
+  Model Gateway uses the same resolver for startup smoke, `/v1/models` health
+  and provider proxy calls without logging the secret.
+  Validation:
+  `uv run pytest tests/unit/test_deep_research.py tests/unit/test_deep_research_eval.py tests/unit/test_auth_schema.py tests/unit/test_gateway_app.py tests/unit/test_retrieval_profile.py`
+  -> exit 0, 51 passed, 2 FastAPI deprecation warnings;
+  `uv run ruff format --check .` -> initial exit 1, then
+  `uv run ruff format src/wikipediarag/deep_research_eval.py tests/unit/test_deep_research_eval.py`
+  -> exit 0 and repeat `uv run ruff format --check .` -> exit 0, 132 files
+  already formatted;
+  `uv run ruff check .` -> exit 0;
+  `uv run mypy src tests` -> exit 0, no issues found in 130 source files;
+  `uv run pytest tests/unit` -> exit 0, 281 passed, 2 FastAPI deprecation
+  warnings;
+  `uv run python -m wikipediarag.cli deep-research-hard-gate --help` -> exit 0.
+  That implementation-validation pass did not run the OpenRouter hard gate
+  because it starts Docker Compose and consumes provider quota; the later
+  isolated baseline is recorded above. The safe resolver check found the key
+  source as `settings:OPENROUTER_API_KEY` without printing the key value, which
+  verifies the previous false-negative `os.environ`-only path is closed.
+- Deep Research planner/tool-loop V1 implementation validation on 2026-08-02:
+  implemented strict planner schemas and deterministic fallback, public-safe
+  `research_tool_calls`, durable derived-question append with lineage, bounded
+  episode planning around `extended_search`, verified claim persistence,
+  contradiction-first repair question creation and API/CLI context-policy
+  override support. Added `make deep-research-hard-smoke`.
+  Validation:
+  `uv run ruff format --check .` -> exit 0, 132 files already formatted;
+  `uv run ruff check .` -> exit 0;
+  `uv run mypy src tests` -> exit 0, no issues found in 130 source files;
+  `uv run pytest tests/unit` -> exit 0, 273 passed, 2 FastAPI deprecation
+  warnings.
+- Deep Research hard fixture/tool-loop target validation on 2026-08-02:
+  Added `tests/fixtures/deep_research/research_tasks_hard.json` with four
+  hard multi-source targets that require alias resolution and evidence-driven
+  query reformulation; added unit coverage for the
+  hard manifest, clarified the implemented V1 tool/reformulation boundary in
+  architecture docs and added `docs/exec-plans/36-deep-research-tool-loop.md`.
+  Focused validation:
+  `uv run ruff check src\wikipediarag\deep_research.py tests\unit\test_deep_research.py tests\unit\test_deep_research_eval.py`
+  -> exit 0;
+  `uv run ruff format --check src\wikipediarag\deep_research.py tests\unit\test_deep_research.py tests\unit\test_deep_research_eval.py`
+  -> exit 0, 3 files already formatted;
+  `uv run mypy src\wikipediarag\deep_research.py src\wikipediarag\deep_research_eval.py tests\unit\test_deep_research.py tests\unit\test_deep_research_eval.py`
+  -> exit 0, no issues found in 4 source files;
+  `uv run pytest tests\unit\test_deep_research.py tests\unit\test_deep_research_eval.py -q`
+  -> exit 0, 21 passed;
+  `uv run python -m wikipediarag.cli deep-research-matrix --fixture-path tests/fixtures/deep_research/research_tasks_hard.json`
+  -> exit 0, passed=true, 4 fixtures, 27 policy aggregates / 108
+  fixture-policy rows, report:
+  `artifacts/validation/deep-research-matrix/20260802T164751Z/report.json`.
+  This hard matrix is still offline packer validation and has been superseded
+  by the planner/tool-loop V1 implementation validation above; runtime hard
+  smoke still needs to be run.
 - Deep Research runtime smoke and policy matrix validation on 2026-08-02:
   `make` was unavailable in the Windows shell, so the Makefile-equivalent `uv`
   commands were run directly. `uv run python -m wikipediarag.cli
@@ -514,6 +874,16 @@ safe improvement.
   `uv run python -m wikipediarag.cli verify-document-upload --skip-compose`
   -> exit 0, report `artifacts/validation/document-upload/20260729T210047Z`.
 
+## Validation after the 2026-08-09 critical Retrieval/Deep Research increment
+
+- `uv run pytest tests/unit -q`: 362 passed, 2 warnings.
+- `uv run pytest tests/integration -q`: 14 passed, 1 skipped.
+- `uv run ruff check .`, `uv run ruff format --check src tests`, `uv run mypy src tests`: passed.
+- `cd services/ui && pnpm lint && pnpm typecheck && pnpm build && pnpm format:check`: passed. The DOCX exporter is dynamically loaded; initial JS remains about 282 kB and the exporter is a separate chunk.
+- `docker compose up -d --build api worker`: passed; `/ready` returned `{"status":"ok"}`. Migration `002_research_evidence_refs_and_job_leases` is applied, null evidence refs = 0, expired leases = 0.
+- Live mock smoke gates remain red/blocked: `deep-research-smoke` with `upload_mock` reports active index alias mismatch (`mock_embed_default` vs `embed_default`); `upload_sota_mvp` and hard gate with a 30/60 second gate deadline outlive the CLI deadline but later terminalize. Tool matrix was started with visible command output and stopped after no progress output; no pass is claimed.
+- Follow-up hardening remains: SSE currently emits stage start/completion events but not a periodic heartbeat while a stage is executing; facets still need a dedicated lexical aggregation path (the Redis window cache is in place, but `_facets` remains a retrieval-window fallback); multi-KB transformed retrieval still shares the existing per-KB first-stage path rather than a single cross-KB embedding batch.
+
 ## Active blockers and risks
 
 - Multi-KB direct retrieval is implemented; Multi-KB Extended Search remains future work.
@@ -528,10 +898,15 @@ safe improvement.
 
 ## Next approved task
 
-If Deep Research tuning continues, implement a runtime context-policy override
-for smoke/experiment runs and compare the current 45% default against the
-offline winner under mock and optional local Qwen/qwen3.6-27b validation before
-changing production defaults.
+If Deep Research tuning continues, use the new approved-plan surface to inspect
+the safe telemetry and report artifacts from the 2026-08-05 real-provider
+`alias_reformulation_chain` rerun, identify the remaining
+`planner_invalid_schema` shape, then rerun the focused fixtures
+`within_doc_exception_clause` and `section_alias_owner_chain` before attempting
+the full default hard gate again. Do not run any `35%` candidate comparison
+until the default `45%` real-provider baseline is stable; accept a candidate
+only if hard-fixture pass rate, evidence recall, ACL safety and
+unsupported-claim counts do not regress and average context ratio improves.
 
 ## Related artifacts
 

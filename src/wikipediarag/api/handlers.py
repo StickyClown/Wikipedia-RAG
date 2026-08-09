@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -47,7 +48,7 @@ from wikipediarag.auth_service import (
     test_actor_context,
 )
 from wikipediarag.config import get_settings
-from wikipediarag.db import connect, ensure_schema
+from wikipediarag.db import connect, connect_autocommit, ensure_schema
 from wikipediarag.deep_research import (
     build_public_research_report,
     build_research_questions,
@@ -72,6 +73,7 @@ from wikipediarag.ids import stable_hash
 from wikipediarag.observability import content_policy, safe_error_code, safe_telemetry_payload
 from wikipediarag.oidc_service import complete_oidc_callback, encrypt_server_tokens, oidc_login_enabled, start_oidc_flow
 from wikipediarag.repository import (
+    approve_research_plan,
     complete_query_run,
     create_document_deletion_job,
     create_document_upload_records,
@@ -79,6 +81,7 @@ from wikipediarag.repository import (
     create_knowledge_source,
     create_query_run,
     create_reprocess_job,
+    create_research_plan,
     create_research_resume_job,
     create_research_run,
     create_source_sync_job,
@@ -90,6 +93,7 @@ from wikipediarag.repository import (
     get_document_public,
     get_knowledge_base,
     get_knowledge_source,
+    get_research_plan,
     get_research_run,
     get_source_sync_run_public,
     get_upload_batch_status,
@@ -100,12 +104,14 @@ from wikipediarag.repository import (
     list_document_versions_public,
     list_knowledge_bases,
     list_knowledge_sources_public,
+    list_research_plans,
     list_research_runs,
     list_source_active_document_refs,
     load_actor_document_access_scope,
     load_effective_knowledge_base_role,
     load_index_version_by_read_alias,
     load_research_detail_records,
+    load_research_run_scopes,
     load_retrieval_events,
     request_cancel,
     request_research_cancel,
@@ -117,7 +123,9 @@ from wikipediarag.repository import (
     update_knowledge_source,
     update_knowledge_source_document_access_default,
     update_query_run_usage,
+    update_research_plan,
 )
+from wikipediarag.research_tool_registry import DEFAULT_RESEARCH_TOOL_MODE
 from wikipediarag.retrieval import retrieve, retrieve_multi
 from wikipediarag.retrieval_contract import KnowledgeBaseNotReady, validate_active_retrieval_contract
 from wikipediarag.retrieval_profile import get_retrieval_profile
@@ -150,6 +158,13 @@ from wikipediarag.schemas import (
     LocalPasswordChangeRequest,
     QueryRunEvaluationRequest,
     QueryRunFeedbackRequest,
+    ResearchPlanActionResponse,
+    ResearchPlanCreate,
+    ResearchPlanDetail,
+    ResearchPlanListResponse,
+    ResearchPlanPatch,
+    ResearchPlanQuestion,
+    ResearchPlanStatus,
     ResearchRunActionResponse,
     ResearchRunCreate,
     ResearchRunDetail,
@@ -2117,11 +2132,6 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
         extended_policy=active_profile.postprocess.extended_search,
         classifier_suggested_extended=classifier_suggested_extended,
     )
-    if len(kb_ids) > 1 and route_decision["route"] != "direct_retrieval":
-        route_decision = {
-            "route": "direct_retrieval",
-            "reason": "multi_kb_extended_search_not_enabled_v1",
-        }
     search_plan = build_search_plan(
         query=payload.message,
         mode=payload.mode.value,
@@ -2199,7 +2209,19 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
             )
         )
         try:
-            async with connect() as conn:
+
+            def stage_notice(event_name: str, stage: str, elapsed_ms: int = 0) -> str:
+                return _event(
+                    SseEvent(
+                        event=event_name,
+                        request_id=request_id,
+                        query_run_id=str(query_run_id),
+                        sequence=0,
+                        data={"stage": stage, "elapsed_ms": elapsed_ms},
+                    )
+                )
+
+            async with connect_autocommit() as conn:
                 current_stage = "path_selected"
                 await insert_retrieval_event(
                     conn,
@@ -2221,6 +2243,9 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                 last_successful_stage = "path_selected"
                 if use_harness_first:
                     current_stage = "extended_search"
+                    sequence += 1
+                    yield stage_notice("stage.started", current_stage)
+                    stage_started = time.perf_counter()
                     retrieval = await run_extended_search(
                         conn,
                         payload.message,
@@ -2232,10 +2257,16 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                         profile=active_profile,
                         profile_overrides=payload.retrieval_overrides,
                         search_filters=search_filters,
+                        knowledge_base_ids=kb_ids,
                     )
+                    sequence += 1
+                    yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
                     last_successful_stage = "extended_search"
                 else:
                     current_stage = "retrieval"
+                    sequence += 1
+                    yield stage_notice("stage.started", current_stage)
+                    stage_started = time.perf_counter()
                     if len(kb_ids) > 1:
                         retrieval = await retrieve_multi(
                             conn,
@@ -2262,9 +2293,10 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                             search_filters=search_filters,
                         )
                     last_successful_stage = "retrieval"
+                    sequence += 1
+                    yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
                     if (
-                        len(kb_ids) == 1
-                        and retrieval.answerability
+                        retrieval.answerability
                         and should_try_extended_search(retrieval.answerability)
                         and active_profile.postprocess.extended_search
                         in {
@@ -2284,6 +2316,9 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                             profile=active_profile,
                         )
                         current_stage = "extended_search"
+                        sequence += 1
+                        yield stage_notice("stage.started", current_stage)
+                        stage_started = time.perf_counter()
                         await update_query_run_usage(
                             conn,
                             query_run_id=str(query_run_id),
@@ -2316,10 +2351,19 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                             profile=active_profile,
                             profile_overrides=payload.retrieval_overrides,
                             search_filters=search_filters,
+                            knowledge_base_ids=kb_ids,
+                            seed_result=retrieval,
                         )
+                        sequence += 1
+                        yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
                         last_successful_stage = "extended_search"
             current_stage = "answer_generation"
+            sequence += 1
+            yield stage_notice("stage.started", current_stage)
+            stage_started = time.perf_counter()
             answer, validation = await generate_answer(payload.message, retrieval, settings, active_profile)
+            sequence += 1
+            yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
             last_successful_stage = "answer_generation"
             timings_ms = _combined_timings(retrieval.model_dump(), validation)
             answer_artifact = build_answer_artifact(
@@ -2541,35 +2585,375 @@ async def query_run_evaluation(
     return {"query_run_id": query_run_id, "status": "recorded"}
 
 
+def _plan_question_records(topic: str, questions: list[ResearchPlanQuestion] | None) -> list[dict[str, Any]]:
+    if questions:
+        ordered = sorted(questions, key=lambda item: item.ordinal)
+        return [
+            {"question": item.question, "ordinal": index, "kind": item.kind}
+            for index, item in enumerate(ordered, start=1)
+        ]
+    return [
+        {"question": question, "ordinal": index, "kind": "primary" if index == 1 else "decomposition"}
+        for index, question in enumerate(build_research_questions(topic), start=1)
+    ]
+
+
+def _research_plan_scope_ids(knowledge_base_ids: Any, knowledge_base_id: str) -> list[str]:
+    scope_ids = [str(item) for item in list(knowledge_base_ids or []) if str(item)]
+    if knowledge_base_id not in scope_ids:
+        scope_ids.insert(0, knowledge_base_id)
+    return scope_ids[:3]
+
+
+def _research_plan_summary(row: dict[str, Any]) -> dict[str, Any]:
+    questions = list(row.get("questions") or [])
+    return {
+        "id": str(row["id"]),
+        "knowledge_base_id": str(row["knowledge_base_id"]),
+        "knowledge_base_ids": [str(item) for item in list(row.get("knowledge_base_ids") or []) if str(item)],
+        "user_id": _optional_uuid(row, "user_id"),
+        "topic": str(row.get("topic") or ""),
+        "retrieval_profile": str(row.get("retrieval_profile") or ""),
+        "tool_mode": str(row.get("tool_mode") or DEFAULT_RESEARCH_TOOL_MODE),
+        "status": str(row.get("status") or ResearchPlanStatus.draft.value),
+        "notes": str(row.get("notes") or ""),
+        "question_count": len(questions),
+        "approved_run_id": _optional_uuid(row, "approved_run_id"),
+        "approved_at": row.get("approved_at"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def _research_plan_detail(row: dict[str, Any]) -> dict[str, Any]:
+    questions = []
+    for index, item in enumerate(list(row.get("questions") or []), start=1):
+        if not isinstance(item, dict):
+            continue
+        questions.append(
+            {
+                "question": str(item.get("question") or ""),
+                "ordinal": int(item.get("ordinal") or index),
+                "kind": str(item.get("kind") or "primary"),
+            }
+        )
+    return {
+        "plan": _research_plan_summary(row),
+        "questions": questions,
+        "retrieval_overrides": dict(row.get("retrieval_overrides") or {}),
+        "context_policy": dict(row.get("context_policy") or {}),
+    }
+
+
+async def create_research_plan_endpoint(
+    payload: ResearchPlanCreate,
+    request: Request,
+) -> ResearchPlanActionResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    settings = get_settings()
+    kb_ids = _kb_scope_ids(payload.knowledge_base_ids, payload.knowledge_base_id or settings.default_kb_id)
+    kb_id = kb_ids[0]
+    profile = get_retrieval_profile(payload.retrieval_profile, settings, payload.retrieval_overrides)
+    try:
+        async with connect() as conn:
+            for scoped_kb_id in kb_ids:
+                await _require_kb_role(
+                    conn,
+                    actor=actor,
+                    tenant_id=tenant_id,
+                    kb_id=scoped_kb_id,
+                    role=KnowledgeBaseRole.viewer,
+                )
+                await validate_active_retrieval_contract(
+                    conn,
+                    tenant_id=tenant_id,
+                    knowledge_base_id=scoped_kb_id,
+                    profile=profile,
+                    retrieval_overrides=payload.retrieval_overrides,
+                    settings=settings,
+                )
+            plan_id = await create_research_plan(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                knowledge_base_ids=kb_ids,
+                user_id=actor.user_id,
+                topic=payload.topic,
+                retrieval_profile=profile.name,
+                tool_mode=payload.tool_mode,
+                retrieval_overrides=payload.retrieval_overrides,
+                context_policy=context_policy_for_profile(profile, payload.context_policy_override),
+                questions=_plan_question_records(payload.topic, payload.questions),
+                notes=payload.notes,
+            )
+    except KnowledgeBaseNotReady as exc:
+        raise _kb_not_ready_http(exc, actor.request_id) from exc
+    return ResearchPlanActionResponse(plan_id=str(plan_id), status=ResearchPlanStatus.draft)
+
+
+async def list_research_plans_endpoint(
+    request: Request, limit: Annotated[int, Query(ge=1, le=100)] = 50
+) -> ResearchPlanListResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        rows = await list_research_plans(conn, tenant_id=tenant_id, limit=limit)
+        visible: list[dict[str, Any]] = []
+        for row in rows:
+            kb_role = await _load_kb_role_optional(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_id=str(row["knowledge_base_id"]),
+            )
+            is_creator = str(row.get("user_id") or "") == actor.user_id
+            if (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
+                kb_role, KnowledgeBaseRole.editor
+            ):
+                visible.append(_research_plan_summary(row))
+    return ResearchPlanListResponse.model_validate({"plans": _jsonable(visible)})
+
+
+async def get_research_plan_endpoint(research_plan_id: str, request: Request) -> ResearchPlanDetail:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    async with connect() as conn:
+        row = await get_research_plan(conn, tenant_id=tenant_id, research_plan_id=research_plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="research plan not found")
+        kb_role = await _load_kb_role_optional(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_id=str(row["knowledge_base_id"]),
+        )
+        is_creator = str(row.get("user_id") or "") == actor.user_id
+        can_view = (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
+            kb_role, KnowledgeBaseRole.editor
+        )
+        if not can_view:
+            raise HTTPException(status_code=404, detail="research plan not found")
+    return ResearchPlanDetail.model_validate(_jsonable(_research_plan_detail(row)))
+
+
+async def patch_research_plan_endpoint(
+    research_plan_id: str,
+    payload: ResearchPlanPatch,
+    request: Request,
+) -> ResearchPlanActionResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    settings = get_settings()
+    async with connect() as conn:
+        row = await get_research_plan(conn, tenant_id=tenant_id, research_plan_id=research_plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="research plan not found")
+        if str(row.get("status") or "") != ResearchPlanStatus.draft.value:
+            raise HTTPException(status_code=409, detail="research plan is not editable")
+        is_creator = str(row.get("user_id") or "") == actor.user_id
+        if not is_creator:
+            raise HTTPException(status_code=403, detail="research plan can only be edited by the creator")
+        next_kb_id = str(payload.knowledge_base_id or row["knowledge_base_id"])
+        next_scope_ids = _research_plan_scope_ids(
+            payload.knowledge_base_ids or row.get("knowledge_base_ids"),
+            next_kb_id,
+        )
+        for scoped_kb_id in next_scope_ids:
+            await _require_kb_role(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_id=scoped_kb_id,
+                role=KnowledgeBaseRole.viewer,
+            )
+        profile = get_retrieval_profile(
+            payload.retrieval_profile or str(row.get("retrieval_profile") or settings.retrieval_profile),
+            settings,
+            (
+                payload.retrieval_overrides
+                if payload.retrieval_overrides is not None
+                else dict(row.get("retrieval_overrides") or {})
+            ),
+        )
+        context_policy = (
+            context_policy_for_profile(profile, payload.context_policy_override)
+            if payload.context_policy_override is not None
+            else dict(row.get("context_policy") or {})
+        )
+        topic = payload.topic or str(row.get("topic") or "")
+        questions = (
+            _plan_question_records(topic, payload.questions)
+            if payload.questions is not None
+            else list(row.get("questions") or [])
+        )
+        await update_research_plan(
+            conn,
+            research_plan_id=research_plan_id,
+            topic=payload.topic,
+            knowledge_base_id=payload.knowledge_base_id,
+            knowledge_base_ids=(
+                next_scope_ids
+                if payload.knowledge_base_ids is not None or payload.knowledge_base_id is not None
+                else None
+            ),
+            retrieval_profile=(
+                profile.name
+                if payload.retrieval_profile is not None or payload.retrieval_overrides is not None
+                else None
+            ),
+            tool_mode=payload.tool_mode,
+            retrieval_overrides=payload.retrieval_overrides,
+            context_policy=context_policy,
+            questions=questions,
+            notes=payload.notes,
+        )
+    return ResearchPlanActionResponse(plan_id=research_plan_id, status=ResearchPlanStatus.draft)
+
+
+async def approve_research_plan_endpoint(research_plan_id: str, request: Request) -> ResearchPlanActionResponse:
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    settings = get_settings()
+    async with connect() as conn:
+        row = await get_research_plan(conn, tenant_id=tenant_id, research_plan_id=research_plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="research plan not found")
+        if str(row.get("status") or "") != ResearchPlanStatus.draft.value:
+            raise HTTPException(status_code=409, detail="research plan is already approved")
+        kb_id = str(row["knowledge_base_id"])
+        kb_ids = _research_plan_scope_ids(row.get("knowledge_base_ids"), kb_id)
+        for scoped_kb_id in kb_ids:
+            await _require_kb_role(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_id=scoped_kb_id,
+                role=KnowledgeBaseRole.viewer,
+            )
+        profile = get_retrieval_profile(
+            str(row.get("retrieval_profile") or settings.retrieval_profile),
+            settings,
+            dict(row.get("retrieval_overrides") or {}),
+        )
+        for scoped_kb_id in kb_ids:
+            await validate_active_retrieval_contract(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=scoped_kb_id,
+                profile=profile,
+                retrieval_overrides=dict(row.get("retrieval_overrides") or {}),
+                settings=settings,
+            )
+        question_rows = [
+            str(item.get("question") or "") for item in list(row.get("questions") or []) if isinstance(item, dict)
+        ]
+        run_id, job_id = await create_research_run(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            knowledge_base_ids=kb_ids,
+            user_id=actor.user_id,
+            topic=str(row.get("topic") or ""),
+            retrieval_profile=profile.name,
+            tool_mode=str(row.get("tool_mode") or DEFAULT_RESEARCH_TOOL_MODE),
+            retrieval_overrides=dict(row.get("retrieval_overrides") or {}),
+            context_policy=dict(row.get("context_policy") or {}),
+            questions=question_rows or build_research_questions(str(row.get("topic") or "")),
+            research_plan_id=research_plan_id,
+        )
+        await approve_research_plan(
+            conn,
+            tenant_id=tenant_id,
+            research_plan_id=research_plan_id,
+            approved_by_user_id=actor.user_id,
+            run_id=str(run_id),
+        )
+    return ResearchPlanActionResponse(
+        plan_id=research_plan_id,
+        status=ResearchPlanStatus.approved,
+        run_id=str(run_id),
+    )
+
+
 async def create_research_run_endpoint(payload: ResearchRunCreate, request: Request) -> ResearchRunActionResponse:
-    """Create a durable single-KB Deep Research run and enqueue worker execution."""
+    """Create a durable Deep Research run and enqueue worker execution."""
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
     settings = get_settings()
     request_id = _request_id(request)
-    kb_id = payload.knowledge_base_id or settings.default_kb_id
-    profile = get_retrieval_profile(payload.retrieval_profile, settings, payload.retrieval_overrides)
     try:
         async with connect() as conn:
-            await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
-            await validate_active_retrieval_contract(
-                conn,
-                tenant_id=tenant_id,
-                knowledge_base_id=kb_id,
-                profile=profile,
-                retrieval_overrides=payload.retrieval_overrides,
-                settings=settings,
+            plan = None
+            if payload.research_plan_id:
+                plan = await get_research_plan(conn, tenant_id=tenant_id, research_plan_id=payload.research_plan_id)
+                if plan is None:
+                    raise HTTPException(status_code=404, detail="research plan not found")
+                if str(plan.get("status") or "") != ResearchPlanStatus.approved.value:
+                    raise HTTPException(status_code=409, detail="research plan must be approved before run creation")
+            kb_ids = (
+                _research_plan_scope_ids(plan.get("knowledge_base_ids"), str(plan["knowledge_base_id"]))
+                if plan is not None
+                else _kb_scope_ids(payload.knowledge_base_ids, payload.knowledge_base_id or settings.default_kb_id)
             )
+            kb_id = kb_ids[0]
+            retrieval_overrides = (
+                dict(plan.get("retrieval_overrides") or {}) if plan is not None else payload.retrieval_overrides
+            )
+            profile = get_retrieval_profile(
+                str(plan.get("retrieval_profile") or settings.retrieval_profile)
+                if plan is not None
+                else payload.retrieval_profile,
+                settings,
+                retrieval_overrides,
+            )
+            tool_mode = (
+                str(plan.get("tool_mode") or DEFAULT_RESEARCH_TOOL_MODE) if plan is not None else payload.tool_mode
+            )
+            topic = str(plan.get("topic") or payload.topic) if plan is not None else payload.topic
+            context_policy = (
+                dict(plan.get("context_policy") or {})
+                if plan is not None
+                else context_policy_for_profile(profile, payload.context_policy_override)
+            )
+            questions = (
+                [
+                    str(item.get("question") or "")
+                    for item in list(plan.get("questions") or [])
+                    if isinstance(item, dict)
+                ]
+                if plan is not None
+                else build_research_questions(payload.topic)
+            )
+            for scoped_kb_id in kb_ids:
+                await _require_kb_role(
+                    conn,
+                    actor=actor,
+                    tenant_id=tenant_id,
+                    kb_id=scoped_kb_id,
+                    role=KnowledgeBaseRole.viewer,
+                )
+                await validate_active_retrieval_contract(
+                    conn,
+                    tenant_id=tenant_id,
+                    knowledge_base_id=scoped_kb_id,
+                    profile=profile,
+                    retrieval_overrides=retrieval_overrides,
+                    settings=settings,
+                )
             run_id, job_id = await create_research_run(
                 conn,
                 tenant_id=tenant_id,
                 knowledge_base_id=kb_id,
+                knowledge_base_ids=kb_ids,
                 user_id=actor.user_id,
-                topic=payload.topic,
+                topic=topic,
                 retrieval_profile=profile.name,
-                retrieval_overrides=payload.retrieval_overrides,
-                context_policy=context_policy_for_profile(profile),
-                questions=build_research_questions(payload.topic),
+                tool_mode=tool_mode,
+                retrieval_overrides=retrieval_overrides,
+                context_policy=context_policy,
+                questions=questions,
+                research_plan_id=payload.research_plan_id,
             )
             await insert_audit_event(
                 conn,
@@ -2579,7 +2963,13 @@ async def create_research_run_endpoint(payload: ResearchRunCreate, request: Requ
                 target_type="research_run",
                 target_id=str(run_id),
                 outcome="success",
-                metadata={"knowledge_base_id": kb_id, "job_id": str(job_id)},
+                metadata={
+                    "knowledge_base_id": kb_id,
+                    "knowledge_base_ids": kb_ids,
+                    "job_id": str(job_id),
+                    "tool_mode": tool_mode,
+                    "research_plan_id": payload.research_plan_id,
+                },
             )
     except KnowledgeBaseNotReady as exc:
         raise _kb_not_ready_http(exc, request_id) from exc
@@ -2596,6 +2986,11 @@ async def list_research_runs_endpoint(
         rows = await list_research_runs(conn, tenant_id=tenant_id, limit=limit)
         visible: list[dict[str, Any]] = []
         for row in rows:
+            scope_rows = await load_research_run_scopes(
+                conn,
+                tenant_id=tenant_id,
+                research_run_id=str(row["id"]),
+            )
             kb_role = await _load_kb_role_optional(
                 conn,
                 actor=actor,
@@ -2606,7 +3001,7 @@ async def list_research_runs_endpoint(
             if (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
                 kb_role, KnowledgeBaseRole.editor
             ):
-                visible.append(_research_run_summary(row))
+                visible.append(_research_run_summary(row, knowledge_base_ids=_research_scope_ids(scope_rows)))
     return ResearchRunListResponse.model_validate({"runs": _jsonable(visible)})
 
 
@@ -2617,15 +3012,37 @@ async def get_research_run_endpoint(research_run_id: str, request: Request) -> R
     async with connect() as conn:
         run = await _load_research_run_or_404(conn, tenant_id=tenant_id, research_run_id=research_run_id)
         kb_role = await _authorize_research_run(conn, actor=actor, tenant_id=tenant_id, run=run, action="read")
-        access_scope = await load_actor_document_access_scope(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            knowledge_base_id=str(run["knowledge_base_id"]),
-            effective_kb_role=kb_role,
-        )
+        scope_rows = await load_research_run_scopes(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+        scope_ids = _research_scope_ids(scope_rows) or [str(run["knowledge_base_id"])]
+        access_scopes: dict[str, DocumentAccessScope] = {
+            str(run["knowledge_base_id"]): await load_actor_document_access_scope(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                knowledge_base_id=str(run["knowledge_base_id"]),
+                effective_kb_role=kb_role,
+            )
+        }
+        for scoped_kb_id in scope_ids:
+            if scoped_kb_id in access_scopes:
+                continue
+            scoped_role = await _load_kb_role_optional(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                kb_id=scoped_kb_id,
+            )
+            if not has_kb_role(scoped_role, KnowledgeBaseRole.viewer):
+                continue
+            access_scopes[scoped_kb_id] = await load_actor_document_access_scope(
+                conn,
+                actor=actor,
+                tenant_id=tenant_id,
+                knowledge_base_id=scoped_kb_id,
+                effective_kb_role=scoped_role,
+            )
         records = await load_research_detail_records(conn, tenant_id=tenant_id, research_run_id=research_run_id)
-    detail = _research_detail(run, records=records, access_scope=access_scope)
+    detail = _research_detail(run, records=records, access_scope=access_scopes, knowledge_base_ids=scope_ids)
     return ResearchRunDetail.model_validate(_jsonable(detail))
 
 
@@ -2635,6 +3052,9 @@ async def research_run_events(research_run_id: str, request: Request) -> dict[st
     return {
         "run_id": research_run_id,
         "episodes": [item.model_dump(mode="json") for item in detail.episodes],
+        "tool_calls": [item.model_dump(mode="json") for item in detail.tool_calls],
+        "decisions": [item.model_dump(mode="json") for item in detail.decisions],
+        "relations": [item.model_dump(mode="json") for item in detail.relations],
         "coverage": [item.model_dump(mode="json") for item in detail.coverage],
         "reflections": [item.model_dump(mode="json") for item in detail.reflections],
     }
@@ -2666,11 +3086,14 @@ async def resume_research_run(research_run_id: str, request: Request) -> Researc
         await _authorize_research_run(conn, actor=actor, tenant_id=tenant_id, run=run, action="control")
         if str(run["status"]) in {"completed", "cancelled"}:
             raise HTTPException(status_code=409, detail="research run cannot be resumed")
+        scope_rows = await load_research_run_scopes(conn, tenant_id=tenant_id, research_run_id=research_run_id)
         job_id = await create_research_resume_job(
             conn,
             tenant_id=tenant_id,
             knowledge_base_id=str(run["knowledge_base_id"]),
             research_run_id=research_run_id,
+            knowledge_base_ids=_research_scope_ids(scope_rows) or [str(run["knowledge_base_id"])],
+            tool_mode=str(run.get("tool_mode") or DEFAULT_RESEARCH_TOOL_MODE),
         )
     return ResearchRunActionResponse(run_id=research_run_id, status=ResearchRunStatus.received, job_id=str(job_id))
 
@@ -2820,6 +3243,10 @@ async def run_debug_search(payload: DebugSearchRequest, request: Request) -> dic
             },
         )
     return output
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.perf_counter() - started) * 1000))
 
 
 def _event(event: SseEvent) -> str:
@@ -3304,13 +3731,32 @@ def _query_run_summary(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _research_run_summary(run: dict[str, Any]) -> dict[str, Any]:
+def _research_scope_ids(scope_rows: list[dict[str, Any]]) -> list[str]:
+    return [
+        normalized
+        for normalized in (str(row.get("knowledge_base_id") or "").strip() for row in scope_rows)
+        if normalized
+    ]
+
+
+def _research_run_summary(run: dict[str, Any], *, knowledge_base_ids: list[str] | None = None) -> dict[str, Any]:
+    scope_ids = list(dict.fromkeys(knowledge_base_ids or []))
+    if not scope_ids:
+        usage = run.get("usage")
+        if isinstance(usage, dict):
+            raw_scope = usage.get("knowledge_base_ids")
+            if isinstance(raw_scope, list):
+                scope_ids = [str(item) for item in raw_scope if str(item)]
+    if not scope_ids and run.get("knowledge_base_id"):
+        scope_ids = [str(run.get("knowledge_base_id"))]
     return {
         "id": str(run.get("id") or ""),
         "knowledge_base_id": str(run.get("knowledge_base_id") or ""),
+        "knowledge_base_ids": scope_ids,
         "user_id": str(run.get("user_id") or "") or None,
         "topic": str(run.get("topic") or ""),
         "retrieval_profile": str(run.get("retrieval_profile") or ""),
+        "tool_mode": str(run.get("tool_mode") or DEFAULT_RESEARCH_TOOL_MODE),
         "status": str(run.get("status") or "received"),
         "progress": run.get("progress") if isinstance(run.get("progress"), dict) else {},
         "stop_reason": run.get("stop_reason"),
@@ -3356,7 +3802,8 @@ def _research_detail(
     run: dict[str, Any],
     *,
     records: dict[str, list[dict[str, Any]]],
-    access_scope: DocumentAccessScope,
+    access_scope: DocumentAccessScope | Mapping[str, DocumentAccessScope],
+    knowledge_base_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     evidence = visible_research_evidence(records["evidence"], access_scope)
     visible_evidence_ids = {str(row.get("id")) for row in evidence}
@@ -3365,6 +3812,13 @@ def _research_detail(
         evidence_ids = [str(item) for item in row.get("evidence_ids") or []]
         if not evidence_ids or any(item in visible_evidence_ids for item in evidence_ids):
             claims.append(row)
+    visible_claim_ids = {str(row.get("id")) for row in claims}
+    relations = [
+        row
+        for row in records.get("relations", [])
+        if str(row.get("source_claim_id") or "") in visible_claim_ids
+        and str(row.get("target_claim_id") or "") in visible_claim_ids
+    ]
     coverage = [
         {
             **row,
@@ -3383,13 +3837,16 @@ def _research_detail(
         reflections=records["reflections"],
     )
     return {
-        "run": _research_run_summary(run),
+        "run": _research_run_summary(run, knowledge_base_ids=knowledge_base_ids),
         "questions": records["questions"],
         "coverage": coverage,
         "evidence": evidence,
         "claims": claims,
+        "relations": relations,
         "reflections": records["reflections"],
         "episodes": records["episodes"],
+        "tool_calls": records.get("tool_calls", []),
+        "decisions": records.get("decisions", []),
         "final_report": final_report,
     }
 
@@ -3527,8 +3984,6 @@ def _extended_search_status(
     reason = route_decision.get("reason", "")
     if route in {"extended_first", "extended_repair"}:
         return {"decision": "started", "reason": reason}
-    if len(knowledge_base_ids) > 1:
-        return {"decision": "skipped", "reason": reason or "multi_kb_extended_search_not_enabled_v1"}
     if extended_policy == "off":
         return {"decision": "skipped", "reason": "extended_search_policy_off"}
     return {"decision": "skipped", "reason": reason or "direct_path_selected"}

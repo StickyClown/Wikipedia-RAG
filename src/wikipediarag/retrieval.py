@@ -16,7 +16,8 @@ from wikipediarag.ids import stable_hash
 from wikipediarag.model_client import embeddings
 from wikipediarag.model_client import rerank as gateway_rerank
 from wikipediarag.model_registry import get_model_registry
-from wikipediarag.observability import retrieval_span, safe_error_code
+from wikipediarag.observability import retrieval_span, safe_error_code, safe_telemetry_payload
+from wikipediarag.query_transforms import bounded_decomposition, bounded_rewrite, normalize_query
 from wikipediarag.repository import fetch_chunks_for_dense_scan, insert_retrieval_event
 from wikipediarag.retrieval_contract import validate_active_retrieval_contract
 from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profile
@@ -26,6 +27,41 @@ from wikipediarag.search_index import bm25_search, dense_search
 QUERY_EMBEDDING_INSTRUCTION = (
     "Represent this query for retrieving factual answers from the local Russian Wikipedia corpus."
 )
+
+
+def _build_query_variants(query: str, profile: RetrievalProfile, enabled: bool) -> list[str]:
+    """Build a small deterministic variant set used by the real first stage."""
+    original = normalize_query(query)
+    if not enabled:
+        return [original]
+    values = [original]
+    rewrite = bounded_rewrite(original)
+    if profile.retrieval.query_rewrite == "always" or (profile.retrieval.query_rewrite == "conditional" and rewrite):
+        if rewrite:
+            values.append(rewrite)
+    decomposition = bounded_decomposition(original, max_subqueries=4)
+    if profile.retrieval.query_decomposition == "always" or (
+        profile.retrieval.query_decomposition == "conditional" and len(decomposition) > 1
+    ):
+        values.extend(decomposition)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = normalize_for_embedding(value)
+        if key and key not in seen:
+            deduped.append(value)
+            seen.add(key)
+    return deduped[:4]
+
+
+def query_embedding_instruction(profile: RetrievalProfile) -> str:
+    if profile.source == "upload":
+        return "Represent this query for retrieving factual answers from the uploaded private document corpus."
+    if profile.source == "xml":
+        return "Represent this query for retrieving factual answers from the Wikipedia XML corpus."
+    return QUERY_EMBEDDING_INSTRUCTION
+
+
 NEGATIVE_EVIDENCE_POLICY_VERSION = "explicit_negative_title_v1"
 _NEGATIVE_TITLE_MARKERS = (
     "не используй",
@@ -41,6 +77,7 @@ _NEGATIVE_TITLE_MARKERS = (
     "exclude",
 )
 _QUOTED_TITLE_RE = re.compile(r"[«\"“]([^»\"”]{2,160})[»\"”]")
+_CONTEXT_VALUE_RE = re.compile(r"\b\d{1,4}(?:[,.]\d+)?\b")
 
 
 async def retrieve(
@@ -59,6 +96,7 @@ async def retrieve(
     query_context: dict[str, Any] | None = None,
     search_filters: dict[str, Any] | None = None,
     persist_events: bool = True,
+    apply_query_transforms: bool = True,
 ) -> RetrievalResult:
     resolved = settings or get_settings()
     profile = profile or get_retrieval_profile(profile_name, resolved, profile_overrides)
@@ -82,13 +120,41 @@ async def retrieve(
         transform_type="normalization",
     )
     requested_top_k = top_k or profile.retrieval.top_k
+    variants = _build_query_variants(normalized_query, profile, apply_query_transforms)
+    semaphore = asyncio.Semaphore(8)
+    variant_vectors: list[list[float]] | None = None
+    shared_embedding_event: dict[str, Any] | None = None
+    if profile.retrieval.dense:
+        embed_model = get_model_registry(resolved).require(profile.model_aliases.embed, "embedding")
+        dimensions = int(embed_model.dimensions or profile.embedding_dimensions(resolved.embedding_dimensions))
+        embedding_started = time.perf_counter()
+        vectors, usage = await embeddings(
+            variants,
+            resolved,
+            alias=profile.model_aliases.embed,
+            dimensions=dimensions,
+            query_instruction=query_embedding_instruction(profile),
+        )
+        variant_vectors = [[float(value) for value in vector] for vector in vectors]
+        timings_ms["dense_embedding"] = _elapsed_ms(embedding_started)
+        shared_embedding_event = {
+            "stage": "dense.embedding",
+            "stable_stage": "dense.embedding",
+            "operation": "embedding",
+            "model_call": dict(usage.get("_gateway_metadata") or {}),
+            "latency_ms": timings_ms["dense_embedding"],
+            "batch_size": len(variants),
+        }
 
-    tasks: list[asyncio.Task[tuple[str, list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]]] = []
-    if profile.retrieval.bm25:
-        tasks.append(
-            asyncio.create_task(
-                _run_bm25_stage(
-                    normalized_query,
+    async def bounded_stage(
+        variant_index: int,
+        variant: str,
+        kind: str,
+    ) -> tuple[str, list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]:
+        async with semaphore:
+            if kind == "bm25":
+                label, candidates, timings, events = await _run_bm25_stage(
+                    variant,
                     tenant_id=tenant_id,
                     knowledge_base_id=knowledge_base_id,
                     top_k=profile.retrieval.bm25_top_k,
@@ -96,15 +162,11 @@ async def retrieve(
                     read_alias=read_alias,
                     strict=profile.requires_real_provider,
                     filters=_filters_for_kb(search_filters, knowledge_base_id),
-                ),
-            )
-        )
-    if profile.retrieval.dense:
-        tasks.append(
-            asyncio.create_task(
-                _run_dense_stage(
+                )
+            else:
+                label, candidates, timings, events = await _run_dense_stage(
                     conn,
-                    normalized_query,
+                    variant,
                     tenant_id,
                     knowledge_base_id,
                     resolved,
@@ -112,14 +174,30 @@ async def retrieve(
                     top_k=profile.retrieval.dense_top_k,
                     read_alias=read_alias,
                     filters=_filters_for_kb(search_filters, knowledge_base_id),
+                    query_vector=variant_vectors[variant_index] if variant_vectors is not None else None,
                 )
-            )
-        )
+            for candidate in candidates:
+                candidate["variant_index"] = variant_index
+                candidate["query_context"] = {
+                    **active_query_context,
+                    "text": variant,
+                    "query_variant_index": variant_index,
+                }
+            return f"{label}:v{variant_index}", candidates, timings, events
+
+    tasks = [
+        asyncio.create_task(bounded_stage(index, variant, kind))
+        for index, variant in enumerate(variants)
+        for kind, enabled in (("bm25", profile.retrieval.bm25), ("dense", profile.retrieval.dense))
+        if enabled
+    ]
     results = await asyncio.gather(*tasks)
     result_sets = {label: candidates for label, candidates, _timing, _model_events in results}
     _tag_candidate_sets(result_sets.values(), active_query_context)
     result_sets_snapshot = {label: _snapshot_candidates(candidates) for label, candidates in result_sets.items()}
-    model_events = [event for _label, _candidates, _timing, events in results for event in events]
+    model_events = ([shared_embedding_event] if shared_embedding_event else []) + [
+        event for _label, _candidates, _timing, events in results for event in events
+    ]
     for _label, _candidates, timing, _model_events in results:
         timings_ms.update(timing)
 
@@ -135,7 +213,7 @@ async def retrieve(
     rerank_started = time.perf_counter()
     if profile.retrieval.rerank:
         reranked, rerank_model_event = await rerank(
-            normalized_query, fused, resolved, profile, top_k=profile.retrieval.rerank_top_k
+            normalized_query, fused, resolved, profile, top_k=profile.retrieval.rerank_top_k, score_all=True
         )
     else:
         reranked = fused[: profile.retrieval.rerank_top_k]
@@ -143,7 +221,9 @@ async def retrieve(
     timings_ms["rerank"] = _elapsed_ms(rerank_started)
     reranked_snapshot = _snapshot_candidates(reranked)
     context_started = time.perf_counter()
-    selected, policy_events = postprocess_candidates(reranked, profile, requested_top_k, query=normalized_query)
+    selected, policy_events = postprocess_candidates(
+        reranked[: profile.retrieval.rerank_top_k], profile, requested_top_k, query=normalized_query
+    )
     timings_ms["context"] = _elapsed_ms(context_started)
     timings_ms["retrieval_total"] = _elapsed_ms(started)
     events = build_stage_events(
@@ -162,6 +242,7 @@ async def retrieve(
         timings_ms=timings_ms,
         contract=active_contract.event_payload(),
         query_context=active_query_context,
+        apply_query_transforms=apply_query_transforms,
     )
     evidence = [
         Evidence(
@@ -175,10 +256,77 @@ async def retrieve(
             scores=dict(item.get("scores", {})),
             ranks=dict(item.get("ranks", {})),
             metadata=_evidence_metadata(item, document_version_id=""),
+            document_id=str(item.get("document_id") or ""),
+            content_unit_id=str(dict(item.get("metadata") or {}).get("content_unit_id") or ""),
+            supporting_chunk_ids=list(
+                dict(item.get("metadata") or {}).get("supporting_chunk_ids") or [item["chunk_id"]]
+            ),
+            provenance_refs=list(dict(item.get("metadata") or {}).get("provenance_refs") or []),
         )
         for index, item in enumerate(selected, start=1)
     ]
     answerability = decide_answerability(query, evidence, profile)
+    if (
+        answerability.status.value == "PARTIAL"
+        and profile.retrieval.rerank
+        and len(reranked) > profile.retrieval.rerank_top_k
+    ):
+        deepening_limit = min(len(fused), max(profile.retrieval.rerank_top_k, 2 * profile.retrieval.rerank_top_k))
+        # All fused candidates were scored by the single reranker request.
+        # Deepening only changes deterministic selection, never calls the gateway again.
+        deepened = reranked[:deepening_limit]
+        selected, deepening_policy_events = postprocess_candidates(
+            deepened,
+            profile,
+            requested_top_k,
+            query=normalized_query,
+        )
+        evidence = [
+            Evidence(
+                evidence_id=f"S{index}",
+                chunk_id=item["chunk_id"],
+                knowledge_base_id=str(item.get("knowledge_base_id") or knowledge_base_id),
+                title=item["title"],
+                section_path=list(item["section_path"]),
+                content=item["content"],
+                source_url=item["source_url"],
+                scores=dict(item.get("scores", {})),
+                ranks=dict(item.get("ranks", {})),
+                metadata=_evidence_metadata(item, document_version_id=""),
+                document_id=str(item.get("document_id") or ""),
+                content_unit_id=str(dict(item.get("metadata") or {}).get("content_unit_id") or ""),
+                supporting_chunk_ids=list(
+                    dict(item.get("metadata") or {}).get("supporting_chunk_ids") or [item["chunk_id"]]
+                ),
+                provenance_refs=list(dict(item.get("metadata") or {}).get("provenance_refs") or []),
+            )
+            for index, item in enumerate(selected, start=1)
+        ]
+        reranked = deepened
+        reranked_snapshot = _snapshot_candidates(reranked)
+        policy_events.extend(deepening_policy_events)
+        rerank_model_event = rerank_model_event
+        timings_ms["retrieval_total"] = _elapsed_ms(started)
+        answerability = decide_answerability(query, evidence, profile)
+        events = build_stage_events(
+            query=query,
+            normalized_query=normalized_query,
+            profile=profile,
+            read_alias=read_alias,
+            result_sets=result_sets_snapshot,
+            fused=fused_snapshot,
+            reranked=reranked_snapshot,
+            selected=selected,
+            policy_events=policy_events,
+            model_events=model_events,
+            rerank_model_event=rerank_model_event,
+            latency_ms=timings_ms["retrieval_total"],
+            timings_ms=timings_ms,
+            contract=active_contract.event_payload(),
+            query_context=active_query_context,
+            apply_query_transforms=apply_query_transforms,
+        )
+    timings_ms["retrieval_total"] = _elapsed_ms(started)
     events.append(_answerability_event(answerability, active_query_context))
     if persist_events:
         for event in events:
@@ -219,6 +367,7 @@ async def retrieve_multi(
     query_context: dict[str, Any] | None = None,
     search_filters: dict[str, Any] | None = None,
     persist_events: bool = True,
+    apply_query_transforms: bool = True,
 ) -> RetrievalResult:
     if len(knowledge_base_ids) == 1:
         return await retrieve(
@@ -236,6 +385,7 @@ async def retrieve_multi(
             query_context=query_context,
             search_filters=search_filters,
             persist_events=persist_events,
+            apply_query_transforms=apply_query_transforms,
         )
 
     resolved = settings or get_settings()
@@ -285,10 +435,29 @@ async def retrieve_multi(
             )
         if active_profile.retrieval.dense:
             dense_stage_inputs.append((kb_id, read_alias))
-    raw_results = list(await asyncio.gather(*tasks))
-    for kb_id, read_alias in dense_stage_inputs:
-        raw_results.append(
-            await _run_scoped_dense_stage(
+    shared_query_vector: list[float] | None = None
+    shared_embedding_started = time.perf_counter()
+    if dense_stage_inputs:
+        embed_alias = active_profile.model_aliases.embed
+        embed_model = get_model_registry(resolved).require(embed_alias, "embedding")
+        embed_dimensions = int(
+            embed_model.dimensions or active_profile.embedding_dimensions(resolved.embedding_dimensions)
+        )
+        vectors, embedding_usage = await embeddings(
+            [normalized_query],
+            resolved,
+            alias=embed_alias,
+            dimensions=embed_dimensions,
+            query_instruction=query_embedding_instruction(active_profile),
+        )
+        shared_query_vector = [float(value) for value in vectors[0]]
+        timings_ms["dense_embedding"] = _elapsed_ms(shared_embedding_started)
+        shared_embedding_event = dict(embedding_usage.get("_gateway_metadata") or {})
+    else:
+        shared_embedding_event = None
+    dense_tasks = [
+        asyncio.create_task(
+            _run_scoped_dense_stage(
                 conn,
                 normalized_query,
                 tenant_id,
@@ -298,16 +467,23 @@ async def retrieve_multi(
                 top_k=active_profile.retrieval.dense_top_k,
                 read_alias=read_alias,
                 filters=_filters_for_kb(search_filters, kb_id),
+                query_vector=shared_query_vector,
             )
         )
+        for kb_id, read_alias in dense_stage_inputs
+    ]
+    raw_results = [*list(await asyncio.gather(*tasks)), *list(await asyncio.gather(*dense_tasks))]
     result_sets: dict[str, list[dict[str, Any]]] = {}
     model_events = [event for _label, _candidates, _timing, events in raw_results for event in events]
+    if shared_embedding_event:
+        model_events.insert(0, shared_embedding_event)
     for label, candidates, timing, _events in raw_results:
         _stage, _separator, kb_id = label.partition(":")
         result_sets[label] = candidates
         for timing_key, timing_value in timing.items():
             base_key = "dense" if timing_key == "dense_total" else timing_key
-            timings_ms[base_key] = timings_ms.get(base_key, 0) + timing_value
+            timings_ms[f"{base_key}_task_sum"] = timings_ms.get(f"{base_key}_task_sum", 0) + timing_value
+            timings_ms[base_key] = max(timings_ms.get(base_key, 0), timing_value)
             if kb_id:
                 timings_ms[f"{timing_key}:{kb_id}"] = timing_value
     _tag_candidate_sets(result_sets.values(), active_query_context)
@@ -320,18 +496,21 @@ async def retrieve_multi(
         else:
             fused = _merge_without_fusion(result_sets, top_k=active_profile.retrieval.fusion_top_k)
     fused_snapshot = _snapshot_candidates(fused)
-    per_kb_cap = max(
-        1, (active_profile.retrieval.rerank_top_k + len(knowledge_base_ids) - 1) // len(knowledge_base_ids)
-    )
-    before_kb_cap = fused
-    fused = apply_knowledge_base_cap(fused, per_kb_cap)
-    kb_cap_policy_events = _knowledge_base_cap_events(before_kb_cap, fused, per_kb_cap)
+    # Do not discard the best candidates of a dominant KB before reranking.
+    # The final context selector still enforces diversity, while global
+    # reranking gets the complete first-stage union.
+    kb_cap_policy_events: list[dict[str, Any]] = []
     timings_ms["fusion"] = _elapsed_ms(fusion_started)
 
     rerank_started = time.perf_counter()
     if active_profile.retrieval.rerank:
         reranked, rerank_model_event = await rerank(
-            normalized_query, fused, resolved, active_profile, top_k=active_profile.retrieval.rerank_top_k
+            normalized_query,
+            fused,
+            resolved,
+            active_profile,
+            top_k=active_profile.retrieval.rerank_top_k,
+            score_all=True,
         )
     else:
         reranked = fused[: active_profile.retrieval.rerank_top_k]
@@ -339,7 +518,9 @@ async def retrieve_multi(
     timings_ms["rerank"] = _elapsed_ms(rerank_started)
     reranked_snapshot = _snapshot_candidates(reranked)
     context_started = time.perf_counter()
-    selected, policy_events = postprocess_candidates(reranked, active_profile, requested_top_k, query=normalized_query)
+    selected, policy_events = postprocess_candidates(
+        reranked[: active_profile.retrieval.rerank_top_k], active_profile, requested_top_k, query=normalized_query
+    )
     timings_ms["context"] = _elapsed_ms(context_started)
     timings_ms["retrieval_total"] = _elapsed_ms(started)
     index_contract_id = "multi:" + _stable_contract_scope(
@@ -369,6 +550,7 @@ async def retrieve_multi(
             "run_contract_id": run_contract_id,
         },
         query_context=active_query_context,
+        apply_query_transforms=apply_query_transforms,
     )
     evidence = [
         Evidence(
@@ -382,11 +564,80 @@ async def retrieve_multi(
             scores=dict(item.get("scores", {})),
             ranks=dict(item.get("ranks", {})),
             metadata=_evidence_metadata(item, document_version_id=""),
+            document_id=str(item.get("document_id") or ""),
+            content_unit_id=str(dict(item.get("metadata") or {}).get("content_unit_id") or ""),
+            supporting_chunk_ids=list(
+                dict(item.get("metadata") or {}).get("supporting_chunk_ids") or [item["chunk_id"]]
+            ),
+            provenance_refs=list(dict(item.get("metadata") or {}).get("provenance_refs") or []),
         )
         for index, item in enumerate(selected, start=1)
     ]
     answerability = decide_answerability(query, evidence, active_profile)
+    if (
+        answerability.status.value == "PARTIAL"
+        and active_profile.retrieval.rerank
+        and len(reranked) > active_profile.retrieval.rerank_top_k
+    ):
+        deepening_limit = min(
+            len(reranked), max(active_profile.retrieval.rerank_top_k, 2 * active_profile.retrieval.rerank_top_k)
+        )
+        deepened = reranked[:deepening_limit]
+        selected, deepening_policy_events = postprocess_candidates(
+            deepened, active_profile, requested_top_k, query=normalized_query
+        )
+        evidence = [
+            Evidence(
+                evidence_id=f"S{index}",
+                chunk_id=item["chunk_id"],
+                knowledge_base_id=str(item.get("knowledge_base_id") or ""),
+                title=item["title"],
+                section_path=list(item["section_path"]),
+                content=item["content"],
+                source_url=item["source_url"],
+                scores=dict(item.get("scores", {})),
+                ranks=dict(item.get("ranks", {})),
+                metadata=_evidence_metadata(item, document_version_id=""),
+                document_id=str(item.get("document_id") or ""),
+                content_unit_id=str(dict(item.get("metadata") or {}).get("content_unit_id") or ""),
+                supporting_chunk_ids=list(
+                    dict(item.get("metadata") or {}).get("supporting_chunk_ids") or [item["chunk_id"]]
+                ),
+                provenance_refs=list(dict(item.get("metadata") or {}).get("provenance_refs") or []),
+            )
+            for index, item in enumerate(selected, start=1)
+        ]
+        policy_events.extend(deepening_policy_events)
+        answerability = decide_answerability(query, evidence, active_profile)
+        reranked_snapshot = _snapshot_candidates(deepened)
+        events = build_stage_events(
+            query=query,
+            normalized_query=normalized_query,
+            profile=active_profile,
+            read_alias="multi",
+            result_sets=result_sets_snapshot,
+            fused=fused_snapshot,
+            reranked=reranked_snapshot,
+            selected=selected,
+            policy_events=[*kb_cap_policy_events, *policy_events],
+            model_events=model_events,
+            rerank_model_event=rerank_model_event,
+            latency_ms=timings_ms.get("retrieval_total", 0),
+            timings_ms=timings_ms,
+            contract={
+                "knowledge_base_ids": knowledge_base_ids,
+                "contracts": [
+                    {"knowledge_base_id": kb_id, **contract_by_kb[kb_id].event_payload()}
+                    for kb_id in knowledge_base_ids
+                ],
+                "index_contract_id": index_contract_id,
+                "run_contract_id": run_contract_id,
+            },
+            query_context=active_query_context,
+            apply_query_transforms=apply_query_transforms,
+        )
     events.append(_answerability_event(answerability, active_query_context))
+    timings_ms["retrieval_total"] = _elapsed_ms(started)
     if persist_events:
         for event in events:
             await insert_retrieval_event(
@@ -502,6 +753,7 @@ async def _run_dense_stage(
     top_k: int,
     read_alias: str,
     filters: dict[str, Any] | None = None,
+    query_vector: list[float] | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]:
     candidates, timings, events = await dense_search_profile(
         conn,
@@ -513,6 +765,7 @@ async def _run_dense_stage(
         top_k=top_k,
         read_alias=read_alias,
         filters=filters,
+        query_vector=query_vector,
     )
     return "dense", candidates, timings, events
 
@@ -528,6 +781,7 @@ async def _run_scoped_dense_stage(
     top_k: int,
     read_alias: str,
     filters: dict[str, Any] | None = None,
+    query_vector: list[float] | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]:
     _label, candidates, timings, events = await _run_dense_stage(
         conn,
@@ -539,6 +793,7 @@ async def _run_scoped_dense_stage(
         top_k=top_k,
         read_alias=read_alias,
         filters=filters,
+        query_vector=query_vector,
     )
     return f"dense:{knowledge_base_id}", candidates, timings, events
 
@@ -554,6 +809,7 @@ async def dense_search_profile(
     top_k: int,
     read_alias: str,
     filters: dict[str, Any] | None = None,
+    query_vector: list[float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]:
     total_started = time.perf_counter()
     timings_ms: dict[str, int] = {}
@@ -561,26 +817,28 @@ async def dense_search_profile(
     alias = profile.model_aliases.embed
     model = registry.require(alias, "embedding")
     dimensions = int(model.dimensions or profile.embedding_dimensions(settings.embedding_dimensions))
-    embedding_started = time.perf_counter()
-    with retrieval_span("dense.embedding", {"knowledge_base_id": knowledge_base_id, "model_alias": alias}):
-        vectors, usage = await embeddings(
-            [query],
-            settings,
-            alias=alias,
-            dimensions=dimensions,
-            query_instruction=QUERY_EMBEDDING_INSTRUCTION,
-        )
-    timings_ms["dense_embedding"] = _elapsed_ms(embedding_started)
-    model_events = [
-        {
-            "stage": "dense.embedding",
-            "stable_stage": "dense.embedding",
-            "operation": "embedding",
-            "model_call": dict(usage.get("_gateway_metadata") or {}),
-            "latency_ms": timings_ms["dense_embedding"],
-        }
-    ]
-    query_vector = [float(value) for value in vectors[0]]
+    model_events: list[dict[str, Any]] = []
+    if query_vector is None:
+        embedding_started = time.perf_counter()
+        with retrieval_span("dense.embedding", {"knowledge_base_id": knowledge_base_id, "model_alias": alias}):
+            vectors, usage = await embeddings(
+                [query],
+                settings,
+                alias=alias,
+                dimensions=dimensions,
+                query_instruction=query_embedding_instruction(profile),
+            )
+        timings_ms["dense_embedding"] = _elapsed_ms(embedding_started)
+        model_events = [
+            {
+                "stage": "dense.embedding",
+                "stable_stage": "dense.embedding",
+                "operation": "embedding",
+                "model_call": dict(usage.get("_gateway_metadata") or {}),
+                "latency_ms": timings_ms["dense_embedding"],
+            }
+        ]
+        query_vector = [float(value) for value in vectors[0]]
     if len(query_vector) != dimensions:
         raise ValueError(f"query embedding returned {len(query_vector)} dimensions, expected {dimensions}")
     search_started = time.perf_counter()
@@ -649,7 +907,11 @@ async def dense_search_db(
                 "locator": row.get("locator") or dict(row.get("metadata") or {}).get("locator", {}),
                 "scores": {"dense": score},
                 "ranks": {},
-                "metadata": dict(row.get("metadata") or {}),
+                "metadata": {
+                    **dict(row.get("metadata") or {}),
+                    "parent_chunk_id": row.get("parent_chunk_id"),
+                    "content_hash": row.get("content_hash"),
+                },
             }
         )
     candidates.sort(key=lambda item: item["scores"]["dense"], reverse=True)
@@ -685,7 +947,14 @@ def rrf_fuse(result_sets: dict[str, list[dict[str, Any]]], top_k: int, k: int = 
             stored["scores"][f"rrf_{stage}"] = 1.0 / (k + rank)
             stored["scores"]["rrf_total"] = stored["scores"].get("rrf_total", 0.0) + 1.0 / (k + rank)
     fused = list(by_id.values())
-    fused.sort(key=lambda item: item["scores"].get("rrf_total", 0.0), reverse=True)
+    fused.sort(
+        key=lambda item: (
+            -float(item["scores"].get("rrf_total", 0.0)),
+            str(item.get("knowledge_base_id") or ""),
+            str(item.get("document_id") or ""),
+            str(item.get("chunk_id") or ""),
+        )
+    )
     for rank, candidate in enumerate(fused, start=1):
         candidate["ranks"]["fusion"] = rank
         candidate["scores"]["fusion"] = float(candidate["scores"].get("rrf_total", 0.0))
@@ -699,7 +968,23 @@ def _merge_without_fusion(result_sets: dict[str, list[dict[str, Any]]], top_k: i
             stored = merged.setdefault(_candidate_scope_key(candidate), {**candidate, "scores": {}, "ranks": {}})
             stored["scores"].update(candidate.get("scores", {}))
             stored["ranks"].update(candidate.get("ranks", {}))
-    candidates = list(merged.values())[:top_k]
+    candidates = list(merged.values())
+    candidates.sort(
+        key=lambda item: (
+            -max(
+                [
+                    float(value)
+                    for key, value in item.get("scores", {}).items()
+                    if key in {"bm25", "dense"} and isinstance(value, (int, float))
+                ]
+                or [0.0]
+            ),
+            str(item.get("knowledge_base_id") or ""),
+            str(item.get("document_id") or ""),
+            str(item.get("chunk_id") or ""),
+        )
+    )
+    candidates = candidates[:top_k]
     for rank, candidate in enumerate(candidates, start=1):
         candidate.setdefault("ranks", {})["fusion"] = rank
     return candidates
@@ -711,6 +996,7 @@ async def rerank(
     settings: Settings,
     profile: RetrievalProfile,
     top_k: int,
+    score_all: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     if not candidates:
         return [], None
@@ -723,12 +1009,16 @@ async def rerank(
                 documents,
                 settings,
                 alias=profile.model_aliases.rerank,
-                top_n=min(top_k, len(documents)),
+                top_n=len(documents) if score_all else min(top_k, len(documents)),
             )
         model_event = dict(payload.get("_gateway_metadata") or {})
+        seen_indexes: set[int] = set()
         for result in payload.get("results", []):
-            index = int(result["index"])
-            candidates[index]["scores"]["rerank"] = float(result["relevance_score"])
+            index = int(result.get("index", -1))
+            if index < 0 or index >= len(candidates) or index in seen_indexes:
+                continue
+            seen_indexes.add(index)
+            candidates[index]["scores"]["rerank"] = float(result.get("relevance_score", 0.0))
             candidates[index]["metadata"] = {
                 **dict(candidates[index].get("metadata") or {}),
                 "rerank_provider": payload.get("provider"),
@@ -747,12 +1037,17 @@ async def rerank(
             doc_terms = set(normalize_for_embedding(item["content"]).split())
             item["scores"]["rerank"] = len(query_terms & doc_terms) / max(len(query_terms), 1)
     candidates.sort(
-        key=lambda item: (item["scores"].get("rerank", 0.0), item["scores"].get("rrf_total", 0.0)),
-        reverse=True,
+        key=lambda item: (
+            -float(item["scores"].get("rerank", 0.0)),
+            -float(item["scores"].get("rrf_total", 0.0)),
+            str(item.get("knowledge_base_id") or ""),
+            str(item.get("document_id") or ""),
+            str(item.get("chunk_id") or ""),
+        )
     )
     for rank, candidate in enumerate(candidates[:top_k], start=1):
         candidate["ranks"]["rerank"] = rank
-    return candidates[:top_k], model_event
+    return (candidates if score_all else candidates[:top_k]), model_event
 
 
 def postprocess_candidates(
@@ -764,8 +1059,10 @@ def postprocess_candidates(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     events: list[dict[str, Any]] = []
     selected: list[dict[str, Any]] = []
-    page_counts: dict[tuple[str, int], int] = {}
+    page_counts: dict[tuple[str, str, str], int] = {}
     seen_hashes: set[str] = set()
+    seen_units: dict[str, dict[str, Any]] = {}
+    deferred_by_quota: list[dict[str, Any]] = []
     negative_titles = extract_explicit_negative_titles(query)
     max_evidence = min(requested_top_k, profile.postprocess.final_evidence_max)
     token_budget = profile.postprocess.max_context_tokens
@@ -785,31 +1082,6 @@ def postprocess_candidates(
             )
             continue
         metadata = dict(candidate.get("metadata") or {})
-        content_hash = str(metadata.get("content_hash") or candidate.get("chunk_id"))
-        if profile.postprocess.dedup and content_hash in seen_hashes:
-            events.append(
-                {
-                    **_decision_base(candidate),
-                    "stage": "context_selection",
-                    "decision": "dropped",
-                    "reason": "NEAR_DUPLICATE",
-                    "content_hash": content_hash,
-                }
-            )
-            continue
-        page_key = (str(candidate.get("knowledge_base_id") or ""), int(candidate.get("page_id") or 0))
-        page_counts[page_key] = page_counts.get(page_key, 0) + 1
-        if page_counts[page_key] > profile.postprocess.page_quota:
-            events.append(
-                {
-                    **_decision_base(candidate),
-                    "stage": "context_selection",
-                    "decision": "dropped",
-                    "reason": "PAGE_QUOTA",
-                    "page_quota": profile.postprocess.page_quota,
-                }
-            )
-            continue
         content = str(candidate["content"])
         if profile.postprocess.parent_expansion in {"selective", "always"}:
             parent_text = str(metadata.get("parent_text") or "")
@@ -829,7 +1101,55 @@ def postprocess_candidates(
                         "parent_expansion": profile.postprocess.parent_expansion,
                     }
                 )
-        candidate_tokens = len(content.split())
+        content_hash = str(metadata.get("content_hash") or stable_hash([content], 32))
+        parent_id = str(metadata.get("parent_chunk_id") or candidate.get("parent_chunk_id") or "")
+        content_unit_id = parent_id or f"content:{content_hash}"
+        metadata["content_unit_id"] = content_unit_id
+        supporting = list(metadata.get("supporting_chunk_ids") or [])
+        chunk_id = str(candidate.get("chunk_id") or "")
+        if chunk_id and chunk_id not in supporting:
+            supporting.append(chunk_id)
+        metadata["supporting_chunk_ids"] = supporting
+        if profile.postprocess.dedup and (content_hash in seen_hashes or content_unit_id in seen_units):
+            if content_unit_id in seen_units:
+                existing = seen_units[content_unit_id]
+                existing_meta = dict(existing.get("metadata") or {})
+                existing_ids = list(existing_meta.get("supporting_chunk_ids") or [])
+                if chunk_id and chunk_id not in existing_ids:
+                    existing_meta["supporting_chunk_ids"] = [*existing_ids, chunk_id]
+                    existing["metadata"] = existing_meta
+            events.append(
+                {
+                    **_decision_base(candidate),
+                    "stage": "context_selection",
+                    "decision": "dropped",
+                    "reason": "NEAR_DUPLICATE",
+                    "content_hash": content_hash,
+                }
+            )
+            continue
+        page_key = page_scope_key(candidate)
+        quota_reached = page_counts.get(page_key, 0) >= profile.postprocess.page_quota
+        existing_terms = set(normalize_for_embedding(" ".join(item["content"] for item in selected)).split())
+        candidate_terms = set(normalize_for_embedding(content).split())
+        query_terms = set(normalize_for_embedding(query).split())
+        novel_requirement = bool((candidate_terms & query_terms) - existing_terms)
+        candidate_values = set(_CONTEXT_VALUE_RE.findall(content))
+        selected_values = set(_CONTEXT_VALUE_RE.findall(" ".join(item["content"] for item in selected)))
+        if quota_reached and not (novel_requirement or candidate_values - selected_values):
+            deferred_by_quota.append({**candidate, "content": content, "metadata": metadata})
+            events.append(
+                {
+                    **_decision_base(candidate),
+                    "stage": "context_selection",
+                    "decision": "deferred",
+                    "reason": "PAGE_QUOTA",
+                    "page_quota": profile.postprocess.page_quota,
+                    "page_quota_policy_version": PAGE_QUOTA_POLICY_VERSION,
+                }
+            )
+            continue
+        candidate_tokens = _count_context_tokens(content)
         if profile.postprocess.context_packing == "token_budget" and used_tokens + candidate_tokens > token_budget:
             events.append(
                 {
@@ -844,7 +1164,9 @@ def postprocess_candidates(
             )
             continue
         seen_hashes.add(content_hash)
+        seen_units[content_unit_id] = selected_candidate = {**candidate, "content": content, "metadata": metadata}
         used_tokens += candidate_tokens
+        page_counts[page_key] = page_counts.get(page_key, 0) + 1
         final_rank = len(selected) + 1
         ranks = {**dict(candidate.get("ranks") or {}), "final": final_rank}
         query_context = dict(candidate.get("query_context") or {})
@@ -852,7 +1174,8 @@ def postprocess_candidates(
             metadata["query_context"] = query_context
             metadata["subquery_id"] = query_context.get("subquery_id")
             metadata["transform_id"] = query_context.get("transform_id")
-        selected_candidate = {**candidate, "content": content, "metadata": metadata, "ranks": ranks}
+        selected_candidate = {**selected_candidate, "ranks": ranks}
+        seen_units[content_unit_id] = selected_candidate
         selected.append(selected_candidate)
         events.append(
             {
@@ -866,7 +1189,75 @@ def postprocess_candidates(
         )
         if len(selected) >= max_evidence:
             break
+    # A second deterministic pass admits deferred candidates only when the
+    # normal quota left the context under-filled. This keeps page diversity as
+    # the default while allowing evidence that carries a new requirement.
+    evidence_target = min(profile.postprocess.final_evidence_min, max_evidence)
+    target_met = len(selected) >= evidence_target
+    if len(selected) < evidence_target:
+        for candidate in deferred_by_quota:
+            if len(selected) >= max_evidence:
+                break
+            content = str(candidate["content"])
+            content_hash = str(dict(candidate.get("metadata") or {}).get("content_hash") or stable_hash([content], 32))
+            unit = str(dict(candidate.get("metadata") or {}).get("content_unit_id") or f"content:{content_hash}")
+            if content_hash in seen_hashes or unit in seen_units:
+                continue
+            selected_text = " ".join(item["content"] for item in selected)
+            novel = bool(
+                (set(normalize_for_embedding(content).split()) & set(normalize_for_embedding(query).split()))
+                - set(normalize_for_embedding(selected_text).split())
+            )
+            novel_values = set(_CONTEXT_VALUE_RE.findall(content)) - set(_CONTEXT_VALUE_RE.findall(selected_text))
+            if not (novel or novel_values) and target_met:
+                continue
+            tokens = _count_context_tokens(content)
+            if profile.postprocess.context_packing == "token_budget" and used_tokens + tokens > token_budget:
+                continue
+            used_tokens += tokens
+            page_key = page_scope_key(candidate)
+            page_counts[page_key] = page_counts.get(page_key, 0) + 1
+            metadata = dict(candidate.get("metadata") or {})
+            metadata["quota_overflow"] = True
+            selected_candidate = {
+                **candidate,
+                "metadata": metadata,
+                "ranks": {**dict(candidate.get("ranks") or {}), "final": len(selected) + 1},
+            }
+            selected.append(selected_candidate)
+            seen_hashes.add(content_hash)
+            seen_units[unit] = selected_candidate
+            events.append(
+                {
+                    **_decision_base(selected_candidate),
+                    "stage": "context_selection",
+                    "decision": "selected",
+                    "reason": "NOVEL_REQUIREMENT_QUOTA_OVERFLOW",
+                    "final_rank": len(selected),
+                }
+            )
+            target_met = len(selected) >= evidence_target
+            if target_met:
+                break
+    events.append(
+        {
+            "stage": "context_selection",
+            "decision": "evidence_target",
+            "evidence_target": evidence_target,
+            "evidence_target_met": len(selected) >= evidence_target,
+        }
+    )
     return selected, events
+
+
+def _count_context_tokens(content: str) -> int:
+    """Stable tokenizer contract approximation used by context packing.
+
+    The gateway exposes a tokenizer contract, but retrieval must remain
+    deterministic when the gateway is unavailable. Unicode word/punctuation
+    segmentation is closer to model token accounting than whitespace counts.
+    """
+    return max(1, len(re.findall(r"\w+|[^\w\s]", content, flags=re.UNICODE)))
 
 
 def _decision_base(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -949,6 +1340,7 @@ def build_stage_events(
     timings_ms: dict[str, int] | None = None,
     contract: dict[str, Any] | None = None,
     query_context: dict[str, Any] | None = None,
+    apply_query_transforms: bool = True,
 ) -> list[dict[str, Any]]:
     timings = dict(timings_ms or {})
     contract_payload = dict(contract or {})
@@ -958,6 +1350,16 @@ def build_stage_events(
         subquery_id="sq.primary.1",
         query_role="primary",
         transform_type="normalization",
+    )
+    rewritten_query = (
+        bounded_rewrite(normalized_query)
+        if apply_query_transforms and profile.retrieval.query_rewrite != "off"
+        else None
+    )
+    decomposition = (
+        bounded_decomposition(normalized_query, max_subqueries=4)
+        if apply_query_transforms and profile.retrieval.query_decomposition != "off"
+        else []
     )
     query_refs = [query_ref_from_context(active_query_context, text=normalized_query, order=1)]
     events: list[dict[str, Any]] = [
@@ -977,38 +1379,38 @@ def build_stage_events(
             "stage": "query_transform",
             "stable_stage": "query_transform",
             "query_context": active_query_context,
-            "original_query": query,
-            "normalized_query": normalized_query,
-            "rewritten_query": None,
+            "original_query_hash": stable_hash(["retrieval_query", query], 32),
+            "normalized_query_hash": stable_hash(["retrieval_query", normalized_query], 32),
+            "query_length_chars": len(query),
+            "rewritten_query": stable_hash(["retrieval_query", rewritten_query], 32) if rewritten_query else None,
             "transforms": [
-                {"order": 1, "type": "original", "transform_id": "tr.original.1", "text": query},
+                {
+                    "order": 1,
+                    "type": "original",
+                    "transform_id": "tr.original.1",
+                    "hash": stable_hash(["retrieval_query", query], 32),
+                },
                 {
                     "order": 2,
                     "type": "normalization",
                     "transform_id": "tr.normalization.1",
-                    "text": normalized_query,
+                    "hash": stable_hash(["retrieval_query", normalized_query], 32),
                     "changed": query != normalized_query,
                 },
                 {
                     "order": 3,
                     "type": "rewrite",
                     "transform_id": "tr.rewrite.1",
-                    "status": "skipped",
-                    "reason": (
-                        "profile_query_rewrite_off"
-                        if profile.retrieval.query_rewrite == "off"
-                        else "no_rewrite_implementation_v1"
-                    ),
+                    "status": "performed" if rewritten_query else "skipped",
+                    "reason": "bounded_deterministic_rewrite_v1" if rewritten_query else "rewrite_not_applicable",
                 },
                 {
                     "order": 4,
                     "type": "decomposition",
                     "transform_id": "tr.decomposition.1",
-                    "status": "skipped",
+                    "status": "performed" if decomposition else "skipped",
                     "reason": (
-                        "profile_query_decomposition_off"
-                        if profile.retrieval.query_decomposition == "off"
-                        else "direct_retrieval_no_decomposition"
+                        "bounded_deterministic_decomposition_v1" if decomposition else "decomposition_not_applicable"
                     ),
                 },
             ],
@@ -1073,20 +1475,40 @@ def build_stage_events(
 
 def _candidate_debug(item: dict[str, Any], query_context: dict[str, Any] | None = None) -> dict[str, Any]:
     active_query_context = dict(item.get("query_context") or query_context or {})
-    return {
-        "chunk_id": item["chunk_id"],
-        "document_id": item.get("document_id"),
-        "knowledge_base_id": item.get("knowledge_base_id", ""),
-        "page_id": item.get("page_id"),
-        "subquery_id": item.get("subquery_id") or active_query_context.get("subquery_id"),
-        "transform_id": item.get("transform_id") or active_query_context.get("transform_id"),
-        "query_context": active_query_context,
-        "title": item["title"],
-        "source_url": item.get("source_url"),
-        "scores": item.get("scores", {}),
-        "ranks": item.get("ranks", {}),
-        "metadata": item.get("metadata", {}),
+    safe_metadata = {
+        key: value
+        for key, value in dict(item.get("metadata") or {}).items()
+        if key
+        in {
+            "source_type",
+            "source_document_id",
+            "source_chunk_id",
+            "document_version_id",
+            "content_hash",
+            "content_unit_id",
+            "supporting_chunk_ids",
+            "parent_expanded",
+            "neighbor_expanded",
+            "quota_overflow",
+        }
     }
+    projected = safe_telemetry_payload(
+        {
+            "chunk_id": item["chunk_id"],
+            "document_id": item.get("document_id"),
+            "knowledge_base_id": item.get("knowledge_base_id", ""),
+            "page_id": item.get("page_id"),
+            "subquery_id": item.get("subquery_id") or active_query_context.get("subquery_id"),
+            "transform_id": item.get("transform_id") or active_query_context.get("transform_id"),
+            "query_context": active_query_context,
+            "title": item["title"],
+            "source_url": item.get("source_url"),
+            "scores": item.get("scores", {}),
+            "ranks": item.get("ranks", {}),
+            "metadata": safe_metadata,
+        }
+    )
+    return dict(projected) if isinstance(projected, dict) else {}
 
 
 def _evidence_metadata(item: dict[str, Any], *, document_version_id: str) -> dict[str, Any]:
@@ -1136,7 +1558,8 @@ def query_ref_from_context(query_context: dict[str, Any], *, text: str, order: i
         "parent_subquery_id": query_context.get("parent_subquery_id"),
         "query_role": query_context.get("query_role"),
         "order": order,
-        "text": text,
+        "query_hash": stable_hash(["retrieval_query", text], 32),
+        "length_chars": len(text),
         "hash": query_context.get("query_hash") or stable_hash(["query_context", text], 32),
     }
 
@@ -1208,14 +1631,47 @@ def _answerability_event(answerability: Any, query_context: dict[str, Any]) -> d
 
 
 def apply_page_quota(candidates: list[dict[str, Any]], max_per_page: int) -> list[dict[str, Any]]:
-    counts: dict[int, int] = {}
+    counts: dict[tuple[str, str, str], int] = {}
     selected: list[dict[str, Any]] = []
     for candidate in candidates:
-        page_id = int(candidate.get("page_id") or 0)
-        counts[page_id] = counts.get(page_id, 0) + 1
-        if counts[page_id] <= max_per_page:
-            selected.append(candidate)
+        page_key = page_scope_key(candidate)
+        if counts.get(page_key, 0) >= max_per_page:
+            continue
+        counts[page_key] = counts.get(page_key, 0) + 1
+        selected.append(candidate)
     return selected
+
+
+PAGE_QUOTA_POLICY_VERSION = "document_scoped_page_quota_v2"
+
+
+def page_scope_key(candidate: dict[str, Any]) -> tuple[str, str, str]:
+    """Return a document-scoped page identity for context diversification.
+
+    Uploaded documents commonly restart their local page/chunk ordinals at one.
+    The document id is therefore part of the quota key; a missing locator falls
+    back to the chunk id so malformed/legacy rows cannot suppress one another.
+    """
+    metadata = dict(candidate.get("metadata") or {})
+    knowledge_base_id = str(candidate.get("knowledge_base_id") or metadata.get("knowledge_base_id") or "")
+    document_id = str(
+        candidate.get("document_id") or metadata.get("document_id") or candidate.get("chunk_id") or "unknown"
+    )
+    raw_locator = candidate.get("locator")
+    locator: dict[str, Any]
+    if isinstance(raw_locator, dict):
+        locator = raw_locator
+    else:
+        metadata_locator = metadata.get("locator")
+        locator = metadata_locator if isinstance(metadata_locator, dict) else {}
+    raw_page = candidate.get("page_id")
+    if raw_page is None:
+        raw_page = locator.get("page")
+    if raw_page is None:
+        raw_page = locator.get("page_id")
+    if raw_page is None:
+        raw_page = candidate.get("chunk_id") or "unknown"
+    return knowledge_base_id, document_id, str(raw_page)
 
 
 def _stable_contract_scope(contract_ids: list[str]) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -10,9 +11,45 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from wikipediarag.auth import ActorContext, KnowledgeBaseRole, PlatformRole, TenantRole, effective_knowledge_base_role
 from wikipediarag.db import json_dumps
 from wikipediarag.document_access import DocumentAccessScope, document_access_bypass, normalize_document_access
-from wikipediarag.ids import new_uuid, stable_hash, stable_uuid
+from wikipediarag.ids import new_uuid, scoped_id, stable_hash, stable_uuid
+from wikipediarag.observability import safe_telemetry_payload
 from wikipediarag.schemas import JobStatus
 from wikipediarag.wiki_dump import Chunk, WikiPage
+
+
+class StaleWorkerLeaseError(RuntimeError):
+    """Raised when a worker no longer owns the durable job lease."""
+
+
+_worker_lease_context: ContextVar[str | None] = ContextVar("worker_lease_id", default=None)
+
+
+def set_worker_lease_context(lease_id: str | None) -> object:
+    return _worker_lease_context.set(lease_id)
+
+
+def reset_worker_lease_context(token: object) -> None:
+    _worker_lease_context.reset(token)  # type: ignore[arg-type]
+
+
+UNSAFE_PUBLIC_METADATA_TOKENS = (
+    "SECRET",
+    "object_key",
+    "original_artifact_key",
+    "normalized_artifact_key",
+    "server_side_tokens",
+    "access_token",
+    "refresh_token",
+    "s3://",
+    "raw_provider_payload",
+)
+
+
+def research_evidence_ref(record_id: uuid.UUID | str) -> str:
+    """Return the stable public citation reference for an evidence record."""
+
+    parsed = record_id if isinstance(record_id, uuid.UUID) else uuid.UUID(str(record_id))
+    return f"E-{parsed.hex}"
 
 
 async def create_ingestion_job(
@@ -25,7 +62,7 @@ async def create_ingestion_job(
     job_id = new_uuid()
     await conn.execute(
         text(
-            """
+            """  # noqa: S608
             INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress)
             VALUES (:id, :tenant_id, :knowledge_base_id, :kind, 'received',
                     CAST(:config AS jsonb), CAST(:progress AS jsonb))
@@ -184,37 +221,76 @@ async def get_job(conn: AsyncConnection, job_id: str) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
-async def claim_next_job(conn: AsyncConnection) -> dict[str, Any] | None:
+async def claim_next_job(
+    conn: AsyncConnection,
+    *,
+    lease_id: str | None = None,
+    allowed_kinds: list[str] | tuple[str, ...] | None = None,
+    lease_seconds: int = 180,
+) -> dict[str, Any] | None:
+    lease_id = lease_id or str(uuid.uuid4())
+    kind_clause = ""
+    params: dict[str, Any] = {"lease_id": lease_id, "lease_seconds": max(int(lease_seconds), 1)}
+    if allowed_kinds:
+        placeholders = []
+        for index, kind in enumerate(allowed_kinds):
+            key = f"kind_{index}"
+            placeholders.append(f":{key}")
+            params[key] = kind
+        kind_clause = f"AND kind IN ({', '.join(placeholders)})"
+    result = await conn.execute(
+        text(
+            f"""
+            WITH candidate AS (
+                SELECT id
+                FROM ingestion_jobs
+                WHERE cancel_requested = false
+                  {kind_clause}
+                  AND (
+                    status = 'received'
+                    OR (status = 'running' AND worker_lease_expires_at IS NOT NULL
+                        AND worker_lease_expires_at < now())
+                  )
+                  AND (
+                    kind <> 'document_delete'
+                    OR config ->> 'purge_after' IS NULL
+                    OR (config ->> 'purge_after')::timestamptz <= now()
+                  )
+                ORDER BY created_at
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE ingestion_jobs AS job
+            SET status = 'running',
+                started_at = COALESCE(job.started_at, now()),
+                worker_lease_id = :lease_id,
+                worker_lease_expires_at = now() + make_interval(secs => :lease_seconds),
+                worker_last_heartbeat_at = now(),
+                updated_at = now()
+            FROM candidate
+            WHERE job.id = candidate.id
+            RETURNING job.*
+            """  # noqa: S608
+        ),
+        params,
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def heartbeat_job_lease(conn: AsyncConnection, *, job_id: str, lease_id: str, lease_seconds: int = 180) -> bool:
     result = await conn.execute(
         text(
             """
-            SELECT * FROM ingestion_jobs
-            WHERE status IN ('received','running') AND cancel_requested = false
-              AND (
-                kind <> 'document_delete'
-                OR config ->> 'purge_after' IS NULL
-                OR (config ->> 'purge_after')::timestamptz <= now()
-              )
-            ORDER BY created_at
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-            """
-        )
-    )
-    row = result.mappings().first()
-    if row is None:
-        return None
-    await conn.execute(
-        text(
-            """
             UPDATE ingestion_jobs
-            SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
-            WHERE id = :id
+            SET worker_lease_expires_at = now() + make_interval(secs => :lease_seconds),
+                worker_last_heartbeat_at = now(), updated_at = now()
+            WHERE id = :id AND status = 'running' AND worker_lease_id = :lease_id
             """
         ),
-        {"id": row["id"]},
+        {"id": job_id, "lease_id": lease_id, "lease_seconds": max(int(lease_seconds), 1)},
     )
-    return dict(row)
+    return bool(getattr(result, "rowcount", 0))
 
 
 async def update_job(
@@ -226,16 +302,26 @@ async def update_job(
     checkpoint: dict[str, Any] | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    lease_id: str | None = None,
 ) -> None:
     assignments = ["updated_at = now()"]
     params: dict[str, Any] = {"id": job_id}
+    lease_id = lease_id or _worker_lease_context.get()
+    lease_clause = ""
+    if lease_id is not None:
+        lease_clause = " AND worker_lease_id = :lease_id"
+        params["lease_id"] = lease_id
     if status is not None:
         assignments.append("status = :status")
         params["status"] = status.value
         if status in {JobStatus.completed, JobStatus.failed, JobStatus.cancelled}:
             assignments.append("completed_at = now()")
-        if status == JobStatus.completed:
+            assignments.extend(
+                ["worker_lease_id = NULL", "worker_lease_expires_at = NULL", "worker_last_heartbeat_at = NULL"]
+            )
+        if status == JobStatus.completed and error_code is None:
             assignments.append("error_code = NULL")
+        if status == JobStatus.completed and error_message is None:
             assignments.append("error_message = NULL")
     if progress is not None:
         assignments.append("progress = CAST(:progress AS jsonb)")
@@ -249,10 +335,12 @@ async def update_job(
     if error_message is not None:
         assignments.append("error_message = :error_message")
         params["error_message"] = error_message[:1000]
-    await conn.execute(
-        text(f"UPDATE ingestion_jobs SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
+    result = await conn.execute(
+        text(f"UPDATE ingestion_jobs SET {', '.join(assignments)} WHERE id = :id{lease_clause}"),  # noqa: S608
         params,
     )
+    if lease_id is not None and not getattr(result, "rowcount", 0):
+        raise StaleWorkerLeaseError(f"job lease lost: {job_id}")
 
 
 async def request_cancel(conn: AsyncConnection, job_id: str) -> None:
@@ -1439,8 +1527,9 @@ async def update_ingestion_job_item(
         params["status"] = status.value
         if status in {JobStatus.completed, JobStatus.failed, JobStatus.cancelled}:
             assignments.append("completed_at = now()")
-        if status == JobStatus.completed:
+        if status == JobStatus.completed and error_code is None:
             assignments.append("error_code = NULL")
+        if status == JobStatus.completed and error_message is None:
             assignments.append("error_message = NULL")
     if stage is not None:
         assignments.append("stage = :stage")
@@ -1991,7 +2080,15 @@ async def upsert_wiki_page_and_chunks(
     page: WikiPage,
     chunks: list[Chunk],
 ) -> None:
-    document_id = f"wiki:{snapshot_id}:{page.page_id}"
+    native_document_id = f"wiki:{snapshot_id}:{page.page_id}"
+    document_id = scoped_id(
+        "wiki-document",
+        page.page_id,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        source_type="wikipedia_xml",
+        snapshot_id=snapshot_id,
+    )
     metadata = {
         "page_id": page.page_id,
         "revision_id": page.revision_id,
@@ -2003,12 +2100,15 @@ async def upsert_wiki_page_and_chunks(
     await conn.execute(
         text(
             """
-            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata)
+            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata,
+                                  source_document_id, identity_scope)
             VALUES (:id, :tenant_id, :kb_id, 'wikipedia_xml', :title, :source_uri,
-                    CAST(:metadata AS jsonb))
+                    CAST(:metadata AS jsonb), :source_document_id, :identity_scope)
             ON CONFLICT (id) DO UPDATE
             SET title = EXCLUDED.title,
                 metadata = EXCLUDED.metadata,
+                source_document_id = EXCLUDED.source_document_id,
+                identity_scope = EXCLUDED.identity_scope,
                 updated_at = now()
             """
         ),
@@ -2018,7 +2118,43 @@ async def upsert_wiki_page_and_chunks(
             "kb_id": knowledge_base_id,
             "title": page.title,
             "source_uri": f"wikipedia://{snapshot_id}/{page.page_id}",
-            "metadata": json_dumps(metadata),
+            "metadata": json_dumps({**metadata, "source_document_id": native_document_id}),
+            "source_document_id": native_document_id,
+            "identity_scope": f"{tenant_id}:{knowledge_base_id}",
+        },
+    )
+    legacy_document_id = str(metadata.get("source_document_id") or document_id)
+    if legacy_document_id != document_id:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
+                VALUES (:tenant_id, :knowledge_base_id, 'document', :legacy_id, :scoped_id)
+                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
+                DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "knowledge_base_id": knowledge_base_id,
+                "legacy_id": legacy_document_id,
+                "scoped_id": document_id,
+            },
+        )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
+            VALUES (:tenant_id, :knowledge_base_id, 'document', :legacy_id, :scoped_id)
+            ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
+            DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "knowledge_base_id": knowledge_base_id,
+            "legacy_id": native_document_id,
+            "scoped_id": document_id,
         },
     )
     for chunk in chunks:
@@ -2042,14 +2178,16 @@ async def upsert_chunk(
               id, tenant_id, knowledge_base_id, document_id, page_id, revision_id, title,
               section_path, content, parent_chunk_id, prev_chunk_id, next_chunk_id,
               source_uri, source_url, embedding, content_hash, metadata,
-              document_version_id, chunk_ordinal, locator, publication_status
+              document_version_id, chunk_ordinal, locator, publication_status,
+              source_chunk_id, content_unit_id, identity_scope
             )
             VALUES (
               :id, :tenant_id, :kb_id, :document_id, :page_id, :revision_id, :title,
               :section_path, :content, :parent_chunk_id, :prev_chunk_id, :next_chunk_id,
               :source_uri, :source_url, CAST(:embedding AS jsonb), :content_hash,
               CAST(:metadata AS jsonb), :document_version_id, :chunk_ordinal,
-              CAST(:locator AS jsonb), :publication_status
+              CAST(:locator AS jsonb), :publication_status, :source_chunk_id,
+              :content_unit_id, :identity_scope
             )
             ON CONFLICT (id) DO UPDATE
             SET content = EXCLUDED.content,
@@ -2061,7 +2199,10 @@ async def upsert_chunk(
                 document_version_id = EXCLUDED.document_version_id,
                 chunk_ordinal = EXCLUDED.chunk_ordinal,
                 locator = EXCLUDED.locator,
-                publication_status = EXCLUDED.publication_status
+                publication_status = EXCLUDED.publication_status,
+                source_chunk_id = EXCLUDED.source_chunk_id,
+                content_unit_id = EXCLUDED.content_unit_id,
+                identity_scope = EXCLUDED.identity_scope
             """
         ),
         {
@@ -2082,12 +2223,33 @@ async def upsert_chunk(
             "embedding": json_dumps(chunk.embedding),
             "content_hash": chunk.content_hash,
             "metadata": json_dumps(metadata),
+            "source_chunk_id": str(metadata.get("source_chunk_id") or chunk.id),
+            "content_unit_id": str(metadata.get("content_unit_id") or metadata.get("parent_chunk_id") or chunk.id),
+            "identity_scope": f"{tenant_id}:{knowledge_base_id}",
             "document_version_id": metadata.get("document_version_id"),
             "chunk_ordinal": int(chunk_ordinal) if isinstance(chunk_ordinal, int | float | str) else None,
             "locator": json_dumps(locator),
             "publication_status": str(metadata.get("publication_status") or "published"),
         },
     )
+    legacy_chunk_id = str(metadata.get("source_chunk_id") or chunk.id)
+    if legacy_chunk_id != chunk.id:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
+                VALUES (:tenant_id, :knowledge_base_id, 'chunk', :legacy_id, :scoped_id)
+                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
+                DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "knowledge_base_id": knowledge_base_id,
+                "legacy_id": legacy_chunk_id,
+                "scoped_id": chunk.id,
+            },
+        )
 
 
 async def replace_document_sections_from_chunks(
@@ -2228,7 +2390,8 @@ async def fetch_chunks_for_dense_scan(
         text(
             """
             SELECT id, knowledge_base_id, title, section_path, content, source_uri, source_url,
-                   embedding, page_id, document_id, document_version_id, locator, metadata
+                   embedding, page_id, document_id, document_version_id, locator, metadata,
+                   parent_chunk_id, content_hash
             FROM chunks
             WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND publication_status = 'published'
             ORDER BY created_at DESC
@@ -2309,11 +2472,22 @@ async def fetch_chunk_by_id(
         text(
             """
             SELECT id, title, section_path, content, source_url, page_id, document_id,
+                   knowledge_base_id,
                    parent_chunk_id, prev_chunk_id, next_chunk_id, metadata
             FROM chunks
             WHERE tenant_id = :tenant_id
               AND knowledge_base_id = :kb_id
-              AND id = :chunk_id
+              AND (
+                id = :chunk_id
+                OR id = (
+                    SELECT scoped_id
+                    FROM legacy_id_mappings
+                    WHERE tenant_id = :tenant_id
+                      AND knowledge_base_id = :kb_id
+                      AND entity_kind = 'chunk'
+                      AND legacy_id = :chunk_id
+                )
+              )
               AND publication_status = 'published'
             """
         ),
@@ -2337,12 +2511,16 @@ async def upsert_document(
     await conn.execute(
         text(
             """
-            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata)
-            VALUES (:id, :tenant_id, :kb_id, :source_type, :title, :source_uri, CAST(:metadata AS jsonb))
+            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata,
+                                  source_document_id, identity_scope)
+            VALUES (:id, :tenant_id, :kb_id, :source_type, :title, :source_uri, CAST(:metadata AS jsonb),
+                    :source_document_id, :identity_scope)
             ON CONFLICT (id) DO UPDATE
             SET title = EXCLUDED.title,
                 source_uri = EXCLUDED.source_uri,
                 metadata = EXCLUDED.metadata,
+                source_document_id = EXCLUDED.source_document_id,
+                identity_scope = EXCLUDED.identity_scope,
                 updated_at = now()
             """
         ),
@@ -2354,8 +2532,28 @@ async def upsert_document(
             "title": title,
             "source_uri": source_uri,
             "metadata": json_dumps(metadata),
+            "source_document_id": str(metadata.get("source_document_id") or document_id),
+            "identity_scope": f"{tenant_id}:{knowledge_base_id}",
         },
     )
+    legacy_document_id = str(metadata.get("source_document_id") or document_id)
+    if legacy_document_id != document_id:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
+                VALUES (:tenant_id, :knowledge_base_id, 'document', :legacy_id, :scoped_id)
+                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
+                DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "knowledge_base_id": knowledge_base_id,
+                "legacy_id": legacy_document_id,
+                "scoped_id": document_id,
+            },
+        )
 
 
 async def save_index_version(
@@ -2379,16 +2577,18 @@ async def save_index_version(
             """
             INSERT INTO index_versions(
               id, tenant_id, knowledge_base_id, source_type, snapshot_id, retrieval_profile,
-              embedding_alias, embedding_dimensions, physical_index, read_alias, write_alias, metadata
+              embedding_alias, embedding_dimensions, physical_index, read_alias, write_alias, metadata,
+              identity_scope
             )
             VALUES (
               :id, :tenant_id, :kb_id, :source_type, :snapshot_id, :retrieval_profile,
               :embedding_alias, :embedding_dimensions, :physical_index, :read_alias, :write_alias,
-              CAST(:metadata AS jsonb)
+              CAST(:metadata AS jsonb), :identity_scope
             )
             ON CONFLICT (id) DO UPDATE
             SET status = 'active',
                 metadata = EXCLUDED.metadata,
+                identity_scope = EXCLUDED.identity_scope,
                 updated_at = now()
             """
         ),
@@ -2405,8 +2605,27 @@ async def save_index_version(
             "read_alias": read_alias,
             "write_alias": write_alias,
             "metadata": json_dumps(metadata),
+            "identity_scope": f"{tenant_id}:{knowledge_base_id}",
         },
     )
+    legacy_index_id = str(metadata.get("source_index_version_id") or index_version_id)
+    if legacy_index_id != index_version_id:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
+                VALUES (:tenant_id, :knowledge_base_id, 'index_version', :legacy_id, :scoped_id)
+                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
+                DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "knowledge_base_id": knowledge_base_id,
+                "legacy_id": legacy_index_id,
+                "scoped_id": index_version_id,
+            },
+        )
 
 
 async def load_index_version_by_read_alias(
@@ -2842,6 +3061,15 @@ async def insert_retrieval_event(
     stage: str,
     payload: dict[str, Any],
 ) -> None:
+    safe_payload = safe_telemetry_payload(payload)
+    encoded = json_dumps(safe_payload)
+    if len(encoded.encode("utf-8")) > 256 * 1024:
+        safe_payload = {
+            "event_truncated": True,
+            "payload_hash": stable_hash([encoded], 32),
+            "payload_bytes": len(encoded.encode("utf-8")),
+        }
+        encoded = json_dumps(safe_payload)
     await conn.execute(
         text(
             """
@@ -2857,7 +3085,7 @@ async def insert_retrieval_event(
             "trace_id": trace_id,
             "event_type": event_type,
             "stage": stage,
-            "payload": json_dumps(payload),
+            "payload": encoded,
         },
     )
 
@@ -2866,10 +3094,10 @@ async def load_retrieval_events(conn: AsyncConnection, tenant_id: str, query_run
     result = await conn.execute(
         text(
             """
-            SELECT event_type, stage, payload, created_at
+            SELECT event_type, stage, payload, created_at, sequence
             FROM retrieval_events
             WHERE tenant_id = :tenant_id AND query_run_id = :query_run_id
-            ORDER BY created_at
+            ORDER BY sequence
             """
         ),
         {"tenant_id": tenant_id, "query_run_id": query_run_id},
@@ -2890,8 +3118,10 @@ async def create_query_run(
     trace_id: str,
     usage: dict[str, Any] | None = None,
 ) -> uuid.UUID:
-    query_run_id = new_uuid()
-    await conn.execute(
+    # The request identifies the logical episode, not a model attempt.  A
+    # retry after a failure before episode creation must find the same row.
+    query_run_id = stable_uuid(["query_run_v3", request_id])
+    result = await conn.execute(
         text(
             """
             INSERT INTO query_runs(
@@ -2900,6 +3130,8 @@ async def create_query_run(
             )
             VALUES (:id, :tenant_id, :knowledge_base_id, :user_id, :request_id, :client_request_id, :mode,
                     'running', :input_text, CAST(:usage AS jsonb), :trace_id, now())
+            ON CONFLICT (request_id) DO NOTHING
+            RETURNING id
             """
         ),
         {
@@ -2915,6 +3147,18 @@ async def create_query_run(
             "trace_id": trace_id,
         },
     )
+    mappings = getattr(result, "mappings", None)
+    row = mappings().first() if callable(mappings) else None
+    if row is not None and row.get("id") is not None:
+        return uuid.UUID(str(row["id"]))
+    existing = await conn.execute(
+        text("SELECT id FROM query_runs WHERE tenant_id = :tenant_id AND request_id = :request_id"),
+        {"tenant_id": tenant_id, "request_id": request_id},
+    )
+    existing_mappings = getattr(existing, "mappings", None)
+    existing_row = existing_mappings().first() if callable(existing_mappings) else None
+    if existing_row is not None and existing_row.get("id") is not None:
+        return uuid.UUID(str(existing_row["id"]))
     return query_run_id
 
 
@@ -3194,20 +3438,183 @@ async def fail_query_run(conn: AsyncConnection, *, query_run_id: str, error_code
     )
 
 
+async def create_research_plan(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    knowledge_base_ids: list[str] | None = None,
+    user_id: str,
+    topic: str,
+    retrieval_profile: str,
+    tool_mode: str,
+    retrieval_overrides: dict[str, Any],
+    context_policy: dict[str, Any],
+    questions: list[dict[str, Any]],
+    notes: str,
+) -> uuid.UUID:
+    plan_id = new_uuid()
+    scope_ids = list(dict.fromkeys(str(item) for item in (knowledge_base_ids or [knowledge_base_id]) if str(item)))
+    if knowledge_base_id not in scope_ids:
+        scope_ids.insert(0, knowledge_base_id)
+    await conn.execute(
+        text(
+            """
+            INSERT INTO research_plans(
+              id, tenant_id, knowledge_base_id, user_id, topic, knowledge_base_ids,
+              retrieval_profile, tool_mode, retrieval_overrides, context_policy, notes, questions, status
+            )
+            VALUES (
+              :id, :tenant_id, :kb_id, :user_id, :topic, CAST(:knowledge_base_ids AS jsonb),
+              :retrieval_profile, :tool_mode, CAST(:retrieval_overrides AS jsonb), CAST(:context_policy AS jsonb),
+              :notes, CAST(:questions AS jsonb), 'draft'
+            )
+            """
+        ),
+        {
+            "id": str(plan_id),
+            "tenant_id": tenant_id,
+            "kb_id": knowledge_base_id,
+            "user_id": user_id,
+            "topic": topic,
+            "knowledge_base_ids": json_dumps(scope_ids),
+            "retrieval_profile": retrieval_profile,
+            "tool_mode": tool_mode,
+            "retrieval_overrides": json_dumps(retrieval_overrides),
+            "context_policy": json_dumps(context_policy),
+            "notes": notes[:4000],
+            "questions": json_dumps(questions),
+        },
+    )
+    return plan_id
+
+
+async def list_research_plans(conn: AsyncConnection, *, tenant_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, tenant_id, knowledge_base_id, user_id, topic, knowledge_base_ids, retrieval_profile,
+                   tool_mode, notes, questions, status, approved_run_id, approved_at, created_at, updated_at
+            FROM research_plans
+            WHERE tenant_id = :tenant_id
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"tenant_id": tenant_id, "limit": limit},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def get_research_plan(conn: AsyncConnection, *, tenant_id: str, research_plan_id: str) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text("SELECT * FROM research_plans WHERE tenant_id = :tenant_id AND id = :id"),
+        {"tenant_id": tenant_id, "id": research_plan_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def update_research_plan(
+    conn: AsyncConnection,
+    *,
+    research_plan_id: str,
+    topic: str | None = None,
+    knowledge_base_id: str | None = None,
+    knowledge_base_ids: list[str] | None = None,
+    retrieval_profile: str | None = None,
+    tool_mode: str | None = None,
+    retrieval_overrides: dict[str, Any] | None = None,
+    context_policy: dict[str, Any] | None = None,
+    questions: list[dict[str, Any]] | None = None,
+    notes: str | None = None,
+) -> None:
+    assignments = ["updated_at = now()"]
+    params: dict[str, Any] = {"id": research_plan_id}
+    if topic is not None:
+        assignments.append("topic = :topic")
+        params["topic"] = topic
+    if knowledge_base_id is not None:
+        assignments.append("knowledge_base_id = :knowledge_base_id")
+        params["knowledge_base_id"] = knowledge_base_id
+    if knowledge_base_ids is not None:
+        assignments.append("knowledge_base_ids = CAST(:knowledge_base_ids AS jsonb)")
+        params["knowledge_base_ids"] = json_dumps(knowledge_base_ids)
+    if retrieval_profile is not None:
+        assignments.append("retrieval_profile = :retrieval_profile")
+        params["retrieval_profile"] = retrieval_profile
+    if tool_mode is not None:
+        assignments.append("tool_mode = :tool_mode")
+        params["tool_mode"] = tool_mode
+    if retrieval_overrides is not None:
+        assignments.append("retrieval_overrides = CAST(:retrieval_overrides AS jsonb)")
+        params["retrieval_overrides"] = json_dumps(retrieval_overrides)
+    if context_policy is not None:
+        assignments.append("context_policy = CAST(:context_policy AS jsonb)")
+        params["context_policy"] = json_dumps(context_policy)
+    if questions is not None:
+        assignments.append("questions = CAST(:questions AS jsonb)")
+        params["questions"] = json_dumps(questions)
+    if notes is not None:
+        assignments.append("notes = :notes")
+        params["notes"] = notes[:4000]
+    await conn.execute(
+        text(f"UPDATE research_plans SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
+        params,
+    )
+
+
+async def approve_research_plan(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_plan_id: str,
+    approved_by_user_id: str,
+    run_id: str,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE research_plans
+            SET status = 'approved',
+                approved_run_id = :run_id,
+                approved_at = now(),
+                approved_by_user_id = :approved_by_user_id,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND id = :id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "id": research_plan_id,
+            "approved_by_user_id": approved_by_user_id,
+            "run_id": run_id,
+        },
+    )
+
+
 async def create_research_run(
     conn: AsyncConnection,
     *,
     tenant_id: str,
     knowledge_base_id: str,
+    knowledge_base_ids: list[str] | None = None,
     user_id: str,
     topic: str,
     retrieval_profile: str,
+    tool_mode: str,
     retrieval_overrides: dict[str, Any],
     context_policy: dict[str, Any],
     questions: list[str],
+    research_plan_id: str | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     run_id = new_uuid()
     job_id = new_uuid()
+    scope_ids = list(dict.fromkeys(str(item) for item in (knowledge_base_ids or [knowledge_base_id]) if str(item)))
+    if knowledge_base_id not in scope_ids:
+        scope_ids.insert(0, knowledge_base_id)
+    if not 1 <= len(scope_ids) <= 3:
+        raise ValueError("research run scope must contain between one and three knowledge bases")
     await conn.execute(
         text(
             """
@@ -3220,8 +3627,23 @@ async def create_research_run(
             "id": str(job_id),
             "tenant_id": tenant_id,
             "kb_id": knowledge_base_id,
-            "config": json_dumps({"research_run_id": str(run_id)}),
-            "progress": json_dumps({"stage": "received", "research_run_id": str(run_id)}),
+            "config": json_dumps(
+                {
+                    "research_run_id": str(run_id),
+                    "knowledge_base_ids": scope_ids,
+                    "tool_mode": tool_mode,
+                    "research_plan_id": research_plan_id,
+                }
+            ),
+            "progress": json_dumps(
+                {
+                    "stage": "received",
+                    "research_run_id": str(run_id),
+                    "knowledge_base_ids": scope_ids,
+                    "tool_mode": tool_mode,
+                    "research_plan_id": research_plan_id,
+                }
+            ),
         },
     )
     await conn.execute(
@@ -3229,12 +3651,12 @@ async def create_research_run(
             """
             INSERT INTO research_runs(
               id, tenant_id, knowledge_base_id, user_id, active_job_id, topic, retrieval_profile,
-              retrieval_overrides, status, progress, checkpoint, context_policy
+              tool_mode, retrieval_overrides, status, progress, checkpoint, context_policy, research_plan_id
             )
             VALUES (
               :id, :tenant_id, :kb_id, :user_id, :job_id, :topic, :profile,
-              CAST(:overrides AS jsonb), 'received', CAST(:progress AS jsonb),
-              CAST(:checkpoint AS jsonb), CAST(:context_policy AS jsonb)
+              :tool_mode, CAST(:overrides AS jsonb), 'received', CAST(:progress AS jsonb),
+              CAST(:checkpoint AS jsonb), CAST(:context_policy AS jsonb), :research_plan_id
             )
             """
         ),
@@ -3246,21 +3668,51 @@ async def create_research_run(
             "job_id": str(job_id),
             "topic": topic,
             "profile": retrieval_profile,
+            "tool_mode": tool_mode,
             "overrides": json_dumps(retrieval_overrides),
-            "progress": json_dumps({"stage": "received", "questions_total": len(questions)}),
+            "progress": json_dumps(
+                {
+                    "stage": "received",
+                    "questions_total": len(questions),
+                    "tool_mode": tool_mode,
+                    "research_plan_id": research_plan_id,
+                }
+            ),
             "checkpoint": json_dumps({}),
             "context_policy": json_dumps(context_policy),
+            "research_plan_id": research_plan_id,
         },
     )
+    for ordinal, scope_id in enumerate(scope_ids, start=1):
+        await conn.execute(
+            text(
+                """
+                INSERT INTO research_run_scopes(
+                  id, tenant_id, research_run_id, knowledge_base_id, ordinal, access_snapshot
+                )
+                VALUES (:id, :tenant_id, :run_id, :kb_id, :ordinal, CAST(:snapshot AS jsonb))
+                """
+            ),
+            {
+                "id": str(new_uuid()),
+                "tenant_id": tenant_id,
+                "run_id": str(run_id),
+                "kb_id": scope_id,
+                "ordinal": ordinal,
+                "snapshot": json_dumps({"version": "research_scope_snapshot_v1", "role": "viewer"}),
+            },
+        )
     for ordinal, question in enumerate(questions, start=1):
         await conn.execute(
             text(
                 """
                 INSERT INTO research_questions(
-                  id, tenant_id, research_run_id, question, ordinal, kind, status, acceptance, metadata
+                  id, tenant_id, research_run_id, question, ordinal, kind, status,
+                  execution_state, outcome, attempt_count, rewrite_count, depth, budget, acceptance, metadata
                 )
                 VALUES (
                   :id, :tenant_id, :run_id, :question, :ordinal, :kind, 'open',
+                  'pending', NULL, 0, 0, 0, CAST(:budget AS jsonb),
                   CAST(:acceptance AS jsonb), CAST(:metadata AS jsonb)
                 )
                 """
@@ -3272,7 +3724,8 @@ async def create_research_run(
                 "question": question,
                 "ordinal": ordinal,
                 "kind": "primary" if ordinal == 1 else "decomposition",
-                "acceptance": json_dumps({"requires_evidence": True}),
+                "acceptance": json_dumps({"requires_evidence": True, "priority": "required"}),
+                "budget": json_dumps({}),
                 "metadata": json_dumps({}),
             },
         )
@@ -3285,6 +3738,8 @@ async def create_research_resume_job(
     tenant_id: str,
     knowledge_base_id: str,
     research_run_id: str,
+    knowledge_base_ids: list[str] | None = None,
+    tool_mode: str,
 ) -> uuid.UUID:
     existing = await conn.execute(
         text(
@@ -3307,6 +3762,9 @@ async def create_research_resume_job(
     if row is not None:
         return uuid.UUID(str(row["id"]))
     job_id = new_uuid()
+    scope_ids = list(dict.fromkeys(str(item) for item in (knowledge_base_ids or [knowledge_base_id]) if str(item)))
+    if knowledge_base_id not in scope_ids:
+        scope_ids.insert(0, knowledge_base_id)
     await conn.execute(
         text(
             """
@@ -3319,8 +3777,17 @@ async def create_research_resume_job(
             "id": str(job_id),
             "tenant_id": tenant_id,
             "kb_id": knowledge_base_id,
-            "config": json_dumps({"research_run_id": research_run_id}),
-            "progress": json_dumps({"stage": "resume_received", "research_run_id": research_run_id}),
+            "config": json_dumps(
+                {"research_run_id": research_run_id, "knowledge_base_ids": scope_ids, "tool_mode": tool_mode}
+            ),
+            "progress": json_dumps(
+                {
+                    "stage": "resume_received",
+                    "research_run_id": research_run_id,
+                    "knowledge_base_ids": scope_ids,
+                    "tool_mode": tool_mode,
+                }
+            ),
         },
     )
     await conn.execute(
@@ -3345,7 +3812,8 @@ async def list_research_runs(conn: AsyncConnection, *, tenant_id: str, limit: in
         text(
             """
             SELECT id, tenant_id, knowledge_base_id, user_id, active_job_id, topic, retrieval_profile,
-                   status, progress, stop_reason, error_code, created_at, updated_at, completed_at
+                   tool_mode, status, progress, stop_reason, error_code, created_at, updated_at, completed_at,
+                   research_plan_id
             FROM research_runs
             WHERE tenant_id = :tenant_id
             ORDER BY created_at DESC
@@ -3353,6 +3821,23 @@ async def list_research_runs(conn: AsyncConnection, *, tenant_id: str, limit: in
             """
         ),
         {"tenant_id": tenant_id, "limit": limit},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def load_research_run_scopes(
+    conn: AsyncConnection, *, tenant_id: str, research_run_id: str
+) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, tenant_id, research_run_id, knowledge_base_id, ordinal, access_snapshot, created_at
+            FROM research_run_scopes
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY ordinal
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id},
     )
     return [dict(row) for row in result.mappings()]
 
@@ -3372,7 +3857,8 @@ async def load_research_run_questions(
     result = await conn.execute(
         text(
             """
-            SELECT id, question, ordinal, kind, status, acceptance, metadata, created_at, updated_at
+            SELECT id, question, ordinal, kind, status, acceptance, metadata,
+                   execution_state, outcome, attempt_count, rewrite_count, depth, budget, created_at, updated_at
             FROM research_questions
             WHERE tenant_id = :tenant_id AND research_run_id = :run_id
             ORDER BY ordinal
@@ -3393,8 +3879,37 @@ async def load_next_research_question(
             FROM research_questions
             WHERE tenant_id = :tenant_id
               AND research_run_id = :run_id
-              AND status IN ('open','running')
-            ORDER BY ordinal
+              AND execution_state IN ('pending','running')
+              AND status IN ('open','running','partial','conflicting')
+            ORDER BY created_at, id
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id},
+    )
+    return select_next_question([dict(row) for row in result.mappings()])
+
+
+async def load_resumable_research_episode(
+    conn: AsyncConnection, *, tenant_id: str, research_run_id: str
+) -> dict[str, Any] | None:
+    """Return the oldest non-terminal episode before selecting a new question.
+
+    A worker restart must continue the durable episode instead of deriving a
+    new episode index from the number of rows already visible.  The row is
+    intentionally not locked here: the run lease is the cross-worker guard;
+    stage transitions use their own compare-and-set predicate.
+    """
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, query_run_id, episode_index, question_id, status, stage,
+                   context_summary, metrics, error_code, created_at, completed_at
+            FROM research_episodes
+            WHERE tenant_id = :tenant_id
+              AND research_run_id = :run_id
+              AND status NOT IN ('completed','failed','cancelled')
+              AND stage NOT IN ('completed','failed')
+            ORDER BY episode_index, created_at, id
             LIMIT 1
             """
         ),
@@ -3402,6 +3917,604 @@ async def load_next_research_question(
     )
     row = result.mappings().first()
     return dict(row) if row is not None else None
+
+
+def select_next_question(questions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Select the next executable question with deterministic priority and tie-breaks."""
+    active = [
+        row
+        for row in questions
+        if str(row.get("execution_state") or "pending") in {"pending", "running"}
+        and str(row.get("status") or "open") in {"open", "running", "partial", "conflicting"}
+    ]
+    if not active:
+        return None
+    return sorted(
+        active,
+        key=lambda row: (
+            _research_question_priority(row),
+            _stable_created_at(row.get("created_at")),
+            str(row.get("id") or ""),
+        ),
+    )[0]
+
+
+def _research_question_priority(row: dict[str, Any]) -> int:
+    raw_acceptance: Any = row.get("acceptance")
+    raw_metadata: Any = row.get("metadata")
+    acceptance: dict[str, Any] = raw_acceptance if isinstance(raw_acceptance, dict) else {}
+    metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+    explicit = str(acceptance.get("priority") or metadata.get("priority") or "").casefold()
+    if explicit == "required":
+        return 0
+    if explicit == "bridge":
+        return 1
+    if explicit == "normal":
+        return 2
+    if str(row.get("kind") or "").casefold() in {"primary", "decomposition"}:
+        return 0
+    rationale = str(metadata.get("rationale") or "").casefold()
+    needed = " ".join(str(item) for item in acceptance.get("needed_evidence") or []).casefold()
+    if "bridge" in rationale or any(token in f"{rationale} {needed}" for token in ("blocking", "approval", "owner")):
+        return 1
+    return 2
+
+
+def _stable_created_at(value: Any) -> str:
+    return value.isoformat() if isinstance(value, datetime) else str(value or "")
+
+
+async def transition_research_question(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    question_id: str,
+    execution_state: str,
+    outcome: str | None,
+    reason: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    if execution_state not in {"pending", "running", "done"}:
+        raise ValueError("invalid research question execution_state")
+    if outcome not in {None, "covered", "partial", "exhausted", "failed"}:
+        raise ValueError("invalid research question outcome")
+    if (execution_state == "done") != (outcome is not None):
+        raise ValueError("done questions require an outcome and non-done questions require null outcome")
+    status = str(outcome) if execution_state == "done" else ("running" if execution_state == "running" else "open")
+    metadata_update: dict[str, str] = {}
+    if reason:
+        metadata_update["termination_reason"] = reason[:240]
+    if error_code:
+        metadata_update["error_code"] = error_code[:120]
+    await conn.execute(
+        text(
+            """
+            UPDATE research_questions
+            SET execution_state = :execution_state,
+                outcome = :outcome,
+                status = :status,
+                metadata = CASE WHEN CAST(:metadata_update AS jsonb) = '{}'::jsonb
+                                THEN metadata ELSE metadata || CAST(:metadata_update AS jsonb) END,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id AND id = :question_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "question_id": question_id,
+            "execution_state": execution_state,
+            "outcome": outcome,
+            "status": status,
+            "metadata_update": json_dumps(metadata_update),
+        },
+    )
+
+
+async def initialize_research_question_budget(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    question_id: str,
+    budget: dict[str, int],
+) -> None:
+    safe_budget = {key: int(budget[key]) for key in ("max_attempts", "max_rewrites", "max_depth") if key in budget}
+    await conn.execute(
+        text(
+            """
+            UPDATE research_questions
+            SET budget = CASE WHEN budget = '{}'::jsonb THEN CAST(:budget AS jsonb) ELSE budget END,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id AND id = :question_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "question_id": question_id,
+            "budget": json_dumps(safe_budget),
+        },
+    )
+
+
+async def record_research_question_attempt(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    question_id: str,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE research_questions
+            SET execution_state = 'running',
+                outcome = NULL,
+                status = 'running',
+                attempt_count = attempt_count + 1,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id AND id = :question_id
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id, "question_id": question_id},
+    )
+
+
+async def record_research_question_rewrites(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    question_id: str,
+    rewrite_count: int,
+) -> None:
+    if rewrite_count < 0:
+        raise ValueError("rewrite_count must be non-negative")
+    if rewrite_count == 0:
+        return
+    await conn.execute(
+        text(
+            """
+            UPDATE research_questions
+            SET rewrite_count = rewrite_count + :rewrite_count,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id AND id = :question_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "question_id": question_id,
+            "rewrite_count": rewrite_count,
+        },
+    )
+
+
+async def terminalize_research_questions(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    reason: str,
+    required_only: bool = False,
+    outcome: str = "exhausted",
+) -> int:
+    if outcome not in {"exhausted", "failed"}:
+        raise ValueError("terminal question outcome must be exhausted or failed")
+    questions = await load_research_run_questions(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+    count = 0
+    for row in questions:
+        if str(row.get("execution_state") or "pending") == "done":
+            continue
+        if required_only and _research_question_priority(row) != 0:
+            continue
+        await transition_research_question(
+            conn,
+            tenant_id=tenant_id,
+            research_run_id=research_run_id,
+            question_id=str(row["id"]),
+            execution_state="done",
+            outcome=outcome,
+            reason=reason,
+        )
+        count += 1
+    return count
+
+
+async def append_research_questions(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    questions: list[Any],
+    source_episode_id: str | None = None,
+    source_evidence_ids: list[str] | None = None,
+    max_total_questions: int = 24,
+    max_append: int = 5,
+    source_depth: int = 0,
+    max_depth: int = 3,
+) -> list[str]:
+    if max_total_questions < 1:
+        raise ValueError("max_total_questions must be >= 1")
+    if max_append < 1:
+        return []
+    existing = await load_research_run_questions(conn, tenant_id=tenant_id, research_run_id=research_run_id)
+    seen = {
+        _research_question_duplicate_key(str(row.get("question") or ""))
+        for row in existing
+        if str(row.get("question") or "")
+    }
+    ordinal_result = await conn.execute(
+        text(
+            """
+            SELECT COALESCE(MAX(ordinal), 0) AS max_ordinal, COUNT(*) AS total
+            FROM research_questions
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id},
+    )
+    ordinal_row = ordinal_result.mappings().first()
+    max_ordinal = int(ordinal_row["max_ordinal"]) if ordinal_row is not None else len(existing)
+    total = int(ordinal_row["total"]) if ordinal_row is not None else len(existing)
+    remaining = max(0, max_total_questions - total)
+    inserted: list[str] = []
+    next_ordinal = max_ordinal + 1
+    for raw in questions:
+        if len(inserted) >= min(max_append, remaining):
+            break
+        payload = _research_question_payload(raw)
+        question = str(payload.get("question") or "").strip()
+        if not question:
+            continue
+        duplicate_key = _research_question_duplicate_key(question)
+        if not duplicate_key or duplicate_key in seen:
+            continue
+        question_id = str(stable_uuid(["research_question_v2", research_run_id, duplicate_key]))
+        question_depth = int(payload.get("depth") or source_depth + 1)
+        if question_depth > max_depth:
+            continue
+        priority = _derived_question_priority(payload)
+        acceptance = {
+            "requires_evidence": True,
+            "priority": priority,
+            "needed_evidence": list(payload.get("needed_evidence") or []),
+        }
+        metadata = _assert_public_safe_metadata(
+            {
+                "source": "research_planner_v1",
+                "lineage": {
+                    "source_episode_id": source_episode_id,
+                    "source_evidence_ids": list(source_evidence_ids or []),
+                },
+                "duplicate_key": duplicate_key,
+                "rationale": str(payload.get("rationale") or "")[:1000],
+                "priority": priority,
+                "depth": question_depth,
+            }
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO research_questions(
+                  id, tenant_id, research_run_id, question, ordinal, kind, status,
+                  execution_state, outcome, attempt_count, rewrite_count, depth, budget, acceptance, metadata
+                )
+                VALUES (
+                  :id, :tenant_id, :run_id, :question, :ordinal, 'derived', 'open',
+                  'pending', NULL, 0, 0, :depth, CAST(:budget AS jsonb),
+                  CAST(:acceptance AS jsonb), CAST(:metadata AS jsonb)
+                )
+                ON CONFLICT (id) DO NOTHING
+                """
+            ),
+            {
+                "id": question_id,
+                "tenant_id": tenant_id,
+                "run_id": research_run_id,
+                "question": question,
+                "ordinal": next_ordinal,
+                "depth": question_depth,
+                "budget": json_dumps({}),
+                "acceptance": json_dumps(acceptance),
+                "metadata": json_dumps(metadata),
+            },
+        )
+        inserted.append(question_id)
+        seen.add(duplicate_key)
+        next_ordinal += 1
+    return inserted
+
+
+async def create_research_tool_call(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    episode_id: str | None,
+    question_id: str | None,
+    query_run_id: str | None,
+    tool_name: str,
+    tool_query_hash: str,
+    tool_args_hash: str | None = None,
+    validated_args: dict[str, Any] | None = None,
+    safe_metadata: dict[str, Any],
+) -> uuid.UUID:
+    call_id = stable_uuid(
+        [
+            "research_tool_call_v1",
+            research_run_id,
+            episode_id or "",
+            question_id or "",
+            query_run_id or "",
+            tool_name,
+            tool_query_hash,
+            tool_args_hash or "",
+        ]
+    )
+    insert_result = await conn.execute(
+        text(
+            """
+            INSERT INTO research_tool_calls(
+              id, tenant_id, research_run_id, episode_id, question_id, query_run_id,
+              tool_name, tool_query_hash, tool_args_hash, status, safe_metadata, validated_args,
+              execution_attempts, last_heartbeat_at, started_at
+            )
+            VALUES (
+              :id, :tenant_id, :run_id, :episode_id, :question_id, :query_run_id,
+              :tool_name, :tool_query_hash, :tool_args_hash, 'running', CAST(:safe_metadata AS jsonb),
+              CAST(:validated_args AS jsonb), 1, now(), now()
+            )
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
+            """
+        ),
+        {
+            "id": str(call_id),
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "episode_id": episode_id,
+            "question_id": question_id,
+            "query_run_id": query_run_id,
+            "tool_name": tool_name,
+            "tool_query_hash": tool_query_hash,
+            "tool_args_hash": tool_args_hash,
+            "safe_metadata": json_dumps(_assert_public_safe_metadata(safe_metadata)),
+            "validated_args": json_dumps(validated_args or {}),
+        },
+    )
+    inserted = insert_result.mappings().first() is not None
+    existing = await conn.execute(
+        text(
+            """
+            SELECT tool_name, tool_query_hash, tool_args_hash
+            FROM research_tool_calls
+            WHERE id = :id
+            """
+        ),
+        {"id": str(call_id)},
+    )
+    existing_row = existing.mappings().first()
+    if existing_row is not None:
+        if (
+            str(existing_row.get("tool_name") or "") != tool_name
+            or str(existing_row.get("tool_query_hash") or "") != tool_query_hash
+            or str(existing_row.get("tool_args_hash") or "") != str(tool_args_hash or "")
+        ):
+            raise ValueError("research tool call identity does not match the existing ledger row")
+        if not inserted:
+            await conn.execute(
+                text(
+                    """
+                    UPDATE research_tool_calls
+                    SET execution_attempts = execution_attempts + 1,
+                        last_heartbeat_at = now(),
+                        updated_at = now()
+                    WHERE id = :id AND status IN ('running','stalled')
+                    """
+                ),
+                {"id": str(call_id)},
+            )
+    return call_id
+
+
+async def update_research_tool_call(
+    conn: AsyncConnection,
+    *,
+    tool_call_id: str,
+    status: str,
+    result_summary: dict[str, Any] | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE research_tool_calls
+            SET status = :status,
+                result_summary = CASE
+                  WHEN CAST(:result_summary AS jsonb) = '{}'::jsonb THEN result_summary
+                  ELSE CAST(:result_summary AS jsonb)
+                END,
+                error_code = :error_code,
+                error_message = :error_message,
+                completed_at = CASE
+                  WHEN :status IN ('completed','failed','cancelled','stalled') THEN now()
+                  ELSE completed_at
+                END,
+                updated_at = now()
+            WHERE id = :id
+              AND (status <> 'completed' OR :status = 'completed')
+            """
+        ),
+        {
+            "id": tool_call_id,
+            "status": status,
+            "result_summary": json_dumps(_assert_public_safe_metadata(result_summary or {})),
+            "error_code": error_code[:120] if error_code else None,
+            "error_message": error_message[:1000] if error_message else None,
+        },
+    )
+
+
+async def touch_research_heartbeat(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    episode_id: str | None = None,
+    tool_call_id: str | None = None,
+    lease_id: str | None = None,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE research_runs
+            SET last_heartbeat_at = now(),
+                controller_lease_expires_at = CASE
+                  WHEN CAST(:lease_id AS text) IS NULL
+                       OR controller_lease_id <> CAST(:lease_id AS text)
+                    THEN controller_lease_expires_at
+                  ELSE now() + interval '120 seconds'
+                END,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND id = :run_id
+              AND (CAST(:lease_id AS text) IS NULL OR controller_lease_id = CAST(:lease_id AS text))
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id, "lease_id": lease_id},
+    )
+    if episode_id:
+        await conn.execute(
+            text("UPDATE research_episodes SET updated_at = now() WHERE tenant_id = :tenant_id AND id = :id"),
+            {"tenant_id": tenant_id, "id": episode_id},
+        )
+    if tool_call_id:
+        await conn.execute(
+            text(
+                """
+                UPDATE research_tool_calls
+                SET last_heartbeat_at = now(), updated_at = now()
+                WHERE tenant_id = :tenant_id AND id = :id AND status = 'running'
+                """
+            ),
+            {"tenant_id": tenant_id, "id": tool_call_id},
+        )
+
+
+async def mark_stalled_research_tool_calls(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    heartbeat_seconds: int,
+) -> int:
+    result = await conn.execute(
+        text(
+            """
+            UPDATE research_tool_calls
+            SET status = 'stalled',
+                error_code = 'research_heartbeat_missing',
+                error_message = 'research tool heartbeat was not observed',
+                completed_at = now(),
+                updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND research_run_id = :run_id
+              AND status = 'running'
+              AND COALESCE(last_heartbeat_at, started_at) < now() - (:heartbeat_seconds * interval '1 second')
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "heartbeat_seconds": heartbeat_seconds,
+        },
+    )
+    return int(result.rowcount or 0)
+
+
+async def acquire_research_run_lease(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    lease_id: str,
+    lease_seconds: int = 120,
+) -> bool:
+    result = await conn.execute(
+        text(
+            """
+            UPDATE research_runs
+            SET controller_lease_id = :lease_id,
+                controller_lease_expires_at = now() + (:lease_seconds * interval '1 second'),
+                controller_lease_epoch = controller_lease_epoch + 1,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id
+              AND id = :run_id
+              AND status IN ('received','running','paused')
+              AND (
+                controller_lease_id IS NULL
+                OR controller_lease_expires_at IS NULL
+                OR controller_lease_expires_at < now()
+                OR controller_lease_id = :lease_id
+              )
+            RETURNING id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "lease_id": lease_id,
+            "lease_seconds": max(15, int(lease_seconds)),
+        },
+    )
+    return result.mappings().first() is not None
+
+
+async def assert_research_run_lease(
+    conn: AsyncConnection, *, tenant_id: str, research_run_id: str, lease_id: str
+) -> int:
+    """Fence a stale worker before a durable controller write."""
+    result = await conn.execute(
+        text(
+            """
+            SELECT controller_lease_epoch
+            FROM research_runs
+            WHERE tenant_id = :tenant_id
+              AND id = :run_id
+              AND controller_lease_id = :lease_id
+              AND controller_lease_expires_at > now()
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id, "lease_id": lease_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        raise PermissionError("research controller lease is no longer owned")
+    return int(row.get("controller_lease_epoch") or 0)
+
+
+async def release_research_run_lease(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    lease_id: str,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE research_runs
+            SET controller_lease_id = NULL,
+                controller_lease_expires_at = NULL,
+                updated_at = now()
+            WHERE tenant_id = :tenant_id AND id = :run_id AND controller_lease_id = :lease_id
+            """
+        ),
+        {"tenant_id": tenant_id, "run_id": research_run_id, "lease_id": lease_id},
+    )
 
 
 async def update_research_run(
@@ -3415,6 +4528,7 @@ async def update_research_run(
     stop_reason: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    clear_error: bool = False,
     pause_requested: bool | None = None,
     cancel_requested: bool | None = None,
 ) -> None:
@@ -3444,6 +4558,14 @@ async def update_research_run(
     if error_message is not None:
         assignments.append("error_message = :error_message")
         params["error_message"] = error_message[:1000]
+    if clear_error:
+        # Do not emit two assignments for the same column.  PostgreSQL rejects
+        # `error_code = :error_code, error_code = NULL` with ProgrammingError;
+        # an explicit error wins over a request to clear stale errors.
+        if error_code is None:
+            assignments.append("error_code = NULL")
+        if error_message is None:
+            assignments.append("error_message = NULL")
     if pause_requested is not None:
         assignments.append("pause_requested = :pause_requested")
         params["pause_requested"] = pause_requested
@@ -3546,8 +4668,8 @@ async def create_research_episode(
     query_run_id: str | None,
     context_summary: dict[str, Any],
 ) -> uuid.UUID:
-    episode_id = new_uuid()
-    await conn.execute(
+    episode_id = stable_uuid(["research_episode_v1", research_run_id, episode_index])
+    result = await conn.execute(
         text(
             """
             INSERT INTO research_episodes(
@@ -3556,8 +4678,10 @@ async def create_research_episode(
             )
             VALUES (
               :id, :tenant_id, :run_id, :query_run_id, :episode_index, :question_id,
-              'running', 'retrieval', CAST(:context_summary AS jsonb), now()
+              'running', 'claimed', CAST(:context_summary AS jsonb), now()
             )
+            ON CONFLICT (research_run_id, episode_index) DO NOTHING
+            RETURNING id, question_id, query_run_id, status, stage
             """
         ),
         {
@@ -3570,13 +4694,52 @@ async def create_research_episode(
             "context_summary": json_dumps(context_summary),
         },
     )
-    if question_id is not None:
+    mappings = getattr(result, "mappings", None)
+    row = mappings().first() if callable(mappings) else None
+    inserted = row is not None
+    if row is None:
+        existing = await conn.execute(
+            text(
+                """
+                SELECT id, question_id, query_run_id, status, stage
+                FROM research_episodes
+                WHERE tenant_id = :tenant_id AND research_run_id = :run_id AND episode_index = :episode_index
+                """
+            ),
+            {"tenant_id": tenant_id, "run_id": research_run_id, "episode_index": episode_index},
+        )
+        row = existing.mappings().first()
+        # Lightweight unit-test connections do not implement RETURNING.  A
+        # real PostgreSQL connection will always return either the inserted
+        # row or the existing conflict row above.
+        if row is None:
+            inserted = True
+    if row is not None:
+        existing_question_id = row.get("question_id")
+        if existing_question_id is not None and str(existing_question_id) != str(question_id):
+            raise ValueError("research episode question does not match the existing episode index")
+        existing_query_run_id = row.get("query_run_id")
+        if existing_query_run_id is not None and str(existing_query_run_id) != str(query_run_id):
+            raise ValueError("research episode query run does not match the existing episode index")
+        if row.get("id") is not None:
+            episode_id = uuid.UUID(str(row["id"]))
+        if str(row.get("status") or "") == "completed":
+            return episode_id
+    # The attempt counter is part of the episode claim.  It is changed only
+    # when the episode row was newly inserted, so a retry cannot spend an
+    # extra attempt before it has a durable episode to resume.
+    if inserted and question_id is not None:
         await conn.execute(
             text(
                 """
                 UPDATE research_questions
-                SET status = 'running', updated_at = now()
+                SET status = 'running',
+                    execution_state = 'running',
+                    outcome = NULL,
+                    attempt_count = attempt_count + 1,
+                    updated_at = now()
                 WHERE tenant_id = :tenant_id AND research_run_id = :run_id AND id = :question_id
+                RETURNING id
                 """
             ),
             {"tenant_id": tenant_id, "run_id": research_run_id, "question_id": question_id},
@@ -3593,19 +4756,50 @@ async def update_research_episode(
     metrics: dict[str, Any] | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    expected_stage: str | None = None,
 ) -> None:
-    await conn.execute(
+    if not str(episode_id).strip():
+        raise ValueError("episode_id is required when updating a research episode")
+    if stage not in {
+        "claimed",
+        "tool_registered",
+        "retrieving",
+        "evidence_persisted",
+        "evaluated",
+        "completed",
+        "failed",
+    }:
+        raise ValueError("invalid research episode stage")
+    result = await conn.execute(
         text(
             """
             UPDATE research_episodes
-            SET status = :status,
-                stage = :stage,
+            SET status = CASE
+                  WHEN :status IN ('running','completed','failed','cancelled') THEN :status
+                  ELSE status
+                END,
+                stage = CASE
+                  WHEN :status = 'failed' THEN 'failed'
+                  ELSE :stage
+                END,
                 metrics = CASE WHEN CAST(:metrics AS jsonb) = '{}'::jsonb THEN metrics ELSE CAST(:metrics AS jsonb) END,
                 error_code = :error_code,
                 error_message = :error_message,
                 completed_at = CASE WHEN :status IN ('completed','failed','cancelled') THEN now() ELSE completed_at END,
                 updated_at = now()
             WHERE id = :id
+              AND NOT (status = 'completed' AND :status <> 'completed')
+              AND (
+                :status = 'failed'
+                OR array_position(
+                  ARRAY['received','claimed','tool_registered','retrieving','evidence_persisted','evaluated','completed'],
+                  :stage
+                ) >= COALESCE(array_position(
+                  ARRAY['received','claimed','tool_registered','retrieving','evidence_persisted','evaluated','completed'],
+                  stage
+                ), 1)
+              )
+              AND (CAST(:expected_stage AS text) IS NULL OR stage = CAST(:expected_stage AS text))
             """
         ),
         {
@@ -3615,8 +4809,33 @@ async def update_research_episode(
             "metrics": json_dumps(metrics or {}),
             "error_code": error_code,
             "error_message": error_message[:1000] if error_message else None,
+            "expected_stage": expected_stage,
         },
     )
+    rowcount = getattr(result, "rowcount", None)
+    if expected_stage is not None and rowcount == 0:
+        current = await conn.execute(
+            text("SELECT status, stage FROM research_episodes WHERE id = :id"),
+            {"id": episode_id},
+        )
+        row = current.mappings().first()
+        if row is None:
+            raise LookupError("research episode does not exist")
+        stage_order = {
+            "received": 0,
+            "claimed": 1,
+            "tool_registered": 2,
+            "retrieving": 3,
+            "evidence_persisted": 4,
+            "evaluated": 5,
+            "completed": 6,
+        }
+        current_stage = str(row.get("stage") or "")
+        if str(row.get("status") or "") == "completed" or (
+            current_stage in stage_order and stage_order[current_stage] >= stage_order.get(stage, -1)
+        ):
+            return
+        raise RuntimeError("research episode stage changed before compare-and-set transition")
 
 
 async def upsert_research_evidence_record(
@@ -3629,7 +4848,6 @@ async def upsert_research_evidence_record(
     document_id: str | None,
     document_version_id: str | None,
     knowledge_base_id: str,
-    evidence_ref: str,
     title: str,
     source_url: str,
     section_path: list[str],
@@ -3637,32 +4855,38 @@ async def upsert_research_evidence_record(
     support_status: str,
     score: float | None,
     metadata: dict[str, Any],
+    evidence_fingerprint: str | None = None,
+    evidence_ref: str | None = None,
 ) -> uuid.UUID:
+    fingerprint = evidence_fingerprint or research_evidence_fingerprint(
+        knowledge_base_id=knowledge_base_id,
+        document_id=document_id,
+        document_version_id=document_version_id,
+        chunk_id=chunk_id,
+        source_url=source_url,
+        title=title,
+        content_abstract=content_abstract,
+    )
     record_id = stable_uuid([research_run_id, chunk_id])
-    await conn.execute(
+    computed_evidence_ref = research_evidence_ref(record_id)
+    # Kept as a compatibility-only argument for older callers; persistence
+    # always uses the server-derived value.
+    evidence_ref = computed_evidence_ref
+    result = await conn.execute(
         text(
             """
             INSERT INTO research_evidence_records(
               id, tenant_id, research_run_id, question_id, chunk_id, document_id, document_version_id,
               knowledge_base_id, evidence_ref, title, source_url, section_path, content_abstract,
-              support_status, score, metadata
+              support_status, score, evidence_fingerprint, metadata
             )
             VALUES (
               :id, :tenant_id, :run_id, :question_id, :chunk_id, :document_id, :document_version_id,
               :kb_id, :evidence_ref, :title, :source_url, :section_path, :abstract,
-              :support_status, :score, CAST(:metadata AS jsonb)
+              :support_status, :score, :evidence_fingerprint, CAST(:metadata AS jsonb)
             )
-            ON CONFLICT (research_run_id, chunk_id) DO UPDATE
-            SET question_id = COALESCE(research_evidence_records.question_id, EXCLUDED.question_id),
-                evidence_ref = EXCLUDED.evidence_ref,
-                title = EXCLUDED.title,
-                source_url = EXCLUDED.source_url,
-                section_path = EXCLUDED.section_path,
-                content_abstract = EXCLUDED.content_abstract,
-                support_status = EXCLUDED.support_status,
-                score = EXCLUDED.score,
-                metadata = EXCLUDED.metadata,
-                updated_at = now()
+            ON CONFLICT (research_run_id, chunk_id) DO NOTHING
+            RETURNING id, evidence_fingerprint
             """
         ),
         {
@@ -3681,10 +4905,84 @@ async def upsert_research_evidence_record(
             "abstract": content_abstract,
             "support_status": support_status,
             "score": score,
+            "evidence_fingerprint": fingerprint,
             "metadata": json_dumps(metadata),
         },
     )
+    row = result.mappings().first()
+    if row is None:
+        existing = await conn.execute(
+            text(
+                """
+                SELECT id, question_id, document_id, document_version_id,
+                       knowledge_base_id, evidence_ref, evidence_fingerprint
+                FROM research_evidence_records
+                WHERE tenant_id = :tenant_id
+                  AND research_run_id = :run_id
+                  AND chunk_id = :chunk_id
+                """
+            ),
+            {"tenant_id": tenant_id, "run_id": research_run_id, "chunk_id": chunk_id},
+        )
+        row = existing.mappings().first()
+    if row is not None:
+        stored_ref = str(row.get("evidence_ref") or "")
+        if stored_ref and stored_ref != evidence_ref:
+            raise ValueError("evidence citation conflicts with the existing record identity")
+        stored_fingerprint = str(row.get("evidence_fingerprint") or "")
+        if stored_fingerprint and stored_fingerprint != fingerprint:
+            raise ValueError("evidence identity conflicts with the existing chunk record")
+        if str(row.get("knowledge_base_id") or knowledge_base_id) != knowledge_base_id:
+            raise ValueError("evidence identity conflicts with the existing knowledge-base scope")
+        if row.get("document_id") is not None and str(row["document_id"]) != str(document_id or ""):
+            raise ValueError("evidence identity conflicts with the existing document")
+        if row.get("id") is not None:
+            record_id = uuid.UUID(str(row["id"]))
+        await conn.execute(
+            text(
+                """
+                UPDATE research_evidence_records
+                SET question_id = COALESCE(question_id, :question_id),
+                    evidence_fingerprint = COALESCE(evidence_fingerprint, :evidence_fingerprint),
+                    support_status = :support_status,
+                    score = :score,
+                    metadata = CAST(:metadata AS jsonb),
+                    updated_at = now()
+                WHERE id = :id
+                  AND (evidence_fingerprint IS NULL OR evidence_fingerprint = :evidence_fingerprint)
+                """
+            ),
+            {
+                "id": str(record_id),
+                "question_id": question_id,
+                "evidence_fingerprint": fingerprint,
+                "support_status": support_status,
+                "score": score,
+                "metadata": json_dumps(metadata),
+            },
+        )
     return record_id
+
+
+def research_evidence_fingerprint(
+    *,
+    knowledge_base_id: str,
+    document_id: str | None,
+    document_version_id: str | None,
+    chunk_id: str | None,
+    source_url: str,
+    title: str,
+    content_abstract: str,
+) -> str:
+    """Return a stable, non-reversible identity for evidence deduplication."""
+    stable_document = document_version_id or document_id or ""
+    stable_chunk = chunk_id or ""
+    if not stable_chunk:
+        stable_chunk = stable_hash(
+            ["fallback", " ".join(source_url.split()), " ".join(title.split()), " ".join(content_abstract.split())],
+            40,
+        )
+    return stable_hash(["research_evidence_fingerprint_v1", knowledge_base_id, stable_document, stable_chunk], 40)
 
 
 async def insert_research_claim_record(
@@ -3697,23 +4995,22 @@ async def insert_research_claim_record(
     support_status: str,
     evidence_ids: list[str],
     metadata: dict[str, Any],
+    verification_input_hash: str | None = None,
 ) -> uuid.UUID:
     claim_id = stable_uuid([research_run_id, question_id or "", claim_text])
-    await conn.execute(
+    result = await conn.execute(
         text(
             """
             INSERT INTO research_claim_records(
-              id, tenant_id, research_run_id, question_id, claim_text, support_status, evidence_ids, metadata
+              id, tenant_id, research_run_id, question_id, claim_text, support_status, evidence_ids, metadata,
+              verification_input_hash
             )
             VALUES (
               :id, :tenant_id, :run_id, :question_id, :claim_text, :support_status,
-              CAST(:evidence_ids AS uuid[]), CAST(:metadata AS jsonb)
+              CAST(:evidence_ids AS uuid[]), CAST(:metadata AS jsonb), :verification_input_hash
             )
-            ON CONFLICT (id) DO UPDATE
-            SET support_status = EXCLUDED.support_status,
-                evidence_ids = EXCLUDED.evidence_ids,
-                metadata = EXCLUDED.metadata,
-                updated_at = now()
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
             """
         ),
         {
@@ -3725,8 +5022,40 @@ async def insert_research_claim_record(
             "support_status": support_status,
             "evidence_ids": evidence_ids,
             "metadata": json_dumps(metadata),
+            "verification_input_hash": verification_input_hash,
         },
     )
+    row = result.mappings().first()
+    if row is None:
+        existing = await conn.execute(
+            text("SELECT verification_input_hash FROM research_claim_records WHERE id = :id"),
+            {"id": str(claim_id)},
+        )
+        existing_row = existing.mappings().first()
+        if existing_row is not None:
+            stored_hash = str(existing_row.get("verification_input_hash") or "")
+            if stored_hash and stored_hash != str(verification_input_hash or ""):
+                raise ValueError("claim verification input does not match the existing claim")
+            await conn.execute(
+                text(
+                    """
+                    UPDATE research_claim_records
+                    SET support_status = :support_status,
+                        evidence_ids = CAST(:evidence_ids AS uuid[]),
+                        metadata = CAST(:metadata AS jsonb),
+                        verification_input_hash = COALESCE(verification_input_hash, :verification_input_hash),
+                        updated_at = now()
+                    WHERE id = :id
+                    """
+                ),
+                {
+                    "id": str(claim_id),
+                    "support_status": support_status,
+                    "evidence_ids": evidence_ids,
+                    "metadata": json_dumps(metadata),
+                    "verification_input_hash": verification_input_hash,
+                },
+            )
     return claim_id
 
 
@@ -3755,7 +5084,12 @@ async def upsert_research_coverage_record(
               CAST(:evidence_ids AS uuid[]), :reason, CAST(:metrics AS jsonb)
             )
             ON CONFLICT (research_run_id, question_id) DO UPDATE
-            SET status = EXCLUDED.status,
+            SET status = CASE
+                  WHEN research_coverage_records.status = 'covered'
+                    AND EXCLUDED.status IN ('missing','partial')
+                    THEN research_coverage_records.status
+                  ELSE EXCLUDED.status
+                END,
                 required_evidence_count = EXCLUDED.required_evidence_count,
                 linked_evidence_ids = EXCLUDED.linked_evidence_ids,
                 reason = EXCLUDED.reason,
@@ -3775,16 +5109,6 @@ async def upsert_research_coverage_record(
             "metrics": json_dumps(metrics),
         },
     )
-    await conn.execute(
-        text(
-            """
-            UPDATE research_questions
-            SET status = :status, updated_at = now()
-            WHERE tenant_id = :tenant_id AND research_run_id = :run_id AND id = :question_id
-            """
-        ),
-        {"tenant_id": tenant_id, "run_id": research_run_id, "question_id": question_id, "status": status},
-    )
     return coverage_id
 
 
@@ -3798,7 +5122,7 @@ async def insert_research_reflection(
     metadata: dict[str, Any],
     reflection_type: str = "operational",
 ) -> uuid.UUID:
-    reflection_id = new_uuid()
+    reflection_id = stable_uuid(["research_reflection_v2", research_run_id, episode_id or "", reflection_type])
     await conn.execute(
         text(
             """
@@ -3808,6 +5132,9 @@ async def insert_research_reflection(
             VALUES (
               :id, :tenant_id, :run_id, :episode_id, :reflection_type, :body, CAST(:metadata AS jsonb)
             )
+            ON CONFLICT (id) DO UPDATE
+            SET body = EXCLUDED.body,
+                metadata = EXCLUDED.metadata
             """
         ),
         {
@@ -3823,12 +5150,99 @@ async def insert_research_reflection(
     return reflection_id
 
 
+async def insert_research_decision(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    episode_id: str | None,
+    question_id: str | None,
+    decision_type: str,
+    selected_strategy: str,
+    reason: str,
+    evidence_gain: int,
+    metadata: dict[str, Any],
+) -> uuid.UUID:
+    decision_id = stable_uuid(
+        ["research_decision_v2", research_run_id, episode_id or "", question_id or "", decision_type]
+    )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO research_decisions(
+              id, tenant_id, research_run_id, episode_id, question_id, decision_type,
+              selected_strategy, reason, evidence_gain, metadata
+            )
+            VALUES (
+              :id, :tenant_id, :run_id, :episode_id, :question_id, :decision_type,
+              :selected_strategy, :reason, :evidence_gain, CAST(:metadata AS jsonb)
+            )
+            ON CONFLICT (id) DO UPDATE
+            SET selected_strategy = EXCLUDED.selected_strategy,
+                reason = EXCLUDED.reason,
+                evidence_gain = EXCLUDED.evidence_gain,
+                metadata = EXCLUDED.metadata
+            """
+        ),
+        {
+            "id": str(decision_id),
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "episode_id": episode_id,
+            "question_id": question_id,
+            "decision_type": decision_type[:120],
+            "selected_strategy": selected_strategy[:120],
+            "reason": reason[:1000],
+            "evidence_gain": max(0, evidence_gain),
+            "metadata": json_dumps(_assert_public_safe_metadata(metadata)),
+        },
+    )
+    return decision_id
+
+
+async def insert_research_claim_relation(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    research_run_id: str,
+    source_claim_id: str,
+    target_claim_id: str,
+    relation: str,
+    metadata: dict[str, Any],
+) -> uuid.UUID:
+    relation_id = stable_uuid([research_run_id, source_claim_id, target_claim_id, relation])
+    await conn.execute(
+        text(
+            """
+            INSERT INTO research_claim_relations(
+              id, tenant_id, research_run_id, source_claim_id, target_claim_id, relation, metadata
+            )
+            VALUES (
+              :id, :tenant_id, :run_id, :source_claim_id, :target_claim_id, :relation, CAST(:metadata AS jsonb)
+            )
+            ON CONFLICT (research_run_id, source_claim_id, target_claim_id, relation) DO NOTHING
+            """
+        ),
+        {
+            "id": str(relation_id),
+            "tenant_id": tenant_id,
+            "run_id": research_run_id,
+            "source_claim_id": source_claim_id,
+            "target_claim_id": target_claim_id,
+            "relation": relation,
+            "metadata": json_dumps(_assert_public_safe_metadata(metadata)),
+        },
+    )
+    return relation_id
+
+
 async def load_research_detail_records(
     conn: AsyncConnection, *, tenant_id: str, research_run_id: str
 ) -> dict[str, list[dict[str, Any]]]:
     queries = {
         "questions": """
-            SELECT id, question, ordinal, kind, status, acceptance, metadata
+            SELECT id, question, ordinal, kind, status, acceptance, metadata,
+                   execution_state, outcome, attempt_count, rewrite_count, depth, budget
             FROM research_questions
             WHERE tenant_id = :tenant_id AND research_run_id = :run_id
             ORDER BY ordinal
@@ -3840,10 +5254,26 @@ async def load_research_detail_records(
             WHERE tenant_id = :tenant_id AND research_run_id = :run_id
             ORDER BY episode_index
         """,
+        "tool_calls": """
+            SELECT id, episode_id, question_id, query_run_id, tool_name, tool_query_hash, status,
+                   result_summary, safe_metadata, error_code, started_at, completed_at
+            FROM research_tool_calls
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY created_at, id
+        """,
+        # Internal controller input only.  Keep validated source handles out
+        # of the public tool-call projection while allowing deterministic
+        # routing to survive pause/resume.
+        "tool_routing_history": """
+            SELECT question_id, tool_name, validated_args, status, created_at
+            FROM research_tool_calls
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY created_at, id
+        """,
         "evidence": """
             SELECT id, question_id, chunk_id, document_id, document_version_id, knowledge_base_id,
                    evidence_ref, title, source_url, section_path, content_abstract, support_status,
-                   score, metadata
+                   score, evidence_fingerprint, metadata
             FROM research_evidence_records
             WHERE tenant_id = :tenant_id AND research_run_id = :run_id
             ORDER BY created_at, evidence_ref
@@ -3851,6 +5281,12 @@ async def load_research_detail_records(
         "claims": """
             SELECT id, question_id, claim_text, support_status, evidence_ids, metadata
             FROM research_claim_records
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY created_at
+        """,
+        "relations": """
+            SELECT id, source_claim_id, target_claim_id, relation, metadata, created_at
+            FROM research_claim_relations
             WHERE tenant_id = :tenant_id AND research_run_id = :run_id
             ORDER BY created_at
         """,
@@ -3863,6 +5299,13 @@ async def load_research_detail_records(
         "reflections": """
             SELECT id, episode_id, reflection_type, body, metadata, created_at
             FROM research_reflections
+            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
+            ORDER BY created_at
+        """,
+        "decisions": """
+            SELECT id, episode_id, question_id, decision_type, selected_strategy, reason,
+                   evidence_gain, metadata, created_at
+            FROM research_decisions
             WHERE tenant_id = :tenant_id AND research_run_id = :run_id
             ORDER BY created_at
         """,
@@ -3902,6 +5345,41 @@ async def get_knowledge_base(conn: AsyncConnection, tenant_id: str, knowledge_ba
     )
     row = result.mappings().first()
     return dict(row) if row is not None else None
+
+
+def _research_question_payload(value: Any) -> dict[str, Any]:
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump(mode="json")
+        return dict(dumped) if isinstance(dumped, dict) else {}
+    if isinstance(value, dict):
+        return dict(value)
+    return {"question": str(value)}
+
+
+def _research_question_duplicate_key(value: str) -> str:
+    return " ".join(value.casefold().replace("?", " ").replace(".", " ").split())
+
+
+def _derived_question_priority(payload: dict[str, Any]) -> str:
+    explicit = str(payload.get("priority") or "").casefold()
+    if explicit in {"required", "bridge", "normal"}:
+        return explicit
+    rationale = str(payload.get("rationale") or "").casefold()
+    needed = " ".join(str(item) for item in payload.get("needed_evidence") or []).casefold()
+    if "bridge" in rationale or "alias" in rationale:
+        return "bridge"
+    if any(token in f"{rationale} {needed}" for token in ("blocking", "approval", "owner")):
+        return "bridge"
+    return "normal"
+
+
+def _assert_public_safe_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    serialized = json_dumps(value)
+    leaked = [token for token in UNSAFE_PUBLIC_METADATA_TOKENS if token in serialized]
+    if leaked:
+        raise ValueError(f"unsafe public metadata tokens: {leaked}")
+    return value
 
 
 async def set_knowledge_base_active_index(
