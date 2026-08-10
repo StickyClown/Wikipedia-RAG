@@ -6,12 +6,14 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from xml.sax.saxutils import escape
 
 import httpx
@@ -24,6 +26,157 @@ from wikipediarag.document_corpus import (
     synthetic_document_corpus,
 )
 from wikipediarag.eval.schemas import TaskFamily
+from wikipediarag.reliability import safe_failure_from_exception
+from wikipediarag.research_tool_registry import DEFAULT_RESEARCH_TOOL_MODE, TOOL_MODE_ALLOWLISTS
+
+DEEP_RESEARCH_GATE_COMPOSE_FILE = Path("compose.deep-research-gate.yaml")
+DOCUMENT_UPLOAD_COMPOSE_SERVICES = (
+    "postgres",
+    "redis",
+    "minio",
+    "opensearch",
+    "mock-provider",
+    "model-gateway",
+    "metadata-service",
+    "xberg",
+    "docling",
+    "api",
+    "worker",
+)
+DEEP_RESEARCH_GATE_COMPOSE_SERVICES = (
+    "postgres",
+    "redis",
+    "minio",
+    "opensearch",
+    "mock-provider",
+    "model-gateway",
+    "api",
+    "worker",
+)
+DEEP_RESEARCH_GATE_COMPOSE_START_ATTEMPTS = 3
+DEEP_RESEARCH_GATE_RUN_RESERVE_SECONDS = 90
+DEEP_RESEARCH_GATE_MIN_RUN_SECONDS = 120
+
+
+class DeepResearchGateInfrastructureError(RuntimeError):
+    safe_code = "DEEP_RESEARCH_GATE_COMPOSE_START_FAILED"
+
+
+class DeepResearchRunTerminalTimeoutError(RuntimeError):
+    safe_code = "DEEP_RESEARCH_RUN_TERMINAL_TIMEOUT"
+
+
+class DeepResearchSuiteDeadlineExceededError(RuntimeError):
+    safe_code = "DEEP_RESEARCH_SUITE_DEADLINE_EXHAUSTED"
+
+
+class ReliabilitySmokeError(RuntimeError):
+    def __init__(self, safe_code: str) -> None:
+        super().__init__(safe_code)
+        self.safe_code = safe_code
+
+
+def _safe_cli_failure(exc: BaseException, *, stage: str) -> dict[str, Any]:
+    """Return a content-free CLI artifact failure without exception details."""
+    failure = safe_failure_from_exception(exc, stage=stage)
+    return {
+        "code": failure.error_code,
+        "retryable": failure.retryable,
+        "stage": stage,
+        "message": "operation failed",
+    }
+
+
+@dataclass(frozen=True)
+class DeepResearchRuntime:
+    api: str
+    database_url: str | None = None
+    compose_project: str | None = None
+    api_port: int | None = None
+    minio_port: int | None = None
+    attempt: int | None = None
+    openrouter_api_key_source: str = ""
+    isolated: bool = False
+
+    def public_details(self) -> dict[str, Any]:
+        if not self.isolated:
+            return {"mode": "external_api"}
+        details: dict[str, Any] = {
+            "mode": "isolated_compose",
+            "compose_project": self.compose_project,
+            "api": self.api,
+            "minio_public_endpoint": f"http://127.0.0.1:{self.minio_port}",
+            "database_host": "127.0.0.1",
+            "database_port": self.database_url_port(),
+            "startup_attempt": self.attempt,
+        }
+        if self.openrouter_api_key_source:
+            details["openrouter_api_key_source"] = self.openrouter_api_key_source
+        return details
+
+    def database_url_port(self) -> int | None:
+        if not self.database_url:
+            return None
+        try:
+            return int(self.database_url.rsplit(":", 1)[1].split("/", 1)[0])
+        except (IndexError, ValueError):
+            return None
+
+
+def _add_deep_research_runtime_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    fixture_path: str,
+    retrieval_profile: str,
+    timeout_seconds: int,
+    compose_model_provider: str,
+    include_tool_mode: bool = True,
+) -> None:
+    parser.add_argument("--api", default="http://localhost:8000")
+    parser.add_argument("--fixture-path", default=fixture_path)
+    parser.add_argument("--task-id", action="append", default=[])
+    parser.add_argument("--max-tasks", type=int, default=None)
+    parser.add_argument("--retrieval-profile", default=retrieval_profile)
+    parser.add_argument(
+        "--declared-context-tokens",
+        type=int,
+        default=80000,
+        help="planner context window used by Deep Research evaluation (default: 80000)",
+    )
+    parser.add_argument("--timeout-seconds", type=int, default=timeout_seconds)
+    parser.add_argument(
+        "--compose-model-provider",
+        choices=["mock", "openrouter"],
+        default=compose_model_provider,
+        help="model provider injected into Docker Compose for the smoke stack",
+    )
+    parser.add_argument("--context-productive-target", type=float, default=None)
+    parser.add_argument("--context-soft-limit", type=float, default=None)
+    parser.add_argument("--context-hard-input-limit", type=float, default=None)
+    if include_tool_mode:
+        parser.add_argument(
+            "--tool-mode",
+            choices=sorted(TOOL_MODE_ALLOWLISTS),
+            default=DEFAULT_RESEARCH_TOOL_MODE,
+            help="server-owned Deep Research tool allowlist mode for runtime runs",
+        )
+    parser.add_argument(
+        "--admin-username",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_USERNAME", "admin"),
+        help="local or hybrid auth platform-admin username",
+    )
+    parser.add_argument(
+        "--admin-secret",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD", "admin"),  # noqa: S106
+        help="platform-admin local login secret; defaults to the local bootstrap admin password",
+    )
+    parser.add_argument(
+        "--admin-secret-file",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD_FILE"),
+        help="file containing the platform-admin local login secret, or WIKIPEDIARAG_ADMIN_PASSWORD_FILE",
+    )
+    parser.add_argument("--skip-compose", action="store_true")
+    parser.add_argument("--down-after", action="store_true")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -179,6 +332,47 @@ def build_parser() -> argparse.ArgumentParser:
     eval_profile_retrieval_parser.add_argument("--measured-iterations", type=int, default=1)
     eval_profile_retrieval_parser.add_argument("--batch-size", type=int, default=5)
 
+    eval_document_prepare_parser = subparsers.add_parser("eval-document-prepare")
+    eval_document_prepare_parser.add_argument("--dataset", choices=["rrncb-public"], default="rrncb-public")
+    eval_document_prepare_parser.add_argument("--documents-dir", required=True)
+    eval_document_prepare_parser.add_argument("--csv", dest="csv_path", default=None)
+    eval_document_prepare_parser.add_argument("--output-suite", default="rrncb-public-v1")
+    eval_document_prepare_parser.add_argument("--artifacts-dir", default="artifacts/eval")
+    eval_document_prepare_parser.add_argument("--json", action="store_true")
+
+    eval_document_ingest_parser = subparsers.add_parser("eval-document-ingest")
+    eval_document_ingest_parser.add_argument("--suite", default="rrncb-public-v1")
+    eval_document_ingest_parser.add_argument("--api", default="http://localhost:8000")
+    eval_document_ingest_parser.add_argument("--batch-size", type=int, default=5)
+    eval_document_ingest_parser.add_argument("--upload-concurrency", type=int, default=2)
+    eval_document_ingest_parser.add_argument("--document-timeout", type=int, default=900)
+    eval_document_ingest_parser.add_argument("--batch-timeout", type=int, default=1800)
+    eval_document_ingest_parser.add_argument("--suite-timeout", type=int, default=21600)
+    eval_document_ingest_parser.add_argument("--run-id", default=None)
+    eval_document_ingest_parser.add_argument("--resume-run-id", default=None)
+    eval_document_ingest_parser.add_argument("--rerun-failed", action="store_true")
+    eval_document_ingest_parser.add_argument("--artifacts-dir", default="artifacts/eval")
+    eval_document_ingest_parser.add_argument("--json", action="store_true")
+
+    eval_document_run_parser = subparsers.add_parser("eval-document-run")
+    eval_document_run_parser.add_argument("--suite", default="rrncb-public-v1")
+    eval_document_run_parser.add_argument("--api", default="http://localhost:8000")
+    eval_document_run_parser.add_argument("--retrieval-profile", default="upload_sota_mvp")
+    eval_document_run_parser.add_argument("--batch-size", type=int, default=2)
+    eval_document_run_parser.add_argument("--question-timeout", type=int, default=300)
+    eval_document_run_parser.add_argument("--suite-timeout", type=int, default=28800)
+    eval_document_run_parser.add_argument("--run-id", default=None)
+    eval_document_run_parser.add_argument("--resume-run-id", default=None)
+    eval_document_run_parser.add_argument("--rerun-failed", action="store_true")
+    eval_document_run_parser.add_argument("--artifacts-dir", default="artifacts/eval")
+    eval_document_run_parser.add_argument("--json", action="store_true")
+
+    eval_document_status_parser = subparsers.add_parser("eval-document-status")
+    eval_document_status_parser.add_argument("--suite", default="rrncb-public-v1")
+    eval_document_status_parser.add_argument("--latest", action="store_true")
+    eval_document_status_parser.add_argument("--json", action="store_true")
+    eval_document_status_parser.add_argument("--artifacts-dir", default="artifacts/eval")
+
     eval_full_parser = subparsers.add_parser("eval-full")
     eval_full_parser.add_argument("--count", type=int, default=None)
     eval_full_parser.add_argument("--api", default="http://localhost:8000")
@@ -228,6 +422,23 @@ def build_parser() -> argparse.ArgumentParser:
     verify_upload_parser.add_argument("--skip-compose", action="store_true")
     verify_upload_parser.add_argument("--down-after", action="store_true")
 
+    reliability_smoke_parser = subparsers.add_parser("reliability-smoke")
+    reliability_smoke_parser.add_argument("--api", default="http://localhost:8000")
+    reliability_smoke_parser.add_argument("--timeout-seconds", type=int, default=420)
+    reliability_smoke_parser.add_argument(
+        "--admin-username",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_USERNAME", "admin"),
+    )
+    reliability_smoke_parser.add_argument(
+        "--admin-secret",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD", "admin"),  # noqa: S106
+    )
+    reliability_smoke_parser.add_argument(
+        "--admin-secret-file", default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD_FILE")
+    )
+    reliability_smoke_parser.add_argument("--skip-compose", action="store_true")
+    reliability_smoke_parser.add_argument("--down-after", action="store_true")
+
     verify_corpus_parser = subparsers.add_parser("verify-document-corpus")
     verify_corpus_parser.add_argument("--api", default="http://localhost:8000")
     verify_corpus_parser.add_argument("--xberg", default=os.environ.get("XBERG_PUBLIC_URL", "http://localhost:8091"))
@@ -270,30 +481,22 @@ def build_parser() -> argparse.ArgumentParser:
     hardening_parser.add_argument("--down-after", action="store_true")
 
     deep_research_parser = subparsers.add_parser("deep-research-smoke")
-    deep_research_parser.add_argument("--api", default="http://localhost:8000")
-    deep_research_parser.add_argument("--fixture-path", default="tests/fixtures/deep_research/research_tasks.json")
-    deep_research_parser.add_argument("--task-id", action="append", default=[])
-    deep_research_parser.add_argument("--max-tasks", type=int, default=None)
-    deep_research_parser.add_argument("--retrieval-profile", default="upload_mock")
-    deep_research_parser.add_argument("--declared-context-tokens", type=int, default=12000)
-    deep_research_parser.add_argument("--timeout-seconds", type=int, default=480)
-    deep_research_parser.add_argument(
-        "--admin-username",
-        default=os.environ.get("WIKIPEDIARAG_ADMIN_USERNAME", "admin"),
-        help="local or hybrid auth platform-admin username",
+    _add_deep_research_runtime_arguments(
+        deep_research_parser,
+        fixture_path="tests/fixtures/deep_research/research_tasks.json",
+        retrieval_profile="upload_mock",
+        timeout_seconds=480,
+        compose_model_provider="mock",
     )
-    deep_research_parser.add_argument(
-        "--admin-secret",
-        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD", "admin"),  # noqa: S106
-        help="platform-admin local login secret; defaults to the local bootstrap admin password",
+
+    deep_research_hard_parser = subparsers.add_parser("deep-research-hard-gate")
+    _add_deep_research_runtime_arguments(
+        deep_research_hard_parser,
+        fixture_path="tests/fixtures/deep_research/research_tasks_hard.json",
+        retrieval_profile="upload_sota_mvp",
+        timeout_seconds=900,
+        compose_model_provider="openrouter",
     )
-    deep_research_parser.add_argument(
-        "--admin-secret-file",
-        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD_FILE"),
-        help="file containing the platform-admin local login secret, or WIKIPEDIARAG_ADMIN_PASSWORD_FILE",
-    )
-    deep_research_parser.add_argument("--skip-compose", action="store_true")
-    deep_research_parser.add_argument("--down-after", action="store_true")
 
     deep_research_matrix_parser = subparsers.add_parser("deep-research-matrix")
     deep_research_matrix_parser.add_argument(
@@ -302,11 +505,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     deep_research_matrix_parser.add_argument("--task-id", action="append", default=[])
     deep_research_matrix_parser.add_argument("--max-tasks", type=int, default=None)
-    deep_research_matrix_parser.add_argument("--declared-context-tokens", type=int, default=12000)
+    deep_research_matrix_parser.add_argument(
+        "--declared-context-tokens",
+        type=int,
+        default=80000,
+        help="planner context window used by the offline matrix (default: 80000)",
+    )
     deep_research_matrix_parser.add_argument(
         "--output-dir",
         default=None,
         help="optional output directory; defaults to artifacts/validation/deep-research-matrix/<timestamp>",
+    )
+    deep_research_tool_matrix_parser = subparsers.add_parser("deep-research-tool-matrix")
+    _add_deep_research_runtime_arguments(
+        deep_research_tool_matrix_parser,
+        fixture_path="tests/fixtures/deep_research/research_tasks_tools.json",
+        retrieval_profile="upload_sota_mvp",
+        timeout_seconds=900,
+        compose_model_provider="openrouter",
+        include_tool_mode=False,
+    )
+    deep_research_tool_matrix_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="optional output directory; defaults to artifacts/validation/deep-research-tool-matrix/<timestamp>",
     )
     return parser
 
@@ -365,6 +587,14 @@ def main() -> None:
         run_eval_reviewed_short(args)
     elif args.command == "eval-profile-retrieval":
         run_eval_profile_retrieval(args)
+    elif args.command == "eval-document-prepare":
+        run_eval_document_prepare(args)
+    elif args.command == "eval-document-ingest":
+        run_eval_document_ingest(args)
+    elif args.command == "eval-document-run":
+        run_eval_document_run(args)
+    elif args.command == "eval-document-status":
+        run_eval_document_status(args)
     elif args.command == "eval-full":
         run_eval_full(args)
     elif args.command == "smoke-models":
@@ -376,14 +606,20 @@ def main() -> None:
         demo_release_gate(args.api, args.job_id)
     elif args.command == "verify-document-upload":
         verify_document_upload(args)
+    elif args.command == "reliability-smoke":
+        verify_reliability_smoke(args)
     elif args.command == "verify-document-corpus":
         verify_document_corpus(args)
     elif args.command == "verify-cross-tenant-hardening":
         verify_cross_tenant_hardening(args)
     elif args.command == "deep-research-smoke":
         verify_deep_research_smoke(args)
+    elif args.command == "deep-research-hard-gate":
+        verify_deep_research_smoke(args)
     elif args.command == "deep-research-matrix":
         verify_deep_research_matrix(args)
+    elif args.command == "deep-research-tool-matrix":
+        verify_deep_research_tool_matrix(args)
 
 
 def _add_eval_generate_arguments(parser: argparse.ArgumentParser) -> None:
@@ -798,6 +1034,78 @@ def run_eval_profile_retrieval(args: argparse.Namespace) -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+def run_eval_document_prepare(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.document_benchmark import prepare_rrncb
+
+    report = prepare_rrncb(
+        documents_dir=Path(args.documents_dir),
+        suite=str(args.output_suite),
+        csv_path=Path(args.csv_path) if args.csv_path else None,
+        artifacts_dir=Path(args.artifacts_dir),
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_document_ingest(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.document_benchmark import ingest_rrncb
+
+    report = ingest_rrncb(
+        suite=str(args.suite),
+        api_url=str(args.api),
+        batch_size=int(args.batch_size),
+        upload_concurrency=int(args.upload_concurrency),
+        document_timeout=int(args.document_timeout),
+        batch_timeout=int(args.batch_timeout),
+        suite_timeout=int(args.suite_timeout),
+        resume=True,
+        run_id=str(args.run_id) if args.run_id else None,
+        resume_run_id=str(args.resume_run_id) if args.resume_run_id else None,
+        rerun_failed=bool(args.rerun_failed),
+        artifacts_dir=Path(args.artifacts_dir),
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_document_run(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.document_benchmark import run_rrncb
+
+    report = asyncio.run(
+        run_rrncb(
+            suite=str(args.suite),
+            api_url=str(args.api),
+            profile_name=str(args.retrieval_profile),
+            batch_size=int(args.batch_size),
+            question_timeout=int(args.question_timeout),
+            suite_timeout=int(args.suite_timeout),
+            resume=True,
+            rerun_failed=bool(args.rerun_failed),
+            run_id=str(args.run_id) if args.run_id else None,
+            resume_run_id=str(args.resume_run_id) if args.resume_run_id else None,
+            artifacts_dir=Path(args.artifacts_dir),
+        )
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_document_status(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.document_benchmark import rrncb_status
+
+    report = rrncb_status(suite=str(args.suite), artifacts_dir=Path(args.artifacts_dir))
+    if args.json or not args.latest:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    print(
+        "\n".join(
+            [
+                f"suite={report.get('suite')} status={report.get('status')}",
+                f"processed={report.get('completed', 0)}/{report.get('total', 0)} failed={report.get('failed', 0)}",
+                f"updated_at={report.get('updated_at', '')}",
+                f"report={report.get('report', '')}",
+            ]
+        )
+    )
+
+
 def run_eval_full(args: argparse.Namespace) -> None:
     from wikipediarag.eval.commands import eval_full
     from wikipediarag.eval.progress import EvalGenerateCliReporter
@@ -1034,7 +1342,7 @@ def verify_document_upload(args: argparse.Namespace) -> None:
         report["passed"] = True
     except Exception as exc:
         exit_code = 1
-        report["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+        report["error"] = _safe_cli_failure(exc, stage="document_corpus")
     finally:
         report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _write_document_upload_reports(report_dir, report)
@@ -1043,6 +1351,222 @@ def verify_document_upload(args: argparse.Namespace) -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if exit_code:
         raise SystemExit(exit_code)
+
+
+def verify_reliability_smoke(args: argparse.Namespace) -> None:
+    """Exercise durable upload, worker restart, timeout and chat idempotency.
+
+    The report intentionally stores only IDs, terminal statuses and safe error
+    codes. It is a disposable isolated Compose stack, never the user's corpus.
+    """
+
+    report_dir = Path("artifacts/validation/reliability") / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    report_dir.mkdir(parents=True, exist_ok=True)
+    api = str(args.api).rstrip("/")
+    report: dict[str, Any] = {
+        "passed": False,
+        "api": api,
+        "report_dir": str(report_dir),
+        "checks": [],
+        "documents": [],
+        "questions": [],
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    runtime: DeepResearchRuntime | None = None
+    exit_code = 0
+    try:
+        if not args.skip_compose:
+            runtime = _compose_up_isolated_reliability_smoke()
+            api = runtime.api
+            report["api"] = api
+            report["runtime"] = runtime.public_details()
+            _record_check(report, "isolated_compose_up", True, runtime.public_details())
+        else:
+            report["runtime"] = {"mode": "external_api"}
+        with httpx.Client(timeout=120, follow_redirects=True) as client:
+            _wait_json_ready(client, f"{api}/ready", "api", require_ok=True, timeout_seconds=int(args.timeout_seconds))
+            _record_check(report, "api_ready", True)
+            _authenticate_smoke_session(
+                client,
+                api,
+                username=str(args.admin_username),
+                admin_secret=_resolve_hardening_admin_secret(args),
+            )
+            knowledge_base_id = _create_verify_knowledge_base(client, api)
+            report["knowledge_base_id"] = knowledge_base_id
+            if runtime is not None:
+                _reliability_compose(runtime, "stop", "worker")
+                _record_check(report, "worker_stopped_before_upload_complete", True)
+            uploads = [
+                _upload_reliability_fixture(client, api, knowledge_base_id, fixture, index)
+                for index, fixture in enumerate(_document_upload_fixtures(), start=1)
+            ]
+            report["documents"] = uploads
+            if runtime is not None:
+                _reliability_compose(runtime, "restart", "worker")
+                _record_check(report, "worker_restarted", True)
+            for upload in uploads:
+                job = _wait_job_terminal(client, api, str(upload["job_id"]), timeout_seconds=int(args.timeout_seconds))
+                if job.get("status") != "completed":
+                    raise RuntimeError("reliability smoke upload did not complete")
+                upload["job_status"] = str(job.get("status"))
+            _record_check(report, "two_uploads_terminal_without_duplicates", True)
+
+            # The isolated mock delays exactly three generation calls. With two
+            # API attempts per call this opens the Gateway circuit without ever
+            # invoking a real provider. After its cooldown, calls 3 and 4 pass.
+            questions = [
+                ("timeout-1", "Какая дата указана в проверочном документе?", "failed"),
+                ("timeout-2", "Какая дата указана в проверочном документе?", "failed"),
+                ("success-1", "Как называется проверочный документ?", "completed"),
+                ("success-2", "Какой язык указан в проверочном документе?", "completed"),
+            ]
+            for index, (key_suffix, question, expected_status) in enumerate(questions, start=1):
+                if index == 3:
+                    time.sleep(16)
+                result = _run_reliability_chat(client, api, knowledge_base_id, key_suffix, question)
+                report["questions"].append(result)
+                if result["terminal_status"] != expected_status:
+                    raise RuntimeError("reliability smoke question did not reach expected terminal state")
+            replay = _run_reliability_chat(client, api, knowledge_base_id, "success-2", questions[-1][1])
+            original = cast(dict[str, Any], report["questions"][-1])
+            if replay["query_run_id"] != original["query_run_id"] or replay["terminal_status"] != "completed":
+                raise RuntimeError("idempotent chat replay created a different terminal run")
+            _record_check(report, "chat_idempotency_replay", True, {"query_run_id": replay["query_run_id"]})
+            _record_check(report, "four_questions_terminal", True)
+        report["passed"] = True
+    except Exception as exc:
+        exit_code = 1
+        safe_code = getattr(exc, "safe_code", "")
+        if not safe_code and isinstance(exc, httpx.HTTPStatusError):
+            safe_code = f"HTTP_{exc.response.status_code}"
+        report["error"] = {"code": safe_code or safe_failure_from_exception(exc, stage="reliability_smoke").error_code}
+    finally:
+        report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        (report_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        if runtime is not None and args.down_after:
+            _compose_down_isolated_deep_research_hard_gate(runtime)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+def _upload_reliability_fixture(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    fixture: dict[str, Any],
+    index: int,
+) -> dict[str, Any]:
+    content = bytes(fixture["content"])
+    # Scope smoke idempotency keys to the disposable KB.  A previous smoke run
+    # must not make a new run look like a fingerprint conflict merely because
+    # it uses the same two deterministic fixtures.
+    key = f"reliability-upload-{knowledge_base_id}-{index:02d}-{hashlib.sha256(content).hexdigest()[:16]}"
+    request = {
+        "filename": fixture["filename"],
+        "content_type": fixture["content_type"],
+        "size_bytes": len(content),
+        "checksum_sha256": hashlib.sha256(content).hexdigest(),
+        "knowledge_base_id": knowledge_base_id,
+        "parser_profile": fixture["parser_profile"],
+        "metadata": {"reliability_smoke": True},
+    }
+    headers = {"Idempotency-Key": key}
+    first_session = client.post(f"{api}/api/v1/uploads/sessions", json=request, headers=headers, timeout=30)
+    first_session.raise_for_status()
+    second_session = client.post(f"{api}/api/v1/uploads/sessions", json=request, headers=headers, timeout=30)
+    second_session.raise_for_status()
+    session = dict(first_session.json())
+    if str(second_session.json().get("upload_session_id") or "") != str(session.get("upload_session_id") or ""):
+        raise RuntimeError("idempotent upload session replay returned a different session")
+    upload_response = client.put(
+        str(session["upload_url"]),
+        content=content,
+        headers=dict(session.get("required_headers") or {}),
+        timeout=120,
+    )
+    upload_response.raise_for_status()
+    complete_key = f"{key}-complete"
+    complete_url = f"{api}/api/v1/uploads/sessions/{session['upload_session_id']}:complete"
+    complete_payload = {"metadata": {"reliability_smoke": True}}
+    first_complete = client.post(
+        complete_url, json=complete_payload, headers={"Idempotency-Key": complete_key}, timeout=30
+    )
+    first_complete.raise_for_status()
+    second_complete = client.post(
+        complete_url, json=complete_payload, headers={"Idempotency-Key": complete_key}, timeout=30
+    )
+    second_complete.raise_for_status()
+    completed = dict(first_complete.json())
+    repeated = dict(second_complete.json())
+    for field in ("document_id", "document_version_id", "job_id"):
+        if str(repeated.get(field) or "") != str(completed.get(field) or ""):
+            raise RuntimeError("idempotent upload completion replay returned a duplicate resource")
+    return {
+        "document_id": str(completed["document_id"]),
+        "document_version_id": str(completed["document_version_id"]),
+        "job_id": str(completed["job_id"]),
+    }
+
+
+def _run_reliability_chat(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    key_suffix: str,
+    question: str,
+) -> dict[str, str]:
+    # The same logical question is replayed inside one smoke run, while a
+    # later run gets a fresh key because its KB is different.
+    key = f"reliability-chat-{knowledge_base_id}-{key_suffix}-f5c7b966"
+    response = client.post(
+        f"{api}/api/v1/chat",
+        json={
+            "message": question,
+            "mode": "normal",
+            "stream": True,
+            "knowledge_base_ids": [knowledge_base_id],
+            "retrieval_profile": "upload_mock",
+            "client_request_id": key,
+        },
+        headers={"Idempotency-Key": key},
+        timeout=120,
+    )
+    if response.is_error:
+        safe_code = f"HTTP_{response.status_code}"
+        try:
+            error_payload = response.json()
+            root_error = error_payload.get("error") if isinstance(error_payload, dict) else None
+            if isinstance(root_error, dict) and isinstance(root_error.get("code"), str):
+                safe_code = str(root_error["code"])
+            detail = error_payload.get("detail") if isinstance(error_payload, dict) else None
+            if isinstance(detail, dict):
+                error = detail.get("error")
+                if isinstance(error, dict) and isinstance(error.get("code"), str):
+                    safe_code = str(error["code"])
+            elif detail == "idempotent chat record is missing query run id":
+                safe_code = "IDEMPOTENCY_RECORD_INCOMPLETE"
+            elif detail == "idempotent chat query run is unavailable":
+                safe_code = "IDEMPOTENCY_QUERY_RUN_UNAVAILABLE"
+        except (ValueError, AttributeError):
+            pass
+        raise ReliabilitySmokeError(safe_code)
+    events = _iter_sse(response.iter_lines())
+    sequences = [int(event["data"].get("sequence") or 0) for event in events]
+    if sequences != list(range(1, len(sequences) + 1)):
+        raise RuntimeError("chat SSE sequence is not continuous")
+    terminals = [event for event in events if event["event"] in {"run.completed", "run.failed"}]
+    if len(terminals) != 1:
+        raise RuntimeError("chat SSE did not contain exactly one terminal event")
+    terminal = terminals[0]
+    payload = terminal["data"]
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return {
+        "query_run_id": str(payload.get("query_run_id") or ""),
+        "terminal_status": "completed" if terminal["event"] == "run.completed" else "failed",
+        "error_code": str(data.get("code") or data.get("error_code") or ""),
+    }
 
 
 def verify_document_corpus(args: argparse.Namespace) -> None:
@@ -1128,7 +1652,7 @@ def verify_document_corpus(args: argparse.Namespace) -> None:
         report["passed"] = True
     except Exception as exc:
         exit_code = 1
-        report["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+        report["error"] = _safe_cli_failure(exc, stage="cross_tenant_hardening")
     finally:
         report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _write_document_corpus_reports(report_dir, report)
@@ -1294,7 +1818,7 @@ def verify_cross_tenant_hardening(args: argparse.Namespace) -> None:
         report["passed"] = True
     except Exception as exc:
         exit_code = 1
-        report["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+        report["error"] = _safe_cli_failure(exc, stage="cross_tenant_hardening")
     finally:
         report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _write_cross_tenant_hardening_reports(report_dir, report)
@@ -1315,9 +1839,18 @@ def verify_deep_research_smoke(args: argparse.Namespace) -> None:
     api = str(args.api).rstrip("/")
     admin_secret = _resolve_hardening_admin_secret(args)
     fixture_path = Path(str(args.fixture_path))
-    report_dir = Path("artifacts/validation/deep-research") / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    command_name = str(getattr(args, "command", "deep-research-smoke"))
+    report_root = (
+        Path("artifacts/validation/deep-research-hard-gate")
+        if command_name == "deep-research-hard-gate"
+        else Path("artifacts/validation/deep-research")
+    )
+    report_dir = report_root / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     report_dir.mkdir(parents=True, exist_ok=True)
     fixtures = load_deep_research_fixtures(fixture_path)
+    context_policy_override = _deep_research_context_policy_override(args)
+    compose_model_provider = str(getattr(args, "compose_model_provider", "mock"))
+    is_hard_gate = command_name == "deep-research-hard-gate"
     if args.task_id:
         requested = set(str(task_id) for task_id in args.task_id)
         fixtures = [fixture for fixture in fixtures if fixture.task_id in requested]
@@ -1328,24 +1861,66 @@ def verify_deep_research_smoke(args: argparse.Namespace) -> None:
         fixtures = fixtures[: max(0, int(args.max_tasks))]
     report: dict[str, Any] = {
         "passed": False,
+        "command": command_name,
         "api": api,
         "fixture_path": str(fixture_path),
         "retrieval_profile": str(args.retrieval_profile),
+        "tool_mode": str(getattr(args, "tool_mode", DEFAULT_RESEARCH_TOOL_MODE)),
+        "compose_model_provider": compose_model_provider,
         "declared_context_tokens": int(args.declared_context_tokens),
+        "context_policy_override": context_policy_override or {},
+        "runtime": {"mode": "pending"},
         "report_dir": str(report_dir),
         "checks": [],
         "items": [],
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     exit_code = 0
+    runtime: DeepResearchRuntime | None = None
     try:
         if not fixtures:
             raise RuntimeError("no Deep Research fixtures selected")
         if not admin_secret:
             raise RuntimeError("deep-research-smoke requires a non-empty admin secret")
-        if not args.skip_compose:
-            _compose_up_deep_research_stack()
-            _record_check(report, "compose_up", True)
+        if is_hard_gate and not args.skip_compose:
+            runtime = _compose_up_isolated_deep_research_hard_gate(
+                model_provider=compose_model_provider,
+                retrieval_profile=str(args.retrieval_profile),
+            )
+            api = runtime.api
+            report["api"] = api
+            report["runtime"] = runtime.public_details()
+            _record_check(
+                report,
+                "compose_up_isolated",
+                True,
+                {
+                    "model_provider": compose_model_provider,
+                    "retrieval_profile": str(args.retrieval_profile),
+                    **runtime.public_details(),
+                },
+            )
+        elif not args.skip_compose:
+            compose_details = _compose_up_deep_research_stack(
+                model_provider=compose_model_provider,
+                retrieval_profile=str(args.retrieval_profile),
+            )
+            runtime = DeepResearchRuntime(api=api)
+            report["runtime"] = runtime.public_details()
+            _record_check(
+                report,
+                "compose_up",
+                True,
+                {
+                    "model_provider": compose_model_provider,
+                    "retrieval_profile": str(args.retrieval_profile),
+                    **compose_details,
+                },
+            )
+        else:
+            runtime = DeepResearchRuntime(api=api)
+            report["runtime"] = runtime.public_details()
+        hard_gate_deadline = time.monotonic() + int(args.timeout_seconds) if is_hard_gate else None
         with httpx.Client(timeout=180, follow_redirects=True) as admin_client:
             _wait_json_ready(admin_client, f"{api}/ready", "api", require_ok=True)
             _record_check(report, "api_ready", True)
@@ -1363,7 +1938,12 @@ def verify_deep_research_smoke(args: argparse.Namespace) -> None:
                 raise RuntimeError(f"admin session has no active tenant: {admin_session}")
             viewer_credentials: dict[str, str] | None = None
             if any(str(fixture.acl_setup.get("mode") or "") == "mixed_visibility" for fixture in fixtures):
-                viewer_credentials = asyncio.run(_seed_deep_research_viewer_user(tenant_id=tenant_id))
+                viewer_credentials = asyncio.run(
+                    _seed_deep_research_viewer_user(
+                        tenant_id=tenant_id,
+                        database_url=runtime.database_url if runtime is not None else None,
+                    )
+                )
                 _record_check(report, "viewer_user_seeded", True, {"user_id": viewer_credentials["user_id"]})
             for index, fixture in enumerate(fixtures, start=1):
                 item = _run_deep_research_fixture(
@@ -1371,9 +1951,13 @@ def verify_deep_research_smoke(args: argparse.Namespace) -> None:
                     api,
                     fixture,
                     retrieval_profile=str(args.retrieval_profile),
+                    tool_mode=str(getattr(args, "tool_mode", DEFAULT_RESEARCH_TOOL_MODE)),
                     declared_context_tokens=int(args.declared_context_tokens),
                     timeout_seconds=int(args.timeout_seconds),
                     viewer_credentials=viewer_credentials,
+                    context_policy_override=context_policy_override,
+                    artifact_dir=report_dir,
+                    deadline_monotonic=hard_gate_deadline,
                 )
                 item["policy_id"] = DEFAULT_DEEP_RESEARCH_POLICY_ID
                 _append_report_item(report, item)
@@ -1381,6 +1965,7 @@ def verify_deep_research_smoke(args: argparse.Namespace) -> None:
                     json.dumps(
                         {
                             "deep_research_task": fixture.task_id,
+                            "tool_mode": str(getattr(args, "tool_mode", DEFAULT_RESEARCH_TOOL_MODE)),
                             "processed": index,
                             "total": len(fixtures),
                             "passed": item.get("passed"),
@@ -1406,11 +1991,13 @@ def verify_deep_research_smoke(args: argparse.Namespace) -> None:
         report["passed"] = True
     except Exception as exc:
         exit_code = 1
-        report["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+        report["error"] = _safe_cli_failure(exc, stage="deep_research_smoke")
     finally:
         report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _write_deep_research_reports(report_dir, report)
-        if args.down_after:
+        if runtime is not None and runtime.isolated and args.down_after:
+            _compose_down_isolated_deep_research_hard_gate(runtime)
+        elif args.down_after:
             subprocess.run([_docker_executable(), "compose", "down"], check=False)  # noqa: S603
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if exit_code:
@@ -1461,12 +2048,172 @@ def verify_deep_research_matrix(args: argparse.Namespace) -> None:
         "notes": [
             "Matrix mode is an offline context-packer experiment over synthetic fixture records.",
             "It exercises all 27 target/packing/reflection policies without requiring Qwen or provider calls.",
-            "Runtime Deep Research currently stores the 45% policy from retrieval profile; "
-            "API-level policy override is future work.",
+            "Runtime Deep Research accepts API/CLI context_policy_override for productive, soft and hard limits.",
         ],
     }
     _write_deep_research_matrix_reports(report_dir, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def verify_deep_research_tool_matrix(args: argparse.Namespace) -> None:
+    from wikipediarag.deep_research_eval import (
+        build_runtime_tool_matrix_report,
+        load_deep_research_fixtures,
+        runtime_tool_matrix_modes,
+    )
+
+    api = str(args.api).rstrip("/")
+    admin_secret = _resolve_hardening_admin_secret(args)
+    fixture_path = Path(str(args.fixture_path))
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    report_dir = (
+        Path(str(args.output_dir))
+        if args.output_dir
+        else Path("artifacts/validation/deep-research-tool-matrix") / timestamp
+    )
+    report_dir.mkdir(parents=True, exist_ok=True)
+    fixtures = load_deep_research_fixtures(fixture_path)
+    if args.task_id:
+        requested = set(str(task_id) for task_id in args.task_id)
+        fixtures = [fixture for fixture in fixtures if fixture.task_id in requested]
+        missing = sorted(requested - {fixture.task_id for fixture in fixtures})
+        if missing:
+            raise RuntimeError(f"unknown Deep Research fixture task-id(s): {missing}")
+    if args.max_tasks is not None:
+        fixtures = fixtures[: max(0, int(args.max_tasks))]
+    if not fixtures:
+        raise RuntimeError("no Deep Research fixtures selected")
+    context_policy_override = _deep_research_context_policy_override(args)
+    compose_model_provider = str(getattr(args, "compose_model_provider", "openrouter"))
+    tool_modes = runtime_tool_matrix_modes()
+    report: dict[str, Any] = {
+        "passed": False,
+        "command": "deep-research-tool-matrix",
+        "api": api,
+        "fixture_path": str(fixture_path),
+        "retrieval_profile": str(args.retrieval_profile),
+        "compose_model_provider": compose_model_provider,
+        "declared_context_tokens": int(args.declared_context_tokens),
+        "context_policy_override": context_policy_override or {},
+        "tool_modes": tool_modes,
+        "gating_policy_id": DEFAULT_RESEARCH_TOOL_MODE,
+        "runtime": {"mode": "pending"},
+        "report_dir": str(report_dir),
+        "items": [],
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    exit_code = 0
+    runtime: DeepResearchRuntime | None = None
+    try:
+        if not admin_secret:
+            raise RuntimeError("deep-research-tool-matrix requires a non-empty admin secret")
+        if not args.skip_compose:
+            runtime = _compose_up_isolated_deep_research_hard_gate(
+                model_provider=compose_model_provider,
+                retrieval_profile=str(args.retrieval_profile),
+            )
+            api = runtime.api
+            report["api"] = api
+            report["runtime"] = runtime.public_details()
+        else:
+            runtime = DeepResearchRuntime(api=api)
+            report["runtime"] = runtime.public_details()
+        with httpx.Client(timeout=180, follow_redirects=True) as admin_client:
+            _wait_json_ready(admin_client, f"{api}/ready", "api", require_ok=True)
+            _authenticate_smoke_session(
+                admin_client,
+                api,
+                username=str(args.admin_username),
+                admin_secret=admin_secret,
+            )
+            admin_session = _get_json(admin_client, f"{api}/api/v1/auth/session")
+            _update_csrf_from_session(admin_client, admin_session)
+            tenant_id = str(admin_session.get("active_tenant_id") or "")
+            if not tenant_id:
+                raise RuntimeError(f"admin session has no active tenant: {admin_session}")
+            viewer_credentials: dict[str, str] | None = None
+            if any(str(fixture.acl_setup.get("mode") or "") == "mixed_visibility" for fixture in fixtures):
+                viewer_credentials = asyncio.run(
+                    _seed_deep_research_viewer_user(
+                        tenant_id=tenant_id,
+                        database_url=runtime.database_url if runtime is not None else None,
+                    )
+                )
+            for mode_index, tool_mode in enumerate(tool_modes, start=1):
+                mode_artifact_dir = report_dir / tool_mode
+                mode_artifact_dir.mkdir(parents=True, exist_ok=True)
+                for fixture_index, fixture in enumerate(fixtures, start=1):
+                    item = _run_deep_research_fixture(
+                        admin_client,
+                        api,
+                        fixture,
+                        retrieval_profile=str(args.retrieval_profile),
+                        tool_mode=tool_mode,
+                        declared_context_tokens=int(args.declared_context_tokens),
+                        timeout_seconds=int(args.timeout_seconds),
+                        viewer_credentials=viewer_credentials,
+                        context_policy_override=context_policy_override,
+                        artifact_dir=mode_artifact_dir,
+                    )
+                    item["policy_id"] = tool_mode
+                    item["tool_mode"] = tool_mode
+                    report["items"].append(item)
+                    _write_partial_deep_research_report(report_dir, report)
+                    print(
+                        json.dumps(
+                            {
+                                "tool_mode": tool_mode,
+                                "mode_index": mode_index,
+                                "mode_total": len(tool_modes),
+                                "deep_research_task": fixture.task_id,
+                                "processed": fixture_index,
+                                "total": len(fixtures),
+                                "passed": item.get("passed"),
+                                "run_status": item.get("metrics", {}).get("run_status")
+                                if isinstance(item, dict)
+                                else None,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+            experiment_rows: list[dict[str, Any]] = [
+                {
+                    "policy_id": str(item.get("policy_id") or DEFAULT_RESEARCH_TOOL_MODE),
+                    "passed": bool(item.get("passed")),
+                    "metrics": item.get("metrics") if isinstance(item.get("metrics"), dict) else {},
+                    "fixture_task_id": str(item.get("task_id") or ""),
+                    "experiment_mode": "runtime_tool_matrix",
+                }
+                for item in report["items"]
+                if isinstance(item, dict)
+            ]
+            report["tool_matrix"] = build_runtime_tool_matrix_report(experiment_rows)
+            policy_results = report["tool_matrix"].get("policy_results")
+            default_policy = next(
+                (
+                    item
+                    for item in policy_results
+                    if isinstance(item, dict) and item.get("policy_id") == DEFAULT_RESEARCH_TOOL_MODE
+                ),
+                None,
+            )
+            if isinstance(default_policy, dict):
+                report["passed"] = bool(default_policy.get("passed"))
+            else:
+                report["passed"] = False
+            if not report["passed"]:
+                exit_code = 1
+    except Exception as exc:
+        exit_code = 1
+        report["error"] = _safe_cli_failure(exc, stage="deep_research_matrix")
+    finally:
+        report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_deep_research_matrix_reports(report_dir, report)
+        if runtime is not None and runtime.isolated:
+            _compose_down_isolated_deep_research_hard_gate(runtime)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 def _resolve_hardening_admin_secret(args: argparse.Namespace) -> str:
@@ -1476,15 +2223,32 @@ def _resolve_hardening_admin_secret(args: argparse.Namespace) -> str:
     return str(getattr(args, "admin_secret", "admin") or "admin")
 
 
+def _deep_research_context_policy_override(args: argparse.Namespace) -> dict[str, float] | None:
+    payload: dict[str, float] = {}
+    for arg_name, field_name in (
+        ("context_productive_target", "productive_target"),
+        ("context_soft_limit", "soft_limit"),
+        ("context_hard_input_limit", "hard_input_limit"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            payload[field_name] = float(value)
+    return payload or None
+
+
 def _run_deep_research_fixture(
     admin_client: httpx.Client,
     api: str,
     fixture: Any,
     *,
     retrieval_profile: str,
+    tool_mode: str,
     declared_context_tokens: int,
     timeout_seconds: int,
     viewer_credentials: dict[str, str] | None,
+    context_policy_override: dict[str, float] | None,
+    artifact_dir: Path | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     from wikipediarag.deep_research_eval import evaluate_research_detail
 
@@ -1492,11 +2256,17 @@ def _run_deep_research_fixture(
     result: dict[str, Any] = {
         "task_id": fixture.task_id,
         "quality_tags": list(fixture.quality_tags),
+        "tool_mode": tool_mode,
         "passed": False,
         "uploads": [],
         "actions": [],
     }
+    uploaded_document_ids: dict[str, str] = {}
     try:
+        _remaining_deep_research_timeout(
+            deadline_monotonic=deadline_monotonic,
+            fallback_timeout_seconds=timeout_seconds,
+        )
         knowledge_base_id = _create_deep_research_knowledge_base(admin_client, api, str(fixture.task_id))
         result["knowledge_base_id"] = knowledge_base_id
         viewer_client: httpx.Client | None = None
@@ -1516,8 +2286,16 @@ def _run_deep_research_fixture(
             result["viewer_user_id"] = viewer_credentials["user_id"]
         try:
             for document in fixture.documents:
-                upload = _upload_deep_research_fixture_document(admin_client, api, knowledge_base_id, fixture, document)
+                upload = _upload_deep_research_fixture_document(
+                    admin_client,
+                    api,
+                    knowledge_base_id,
+                    fixture,
+                    document,
+                    deadline_monotonic=deadline_monotonic,
+                )
                 result["uploads"].append(upload)
+                uploaded_document_ids[str(upload["fixture_document_id"])] = str(upload["document_id"])
                 if document.access is not None:
                     _patch_deep_research_document_access(
                         admin_client,
@@ -1532,7 +2310,14 @@ def _run_deep_research_fixture(
                     knowledge_base_id,
                     str(fixture.topic),
                     retrieval_profile=retrieval_profile,
+                    tool_mode=tool_mode,
                     timeout_seconds=timeout_seconds,
+                    context_policy_override=context_policy_override,
+                    deadline_monotonic=deadline_monotonic,
+                    run_deadline_seconds=_deep_research_run_deadline_seconds(
+                        deadline_monotonic=deadline_monotonic,
+                        fallback_timeout_seconds=timeout_seconds,
+                    ),
                 )
                 result["actions"].extend(action_detail["actions"])
                 detail = action_detail["detail"]
@@ -1543,13 +2328,30 @@ def _run_deep_research_fixture(
                     knowledge_base_id,
                     str(fixture.topic),
                     retrieval_profile=retrieval_profile,
+                    tool_mode=tool_mode,
+                    context_policy_override=context_policy_override,
+                    run_deadline_seconds=_deep_research_run_deadline_seconds(
+                        deadline_monotonic=deadline_monotonic,
+                        fallback_timeout_seconds=timeout_seconds,
+                    ),
                 )
                 result["run_id"] = run_id
-                detail = _wait_research_run_terminal(runner_client, api, run_id, timeout_seconds=timeout_seconds)
+                detail = _wait_research_run_terminal(
+                    runner_client,
+                    api,
+                    run_id,
+                    timeout_seconds=timeout_seconds,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            if artifact_dir is not None:
+                detail_artifact = artifact_dir / f"{fixture.task_id}-detail.json"
+                detail_artifact.write_text(json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8")
+                result["detail_artifact"] = str(detail_artifact)
             evaluation = evaluate_research_detail(
                 fixture,
                 detail,
                 declared_context_tokens=declared_context_tokens,
+                document_id_aliases=uploaded_document_ids or None,
             )
             result.update(evaluation)
             result["latency_seconds"] = round(time.monotonic() - started, 3)
@@ -1560,11 +2362,11 @@ def _run_deep_research_fixture(
             if viewer_client is not None:
                 viewer_client.close()
     except Exception as exc:
-        result["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+        result["error"] = _safe_cli_failure(exc, stage="deep_research_fixture")
     return result
 
 
-async def _seed_deep_research_viewer_user(*, tenant_id: str) -> dict[str, str]:
+async def _seed_deep_research_viewer_user(*, tenant_id: str, database_url: str | None = None) -> dict[str, str]:
     from sqlalchemy import text
 
     from wikipediarag.auth_service import hash_password
@@ -1573,9 +2375,9 @@ async def _seed_deep_research_viewer_user(*, tenant_id: str) -> dict[str, str]:
     from wikipediarag.ids import new_uuid
 
     settings = get_settings()
-    database_url = _host_reachable_database_url(settings.database_url)
-    if database_url != settings.database_url:
-        settings = settings.model_copy(update={"database_url": database_url})
+    resolved_database_url = database_url or _host_reachable_database_url(settings.database_url)
+    if resolved_database_url != settings.database_url:
+        settings = settings.model_copy(update={"database_url": resolved_database_url})
     suffix = time.strftime("%Y%m%d%H%M%S", time.gmtime()) + uuid.uuid4().hex[:8]
     user_id = str(new_uuid())
     username = f"deep-research-viewer-{suffix}"
@@ -1694,6 +2496,8 @@ def _upload_deep_research_fixture_document(
     knowledge_base_id: str,
     fixture: Any,
     document: Any,
+    *,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     content = str(document.content).encode("utf-8")
     checksum = hashlib.sha256(content).hexdigest()
@@ -1713,7 +2517,10 @@ def _upload_deep_research_fixture_document(
                 **dict(document.metadata),
             },
         },
-        timeout=30,
+        timeout=_remaining_deep_research_timeout(
+            deadline_monotonic=deadline_monotonic,
+            fallback_timeout_seconds=30,
+        ),
     )
     session_response.raise_for_status()
     session = session_response.json()
@@ -1721,21 +2528,36 @@ def _upload_deep_research_fixture_document(
         session["upload_url"],
         content=content,
         headers=session.get("required_headers") or {},
-        timeout=120,
+        timeout=_remaining_deep_research_timeout(
+            deadline_monotonic=deadline_monotonic,
+            fallback_timeout_seconds=120,
+        ),
     )
     upload_response.raise_for_status()
     complete_response = client.post(
         f"{api}/api/v1/uploads/sessions/{session['upload_session_id']}:complete",
         json={"metadata": {"deep_research_fixture_completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}},
-        timeout=30,
+        timeout=_remaining_deep_research_timeout(
+            deadline_monotonic=deadline_monotonic,
+            fallback_timeout_seconds=30,
+        ),
     )
     complete_response.raise_for_status()
     completed = complete_response.json()
     if not isinstance(completed, dict):
         raise RuntimeError("upload complete returned a non-object JSON payload")
-    job_payload = _wait_job_terminal(client, api, str(completed["job_id"]))
+    job_payload = _wait_job_terminal(
+        client,
+        api,
+        str(completed["job_id"]),
+        timeout_seconds=_remaining_deep_research_timeout(
+            deadline_monotonic=deadline_monotonic,
+            fallback_timeout_seconds=360,
+        ),
+        deadline_monotonic=deadline_monotonic,
+    )
     if job_payload.get("status") != "completed":
-        raise RuntimeError(f"Deep Research fixture upload job failed: {job_payload}")
+        raise RuntimeError("Deep Research fixture upload job did not complete successfully")
     return {
         "fixture_document_id": str(document.id),
         "document_id": str(completed["document_id"]),
@@ -1766,21 +2588,35 @@ def _create_deep_research_run(
     topic: str,
     *,
     retrieval_profile: str,
+    tool_mode: str,
+    context_policy_override: dict[str, float] | None,
+    run_deadline_seconds: int | None = None,
 ) -> str:
+    retrieval_overrides: dict[str, Any] = {
+        "retrieval": {"top_k": 12},
+        "postprocess": {"extended_search": "always"},
+    }
+    if run_deadline_seconds is not None:
+        retrieval_overrides["deep_research"] = {"deadline_seconds": int(run_deadline_seconds)}
+    payload: dict[str, Any] = {
+        "topic": topic,
+        "knowledge_base_id": knowledge_base_id,
+        "retrieval_profile": retrieval_profile,
+        "tool_mode": tool_mode,
+        "retrieval_overrides": retrieval_overrides,
+    }
+    if context_policy_override:
+        payload["context_policy_override"] = context_policy_override
     response = client.post(
         f"{api}/api/v1/research-runs",
-        json={
-            "topic": topic,
-            "knowledge_base_id": knowledge_base_id,
-            "retrieval_profile": retrieval_profile,
-            "retrieval_overrides": {
-                "retrieval": {"top_k": 12},
-                "postprocess": {"extended_search": "always"},
-            },
-        },
+        json=payload,
         timeout=30,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        body = response.text[:1000]
+        raise RuntimeError(f"deep research run creation failed: status={response.status_code} body={body}") from exc
     payload = response.json()
     if not isinstance(payload, dict) or not payload.get("run_id"):
         raise RuntimeError(f"research run creation returned invalid payload: {payload}")
@@ -1793,8 +2629,13 @@ def _wait_research_run_terminal(
     research_run_id: str,
     *,
     timeout_seconds: int,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    deadline = min(
+        started + timeout_seconds,
+        deadline_monotonic if deadline_monotonic is not None else float("inf"),
+    )
     last_payload: dict[str, Any] = {}
     terminal = {"completed", "failed", "cancelled", "paused"}
     while time.monotonic() < deadline:
@@ -1815,8 +2656,10 @@ def _wait_research_run_terminal(
                 ensure_ascii=False,
             )
         )
-        time.sleep(3)
-    raise RuntimeError(f"research run did not reach terminal state: {last_payload}")
+        time.sleep(min(3, max(0, deadline - time.monotonic())))
+    if deadline_monotonic is not None and deadline <= started + timeout_seconds:
+        raise DeepResearchSuiteDeadlineExceededError("deep research hard gate deadline elapsed during run wait")
+    raise DeepResearchRunTerminalTimeoutError("research run did not reach a terminal status before the gate deadline")
 
 
 def _exercise_deep_research_actions(
@@ -1826,7 +2669,11 @@ def _exercise_deep_research_actions(
     topic: str,
     *,
     retrieval_profile: str,
+    tool_mode: str,
     timeout_seconds: int,
+    context_policy_override: dict[str, float] | None,
+    deadline_monotonic: float | None = None,
+    run_deadline_seconds: int | None = None,
 ) -> dict[str, Any]:
     actions: list[dict[str, Any]] = []
     pause_run_id = _create_deep_research_run(
@@ -1835,30 +2682,95 @@ def _exercise_deep_research_actions(
         knowledge_base_id,
         topic,
         retrieval_profile=retrieval_profile,
+        tool_mode=tool_mode,
+        context_policy_override=context_policy_override,
+        run_deadline_seconds=run_deadline_seconds,
     )
     pause_response = client.post(f"{api}/api/v1/research-runs/{pause_run_id}:pause", timeout=30)
     actions.append({"action": "pause", "status_code": pause_response.status_code})
     pause_response.raise_for_status()
-    pause_detail = _wait_research_run_terminal(client, api, pause_run_id, timeout_seconds=timeout_seconds)
+    pause_detail = _wait_research_run_terminal(
+        client,
+        api,
+        pause_run_id,
+        timeout_seconds=_remaining_deep_research_timeout(
+            deadline_monotonic=deadline_monotonic,
+            fallback_timeout_seconds=timeout_seconds,
+        ),
+        deadline_monotonic=deadline_monotonic,
+    )
     pause_status = str(_mapping_from_payload(pause_detail, "run").get("status") or "")
     if pause_status == "paused":
         resume_response = client.post(f"{api}/api/v1/research-runs/{pause_run_id}:resume", timeout=30)
         actions.append({"action": "resume", "status_code": resume_response.status_code})
         resume_response.raise_for_status()
-        pause_detail = _wait_research_run_terminal(client, api, pause_run_id, timeout_seconds=timeout_seconds)
+        pause_detail = _wait_research_run_terminal(
+            client,
+            api,
+            pause_run_id,
+            timeout_seconds=_remaining_deep_research_timeout(
+                deadline_monotonic=deadline_monotonic,
+                fallback_timeout_seconds=timeout_seconds,
+            ),
+            deadline_monotonic=deadline_monotonic,
+        )
     cancel_run_id = _create_deep_research_run(
         client,
         api,
         knowledge_base_id,
         topic,
         retrieval_profile=retrieval_profile,
+        tool_mode=tool_mode,
+        context_policy_override=context_policy_override,
+        run_deadline_seconds=run_deadline_seconds,
     )
     cancel_response = client.post(f"{api}/api/v1/research-runs/{cancel_run_id}:cancel", timeout=30)
     actions.append({"action": "cancel", "status_code": cancel_response.status_code})
     cancel_response.raise_for_status()
-    cancel_detail = _wait_research_run_terminal(client, api, cancel_run_id, timeout_seconds=timeout_seconds)
+    cancel_detail = _wait_research_run_terminal(
+        client,
+        api,
+        cancel_run_id,
+        timeout_seconds=_remaining_deep_research_timeout(
+            deadline_monotonic=deadline_monotonic,
+            fallback_timeout_seconds=timeout_seconds,
+        ),
+        deadline_monotonic=deadline_monotonic,
+    )
     actions.append({"action": "cancel_terminal", "status": _mapping_from_payload(cancel_detail, "run").get("status")})
     return {"actions": actions, "detail": pause_detail}
+
+
+def _remaining_deep_research_timeout(
+    *,
+    deadline_monotonic: float | None,
+    fallback_timeout_seconds: int,
+) -> int:
+    if deadline_monotonic is None:
+        return fallback_timeout_seconds
+    remaining_seconds = deadline_monotonic - time.monotonic()
+    if remaining_seconds <= 0:
+        raise DeepResearchSuiteDeadlineExceededError("deep research hard gate deadline elapsed")
+    return min(fallback_timeout_seconds, max(1, int(remaining_seconds) + 1))
+
+
+def _deep_research_run_deadline_seconds(
+    *,
+    deadline_monotonic: float | None,
+    fallback_timeout_seconds: int,
+    reserve_seconds: int = DEEP_RESEARCH_GATE_RUN_RESERVE_SECONDS,
+    minimum_seconds: int = DEEP_RESEARCH_GATE_MIN_RUN_SECONDS,
+) -> int | None:
+    """Bound a run by the remaining hard-gate budget, leaving report time."""
+    if deadline_monotonic is None:
+        return None
+    remaining_seconds = deadline_monotonic - time.monotonic()
+    if remaining_seconds <= reserve_seconds + minimum_seconds:
+        raise DeepResearchSuiteDeadlineExceededError("insufficient hard-gate time for a new research run")
+    return max(
+        minimum_seconds,
+        min(fallback_timeout_seconds, int(remaining_seconds - reserve_seconds)),
+    )
 
 
 def _mapping_from_payload(payload: dict[str, Any], key: str) -> dict[str, Any]:
@@ -1869,6 +2781,7 @@ def _mapping_from_payload(payload: dict[str, Any], key: str) -> dict[str, Any]:
 def _write_deep_research_reports(report_dir: Path, report: dict[str, Any]) -> None:
     report_path = report_dir / "report.json"
     junit_path = report_dir / "junit.xml"
+    suite_name = str(report.get("command") or "deep-research-smoke")
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     raw_items = report.get("items")
     items: list[Any] = raw_items if isinstance(raw_items, list) else []
@@ -1891,13 +2804,13 @@ def _write_deep_research_reports(report_dir: Path, report: dict[str, Any]) -> No
     if not testcases and report.get("error"):
         error = report["error"] if isinstance(report["error"], dict) else {}
         testcases.append(
-            '  <testcase classname="wikipediarag.cli" name="deep_research_smoke">'
+            f'  <testcase classname="wikipediarag.cli" name="{escape(suite_name)}">'
             f'<failure type="{escape(str(error.get("code") or "Error"))}">'
             f"{escape(str(error.get('message') or ''))}</failure></testcase>\n"
         )
     junit = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f'<testsuite name="deep-research-smoke" tests="{len(testcases)}" failures="{failure_count}">\n'
+        f'<testsuite name="{escape(suite_name)}" tests="{len(testcases)}" failures="{failure_count}">\n'
         f"{''.join(testcases)}</testsuite>\n"
     )
     junit_path.write_text(junit, encoding="utf-8")
@@ -1909,13 +2822,24 @@ def _write_deep_research_matrix_reports(report_dir: Path, report: dict[str, Any]
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     raw_items = report.get("items")
     items: list[Any] = raw_items if isinstance(raw_items, list) else []
-    acl_failures = [item for item in items if isinstance(item, dict) and item.get("acl_safety") is False]
+    gating_policy_id = str(report.get("gating_policy_id") or "")
+    failure_items = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and not bool(item.get("passed", True))
+        and (
+            not gating_policy_id
+            or str(item.get("policy_id") or "") == gating_policy_id
+            or item.get("acl_safety") is False
+        )
+    ]
     testcases: list[str] = []
     for item in items:
         if not isinstance(item, dict):
             continue
         failure_xml = ""
-        if item.get("acl_safety") is False:
+        if item in failure_items:
             message = json.dumps({"failures": item.get("failures")}, ensure_ascii=False)
             failure_xml = f'<failure type="DeepResearchMatrixAclFailure">{escape(message)}</failure>'
         testcases.append(
@@ -1924,14 +2848,24 @@ def _write_deep_research_matrix_reports(report_dir: Path, report: dict[str, Any]
         )
     junit = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f'<testsuite name="deep-research-matrix" tests="{len(testcases)}" failures="{len(acl_failures)}">\n'
+        f'<testsuite name="{escape(str(report.get("command") or "deep-research-matrix"))}" '
+        f'tests="{len(testcases)}" failures="{len(failure_items)}">\n'
         f"{''.join(testcases)}</testsuite>\n"
     )
     junit_path.write_text(junit, encoding="utf-8")
 
 
-def _compose_up_deep_research_stack() -> None:
-    _compose_up_document_upload_stack()
+def _write_partial_deep_research_report(report_dir: Path, report: dict[str, Any]) -> None:
+    partial_path = report_dir / "report.partial.json"
+    partial_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _compose_up_deep_research_stack(
+    *,
+    model_provider: str = "mock",
+    retrieval_profile: str = "upload_mock",
+) -> dict[str, Any]:
+    return _compose_up_document_upload_stack(model_provider=model_provider, retrieval_profile=retrieval_profile)
 
 
 def _login_for_hardening(client: httpx.Client, api: str, username: str, admin_secret: str) -> None:
@@ -2300,7 +3234,7 @@ def _run_corpus_item(
         _assert_corpus_item_outcome(client, api, knowledge_base_id, item, result)
         result["passed"] = True
     except Exception as exc:
-        result["error"] = {"code": type(exc).__name__, "message": str(exc)[:1000]}
+        result["error"] = _safe_cli_failure(exc, stage="document_corpus_item")
     return result
 
 
@@ -2537,11 +3471,227 @@ def _write_document_corpus_reports(report_dir: Path, report: dict[str, Any]) -> 
     junit_path.write_text(junit, encoding="utf-8")
 
 
-def _compose_up_document_upload_stack() -> None:
+def _compose_up_document_upload_stack(
+    *,
+    model_provider: str = "mock",
+    retrieval_profile: str = "test_mock",
+) -> dict[str, Any]:
+    env, openrouter_key_source = _deep_research_compose_environment(
+        model_provider=model_provider,
+        retrieval_profile=retrieval_profile,
+    )
+    subprocess.run(  # noqa: S603
+        [
+            _docker_executable(),
+            "compose",
+            "up",
+            "-d",
+            "--build",
+            "--force-recreate",
+            *DOCUMENT_UPLOAD_COMPOSE_SERVICES,
+        ],
+        check=True,
+        env=env,
+    )
+    return {"openrouter_api_key_source": openrouter_key_source} if openrouter_key_source else {}
+
+
+def _compose_up_isolated_deep_research_hard_gate(
+    *,
+    model_provider: str,
+    retrieval_profile: str,
+) -> DeepResearchRuntime:
+    last_port_conflict = False
+    attempts_made = 0
+    for attempt in range(1, DEEP_RESEARCH_GATE_COMPOSE_START_ATTEMPTS + 1):
+        attempts_made = attempt
+        runtime = _new_isolated_deep_research_runtime(attempt)
+        env, openrouter_key_source = _deep_research_compose_environment(
+            model_provider=model_provider,
+            retrieval_profile=retrieval_profile,
+            runtime=runtime,
+        )
+        runtime = DeepResearchRuntime(
+            api=runtime.api,
+            database_url=runtime.database_url,
+            compose_project=runtime.compose_project,
+            api_port=runtime.api_port,
+            minio_port=runtime.minio_port,
+            attempt=runtime.attempt,
+            openrouter_api_key_source=openrouter_key_source,
+            isolated=True,
+        )
+        command = _isolated_deep_research_compose_command(runtime, "up", "-d", "--build", "--force-recreate")
+        try:
+            subprocess.run(  # noqa: S603
+                [*command, *DEEP_RESEARCH_GATE_COMPOSE_SERVICES],
+                check=True,
+                env=env,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return runtime
+        except subprocess.CalledProcessError as exc:
+            _compose_down_isolated_deep_research_hard_gate(runtime)
+            last_port_conflict = _is_compose_port_conflict(exc.stderr or "")
+            if last_port_conflict and attempt < DEEP_RESEARCH_GATE_COMPOSE_START_ATTEMPTS:
+                continue
+            break
+    reason = "port conflict" if last_port_conflict else "compose startup failure"
+    raise DeepResearchGateInfrastructureError(
+        f"isolated Deep Research hard-gate Compose startup failed after {attempts_made} attempt(s): {reason}"
+    )
+
+
+def _compose_up_isolated_reliability_smoke() -> DeepResearchRuntime:
+    for attempt in range(1, DEEP_RESEARCH_GATE_COMPOSE_START_ATTEMPTS + 1):
+        runtime = _new_isolated_deep_research_runtime(attempt)
+        env, _ = _deep_research_compose_environment(
+            model_provider="mock",
+            retrieval_profile="upload_mock",
+            runtime=runtime,
+        )
+        env.update(
+            {
+                "DOCUMENT_PARSER_SERVICES_REQUIRED": "true",
+                "METADATA_SERVICE_URL": "http://metadata-service:8090",
+                "MODEL_PROVIDER_TIMEOUT_SECONDS": "1",
+                "MODEL_CLIENT_CHAT_TIMEOUT_SECONDS": "10",
+                "MOCK_PROVIDER_CHAT_DELAY_SECONDS": "2",
+                "MOCK_PROVIDER_CHAT_DELAY_REQUESTS": "3",
+            }
+        )
+        command = _isolated_deep_research_compose_command(runtime, "up", "-d", "--build", "--force-recreate")
+        try:
+            subprocess.run(  # noqa: S603
+                [*command, *DOCUMENT_UPLOAD_COMPOSE_SERVICES],
+                check=True,
+                env=env,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return runtime
+        except subprocess.CalledProcessError as exc:
+            _compose_down_isolated_deep_research_hard_gate(runtime)
+            if not _is_compose_port_conflict(exc.stderr or "") or attempt == DEEP_RESEARCH_GATE_COMPOSE_START_ATTEMPTS:
+                break
+    raise DeepResearchGateInfrastructureError("isolated reliability Compose startup failed")
+
+
+def _reliability_compose(runtime: DeepResearchRuntime, *arguments: str) -> None:
+    database_port = runtime.database_url_port()
+    if runtime.api_port is None or runtime.minio_port is None or database_port is None:
+        raise DeepResearchGateInfrastructureError("isolated reliability runtime is incomplete")
     env = {
         **os.environ,
-        "MODEL_PROVIDER": "mock",
-        "RETRIEVAL_PROFILE": "test_mock",
+        "DEEP_RESEARCH_GATE_API_PORT": str(runtime.api_port),
+        "DEEP_RESEARCH_GATE_MINIO_PORT": str(runtime.minio_port),
+        "DEEP_RESEARCH_GATE_POSTGRES_PORT": str(database_port),
+        "DOCUMENT_PARSER_SERVICES_REQUIRED": "true",
+        "METADATA_SERVICE_URL": "http://metadata-service:8090",
+        "MODEL_PROVIDER_TIMEOUT_SECONDS": "1",
+        "MODEL_CLIENT_CHAT_TIMEOUT_SECONDS": "10",
+        "MOCK_PROVIDER_CHAT_DELAY_SECONDS": "2",
+        "MOCK_PROVIDER_CHAT_DELAY_REQUESTS": "3",
+    }
+    subprocess.run(  # noqa: S603
+        _isolated_deep_research_compose_command(runtime, *arguments),
+        check=True,
+        env=env,
+    )
+
+
+def _new_isolated_deep_research_runtime(attempt: int) -> DeepResearchRuntime:
+    postgres_port = _allocate_localhost_port()
+    minio_port = _allocate_localhost_port(excluded={postgres_port})
+    api_port = _allocate_localhost_port(excluded={postgres_port, minio_port})
+    project = f"wikipediarag-dr-gate-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:8]}"
+    return DeepResearchRuntime(
+        api=f"http://127.0.0.1:{api_port}",
+        database_url=(f"postgresql+asyncpg://rag:change-me-local-only@127.0.0.1:{postgres_port}/rag"),
+        compose_project=project,
+        api_port=api_port,
+        minio_port=minio_port,
+        attempt=attempt,
+        isolated=True,
+    )
+
+
+def _allocate_localhost_port(*, excluded: set[int] | None = None) -> int:
+    blocked = excluded or set()
+    for _ in range(10):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = int(listener.getsockname()[1])
+        if port not in blocked:
+            return port
+    raise DeepResearchGateInfrastructureError("could not allocate distinct localhost ports for isolated hard gate")
+
+
+def _isolated_deep_research_compose_command(runtime: DeepResearchRuntime, *arguments: str) -> list[str]:
+    if not runtime.compose_project:
+        raise DeepResearchGateInfrastructureError("isolated hard gate is missing Compose project name")
+    return [
+        _docker_executable(),
+        "compose",
+        "--project-name",
+        runtime.compose_project,
+        "--file",
+        "compose.yaml",
+        "--file",
+        str(DEEP_RESEARCH_GATE_COMPOSE_FILE),
+        *arguments,
+    ]
+
+
+def _compose_down_isolated_deep_research_hard_gate(runtime: DeepResearchRuntime) -> None:
+    if not runtime.isolated:
+        return
+    database_port = runtime.database_url_port()
+    if runtime.api_port is None or runtime.minio_port is None or database_port is None:
+        return
+    env = {
+        **os.environ,
+        "DEEP_RESEARCH_GATE_API_PORT": str(runtime.api_port),
+        "DEEP_RESEARCH_GATE_MINIO_PORT": str(runtime.minio_port),
+        "DEEP_RESEARCH_GATE_POSTGRES_PORT": str(database_port),
+    }
+    subprocess.run(  # noqa: S603
+        _isolated_deep_research_compose_command(runtime, "down", "--remove-orphans"),
+        check=False,
+        env=env,
+    )
+
+
+def _is_compose_port_conflict(output: str) -> bool:
+    normalized = output.lower()
+    return "address already in use" in normalized or "port is already allocated" in normalized
+
+
+def _deep_research_compose_environment(
+    *,
+    model_provider: str,
+    retrieval_profile: str,
+    runtime: DeepResearchRuntime | None = None,
+) -> tuple[dict[str, str], str]:
+    if model_provider not in {"mock", "openrouter"}:
+        raise RuntimeError(f"unsupported compose model provider: {model_provider}")
+    openrouter_api_key = ""
+    openrouter_key_source = ""
+    if model_provider == "openrouter":
+        openrouter_api_key, openrouter_key_source = _resolve_openrouter_api_key_for_compose()
+        if not openrouter_api_key:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY is required for --compose-model-provider openrouter; "
+                "set OPENROUTER_API_KEY, OPENROUTER_API_KEY_FILE, or OPENROUTER_API_KEY in .env"
+            )
+    env = {
+        **os.environ,
+        "MODEL_PROVIDER": model_provider,
+        "MODEL_GATEWAY_STARTUP_SMOKE": "required"
+        if model_provider == "openrouter"
+        else os.environ.get("MODEL_GATEWAY_STARTUP_SMOKE", "warn"),
+        "RETRIEVAL_PROFILE": retrieval_profile,
         "DOCUMENT_PARSER_SERVICES_REQUIRED": "true",
         "MINIO_PUBLIC_ENDPOINT": os.environ.get("MINIO_PUBLIC_ENDPOINT", "http://localhost:9000"),
         "API_PUBLIC_BASE_URL": os.environ.get("API_PUBLIC_BASE_URL", "http://localhost:8000"),
@@ -2549,24 +3699,56 @@ def _compose_up_document_upload_stack() -> None:
         "DOCLING_URL": os.environ.get("DOCLING_URL", "http://docling:5001"),
         "METADATA_SERVICE_URL": os.environ.get("METADATA_SERVICE_URL", "http://metadata-service:8090"),
     }
-    services = [
-        "postgres",
-        "redis",
-        "minio",
-        "opensearch",
-        "mock-provider",
-        "model-gateway",
-        "metadata-service",
-        "xberg",
-        "docling",
-        "api",
-        "worker",
-    ]
-    subprocess.run(  # noqa: S603
-        [_docker_executable(), "compose", "up", "-d", "--build", "--force-recreate", *services],
-        check=True,
-        env=env,
-    )
+    if openrouter_api_key:
+        env["OPENROUTER_API_KEY"] = openrouter_api_key
+    if model_provider == "openrouter":
+        env["MODEL_PROVIDER_TIMEOUT_SECONDS"] = os.environ.get("MODEL_PROVIDER_TIMEOUT_SECONDS", "240")
+        env["MODEL_CLIENT_CHAT_TIMEOUT_SECONDS"] = os.environ.get("MODEL_CLIENT_CHAT_TIMEOUT_SECONDS", "360")
+        env["MODEL_CLIENT_EMBEDDING_TIMEOUT_SECONDS"] = os.environ.get("MODEL_CLIENT_EMBEDDING_TIMEOUT_SECONDS", "300")
+        env["MODEL_CLIENT_RERANK_TIMEOUT_SECONDS"] = os.environ.get("MODEL_CLIENT_RERANK_TIMEOUT_SECONDS", "300")
+    if runtime is not None:
+        database_port = runtime.database_url_port()
+        if not runtime.isolated or runtime.api_port is None or runtime.minio_port is None or database_port is None:
+            raise DeepResearchGateInfrastructureError("isolated hard gate runtime is incomplete")
+        env.update(
+            {
+                "DEEP_RESEARCH_GATE_API_PORT": str(runtime.api_port),
+                "DEEP_RESEARCH_GATE_MINIO_PORT": str(runtime.minio_port),
+                "DEEP_RESEARCH_GATE_POSTGRES_PORT": str(database_port),
+                "POSTGRES_DB": "rag",
+                "POSTGRES_USER": "rag",
+                "POSTGRES_PASSWORD": "change-me-local-only",
+                "DATABASE_URL": "postgresql+asyncpg://rag:change-me-local-only@postgres:5432/rag",
+                "REDIS_URL": "redis://redis:6379/0",
+                "MINIO_ENDPOINT": "http://minio:9000",
+                "MINIO_PUBLIC_ENDPOINT": f"http://127.0.0.1:{runtime.minio_port}",
+                "OPENSEARCH_URL": "http://opensearch:9200",
+                "MODEL_GATEWAY_URL": "http://model-gateway:8080",
+                "API_PUBLIC_BASE_URL": runtime.api,
+                "XBERG_URL": "http://xberg:8000",
+                "DOCLING_URL": "http://docling:5001",
+                "METADATA_SERVICE_URL": "http://127.0.0.1:9",
+                "DOCUMENT_PARSER_SERVICES_REQUIRED": "false",
+            }
+        )
+    return env, openrouter_key_source
+
+
+def _resolve_openrouter_api_key_for_compose() -> tuple[str, str]:
+    env_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if env_key:
+        return env_key, "env:OPENROUTER_API_KEY"
+    from wikipediarag.config import Settings, resolve_openrouter_api_key
+
+    settings = cast(Any, Settings)(_env_ignore_empty=True)
+    key = resolve_openrouter_api_key(settings)
+    if not key:
+        return "", ""
+    if settings.openrouter_api_key.strip():
+        return key, "settings:OPENROUTER_API_KEY"
+    if settings.openrouter_api_key_file is not None:
+        return key, "settings:OPENROUTER_API_KEY_FILE"
+    return key, "settings"
 
 
 def _docker_executable() -> str:
@@ -2755,8 +3937,19 @@ def _upload_verify_fixture(
     return dict(payload)
 
 
-def _wait_job_terminal(client: httpx.Client, api: str, job_id: str, *, timeout_seconds: int = 360) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_seconds
+def _wait_job_terminal(
+    client: httpx.Client,
+    api: str,
+    job_id: str,
+    *,
+    timeout_seconds: int = 360,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    deadline = min(
+        started + timeout_seconds,
+        deadline_monotonic if deadline_monotonic is not None else float("inf"),
+    )
     last_payload: dict[str, Any] = {}
     while time.monotonic() < deadline:
         payload = _get_json(client, f"{api}/api/v1/ingestion-jobs/{job_id}")
@@ -2764,14 +3957,21 @@ def _wait_job_terminal(client: httpx.Client, api: str, job_id: str, *, timeout_s
         if last_payload.get("status") in {"completed", "failed", "cancelled"}:
             return last_payload
         progress = last_payload.get("progress") if isinstance(last_payload, dict) else {}
+        safe_progress = {
+            key: value
+            for key in ("stage", "processed", "total", "completed", "failed", "last_update")
+            if isinstance(progress, dict) and isinstance((value := progress.get(key)), (str, int, float, bool))
+        }
         print(
             json.dumps(
-                {"job_id": job_id, "status": last_payload.get("status"), "progress": progress},
+                {"job_id": job_id, "status": last_payload.get("status"), "progress": safe_progress},
                 ensure_ascii=False,
             )
         )
-        time.sleep(3)
-    raise RuntimeError(f"job did not reach terminal state: {last_payload}")
+        time.sleep(min(3, max(0, deadline - time.monotonic())))
+    if deadline_monotonic is not None and deadline <= started + timeout_seconds:
+        raise DeepResearchSuiteDeadlineExceededError("deep research hard gate deadline elapsed during job wait")
+    raise RuntimeError("ingestion job did not reach a terminal status before its timeout")
 
 
 def _get_json(client: httpx.Client, url: str) -> dict[str, Any]:
@@ -2866,9 +4066,10 @@ if __name__ == "__main__":
     try:
         main()
     except httpx.HTTPError as exc:
-        message = str(exc) or type(exc).__name__
-        print(f"HTTP error: {message}", file=sys.stderr)
+        failure = _safe_cli_failure(exc, stage="cli_http")
+        print(f"HTTP error: {failure['code']}", file=sys.stderr)
         raise SystemExit(1) from exc
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
+        failure = _safe_cli_failure(exc, stage="cli")
+        print(failure["code"], file=sys.stderr)
         raise SystemExit(1) from exc

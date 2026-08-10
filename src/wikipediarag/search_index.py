@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from functools import lru_cache
+from typing import Any, cast
 
 from opensearchpy import OpenSearch
 from opensearchpy.helpers import bulk
@@ -23,19 +24,45 @@ def build_index_names(
     retrieval_profile: str,
     embedding_alias: str,
     embedding_dimensions: int,
+    tenant_id: str | None = None,
+    knowledge_base_id: str | None = None,
 ) -> dict[str, str]:
-    suffix = stable_hash([source_type, snapshot_id, retrieval_profile, embedding_alias, embedding_dimensions], 16)
+    scope_prefix = stable_hash([tenant_id or "legacy", knowledge_base_id or "legacy"], 10)
+    suffix = stable_hash(
+        [
+            tenant_id or "legacy",
+            knowledge_base_id or "legacy",
+            source_type,
+            snapshot_id,
+            retrieval_profile,
+            embedding_alias,
+            embedding_dimensions,
+        ],
+        16,
+    )
     return {
-        "version_id": f"{source_type}:{snapshot_id}:{retrieval_profile}:{embedding_alias}:{embedding_dimensions}",
-        "physical": f"wiki-chunks-{suffix}",
-        "read_alias": f"wiki-chunks-read-{suffix}",
-        "write_alias": f"wiki-chunks-write-{suffix}",
+        "version_id": (
+            f"{scope_prefix}:{source_type}:{snapshot_id}:{retrieval_profile}:{embedding_alias}:{embedding_dimensions}"
+        ),
+        "physical": f"wiki-chunks-{scope_prefix}-{suffix}",
+        "read_alias": f"wiki-chunks-read-{scope_prefix}-{suffix}",
+        "write_alias": f"wiki-chunks-write-{scope_prefix}-{suffix}",
     }
+
+
+@lru_cache(maxsize=16)
+def _cached_client(opensearch_url: str) -> OpenSearch:
+    return OpenSearch(
+        hosts=[opensearch_url],
+        verify_certs=False,
+        ssl_show_warn=False,
+        pool_maxsize=20,
+    )
 
 
 def get_client(settings: Settings | None = None) -> OpenSearch:
     resolved = settings or get_settings()
-    return OpenSearch(hosts=[resolved.opensearch_url], verify_certs=False, ssl_show_warn=False)
+    return _cached_client(resolved.opensearch_url)
 
 
 def ensure_index(
@@ -64,6 +91,7 @@ def ensure_index(
                         "page_id": {"type": "long"},
                         "revision_id": {"type": "long"},
                         "title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+                        "alias_text": {"type": "text"},
                         "section_path_text": {"type": "text"},
                         "content": {"type": "text"},
                         "embedding": {
@@ -110,7 +138,7 @@ def bulk_index_chunks(
         {
             "_op_type": "index",
             "_index": write_alias,
-            "_id": chunk.id,
+            "_id": f"{tenant_id}:{knowledge_base_id}:{chunk.id}",
             "_source": {
                 "tenant_id": tenant_id,
                 "knowledge_base_id": knowledge_base_id,
@@ -120,6 +148,11 @@ def bulk_index_chunks(
                 "page_id": chunk.page_id,
                 "revision_id": chunk.revision_id,
                 "title": chunk.title,
+                "alias_text": " ".join(
+                    str(value) for value in cast(list[object], chunk.metadata.get("aliases", [])) if value
+                )
+                if isinstance(chunk.metadata.get("aliases"), list)
+                else "",
                 "section_path_text": " / ".join(chunk.section_path),
                 "content": chunk.content,
                 "embedding": chunk.embedding,
@@ -128,7 +161,12 @@ def bulk_index_chunks(
                 "prev_chunk_id": chunk.prev_chunk_id,
                 "next_chunk_id": chunk.next_chunk_id,
                 "content_hash": chunk.content_hash,
-                "metadata": chunk.metadata,
+                "metadata": {
+                    **chunk.metadata,
+                    "parent_chunk_id": chunk.parent_chunk_id,
+                    "content_hash": chunk.content_hash,
+                    "source_chunk_id": chunk.metadata.get("source_chunk_id") or chunk.id,
+                },
             },
         }
         for chunk in chunks
@@ -150,7 +188,6 @@ def bm25_search(
     filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     resolved = settings or get_settings()
-    ensure_index(resolved)
     client = get_client(resolved)
     filter_clauses = [
         {"term": {"tenant_id": tenant_id}},
@@ -168,7 +205,7 @@ def bm25_search(
                         {
                             "multi_match": {
                                 "query": query,
-                                "fields": ["title^3", "section_path_text^2", "content"],
+                                "fields": ["title^3", "alias_text^4", "section_path_text^2", "content"],
                             }
                         }
                     ],
@@ -176,7 +213,8 @@ def bm25_search(
             },
         },
     )
-    return [_hit_to_candidate(hit, "bm25") for hit in response["hits"]["hits"]]
+    candidates = [_hit_to_candidate(hit, "bm25") for hit in response["hits"]["hits"]]
+    return sorted(candidates, key=lambda item: (-float(item["scores"].get("bm25", 0.0)), str(item.get("chunk_id"))))
 
 
 def dense_search(
@@ -208,7 +246,8 @@ def dense_search(
             },
         },
     )
-    return [_hit_to_candidate(hit, "dense") for hit in response["hits"]["hits"]]
+    candidates = [_hit_to_candidate(hit, "dense") for hit in response["hits"]["hits"]]
+    return sorted(candidates, key=lambda item: (-float(item["scores"].get("dense", 0.0)), str(item.get("chunk_id"))))
 
 
 def delete_document_chunks(

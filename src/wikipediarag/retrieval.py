@@ -18,6 +18,7 @@ from wikipediarag.model_client import rerank as gateway_rerank
 from wikipediarag.model_registry import get_model_registry
 from wikipediarag.observability import retrieval_span, safe_error_code, safe_telemetry_payload
 from wikipediarag.query_transforms import bounded_decomposition, bounded_rewrite, normalize_query
+from wikipediarag.reliability import OperationDeadline
 from wikipediarag.repository import fetch_chunks_for_dense_scan, insert_retrieval_event
 from wikipediarag.retrieval_contract import validate_active_retrieval_contract
 from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profile
@@ -97,6 +98,7 @@ async def retrieve(
     search_filters: dict[str, Any] | None = None,
     persist_events: bool = True,
     apply_query_transforms: bool = True,
+    deadline: OperationDeadline | None = None,
 ) -> RetrievalResult:
     resolved = settings or get_settings()
     profile = profile or get_retrieval_profile(profile_name, resolved, profile_overrides)
@@ -134,6 +136,8 @@ async def retrieve(
             alias=profile.model_aliases.embed,
             dimensions=dimensions,
             query_instruction=query_embedding_instruction(profile),
+            deadline=deadline,
+            correlation_id=query_run_id or trace_id,
         )
         variant_vectors = [[float(value) for value in vector] for vector in vectors]
         timings_ms["dense_embedding"] = _elapsed_ms(embedding_started)
@@ -175,6 +179,7 @@ async def retrieve(
                     read_alias=read_alias,
                     filters=_filters_for_kb(search_filters, knowledge_base_id),
                     query_vector=variant_vectors[variant_index] if variant_vectors is not None else None,
+                    deadline=deadline,
                 )
             for candidate in candidates:
                 candidate["variant_index"] = variant_index
@@ -213,7 +218,14 @@ async def retrieve(
     rerank_started = time.perf_counter()
     if profile.retrieval.rerank:
         reranked, rerank_model_event = await rerank(
-            normalized_query, fused, resolved, profile, top_k=profile.retrieval.rerank_top_k, score_all=True
+            normalized_query,
+            fused,
+            resolved,
+            profile,
+            top_k=profile.retrieval.rerank_top_k,
+            score_all=True,
+            deadline=deadline,
+            correlation_id=query_run_id or trace_id,
         )
     else:
         reranked = fused[: profile.retrieval.rerank_top_k]
@@ -368,6 +380,7 @@ async def retrieve_multi(
     search_filters: dict[str, Any] | None = None,
     persist_events: bool = True,
     apply_query_transforms: bool = True,
+    deadline: OperationDeadline | None = None,
 ) -> RetrievalResult:
     if len(knowledge_base_ids) == 1:
         return await retrieve(
@@ -386,6 +399,7 @@ async def retrieve_multi(
             search_filters=search_filters,
             persist_events=persist_events,
             apply_query_transforms=apply_query_transforms,
+            deadline=deadline,
         )
 
     resolved = settings or get_settings()
@@ -449,6 +463,8 @@ async def retrieve_multi(
             alias=embed_alias,
             dimensions=embed_dimensions,
             query_instruction=query_embedding_instruction(active_profile),
+            deadline=deadline,
+            correlation_id=query_run_id or trace_id,
         )
         shared_query_vector = [float(value) for value in vectors[0]]
         timings_ms["dense_embedding"] = _elapsed_ms(shared_embedding_started)
@@ -468,6 +484,7 @@ async def retrieve_multi(
                 read_alias=read_alias,
                 filters=_filters_for_kb(search_filters, kb_id),
                 query_vector=shared_query_vector,
+                deadline=deadline,
             )
         )
         for kb_id, read_alias in dense_stage_inputs
@@ -511,6 +528,8 @@ async def retrieve_multi(
             active_profile,
             top_k=active_profile.retrieval.rerank_top_k,
             score_all=True,
+            deadline=deadline,
+            correlation_id=query_run_id or trace_id,
         )
     else:
         reranked = fused[: active_profile.retrieval.rerank_top_k]
@@ -754,6 +773,7 @@ async def _run_dense_stage(
     read_alias: str,
     filters: dict[str, Any] | None = None,
     query_vector: list[float] | None = None,
+    deadline: OperationDeadline | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]:
     candidates, timings, events = await dense_search_profile(
         conn,
@@ -766,6 +786,7 @@ async def _run_dense_stage(
         read_alias=read_alias,
         filters=filters,
         query_vector=query_vector,
+        deadline=deadline,
     )
     return "dense", candidates, timings, events
 
@@ -782,6 +803,7 @@ async def _run_scoped_dense_stage(
     read_alias: str,
     filters: dict[str, Any] | None = None,
     query_vector: list[float] | None = None,
+    deadline: OperationDeadline | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]:
     _label, candidates, timings, events = await _run_dense_stage(
         conn,
@@ -794,6 +816,7 @@ async def _run_scoped_dense_stage(
         read_alias=read_alias,
         filters=filters,
         query_vector=query_vector,
+        deadline=deadline,
     )
     return f"dense:{knowledge_base_id}", candidates, timings, events
 
@@ -810,6 +833,7 @@ async def dense_search_profile(
     read_alias: str,
     filters: dict[str, Any] | None = None,
     query_vector: list[float] | None = None,
+    deadline: OperationDeadline | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]:
     total_started = time.perf_counter()
     timings_ms: dict[str, int] = {}
@@ -827,6 +851,8 @@ async def dense_search_profile(
                 alias=alias,
                 dimensions=dimensions,
                 query_instruction=query_embedding_instruction(profile),
+                deadline=deadline,
+                correlation_id=knowledge_base_id,
             )
         timings_ms["dense_embedding"] = _elapsed_ms(embedding_started)
         model_events = [
@@ -997,6 +1023,8 @@ async def rerank(
     profile: RetrievalProfile,
     top_k: int,
     score_all: bool = False,
+    deadline: OperationDeadline | None = None,
+    correlation_id: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     if not candidates:
         return [], None
@@ -1010,6 +1038,8 @@ async def rerank(
                 settings,
                 alias=profile.model_aliases.rerank,
                 top_n=len(documents) if score_all else min(top_k, len(documents)),
+                deadline=deadline,
+                correlation_id=correlation_id,
             )
         model_event = dict(payload.get("_gateway_metadata") or {})
         seen_indexes: set[int] = set()
@@ -1036,8 +1066,10 @@ async def rerank(
         for item in candidates:
             doc_terms = set(normalize_for_embedding(item["content"]).split())
             item["scores"]["rerank"] = len(query_terms & doc_terms) / max(len(query_terms), 1)
+    _apply_entity_title_boost(query, candidates)
     candidates.sort(
         key=lambda item: (
+            -float(item["scores"].get("title_exact", 0.0)),
             -float(item["scores"].get("rerank", 0.0)),
             -float(item["scores"].get("rrf_total", 0.0)),
             str(item.get("knowledge_base_id") or ""),
@@ -1050,6 +1082,32 @@ async def rerank(
     return (candidates if score_all else candidates[:top_k]), model_event
 
 
+def _apply_entity_title_boost(query: str, candidates: list[dict[str, Any]]) -> None:
+    """Promote one unambiguous exact title without treating parentheticals as exact."""
+
+    normalized_query = normalize_for_embedding(query).strip(" ?!.,")
+    if not normalized_query:
+        return
+    title_candidates = {normalized_query}
+    for prefix in ("что такое ", "кто такой ", "кто такая ", "what is ", "who is "):
+        if normalized_query.startswith(prefix):
+            tail = normalized_query.removeprefix(prefix).strip(" ?!.,")
+            if tail:
+                title_candidates.add(tail)
+    exact: list[dict[str, Any]] = []
+    for candidate in candidates:
+        aliases = [str(candidate.get("title") or ""), *[str(item) for item in candidate.get("section_path") or []]]
+        is_exact = any(normalize_for_embedding(alias).strip(" ?!.,") in title_candidates for alias in aliases)
+        if is_exact:
+            exact.append(candidate)
+    if len({str(item.get("document_id") or item.get("title")) for item in exact}) != 1:
+        return
+    for candidate in candidates:
+        aliases = [str(candidate.get("title") or ""), *[str(item) for item in candidate.get("section_path") or []]]
+        if any(normalize_for_embedding(alias).strip(" ?!.,") in title_candidates for alias in aliases):
+            candidate.setdefault("scores", {})["title_exact"] = 1.0
+
+
 def postprocess_candidates(
     candidates: list[dict[str, Any]],
     profile: RetrievalProfile,
@@ -1060,6 +1118,7 @@ def postprocess_candidates(
     events: list[dict[str, Any]] = []
     selected: list[dict[str, Any]] = []
     page_counts: dict[tuple[str, str, str], int] = {}
+    document_counts: dict[str, int] = {}
     seen_hashes: set[str] = set()
     seen_units: dict[str, dict[str, Any]] = {}
     deferred_by_quota: list[dict[str, Any]] = []
@@ -1129,14 +1188,33 @@ def postprocess_candidates(
             )
             continue
         page_key = page_scope_key(candidate)
+        document_key = str(candidate.get("document_id") or candidate.get("source_url") or candidate.get("title") or "")
+        document_quota_reached = (
+            document_counts.get(document_key, 0) >= 3
+            and not metadata.get("parent_expanded")
+            and not metadata.get("adjacent_expansion")
+        )
         quota_reached = page_counts.get(page_key, 0) >= profile.postprocess.page_quota
         existing_terms = set(normalize_for_embedding(" ".join(item["content"] for item in selected)).split())
         candidate_terms = set(normalize_for_embedding(content).split())
         query_terms = set(normalize_for_embedding(query).split())
         novel_requirement = bool((candidate_terms & query_terms) - existing_terms)
-        candidate_values = set(_CONTEXT_VALUE_RE.findall(content))
-        selected_values = set(_CONTEXT_VALUE_RE.findall(" ".join(item["content"] for item in selected)))
-        if quota_reached and not (novel_requirement or candidate_values - selected_values):
+        # A new number is not by itself a new requirement: tables and legal
+        # documents legitimately contain many unrelated values.  Let only
+        # query-term novelty bypass the per-page quota.
+        if document_quota_reached:
+            deferred_by_quota.append({**candidate, "content": content, "metadata": metadata})
+            events.append(
+                {
+                    **_decision_base(candidate),
+                    "stage": "context_selection",
+                    "decision": "deferred",
+                    "reason": "DOCUMENT_UNIT_QUOTA",
+                    "document_unit_quota": 3,
+                }
+            )
+            continue
+        if quota_reached and not novel_requirement:
             deferred_by_quota.append({**candidate, "content": content, "metadata": metadata})
             events.append(
                 {
@@ -1167,6 +1245,7 @@ def postprocess_candidates(
         seen_units[content_unit_id] = selected_candidate = {**candidate, "content": content, "metadata": metadata}
         used_tokens += candidate_tokens
         page_counts[page_key] = page_counts.get(page_key, 0) + 1
+        document_counts[document_key] = document_counts.get(document_key, 0) + 1
         final_rank = len(selected) + 1
         ranks = {**dict(candidate.get("ranks") or {}), "final": final_rank}
         query_context = dict(candidate.get("query_context") or {})
@@ -1208,15 +1287,24 @@ def postprocess_candidates(
                 (set(normalize_for_embedding(content).split()) & set(normalize_for_embedding(query).split()))
                 - set(normalize_for_embedding(selected_text).split())
             )
-            novel_values = set(_CONTEXT_VALUE_RE.findall(content)) - set(_CONTEXT_VALUE_RE.findall(selected_text))
-            if not (novel or novel_values) and target_met:
+            if not novel and target_met:
                 continue
             tokens = _count_context_tokens(content)
             if profile.postprocess.context_packing == "token_budget" and used_tokens + tokens > token_budget:
                 continue
-            used_tokens += tokens
             page_key = page_scope_key(candidate)
+            document_key = str(
+                candidate.get("document_id") or candidate.get("source_url") or candidate.get("title") or ""
+            )
+            if (
+                document_counts.get(document_key, 0) >= 3
+                and not dict(candidate.get("metadata") or {}).get("parent_expanded")
+                and not dict(candidate.get("metadata") or {}).get("adjacent_expansion")
+            ):
+                continue
+            used_tokens += tokens
             page_counts[page_key] = page_counts.get(page_key, 0) + 1
+            document_counts[document_key] = document_counts.get(document_key, 0) + 1
             metadata = dict(candidate.get("metadata") or {})
             metadata["quota_overflow"] = True
             selected_candidate = {

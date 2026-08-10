@@ -5,7 +5,8 @@ containers in Compose; some are external provider profiles.
 
 ## Web UI
 
-- Responsibility: Browser UI for login, KB selection, import, upload, chat and retrieval debugging.
+- Responsibility: Browser UI for login, KB selection, import, upload, search,
+  Deep Research, chat and retrieval debugging.
 - Owns: In-memory React state only.
 - Inputs: User actions, session responses, KB lists, upload files, SSE events.
 - Outputs: API JSON calls, presigned upload `PUT`, rendered answers and progress.
@@ -16,7 +17,9 @@ containers in Compose; some are external provider profiles.
 
 ## API
 
-- Responsibility: Auth, tenancy, admin APIs, KBs, upload sessions, document lifecycle, chat SSE, debug search, readiness and safe errors.
+- Responsibility: Auth, tenancy, admin APIs, KBs, upload sessions, document
+  lifecycle, Deep Research lifecycle, chat SSE, debug search, readiness and
+  safe errors.
 - Owns: Public API contracts, server-owned `ActorContext`, application sessions and authorization checks.
 - Inputs: Browser/API client requests, cookies, CSRF token, OIDC callbacks.
 - Outputs: JSON responses, SSE events, presigned upload URLs, durable DB writes.
@@ -27,19 +30,26 @@ containers in Compose; some are external provider profiles.
 
 ## Worker
 
-- Responsibility: Claim and process ingestion jobs, import Wikipedia, process document uploads, reprocess documents and purge deleted documents.
+- Responsibility: Claim and process ingestion jobs, import Wikipedia, process
+  document uploads, run bounded Deep Research episodes, reprocess documents and
+  purge deleted documents.
 - Owns: Background state transitions and publication ordering.
-- Inputs: PostgreSQL `ingestion_jobs` and `ingestion_job_items`.
-- Outputs: PostgreSQL lifecycle/job/chunk updates, MinIO artifacts, OpenSearch documents.
+- Inputs: PostgreSQL ingestion jobs/items plus durable Deep Research run state.
+- Outputs: PostgreSQL lifecycle/job/chunk updates, research episodes/evidence/
+  claims/coverage/tool metadata, MinIO artifacts and OpenSearch documents.
 - Dependencies: PostgreSQL, MinIO, OpenSearch, Kiwix, Xberg, Docling, metadata-service, Model Gateway.
-- Must not: Publish failed/cancelled/parser-error jobs or pass tenant authority, object keys, prompts or provider payloads to parsers.
+- Must not: Publish failed/cancelled/parser-error jobs; pass tenant authority,
+  object keys, prompts or provider payloads to parsers; or persist raw planner
+  queries, prompts, chunks or provider payloads in the public research ledger.
 - Failure behavior: Records failed job/item state with safe error codes; worker loop logs exceptions and continues.
 - Scaling or concurrency model: Jobs and items are claimed with PostgreSQL `FOR UPDATE SKIP LOCKED`; document item concurrency and parser semaphores are bounded.
 
 ## PostgreSQL
 
 - Responsibility: Control-plane source of truth and durable job state.
-- Owns: Tenants, users, identities, sessions, groups, grants, audit events, KBs, sources, uploads, documents, versions, artifacts metadata, jobs, chunks, index versions, query runs and retrieval events.
+- Owns: Tenants, users, identities, sessions, groups, grants, audit events,
+  KBs, sources, uploads, documents, versions, artifacts metadata, jobs, chunks,
+  index versions, query runs, retrieval events and durable Deep Research state.
 - Inputs: API and worker writes.
 - Outputs: Control-plane reads, job claims, authorization lookups and recovery data.
 - Dependencies: Persistent volume or external PostgreSQL service.
@@ -66,18 +76,22 @@ containers in Compose; some are external provider profiles.
 - Outputs: API retrieval candidates.
 - Dependencies: OpenSearch data volume.
 - Must not: Be treated as source of truth or queried without server-owned tenant/KB filters.
-- Failure behavior: Retrieval and publication fail; API `/ready` does not currently check OpenSearch.
+- Failure behavior: Retrieval and publication fail; API `/ready` reports the
+  dependency as degraded.
 - Scaling or concurrency model: Single-node local Compose setup; versioned physical indices and read/write aliases.
 
 ## Redis or Valkey
 
-- Responsibility: Configured local dependency for future transient state.
-- Owns: Not confirmed from the current implementation.
-- Inputs: Not confirmed from the current implementation.
-- Outputs: Not confirmed from the current implementation.
+- Responsibility: Tenant-scoped search-window cache for public-search pagination.
+- Owns: Rebuildable result windows and facet snapshots with a short TTL; never
+  authoritative data.
+- Inputs: Server-generated search fingerprints and filtered retrieval results.
+- Outputs: Cached windows used to serve later cursor pages; cache failures fall
+  back to uncached retrieval.
 - Dependencies: Compose `valkey/valkey:8.0.2-alpine`.
 - Must not: Be treated as durable storage.
-- Failure behavior: Not confirmed from the current implementation; API `/ready` does not currently check Redis/Valkey.
+- Failure behavior: Redis/Valkey errors are swallowed at the cache boundary;
+  API readiness remains degraded-only because the search path is still usable.
 - Scaling or concurrency model: Single local container in Compose.
 
 ## Kiwix
@@ -93,11 +107,13 @@ containers in Compose; some are external provider profiles.
 
 ## Model Gateway
 
-- Responsibility: Boundary for chat, embedding and rerank aliases.
+- Responsibility: Boundary for chat, embedding, rerank and Deep Research
+  planner/verifier aliases.
 - Owns: Alias resolution, provider readiness and provider error normalization.
 - Inputs: `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/models`.
 - Outputs: Provider-compatible results with alias metadata.
-- Dependencies: `config/models.yaml`, `config/retrieval.yaml`, mock provider, OpenRouter or future local providers.
+- Dependencies: `config/models.yaml`, `config/retrieval.yaml`, mock provider,
+  OpenRouter proxy validation or future local providers.
 - Must not: Hide provider-backed readiness failures for release gates.
 - Failure behavior: `/ready` returns degraded with safe reasons; API readiness degrades.
 - Scaling or concurrency model: Stateless FastAPI service.
@@ -112,6 +128,10 @@ containers in Compose; some are external provider profiles.
 - Must not: Let `sota_mvp` silently fall back to mock aliases.
 - Failure behavior: Gateway readiness or smoke checks fail.
 - Scaling or concurrency model: Configuration-driven, not a separate service.
+
+The product target is fully local/private model usage. OpenRouter-backed Qwen
+aliases are a development/proxy validation path only; they remain behind this
+gateway and do not create a direct provider dependency in business code.
 
 ## Xberg
 

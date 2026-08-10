@@ -87,6 +87,15 @@ def test_run_contract_hash_changes_with_policy_versions() -> None:
     assert contract.contract_id != changed_negative_policy.contract_id
 
 
+def test_run_contract_includes_context_and_extended_control_policy_versions() -> None:
+    index = _index_contract()
+    contract = build_run_contract(index_contract_id=index.contract_id, profile=_profile(), settings=Settings())
+
+    assert contract.schema_version == 2
+    assert contract.context_selection_policy_version == "document_scoped_page_quota_v2"
+    assert contract.extended_search_control_policy_version == "answerability_gap_control_v2"
+
+
 def test_index_version_validation_rejects_incompatible_source() -> None:
     index = _index_contract()
     metadata = index_contract_metadata(index)

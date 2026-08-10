@@ -17,6 +17,7 @@ ContextPackingMode = Literal["token_budget", "top_k"]
 ExtendedMode = Literal["off", "conditional", "always"]
 CitationValidationMode = Literal["strict", "warn", "off"]
 ClaimVerificationMode = Literal["off", "deterministic_warn", "deterministic_strict", "llm_warn", "llm_strict"]
+DeepResearchPlannerMode = Literal["deterministic", "assisted"]
 
 
 class ModelAliases(BaseModel):
@@ -78,6 +79,53 @@ class PostprocessConfig(BaseModel):
         return self
 
 
+class DeepResearchStageConfig(BaseModel):
+    model_alias: str
+    max_context_tokens: int = Field(default=80000, ge=256)
+    productive_target: float = Field(default=0.45, gt=0.0, le=0.95)
+    soft_limit: float = Field(default=0.55, gt=0.0, le=0.95)
+    hard_input_limit: float = Field(default=0.70, gt=0.0, le=0.95)
+    output_reserve: float = Field(default=0.15, gt=0.0, le=0.95)
+    safety_reserve: float = Field(default=0.15, gt=0.0, le=0.95)
+    max_output_tokens: int = Field(default=12000, ge=256)
+
+    @model_validator(mode="after")
+    def validate_ratios(self) -> DeepResearchStageConfig:
+        if not self.productive_target <= self.soft_limit <= self.hard_input_limit:
+            raise ValueError("deep research stage ratios must satisfy productive <= soft <= hard")
+        if self.hard_input_limit + self.output_reserve + self.safety_reserve > 1.0:
+            raise ValueError("deep research stage input and reserve ratios exceed context window")
+        if self.max_output_tokens > int(self.max_context_tokens * self.output_reserve):
+            raise ValueError("deep research stage max_output_tokens exceeds output reserve")
+        return self
+
+
+class DeepResearchQuestionBudget(BaseModel):
+    max_attempts: int = Field(default=2, ge=1, le=100)
+    max_rewrites: int = Field(default=2, ge=0, le=20)
+    max_depth: int = Field(default=2, ge=0, le=20)
+
+
+class DeepResearchConfig(BaseModel):
+    max_questions: int = Field(default=8, ge=1, le=1000)
+    max_derived_per_episode: int = Field(default=2, ge=0, le=100)
+    max_episodes: int = Field(default=12, ge=1, le=1000)
+    max_tool_calls: int = Field(default=12, ge=1, le=5000)
+    heartbeat_seconds: int = Field(default=120, ge=15, le=900)
+    tool_timeout_seconds: int = Field(default=120, ge=15, le=900)
+    deadline_seconds: int = Field(default=900, ge=30, le=86400)
+    report_reserve_seconds: int = Field(default=30, ge=10, le=300)
+    planner_mode: DeepResearchPlannerMode = "deterministic"
+    question_budget: DeepResearchQuestionBudget = Field(default_factory=DeepResearchQuestionBudget)
+    planner: DeepResearchStageConfig
+    verifier: DeepResearchStageConfig
+    synthesis: DeepResearchStageConfig
+
+    @property
+    def stages(self) -> dict[str, DeepResearchStageConfig]:
+        return {"planner": self.planner, "verifier": self.verifier, "synthesis": self.synthesis}
+
+
 class VerificationPolicy(BaseModel):
     citation_validation: CitationValidationMode = "strict"
     claim_verification: ClaimVerificationMode = "off"
@@ -99,6 +147,7 @@ class AnswerConfig(BaseModel):
     citations_required: bool = True
     deterministic_citation_validation: bool = True
     insufficient_evidence_mode: bool = True
+    max_output_tokens: int = Field(default=768, ge=64, le=2048)
     verification: VerificationPolicy = Field(default_factory=VerificationPolicy)
 
     @model_validator(mode="before")
@@ -129,6 +178,7 @@ class RetrievalProfile(BaseModel):
     chunking: ChunkingConfig
     retrieval: RetrievalConfig
     postprocess: PostprocessConfig
+    deep_research: DeepResearchConfig
     answer: AnswerConfig
 
     @model_validator(mode="after")
@@ -141,7 +191,7 @@ class RetrievalProfile(BaseModel):
 
     @property
     def requires_real_provider(self) -> bool:
-        return self.name in {"sota_mvp", "sota_mvp_verified"}
+        return self.name in {"sota_mvp", "sota_mvp_verified", "upload_sota_mvp"}
 
     def embedding_dimensions(self, default: int) -> int:
         if self.name in {"sota_mvp", "sota_mvp_verified", "upload_sota_mvp"}:

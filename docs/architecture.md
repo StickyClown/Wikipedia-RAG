@@ -31,7 +31,10 @@ deployment.
 - End users: sign in, select knowledge bases, upload documents, import Wikipedia subsets, ask questions, run bounded Deep Research and inspect citations.
 - Operators and coding agents: run Compose, validation commands, eval gates and runtime smokes.
 - Identity provider: optional OIDC provider, with a local Keycloak smoke profile.
-- Model providers: OpenRouter and mock provider through the Model Gateway alias contract; local llama.cpp is an optional future profile.
+- Model providers: OpenRouter (development proxy), vLLM, llama.cpp,
+  text-generation-webui, generic OpenAI-compatible endpoints and test-only
+  Mock through the Model Gateway control-plane contract. WikipediaRag never
+  manages the lifecycle of an external model process.
 - Source archives and connectors: local ZIM files served by Kiwix; XML
   multistream dumps are a fallback path; Confluence Data Center, Jira Data
   Center, GitLab Self-Managed, local folder, internal crawler, Kiwix/ZIM
@@ -73,7 +76,7 @@ flowchart LR
     API["WikipediaRag API"]
     Worker["Ingestion Worker"]
     IdP["OIDC Provider or Local Auth"]
-    Models["Model Providers"]
+    Models["Model Endpoints"]
     Kiwix["Kiwix ZIM Server"]
     Sources["External Source Connectors"]
     Stores["PostgreSQL, MinIO, OpenSearch"]
@@ -87,7 +90,7 @@ flowchart LR
     Worker -->|"read Wikipedia pages"| Kiwix
     Worker -->|"sync changed/deleted source docs"| Sources
     Sources -->|"source documents and tombstones"| Worker
-    API -->|"retrieval and generation calls"| Models
+    API -->|"retrieval and generation calls through Gateway"| Models
     Worker -->|"embedding calls"| Models
     Operator -->|"compose, smoke, eval"| API
     Operator -->|"read reports"| Eval
@@ -104,6 +107,7 @@ flowchart LR
     Gateway["Model Gateway"]
     Mock["Mock Provider"]
     OpenRouter["OpenRouter"]
+    LocalEndpoints["vLLM / llama.cpp / textgen / OpenAI-compatible"]
     Postgres["PostgreSQL"]
     MinIO["MinIO"]
     Search["OpenSearch"]
@@ -131,6 +135,7 @@ flowchart LR
     Worker -->|"embeddings"| Gateway
     Gateway -->|"mock aliases"| Mock
     Gateway -->|"OpenRouter aliases"| OpenRouter
+    Gateway -->|"stage + revision"| LocalEndpoints
     API -. "OTLP env configured" .-> OTel
 ```
 
@@ -144,7 +149,10 @@ flowchart LR
 - OpenSearch: derived BM25/vector search representation.
 - Redis/Valkey: tenant-scoped search-window cache with bounded pooled clients; failures fall back to uncached search.
 - Kiwix: read-only local ZIM serving.
-- Model Gateway: provider boundary for chat, embedding and rerank aliases.
+- Model Gateway: provider boundary for chat, embedding and rerank. PostgreSQL
+  stores one global draft/validated/active revision with immutable resolved
+  snapshots; stage calls pin a revision and may only reduce workload output
+  limits. YAML is bootstrap/export input without secrets.
 - Parser services: Xberg, Docling and metadata-service.
 - OpenTelemetry collector: local collector configured in Compose; application instrumentation beyond request/trace IDs is limited.
 
@@ -161,6 +169,7 @@ flowchart LR
 | Chunks and publication state | PostgreSQL for durable metadata; OpenSearch for search | OpenSearch documents |
 | Query runs and retrieval events | PostgreSQL | Chat SSE payloads and debug responses |
 | Deep Research runs, questions, episodes, tool metadata, evidence, claims, coverage and reflections | PostgreSQL | ACL-trimmed API detail and deterministic report |
+| Model connections, encrypted credential versions, aliases, revisions, stage bindings and validation reports | PostgreSQL | YAML bootstrap/export without secrets; Gateway request metadata |
 | ZIM archive | Local ignored `zim/` files served by Kiwix | Imported chunks and source URLs |
 | Eval and validation reports | Ignored `artifacts/` paths | `docs/STATUS.md` latest pointers |
 

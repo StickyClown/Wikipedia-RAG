@@ -731,7 +731,18 @@ def _task_from_candidate(
 ) -> EvalTask:
     chunks = [chunk for _label, chunk in packet]
     unanswerable = family == "unanswerable"
-    gold_chunks = [] if unanswerable else chunks
+    # The distractor packet is evidence for construction only; it must never
+    # be simultaneously labelled as gold. Unanswerable tasks retain the
+    # packet as explicit negatives so false-positive retrieval is measurable.
+    if unanswerable:
+        gold_chunks = []
+        negative_chunks = chunks
+    elif family == "hard_negative" and len(chunks) > 1:
+        gold_chunks = [chunks[0]]
+        negative_chunks = chunks[1:]
+    else:
+        gold_chunks = chunks
+        negative_chunks = []
     gold_evidence = [
         GoldEvidence(
             evidence_id=f"e{index}",
@@ -779,7 +790,7 @@ def _task_from_candidate(
         retrieval_profile_hash=snapshot.retrieval_profile_hash,
         tags=["wikipedia", family],
         generation_seed=seed,
-        hard_negative_page_ids=[chunks[1].document_id] if family == "hard_negative" and len(chunks) > 1 else [],
+        hard_negative_page_ids=sorted({chunk.document_id for chunk in negative_chunks}),
     )
 
 
@@ -924,6 +935,9 @@ def _generic_question(question: str) -> bool:
         r"^что (известно|говорится) о статье",
         r"^сравни,? что говорится",
         r"^расскажи о статье",
+        r"в (данном|этом) документ",
+        r"по (данному|этому) текст",
+        r"что сказано в статье",
     )
     return any(re.search(pattern, normalized) for pattern in generic_patterns)
 
@@ -939,6 +953,16 @@ def _comparison_task_valid(task: EvalTask) -> bool:
     if len(set(task.gold_page_ids)) < 2:
         return False
     if len(task.reasoning_path) < 2:
+        return False
+    question_text = " ".join(task.question.casefold().split())
+    operands = {
+        " ".join(evidence.title.casefold().split())
+        for evidence in task.gold_evidence
+        if " ".join(evidence.title.casefold().split()) in question_text
+    }
+    # A comparison must be independently retrievable; “the two releases” or
+    # hidden packet references are not valid benchmark questions.
+    if len(operands) < 2:
         return False
     return True
 

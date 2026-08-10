@@ -18,8 +18,8 @@ Current project state and the next approved task are tracked in
 - Async document ingestion through presigned MinIO upload, worker validation, parsing, normalization, chunking, embedding and publication.
 - Parser services for document formats: app-owned local adapters, Xberg default parser, Docling high-quality fallback and metadata-service language/date extraction.
 - Hybrid retrieval with BM25, dense vectors, RRF, rerank, parent expansion, answerability and citation validation.
-- Direct Multi-KB chat/debug retrieval with all-KB role and readiness checks; Extended Search remains single-KB.
-- Durable single-KB Deep Research V1 with worker episodes, typed evidence memory, coverage records, operational reflections, pause/resume/cancel and ACL-trimmed reports.
+- Direct Multi-KB chat/debug retrieval with all-KB role and readiness checks; the chat Extended Search harness remains single-KB.
+- Durable Deep Research with one-to-three KB scoped runs, stage-specific 80k/24k context budgets, bounded planner/tool episodes, typed evidence/claim/decision memory, pause/resume/cancel, heartbeat recovery and ACL-trimmed reports.
 - Local eval, document corpus verification, release-gate reports and cross-tenant hardening smoke commands.
 
 ## User Path
@@ -33,6 +33,45 @@ Current project state and the next approved task are tracked in
 
 The current UI is a single screen, not a routed multi-page app. Details are in
 [docs/architecture/web.md](docs/architecture/web.md).
+
+## Deep Research: Current State
+
+Deep Research investigates a question inside a **server-owned scope of one to
+three KBs in the same tenant**. It does not browse the public web. A run keeps
+a primary KB for lifecycle ownership plus a durable scope snapshot, packs only
+the current episode envelope, validates a planner decision, calls a closed
+local-private tool registry (`extended_search`, section lookup, in-document
+search, table/CSV lookup and metadata lookup), saves evidence and verified
+claims, and can append deduplicated derived questions such as aliases, owners,
+exceptions, blockers, budget or scope terms. The final report is rebuilt only
+from evidence still visible to the current actor.
+
+The current default Deep Research stage profiles are:
+
+- planner/reflection: `generator_fast`, `80k` declared context, `45/55/70`
+  productive/soft/hard ratios;
+- claim verification: `generator_main`, `24k` input and `2k` output;
+- final synthesis: `generator_main`, `80k` declared context, same `45/55/70`
+  ratios;
+- ordinary Search / Extended Search outside Deep Research: unchanged `30k`
+  normal search context budget.
+
+What has actually been demonstrated:
+
+- The normal mock runtime smoke passed 10/10 synthetic fixtures.
+- The isolated hard mock preflight passed the `alias_reformulation_chain`
+  upload-to-report case: all three required evidence markers, 9 completed
+  hashed tool calls, 7 derived questions, evidence recall `1.0`, zero
+  unsupported claims and ACL safety. This confirms the local system path, not
+  general research quality.
+- The full hard OpenRouter/Qwen proxy baseline at the default 45% context
+  target did not complete successfully within its shared 900-second deadline.
+  It must not be used to claim that policy-exception, contradiction or finance
+  chain cases are solved by a real model; no 35% candidate comparison has run.
+
+The target remains fully local/private model usage. OpenRouter-backed Qwen is a
+temporary development/proxy validation path behind Model Gateway aliases; no
+business component calls a provider directly.
 
 ## Requirements
 
@@ -91,7 +130,16 @@ make verify-document-corpus
 make verify-cross-tenant-hardening
 make deep-research-smoke
 make deep-research-matrix
+make deep-research-hard-gate
+make eval-document-prepare EVAL_DOCUMENT_PREPARE_ARGS="--documents-dir RRNCB --output-suite rrncb-unit"
 ```
+
+## RRNCB Benchmark Inputs
+
+The 65 RRNCB PDF files are local evaluation inputs, not repository source.
+Keep them in the ignored `RRNCB/` directory or another local path, then use an
+explicit `--output-suite`, `--suite` and fresh `--run-id` for a new benchmark.
+Do not reuse or overwrite the historical `rrncb-public-v1` artifacts.
 
 UI checks:
 
@@ -117,6 +165,7 @@ the active task or CI policy says otherwise.
 - [docs/architecture/search-and-deep-research.md](docs/architecture/search-and-deep-research.md) - backend search, chat retrieval, Extended Search and Deep Research contract.
 - [docs/architecture/deployment-and-operations.md](docs/architecture/deployment-and-operations.md) - local Compose and external deployment requirements.
 - [AGENTS.md](AGENTS.md) - long-lived instructions for coding agents.
-- [docs/exec-plans/](docs/exec-plans/) - historical implementation plans.
+- [docs/exec-plans/35-development-roadmap.md](docs/exec-plans/35-development-roadmap.md) and [docs/exec-plans/36-deep-research-tool-loop.md](docs/exec-plans/36-deep-research-tool-loop.md) - current/recent implementation plans and their measured status.
+- [docs/exec-plans/](docs/exec-plans/) - older implementation plans retained as historical records.
 - [docs/history/STATUS-archive.md](docs/history/STATUS-archive.md) - compact archive of historical status details.
 - [docs/decisions/](docs/decisions/) - ADR guidance and template.

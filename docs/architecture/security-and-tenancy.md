@@ -76,9 +76,9 @@ implemented. Document-level ACL/security trimming uses trusted
 | Delete document | KB `OWNER` | document delete endpoint |
 | Chat | Document visibility within requested KBs | `POST /api/v1/chat` |
 | Debug search | KB `EDITOR` on every requested KB | `POST /api/v1/search:debug` |
-| Create Deep Research run | KB `VIEWER` on selected KB | `POST /api/v1/research-runs` |
-| Read Deep Research run | Run creator with KB `VIEWER`, or KB `EDITOR` | research-run detail/events endpoints |
-| Pause/resume/cancel Deep Research run | Run creator with KB `VIEWER`, or KB `EDITOR` | research-run action endpoints |
+| Create Deep Research run | KB `VIEWER` on every requested KB in the 1-3 KB run scope | `POST /api/v1/research-runs` |
+| Read Deep Research run | Run creator with primary-KB `VIEWER`, or primary-KB `EDITOR`; evidence is trimmed again per current KB/document ACL | research-run detail/events endpoints |
+| Pause/resume/cancel Deep Research run | Run creator with primary-KB `VIEWER`, or primary-KB `EDITOR` | research-run action endpoints |
 | Update source document access default | KB `MANAGER` | `PATCH /api/v1/knowledge-bases/{kb_id}/sources/{source_id}/access` |
 | Query-run retrieval events | KB `EDITOR` for query-run KB scope | query-run retrieval endpoint |
 
@@ -118,8 +118,9 @@ can be retrieved by an authenticated active-tenant actor without a KB grant.
 Debug retrieval remains KB `EDITOR` scoped. BM25, dense search, delete and
 debug paths apply `tenant_id` and `knowledge_base_id` filters server-side.
 
-Multi-KB direct retrieval is implemented for chat/debug. Extended Search and
-Deep Research V1 remain single-KB in the current slice.
+Multi-KB direct retrieval is implemented for chat/debug. The chat Extended
+Search harness remains single-KB. Deep Research can now persist and revalidate
+a server-owned scope of one to three KBs in the same tenant.
 
 Search, chat, debug retrieval, Extended Search neighbor expansion and document
 viewer paths apply the same document visibility rule. `policy="kb"` is the
@@ -132,10 +133,23 @@ Source defaults live in `knowledge_sources.metadata.document_access_default`
 and can be applied to existing source documents by a KB manager.
 
 Deep Research run detail is rebuilt for the current actor before returning:
-evidence records are filtered through the same `DocumentAccessScope`, linked
-coverage evidence ids are trimmed to visible records and the public report is
-regenerated from visible evidence only. Reflections are operational notes; they
-do not bypass evidence or coverage authorization.
+evidence records are filtered through the same `DocumentAccessScope` per KB,
+linked coverage evidence ids are trimmed to visible records, claim relations
+are filtered to visible claims only and the public report is regenerated from
+visible verified evidence only. Reflections are operational notes; they do not
+bypass evidence or coverage authorization.
+
+Deep Research planner context is built only from ACL-visible compact evidence,
+coverage and reflection state. Retrieved document text is evidence, not
+executable instruction text. The current server-owned local-private tool
+registry is `extended_search`, `document_section_lookup`,
+`search_within_document`, `table_csv_lookup` and `metadata_lookup`. Planner
+output cannot select arbitrary KB ids or arbitrary tools. Document tools
+resolve only already-visible evidence handles and re-check ACL before use. The
+durable public tool ledger contains normalized query/args hashes and safe
+outcome metadata, never the raw tool query, planner prompt, provider payload,
+chunks or storage key. Claims without visible linked evidence remain
+`unsupported` or `conflicting` and are not synthesized as confident findings.
 
 ## Parser And Upload Boundaries
 
@@ -159,6 +173,7 @@ Normal logs and public validation reports must not contain:
 - `.env` secrets or mounted secret values;
 - provider access/refresh tokens;
 - raw provider payloads or prompts;
+- raw planner context or raw research tool queries;
 - raw document text outside explicit answer/citation payloads;
 - storage object keys, `s3://` URIs or parser stderr;
 - cross-tenant probe payloads beyond safe IDs/status/error codes.
@@ -189,14 +204,16 @@ production auth.
 - Tenant/KB filters in retrieval and delete-by-query paths.
 - Safe public document metadata and safe error envelopes.
 - ACL-trimmed Deep Research read surface and worker-side creator access
-  reconstruction before episode execution.
+  reconstruction before episode execution across the stored KB scope.
 
 ## Accepted Local MVP Risks
 
 - Local Compose includes deterministic development credentials.
 - `AUTH_DISABLED=true` exists for local/demo workflows.
 - UI failure rendering is incomplete for some forbidden and stream-failure paths.
-- Redis/Valkey exists in Compose but runtime use is not confirmed.
+- Redis/Valkey is used only for tenant-scoped public-search cache windows; cache
+  keys are server-generated and cache failures fall back without bypassing
+  tenant/KB or document-access filters.
 - API `/ready` does not currently check every dependency.
 
 ## Production Hardening Not Yet Done

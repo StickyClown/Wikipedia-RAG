@@ -26,14 +26,17 @@
 - durable Deep Research V1: single-KB research runs, typed evidence memory,
   coverage records, operational reflections, pause/resume/cancel и compact UI.
 
-Следующий Pareto-инкремент после Deep Research V1 уже частично закрыт:
-mock-provider runtime smoke и offline quality/context matrix выполнены. Новый
-следующий шаг теперь более узкий: дать runtime policy override для
-экспериментов и подтвердить candidate policy на локальных моделях/Qwen без
-ухудшения безопасности. Минимальный document-level ACL/security trimming уже
-реализован поверх trusted `metadata.document_access`: обычные документы
-остаются KB-visible, restricted-документы видят только админы/KB
-managers/owners или явно разрешённые users/groups.
+Следующий Pareto-инкремент после Deep Research V1 реализован: bounded
+single-agent planner/tool loop вызывает только `extended_search`, сохраняет
+безопасный tool ledger, создаёт derived questions с lineage и сохраняет
+проверенные claims. Mock runtime smoke и offline quality/context matrix
+выполнены. Новый следующий шаг теперь более узкий: стабилизировать изолированный
+OpenRouter/Qwen hard gate, затем сравнить runtime policy 45% и 35% без
+ухудшения безопасности. Полный Qwen hard pack пока не прошёл общий
+900-секундный deadline, поэтому он не является основанием менять default.
+Минимальный document-level ACL/security trimming уже реализован поверх trusted `metadata.document_access`:
+обычные документы остаются KB-visible, restricted-документы видят только
+админы/KB managers/owners или явно разрешённые users/groups.
 
 ## Этап 1. Закрепить текущую версию
 
@@ -157,10 +160,14 @@ trusted source sync metadata может.
 
 ## Этап 8. Добавить глубокое исследование
 
-Статус: реализовано V1 как single-KB durable lifecycle. Runs создаются через
+Статус: реализовано V1 как single-KB durable lifecycle с bounded planner/tool
+loop. Runs создаются через
 `/api/v1/research-runs`, исполняются worker job `deep_research`, чекпойнтятся
 после каждого episode, поддерживают pause/resume/cancel и показываются в
-компактной UI-панели. Multi-KB, web browsing, meta-loop и тяжелый multi-agent
+компактной UI-панели. В каждом episode planner валидируется сервером и может
+вызвать только `extended_search`; найденные aliases/exceptions/owners/blockers
+могут стать deduplicated `derived` questions. Claims проходят verification до
+уверенного вывода. Multi-KB, web browsing, meta-loop и тяжелый multi-agent
 runtime не входят в V1.
 
 Что сделать:
@@ -184,7 +191,13 @@ CLI и offline multi-policy context matrix. Полный mock runtime smoke пр
 rows и рекомендовала `target_35_abstracts_only_none` как самый экономный
 synthetic packer policy. Это не меняет runtime default автоматически: нужен
 runtime policy override и локальная/Qwen-проверка перед сменой текущего 45%
-профиля.
+профиля. Дополнительно добавлен hard-набор
+`tests/fixtures/deep_research/research_tasks_hard.json`: он не является
+обычным smoke-набором, а фиксирует regression target для уже реализованных
+tools, alias resolution, chain-of-sources и query reformulation. Изолированный
+mock preflight подтвердил alias chain end-to-end; полный OpenRouter/Qwen pack
+пока не прошёл deadline, поэтому policy exception, contradiction и finance
+chains остаются целями валидации, а не подтверждёнными результатами.
 
 Что сделать:
 
@@ -219,7 +232,7 @@ runtime policy override и локальная/Qwen-проверка перед �
 6. Сделать выбор способа поиска по типу вопроса. Foundations реализованы.
 7. Сохранять полный путь к ответу как typed evidence memory и coverage records. Выполнено.
 8. Добавить глубокое исследование как durable run lifecycle. Выполнено V1.
-9. Расширить проверки качества. Fixtures/evaluator/smoke CLI и offline matrix выполнены; следующий шаг - runtime policy override и локальная/Qwen-проверка кандидата перед сменой default.
+9. Расширить проверки качества. Fixtures/evaluator/smoke CLI, planner/tool loop, runtime override и offline matrix выполнены; следующий шаг - устранить terminal stall в изолированном Qwen baseline, подтвердить default 45%, затем проверить 35% кандидата без регрессий.
 10. Отдельно исследовать графовый поиск.
 
 ## Критерии готовности

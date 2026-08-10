@@ -110,6 +110,9 @@ async def test_search_debug_accepts_multi_kb_scope_and_returns_kb_citations(
     async def complete_query_run(_conn: object, **_kwargs: Any) -> None:
         return None
 
+    async def resolve_profile(_conn: object, **_kwargs: Any) -> Any:
+        return get_retrieval_profile("test_mock", Settings())
+
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
     monkeypatch.setattr(api_app, "_require_kb_role", require_role)
@@ -118,6 +121,7 @@ async def test_search_debug_accepts_multi_kb_scope_and_returns_kb_citations(
     monkeypatch.setattr(api_app, "insert_retrieval_event", insert_retrieval_event)
     monkeypatch.setattr(api_app, "complete_query_run", complete_query_run)
     monkeypatch.setattr(api_app, "retrieve_multi", retrieve_multi)
+    monkeypatch.setattr(api_app, "resolve_retrieval_profile", resolve_profile)
 
     payload = DebugSearchRequest(message="query", knowledge_base_ids=["kb-a", "kb-b"])
     output = await api_app.search_debug(payload, _request())

@@ -26,6 +26,7 @@ from wikipediarag.eval.schemas import (
     RetrievalTaskResult,
     RetrievalTaskScores,
 )
+from wikipediarag.reliability import safe_failure_from_exception
 
 type RetrievalProgressCallback = Callable[[RetrievalEvalStatus, str], None]
 
@@ -204,6 +205,7 @@ async def run_retrieval_suite(
         _emit(progress_callback, status, "run_completed")
         return run_manifest
     except Exception as exc:
+        failure = safe_failure_from_exception(exc, stage=status.phase)
         status = _advance_status(
             status,
             started=started,
@@ -215,7 +217,7 @@ async def run_retrieval_suite(
                 "state": "failed",
                 "phase": "failed",
                 "updated_at": utc_now_iso(),
-                "error_message": type(exc).__name__ + ": " + str(exc),
+                "error_message": failure.error_code,
             }
         )
         _write_status(status)
@@ -237,13 +239,18 @@ async def run_retrieval_task(
 ) -> RetrievalTaskResult:
     started = time.perf_counter()
     try:
+        debug_kwargs: dict[str, Any] = {
+            "api": api,
+            "top_k": 20,
+            "retrieval_profile": config.retrieval_profile,
+            "retrieval_overrides": config.retrieval_overrides,
+        }
+        if task.knowledge_base_ids:
+            debug_kwargs["knowledge_base_ids"] = task.knowledge_base_ids
         payload = await asyncio.to_thread(
             client.run_search_debug,
             task.question,
-            api=api,
-            top_k=20,
-            retrieval_profile=config.retrieval_profile,
-            retrieval_overrides=config.retrieval_overrides,
+            **debug_kwargs,
         )
         total_ms = int((time.perf_counter() - started) * 1000)
         prefusion, reranked, final = await extract_search_debug_candidates(payload, settings=settings)
@@ -279,6 +286,7 @@ async def run_retrieval_task(
         )
     except Exception as exc:
         total_ms = int((time.perf_counter() - started) * 1000)
+        failure = safe_failure_from_exception(exc, stage="retrieval")
         return RetrievalTaskResult(
             task_id=task.task_id,
             config_id=config.config_id,
@@ -291,7 +299,7 @@ async def run_retrieval_task(
             task_index=task_index,
             latency_ms={"total": total_ms},
             diagnosis=diagnose_retrieval_task(task, status="failed", scores=None),
-            errors=[type(exc).__name__ + ": " + str(exc)],
+            errors=[failure.error_code],
             corpus={
                 "snapshot_id": manifest.snapshot_id,
                 "index_version": manifest.index_version,
@@ -410,6 +418,14 @@ def _aggregate_retrieval_results(
         "page_recall_at_5": aggregate(score.page_recall["5"] for score in retrieval_scores),
         "page_recall_at_10": aggregate(score.page_recall["10"] for score in retrieval_scores),
         "page_recall_at_20": aggregate(score.page_recall["20"] for score in retrieval_scores),
+        "document_recall_at_1": aggregate(score.document_recall.get("1", 0.0) for score in retrieval_scores),
+        "document_recall_at_5": aggregate(score.document_recall.get("5", 0.0) for score in retrieval_scores),
+        "document_recall_at_10": aggregate(score.document_recall.get("10", 0.0) for score in retrieval_scores),
+        "document_mrr_at_10": aggregate(score.document_mrr_at_10 for score in retrieval_scores),
+        "document_reranker_gold_delta": aggregate(
+            score.document_reranker_gold_delta or 0.0 for score in retrieval_scores
+        ),
+        "document_ndcg_at_10": aggregate(score.document_ndcg_at_10 for score in retrieval_scores),
         "section_recall_at_5": aggregate(score.section_recall["5"] for score in retrieval_scores),
         "section_recall_at_10": aggregate(score.section_recall["10"] for score in retrieval_scores),
         "section_recall_at_20": aggregate(score.section_recall["20"] for score in retrieval_scores),

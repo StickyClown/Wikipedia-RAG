@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
-from wikipediarag.ids import stable_hash
+from wikipediarag.ids import scoped_id, stable_hash
 from wikipediarag.wiki_dump import Chunk
 
 ARTICLE_MIMETYPES = {"text/html", "text/plain", "text/html; charset=utf-8"}
@@ -207,10 +207,24 @@ def chunks_for_zim_page(
     child_tokens_max: int,
     parent_tokens_min: int,
     parent_tokens_max: int,
+    tenant_id: str | None = None,
+    knowledge_base_id: str | None = None,
 ) -> list[Chunk]:
     sections = extract_zim_sections(page)
     chunks: list[Chunk] = []
-    document_id = f"zim:{snapshot_id}:{stable_hash([page.zim_entry_path], 24)}"
+    native_document_id = f"zim:{snapshot_id}:{stable_hash([page.zim_entry_path], 24)}"
+    document_id = (
+        scoped_id(
+            "zim-document",
+            native_document_id,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            source_type="zim",
+            snapshot_id=snapshot_id,
+        )
+        if tenant_id and knowledge_base_id
+        else native_document_id
+    )
     for section_index, section in enumerate(sections):
         words = section["text"].split()
         if not words:
@@ -227,9 +241,21 @@ def chunks_for_zim_page(
             content = " ".join(words[start:end])
             content_hash = stable_hash([content])
             chunk_ordinal = len(chunks) + 1
-            chunk_id = "zim:" + stable_hash(
+            native_chunk_id = "zim:" + stable_hash(
                 [snapshot_id, page.zim_entry_path, section_index, sequence, content_hash],
                 32,
+            )
+            chunk_id = (
+                scoped_id(
+                    "zim-chunk",
+                    native_chunk_id,
+                    tenant_id=tenant_id,
+                    knowledge_base_id=knowledge_base_id,
+                    source_type="zim",
+                    snapshot_id=snapshot_id,
+                )
+                if tenant_id and knowledge_base_id
+                else native_chunk_id
             )
             section_path = tuple(str(item) for item in section["path"])
             section_id = f"section:{stable_hash([snapshot_id, page.zim_entry_path, *section_path], 24)}"
@@ -240,6 +266,8 @@ def chunks_for_zim_page(
                 "parent_tokens_min": parent_tokens_min,
                 "child_tokens": len(content.split()),
                 "chunk_ordinal": chunk_ordinal,
+                "source_document_id": native_document_id,
+                "source_chunk_id": native_chunk_id,
                 "section_id": section_id,
                 "locator": {
                     "entry_index": page.entry_index,

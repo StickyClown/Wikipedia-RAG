@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.embedding import normalize_for_embedding
 from wikipediarag.model_client import chat_completion
+from wikipediarag.reliability import OperationDeadline
 from wikipediarag.retrieval_profile import RetrievalProfile, VerificationPolicy
 from wikipediarag.schemas import Evidence
 
@@ -65,6 +66,8 @@ async def verify_claims(
     *,
     settings: Settings | None = None,
     profile: RetrievalProfile,
+    deadline: OperationDeadline | None = None,
+    correlation_id: str = "",
 ) -> dict[str, Any]:
     started = time.perf_counter()
     policy = profile.answer.verification
@@ -82,6 +85,8 @@ async def verify_claims(
                 evidence,
                 settings=settings,
                 profile=profile,
+                deadline=deadline,
+                correlation_id=correlation_id,
             )
             result = _result(policy, verdicts, started, model_alias=profile.model_aliases.verifier)
             result["provider"] = provider_payload.get("provider")
@@ -199,6 +204,8 @@ async def _verify_claims_llm(
     *,
     settings: Settings | None,
     profile: RetrievalProfile,
+    deadline: OperationDeadline | None,
+    correlation_id: str,
 ) -> tuple[list[ClaimSupportVerdict], dict[str, Any]]:
     resolved = settings or get_settings()
     allowed = {item.evidence_id for item in evidence}
@@ -235,6 +242,9 @@ async def _verify_claims_llm(
         resolved,
         alias=profile.model_aliases.verifier,
         response_format=VERIFIER_JSON_SCHEMA,
+        max_output_tokens=profile.deep_research.verifier.max_output_tokens,
+        deadline=deadline,
+        correlation_id=correlation_id,
     )
     content = str(payload["choices"][0]["message"]["content"])
     parsed = json.loads(content)

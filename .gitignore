@@ -12,11 +12,13 @@ htmlcov/
 node_modules/
 dist/
 build/
+services/ui/test-results/
 *.log
 .DS_Store
 .idea/
 .vscode/
 artifacts/
+RRNCB/
 data/
 models/
 *.zim

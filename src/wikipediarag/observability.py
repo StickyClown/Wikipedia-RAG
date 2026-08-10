@@ -29,6 +29,10 @@ CONTENT_KEYS = {
     "rewritten_query",
     "source_text",
     "text",
+    "parent_text",
+    "acl",
+    "document_access",
+    "provider_response",
 }
 STORAGE_KEY_MARKERS = ("object_key", "storage_key", "minio_key", "artifact_key")
 MASK_RE = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})|(\b\d{6,}\b)")
@@ -89,16 +93,39 @@ def safe_telemetry_payload(payload: Any, *, settings: Settings | None = None) ->
 
 
 def safe_error_code(exc: Exception) -> str:
+    explicit_code = getattr(exc, "safe_code", None)
+    if isinstance(explicit_code, str) and explicit_code:
+        return explicit_code
+    domain_code = getattr(exc, "code", None)
+    if isinstance(domain_code, str) and domain_code:
+        return domain_code
     if isinstance(exc, ModelGatewayError):
         code = exc.metadata.get("safe_error_code")
-        return str(code) if code else "model_gateway_error"
+        return str(code) if code else "INTERNAL_ERROR"
     if isinstance(exc, httpx.TimeoutException):
-        return "provider_timeout"
+        return "DEPENDENCY_TIMEOUT"
     if isinstance(exc, httpx.NetworkError):
-        return "provider_network_error"
+        return "DEPENDENCY_UNAVAILABLE"
     if isinstance(exc, httpx.HTTPStatusError):
-        return f"provider_http_{exc.response.status_code}"
-    return type(exc).__name__
+        try:
+            payload = exc.response.json()
+            if isinstance(payload, dict):
+                envelope = payload.get("error")
+                if isinstance(envelope, dict):
+                    code = envelope.get("code")
+                    if isinstance(code, str) and code:
+                        return code
+                detail = payload.get("detail")
+                if isinstance(detail, dict):
+                    envelope = detail.get("error")
+                    if isinstance(envelope, dict):
+                        code = envelope.get("code")
+                        if isinstance(code, str) and code:
+                            return code
+        except (ValueError, TypeError):
+            pass
+        return "DEPENDENCY_UNAVAILABLE" if exc.response.status_code in {429, 502, 503, 504} else "INTERNAL_ERROR"
+    return "INTERNAL_ERROR"
 
 
 def model_call_metadata(

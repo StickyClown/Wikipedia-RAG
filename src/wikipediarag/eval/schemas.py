@@ -88,6 +88,16 @@ class EvalTask(BaseModel):
     tags: list[str] = Field(default_factory=list)
     generation_seed: int = 0
     hard_negative_page_ids: list[str] = Field(default_factory=list)
+    # Document-level external benchmarks can provide a source document without
+    # exposing a gold chunk.  The legacy page fields remain the canonical
+    # Wikipedia-compatible fields for existing suites.
+    gold_document_ids: list[str] = Field(default_factory=list)
+    evaluation_granularity: Literal["chunk", "document"] = "chunk"
+    knowledge_base_ids: list[str] = Field(default_factory=list, max_length=50)
+    # Keep ``train`` for compatibility with reviewed/trusted task subclasses;
+    # external document benchmarks use only the deterministic dev/test split.
+    split: Literal["train", "dev", "test"] = "test"
+    source_document_name: str = ""
 
 
 class EvalDatasetManifest(BaseModel):
@@ -103,6 +113,7 @@ class EvalDatasetManifest(BaseModel):
     generator_alias: str
     verifier_alias: str
     jsonl_path: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvalGenerateStats(BaseModel):
@@ -219,6 +230,14 @@ class TaskScores(BaseModel):
     unsupported_claim_rate: float
     cited_hard_negative_rate: float = 0.0
     kiwix_url_ok: float
+    document_recall: dict[str, float] = Field(default_factory=dict)
+    document_mrr_at_10: float = 0.0
+    document_ndcg_at_10: float = 0.0
+    document_reranker_gold_delta: float | None = None
+    document_citation_precision: float = 0.0
+    document_citation_recall: float = 0.0
+    gold_document_citation_hit: float = 0.0
+    rouge_l: float = 0.0
 
 
 class EvalTaskResult(BaseModel):
@@ -234,6 +253,7 @@ class EvalTaskResult(BaseModel):
     answer: str = ""
     citations: list[str] = Field(default_factory=list)
     cited_chunk_ids: list[str] = Field(default_factory=list)
+    cited_document_ids: list[str] = Field(default_factory=list)
     retrieved_candidates: list[CandidateRef] = Field(default_factory=list)
     reranked_candidates: list[CandidateRef] = Field(default_factory=list)
     mode_selected: Literal["normal", "harness"] = "normal"
@@ -251,10 +271,14 @@ class EvalTaskResult(BaseModel):
     latency_ms: dict[str, int] = Field(default_factory=dict)
     usage: dict[str, Any] = Field(default_factory=dict)
     scores: TaskScores | None = None
+    retrieval_scores: TaskScores | None = None
     diagnosis: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     query_run_id: str | None = None
     trace_id: str | None = None
+    server_terminal_event: bool = False
+    last_sequence: int = 0
+    cold_start: bool = False
     corpus: dict[str, str] = Field(default_factory=dict)
     model_aliases: dict[str, str] = Field(default_factory=dict)
     contract_ids: dict[str, str] = Field(default_factory=dict)
@@ -327,6 +351,10 @@ class RetrievalTaskScores(BaseModel):
     hard_negative_page_hit_at_10: float = 0.0
     hard_negative_page_hit_at_20: float = 0.0
     gold_vs_hard_negative_rank_margin: float | None = None
+    document_recall: dict[str, float] = Field(default_factory=dict)
+    document_mrr_at_10: float = 0.0
+    document_ndcg_at_10: float = 0.0
+    document_reranker_gold_delta: float | None = None
 
 
 class RetrievalTaskResult(BaseModel):

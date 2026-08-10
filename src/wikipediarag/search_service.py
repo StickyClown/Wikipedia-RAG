@@ -127,12 +127,15 @@ async def run_public_search(
             search_filters=search_filters,
             persist_events=False,
         )
-    if retrieval is not None:
-        filtered = [
+    filtered = (
+        [
             item
             for item in retrieval.evidence
             if _matches_document_access(item, document_access_scopes) and _matches_request(item, payload)
         ]
+        if retrieval is not None
+        else []
+    )
     search_results = [
         _search_result(item, query=payload.query, include_highlights=payload.include_highlights) for item in filtered
     ]

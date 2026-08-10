@@ -13,11 +13,14 @@ from wikipediarag.model_registry import ModelOperation, get_model_registry
 from wikipediarag.repository import get_knowledge_base, load_index_version_by_read_alias
 from wikipediarag.retrieval_profile import RetrievalProfile
 
-INDEX_CONTRACT_SCHEMA_VERSION = 1
-RUN_CONTRACT_SCHEMA_VERSION = 1
+INDEX_CONTRACT_SCHEMA_VERSION = 2
+RUN_CONTRACT_SCHEMA_VERSION = 2
 VECTOR_FIELD = "embedding"
 CLAIM_VERIFIER_VERSION = "claim_verifier_v1"
 NEGATIVE_EVIDENCE_POLICY_VERSION = "explicit_negative_title_v1"
+CONTEXT_SELECTION_POLICY_VERSION = "document_scoped_page_quota_v2"
+EXTENDED_SEARCH_CONTROL_POLICY_VERSION = "answerability_gap_control_v2"
+IDENTITY_POLICY_VERSION = "scoped_identity_v1"
 
 
 class KnowledgeBaseNotReady(RuntimeError):
@@ -25,6 +28,14 @@ class KnowledgeBaseNotReady(RuntimeError):
         super().__init__(message)
         self.code = "KB_NOT_READY"
         self.details = details or {}
+
+
+class RetrievalProfileIncompatible(KnowledgeBaseNotReady):
+    """The requested profile cannot run against one or more scoped indexes."""
+
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message, details=details)
+        self.code = "RETRIEVAL_PROFILE_INCOMPATIBLE"
 
 
 class ModelRef(BaseModel):
@@ -49,6 +60,7 @@ class IndexContract(BaseModel):
     retrieval_profile_source: str
     retrieval_profile_version: int
     chunking: dict[str, Any]
+    identity_policy_version: str = IDENTITY_POLICY_VERSION
 
     @property
     def contract_id(self) -> str:
@@ -66,6 +78,12 @@ class RunContract(BaseModel):
     negative_evidence_policy_version: str = NEGATIVE_EVIDENCE_POLICY_VERSION
     verification_policy: dict[str, Any]
     claim_verifier_version: str = CLAIM_VERIFIER_VERSION
+    context_selection_policy_version: str = CONTEXT_SELECTION_POLICY_VERSION
+    extended_search_control_policy_version: str = EXTENDED_SEARCH_CONTROL_POLICY_VERSION
+    fusion_policy_version: str = "stable_rrf_v2"
+    answerability_policy_version: str = "answerability_gate_v5"
+    context_selection_policy_v3: str = "marginal_content_unit_selector_v3"
+    extended_search_control_policy_v3: str = "answerability_gap_control_v3"
 
     @property
     def contract_id(self) -> str:

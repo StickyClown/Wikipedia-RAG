@@ -15,6 +15,7 @@ from wikipediarag.db import connect_autocommit, json_dumps
 from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.embedding import normalize_for_embedding
 from wikipediarag.ids import new_uuid, stable_hash
+from wikipediarag.reliability import OperationDeadline
 from wikipediarag.repository import fetch_chunk_by_id, insert_retrieval_event
 from wikipediarag.retrieval import make_query_context, query_ref_from_context, retrieve, retrieve_multi
 from wikipediarag.retrieval_profile import RetrievalProfile
@@ -126,6 +127,7 @@ async def run_extended_search(
     profile_overrides: dict[str, Any] | None = None,
     search_filters: dict[str, Any] | None = None,
     seed_result: RetrievalResult | None = None,
+    deadline: OperationDeadline | None = None,
 ) -> RetrievalResult:
     extended_started = time.perf_counter()
     budgets = HarnessBudgets(max_context_tokens=profile.postprocess.max_context_tokens)
@@ -248,6 +250,7 @@ async def run_extended_search(
                     search_filters=search_filters,
                     persist_events=False,
                     apply_query_transforms=False,
+                    deadline=deadline,
                 )
             return await retrieve(
                 retrieval_conn,
@@ -264,6 +267,7 @@ async def run_extended_search(
                 search_filters=search_filters,
                 persist_events=False,
                 apply_query_transforms=False,
+                deadline=deadline,
             )
 
         try:
@@ -321,6 +325,7 @@ async def run_extended_search(
                 search_filters=search_filters,
                 persist_events=False,
                 apply_query_transforms=False,
+                deadline=deadline,
             )
         else:
             result = await retrieve(
@@ -338,6 +343,7 @@ async def run_extended_search(
                 search_filters=search_filters,
                 persist_events=False,
                 apply_query_transforms=False,
+                deadline=deadline,
             )
         tool_latency_ms = _elapsed_ms(tool_started)
         retrieval_timings = _extract_timings(result.events)

@@ -88,3 +88,24 @@ def test_upload_profiles_keep_embedding_dimension_contract() -> None:
     assert upload_sota.source == "upload"
     assert upload_sota.model_aliases.embed == "embed_default"
     assert upload_sota.embedding_dimensions(64) == 1024
+    assert upload_sota.requires_real_provider is True
+
+
+def test_deep_research_profile_separates_stage_context_from_normal_search() -> None:
+    profile = get_retrieval_profile("sota_mvp")
+
+    planner = profile.deep_research.planner
+    verifier = profile.deep_research.verifier
+    synthesis = profile.deep_research.synthesis
+
+    assert profile.postprocess.max_context_tokens == 30_000
+    assert profile.deep_research.max_episodes == 12
+    assert profile.deep_research.max_tool_calls == 12
+    assert profile.deep_research.tool_timeout_seconds == 120
+    assert planner.model_alias == "generator_fast"
+    assert planner.max_context_tokens == 80_000
+    assert verifier.model_alias == "generator_main"
+    assert verifier.max_context_tokens == 24_000
+    assert verifier.max_output_tokens == 2_000
+    assert synthesis.model_alias == "generator_main"
+    assert synthesis.max_context_tokens == 80_000

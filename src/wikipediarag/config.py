@@ -22,10 +22,31 @@ class Settings(BaseSettings):
     opensearch_url: str = "http://localhost:9200"
     model_gateway_url: str = "http://localhost:8081"
     mock_provider_url: str = "http://localhost:8082"
+    mock_provider_chat_delay_seconds: float = Field(default=0, ge=0, le=60)
+    mock_provider_chat_delay_requests: int = Field(default=0, ge=0, le=100)
+    mock_provider_output_mode: str = Field(
+        default="normal", pattern="^(normal|malformed_json|truncated_json|schema_mismatch)$"
+    )
     model_provider: str = "mock"
     model_gateway_startup_smoke: Literal["required", "warn", "off"] = "required"
     openrouter_api_key: str = ""
+    openrouter_api_key_file: Path | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    model_endpoint_host_allowlist: str = ""
+    model_provider_timeout_seconds: float = 180
+    model_client_chat_timeout_seconds: float = 300
+    model_client_embedding_timeout_seconds: float = 240
+    model_client_rerank_timeout_seconds: float = 240
+    chat_run_deadline_seconds: float = 300
+    operation_heartbeat_seconds: int = 10
+    dependency_circuit_failure_threshold: int = 3
+    dependency_circuit_cooldown_seconds: float = 15
+    idempotency_record_ttl_seconds: int = 24 * 60 * 60
+    safe_external_retry_attempts: int = 2
+    worker_research_concurrency: int = 1
+    worker_background_concurrency: int = 1
+    worker_job_lease_seconds: int = 180
+    worker_job_heartbeat_seconds: int = 30
     models_config_path: Path = Path("config/models.yaml")
     retrieval_config_path: Path = Path("config/retrieval.yaml")
     retrieval_profile: str = "test_mock"
@@ -108,6 +129,13 @@ class Settings(BaseSettings):
             return value
         return Path(value.as_posix().removeprefix("/app/"))
 
+    @field_validator("openrouter_api_key_file", mode="before")
+    @classmethod
+    def empty_openrouter_key_file_is_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @model_validator(mode="after")
     def validate_auth_mode(self) -> "Settings":
         if self.auth_mode == "test" and self.app_env != "test":
@@ -122,3 +150,19 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def resolve_openrouter_api_key(settings: Settings | None = None) -> str:
+    resolved = settings or get_settings()
+    key = resolved.openrouter_api_key.strip()
+    if key:
+        return key
+    key_file = resolved.openrouter_api_key_file
+    if key_file is None:
+        return ""
+    try:
+        return key_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        raise RuntimeError("OPENROUTER_API_KEY_FILE could not be read") from exc

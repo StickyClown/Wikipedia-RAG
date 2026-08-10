@@ -7,6 +7,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from wikipediarag.research_tool_registry import (
+    ALLOWED_RESEARCH_TOOLS,
+    DEFAULT_RESEARCH_TOOL_MODE,
+    ResearchToolMode,
+    allowed_research_tools_for_mode,
+    is_document_research_tool,
+    normalize_research_tool_mode,
+)
+
 DEEP_RESEARCH_FIXTURE_SCHEMA_VERSION = "deep_research_fixture_v1"
 DEFAULT_DEEP_RESEARCH_FIXTURE_PATH = Path("tests/fixtures/deep_research/research_tasks.json")
 DEFAULT_DEEP_RESEARCH_POLICY_ID = "target_45_abstracts_only_short_structured"
@@ -63,6 +72,27 @@ class DeepResearchExpectedCoverage(BaseModel):
     requires_conflicting: bool = False
 
 
+class DeepResearchTrajectoryExpectations(BaseModel):
+    min_completed_tool_calls: int = Field(default=0, ge=0)
+    min_document_tool_calls: int = Field(default=0, ge=0)
+    min_derived_questions: int = Field(default=0, ge=0)
+    derived_question_contains: list[str] = Field(default_factory=list)
+    required_tool_names: list[str] = Field(default_factory=list)
+    require_tool_query_hash: bool = True
+    forbid_raw_tool_query: bool = True
+
+    @model_validator(mode="after")
+    def validate_trajectory_expectations(self) -> DeepResearchTrajectoryExpectations:
+        normalized_terms = [term.casefold() for term in self.derived_question_contains]
+        duplicates = sorted({term for term in normalized_terms if normalized_terms.count(term) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate derived question expectation terms: {duplicates}")
+        unknown_tools = sorted({name for name in self.required_tool_names if name not in ALLOWED_RESEARCH_TOOLS})
+        if unknown_tools:
+            raise ValueError(f"unknown research tool expectation(s): {unknown_tools}")
+        return self
+
+
 class DeepResearchFixture(BaseModel):
     task_id: str = Field(min_length=1, max_length=120)
     topic: str = Field(min_length=1, max_length=32000)
@@ -75,6 +105,9 @@ class DeepResearchFixture(BaseModel):
     acl_setup: dict[str, Any] = Field(default_factory=dict)
     quality_tags: list[str] = Field(default_factory=list)
     expected_run_statuses: list[str] = Field(default_factory=lambda: ["completed"])
+    trajectory_expectations: DeepResearchTrajectoryExpectations = Field(
+        default_factory=DeepResearchTrajectoryExpectations
+    )
 
     @model_validator(mode="after")
     def validate_fixture_links(self) -> DeepResearchFixture:
@@ -132,7 +165,8 @@ def evaluate_research_detail(
     fixture: DeepResearchFixture,
     detail: Any,
     *,
-    declared_context_tokens: int = 30000,
+    declared_context_tokens: int = 80000,
+    document_id_aliases: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     payload = _detail_dict(detail)
     run = _mapping(payload.get("run"))
@@ -141,6 +175,7 @@ def evaluate_research_detail(
     evidence = _dict_list(payload.get("evidence"))
     claims = _dict_list(payload.get("claims"))
     episodes = _dict_list(payload.get("episodes"))
+    tool_calls = _dict_list(payload.get("tool_calls"))
     report = _mapping(payload.get("final_report"))
 
     failures: list[str] = []
@@ -150,8 +185,22 @@ def evaluate_research_detail(
 
     question_score, question_failures = _question_coverage_score(fixture, questions, coverage)
     failures.extend(question_failures)
+    open_required = [
+        str(row.get("id") or row.get("question") or "")
+        for row in questions
+        if "execution_state" in row
+        and str(row.get("execution_state") or "pending") != "done"
+        and bool((_mapping(row.get("acceptance"))).get("required", True))
+    ]
+    if status in {"completed", "completed_partial"} and open_required:
+        failures.append(f"terminal run has required questions open: {len(open_required)}")
 
-    evidence_recall, missing_markers = _evidence_recall(fixture, evidence, report)
+    evidence_recall, missing_markers = _evidence_recall(
+        fixture,
+        evidence,
+        report,
+        document_id_aliases=document_id_aliases,
+    )
     for marker in missing_markers:
         failures.append(f"missing required evidence marker {marker}")
 
@@ -169,6 +218,12 @@ def evaluate_research_detail(
     contradiction_handled = _contradiction_handled(fixture, coverage, evidence, report)
     if not contradiction_handled:
         failures.append("expected contradiction was not represented in coverage, evidence or report")
+    if (
+        expected.requires_conflicting
+        and coverage_metrics["total"] > 0
+        and coverage_metrics["covered"] == coverage_metrics["total"]
+    ):
+        failures.append("contradiction task ended with only confident covered coverage")
 
     unsupported_claim_count = _unsupported_claim_count(claims, evidence)
     if unsupported_claim_count:
@@ -179,6 +234,16 @@ def evaluate_research_detail(
 
     resume_integrity, resume_failures = _resume_integrity(questions, evidence, episodes)
     failures.extend(resume_failures)
+
+    trajectory_metrics, trajectory_failures = _trajectory_metrics(
+        fixture,
+        run,
+        questions,
+        tool_calls,
+        episodes,
+        payload,
+    )
+    failures.extend(trajectory_failures)
 
     context_metrics = _context_metrics(episodes, declared_context_tokens=max(1, declared_context_tokens))
     coverage_score = (
@@ -197,7 +262,9 @@ def evaluate_research_detail(
             "context_efficiency": context_metrics,
             "acl_safety": acl_safety,
             "resume_integrity": resume_integrity,
+            "trajectory": trajectory_metrics,
             "coverage": coverage_metrics,
+            "open_required_questions": len(open_required),
             "run_status": status,
         },
     }
@@ -255,7 +322,7 @@ def build_context_experiment_report(rows: list[dict[str, Any]]) -> dict[str, Any
 def run_context_policy_experiment_rows(
     fixtures: list[DeepResearchFixture],
     *,
-    declared_context_tokens: int = 12000,
+    declared_context_tokens: int = 80000,
 ) -> list[dict[str, Any]]:
     from wikipediarag.deep_research import ResearchContextBudget, pack_research_context
 
@@ -351,13 +418,19 @@ def _question_coverage_score(
     matched = 0
     failures: list[str] = []
     for expected in fixture.expected_questions:
+        matches = [
+            row
+            for row in questions
+            if expected.question_contains.casefold() in str(row.get("question") or "").casefold()
+        ]
+        allowed = set(expected.allowed_statuses)
         question = next(
             (
                 row
-                for row in questions
-                if expected.question_contains.casefold() in str(row.get("question") or "").casefold()
+                for row in matches
+                if coverage_by_question_id.get(str(row.get("id")), str(row.get("status") or "")) in allowed
             ),
-            None,
+            matches[0] if matches else None,
         )
         if question is None:
             if expected.required:
@@ -378,12 +451,34 @@ def _evidence_recall(
     fixture: DeepResearchFixture,
     evidence: list[dict[str, Any]],
     report: dict[str, Any],
+    *,
+    document_id_aliases: dict[str, str] | None = None,
 ) -> tuple[float, list[str]]:
-    serialized = json.dumps({"evidence": evidence, "report": report}, ensure_ascii=False, sort_keys=True)
     required = [item for item in fixture.gold_evidence if item.required]
     if not required:
         return 1.0, []
-    missing = [item.marker for item in required if item.marker not in serialized]
+    evidence_by_document: dict[str, str] = {}
+    has_document_provenance = any(str(row.get("document_id") or "") for row in evidence)
+    for row in evidence:
+        document_id = str(row.get("document_id") or "")
+        if not document_id:
+            continue
+        evidence_by_document[document_id] = (
+            f"{evidence_by_document.get(document_id, '')} {json.dumps(row, ensure_ascii=False)}"
+        )
+    if has_document_provenance:
+        missing = [
+            item.marker
+            for item in required
+            if item.marker
+            not in evidence_by_document.get(
+                str((document_id_aliases or {}).get(item.document_id) or item.document_id),
+                "",
+            )
+        ]
+    else:
+        evidence_text = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+        missing = [item.marker for item in required if item.marker not in evidence_text]
     return (len(required) - len(missing)) / len(required), missing
 
 
@@ -428,6 +523,9 @@ def _unsupported_claim_count(claims: list[dict[str, Any]], evidence: list[dict[s
     visible_evidence_ids = {str(row.get("id")) for row in evidence}
     unsupported = 0
     for claim in claims:
+        if str(claim.get("support_status") or "") == "unsupported":
+            unsupported += 1
+            continue
         evidence_ids = [str(item) for item in claim.get("evidence_ids") or []]
         if not evidence_ids or not any(item in visible_evidence_ids for item in evidence_ids):
             unsupported += 1
@@ -460,6 +558,111 @@ def _resume_integrity(
         [str(row.get("episode_index")) for row in episodes if row.get("episode_index") is not None],
     )
     return not failures, failures
+
+
+def _trajectory_metrics(
+    fixture: DeepResearchFixture,
+    run: dict[str, Any],
+    questions: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+    episodes: list[dict[str, Any]],
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    expectations = fixture.trajectory_expectations
+    tool_mode = normalize_research_tool_mode(str(run.get("tool_mode") or DEFAULT_RESEARCH_TOOL_MODE))
+    allowed_tool_names = set(allowed_research_tools_for_mode(tool_mode))
+    required_tool_names = set(expectations.required_tool_names)
+    derived_questions = [row for row in questions if str(row.get("kind") or "").casefold() == "derived"]
+    completed_tool_calls = [row for row in tool_calls if str(row.get("status") or "").casefold() == "completed"]
+    completed_document_tool_calls = [
+        row for row in completed_tool_calls if is_document_research_tool(str(row.get("tool_name") or ""))
+    ]
+    tool_names = sorted({str(row.get("tool_name") or "") for row in tool_calls if row.get("tool_name")})
+    completed_tool_names = {str(row.get("tool_name") or "") for row in completed_tool_calls if row.get("tool_name")}
+    missing_hash_count = sum(1 for row in tool_calls if not str(row.get("tool_query_hash") or ""))
+    derived_payload = json.dumps(
+        [str(row.get("question") or "") for row in derived_questions],
+        ensure_ascii=False,
+        sort_keys=True,
+    ).casefold()
+    required_terms = list(expectations.derived_question_contains)
+    found_terms = [term for term in required_terms if term.casefold() in derived_payload]
+    missing_terms = [term for term in required_terms if term.casefold() not in derived_payload]
+    raw_payload_leak = _contains_forbidden_public_key(payload)
+    context_summaries = [_mapping(row.get("context_summary")) for row in episodes]
+
+    failures: list[str] = []
+    # Counts and preferred tool names describe research efficiency.  They do
+    # not prove correctness and therefore remain diagnostic metrics rather
+    # than hard failures.  The hard gate below still enforces allowlists,
+    # hashes and public-surface safety.
+    unknown_tools = sorted({name for name in tool_names if name not in ALLOWED_RESEARCH_TOOLS})
+    if unknown_tools:
+        failures.append(f"unknown public research tool calls: {unknown_tools}")
+    disallowed_tools = sorted(
+        {name for name in tool_names if name in ALLOWED_RESEARCH_TOOLS and name not in allowed_tool_names}
+    )
+    if disallowed_tools:
+        failures.append(f"tool calls outside current tool_mode allowlist: {disallowed_tools}")
+    if expectations.require_tool_query_hash and missing_hash_count:
+        failures.append(f"tool calls without tool_query_hash: {missing_hash_count}")
+    if expectations.forbid_raw_tool_query and raw_payload_leak:
+        failures.append("unsafe raw query/provider/storage key leaked in public research detail")
+
+    return (
+        {
+            "tool_call_count": len(tool_calls),
+            "completed_tool_call_count": len(completed_tool_calls),
+            "document_tool_call_count": sum(
+                1 for row in tool_calls if is_document_research_tool(str(row.get("tool_name") or ""))
+            ),
+            "completed_document_tool_call_count": len(completed_document_tool_calls),
+            "tool_names": tool_names,
+            "tool_mode": tool_mode,
+            "allowed_tool_names": sorted(allowed_tool_names),
+            "required_tool_names_found": sorted(required_tool_names & completed_tool_names),
+            "missing_tool_query_hash_count": missing_hash_count,
+            "derived_question_count": len(derived_questions),
+            "required_derived_terms": required_terms,
+            "required_derived_terms_found": found_terms,
+            "required_derived_terms_missing": missing_terms,
+            "raw_tool_payload_leak": raw_payload_leak,
+            "episodes_with_context_summary": sum(1 for summary in context_summaries if summary),
+            "episodes_over_soft_limit": sum(
+                1 for summary in context_summaries if summary.get("over_soft_limit") is True
+            ),
+            "episodes_over_hard_input_limit": sum(
+                1 for summary in context_summaries if summary.get("over_hard_input_limit") is True
+            ),
+        },
+        failures,
+    )
+
+
+def _contains_forbidden_public_key(value: Any) -> bool:
+    forbidden = {
+        "tool_query",
+        "raw_query",
+        "provider_payload",
+        "raw_provider_payload",
+        "prompt",
+        "messages",
+        "object_key",
+        "original_artifact_key",
+        "normalized_artifact_key",
+        "server_side_tokens",
+        "access_token",
+        "refresh_token",
+    }
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key) in forbidden:
+                return True
+            if _contains_forbidden_public_key(child):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_forbidden_public_key(child) for child in value)
+    return False
 
 
 def _append_duplicate_failure(failures: list[str], label: str, values: list[str]) -> None:
@@ -677,3 +880,50 @@ def _beats_default(best: dict[str, Any], default: dict[str, Any]) -> bool:
         best["evidence_recall"]
     ) > float(default["evidence_recall"])
     return quality_is_not_worse and (context_improves or quality_improves)
+
+
+def runtime_tool_matrix_modes() -> list[ResearchToolMode]:
+    return ["extended_search_only", "search_plus_document_tools", "all_local_tools"]
+
+
+def build_runtime_tool_matrix_report(
+    rows: list[dict[str, Any]],
+    *,
+    default_policy_id: str = DEFAULT_RESEARCH_TOOL_MODE,
+) -> dict[str, Any]:
+    policies = [
+        {
+            "policy_id": tool_mode,
+            "tool_mode": tool_mode,
+            "allowed_tools": list(allowed_research_tools_for_mode(tool_mode)),
+        }
+        for tool_mode in runtime_tool_matrix_modes()
+    ]
+    if not rows:
+        return {
+            "schema_version": "deep_research_runtime_tool_matrix_report_v1",
+            "policies": policies,
+            "results": [],
+            "policy_results": [],
+            "recommended_policy_id": default_policy_id,
+            "reason": "no measured rows; keep current default tool_mode",
+        }
+    normalized = [_normalize_experiment_row(row) for row in rows]
+    policy_results = _aggregate_experiment_rows(normalized)
+    ranked = sorted(policy_results, key=_experiment_sort_key)
+    default = next((row for row in ranked if row["policy_id"] == default_policy_id), None)
+    best = ranked[0]
+    recommended = best
+    reason = "best measured tool_mode wins safety-first Pareto ranking"
+    if default is not None and not _beats_default(best, default):
+        recommended = default
+        reason = "current all_local_tools default remains because no tool_mode gives a clear safe Pareto improvement"
+    return {
+        "schema_version": "deep_research_runtime_tool_matrix_report_v1",
+        "policies": policies,
+        "results": normalized,
+        "policy_results": policy_results,
+        "ranked_policy_ids": [row["policy_id"] for row in ranked],
+        "recommended_policy_id": recommended["policy_id"],
+        "reason": reason,
+    }

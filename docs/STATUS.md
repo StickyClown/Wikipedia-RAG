@@ -1,6 +1,6 @@
 # Project Status
 
-Last updated: 2026-08-09
+Last updated: 2026-08-10
 
 ## Current milestone
 
@@ -19,10 +19,87 @@ Ordinary Search and the chat Extended Search harness keep their existing
 smaller normal-search context profile. The runtime default productive target
 remains `45%` until a fresh real-model/local-model matrix safely beats it.
 
+## Reliability & UX Correction V2 (2026-08-10)
+
+The approved post-RRNCB correction is implemented in the current source tree.
+Structured model output now uses typed `AnswerDraft`/`ClaimDraft` validation;
+BOM/fenced JSON is normalized locally, while malformed or truncated output ends
+with `MODEL_OUTPUT_INVALID`/`MODEL_OUTPUT_TRUNCATED` and never triggers an
+automatic repair call. The Gateway performs the generator schema/max-token
+startup canary, keeps alias readiness/circuit state, and the mock provider has
+deterministic malformed/truncated/delayed/schema-mismatch modes.
+
+Chat, replay and eval share canonical safe failures, one monotonic deadline,
+durable terminal query runs, disconnect cancellation, additive stage/heartbeat
+SSE fields and idempotent `client_request_id` replay. Eval consumes SSE
+incrementally and retains the query-run ID, last stage, terminal status and a
+read-only retrieval snapshot after a truncated stream. Retrieval profile
+resolution is server-side across every scoped KB; exact entity/title handling,
+answerability, contextual abstention and bounded context packing cover the
+RRNCB regressions (including the table-number false conflict). Worker and
+parser persistence no longer writes exception class names as public error
+codes; transport/parser/research failures use the canonical safe taxonomy.
+
+Chat/Search UI now share an explicit multi-KB scope, use the backend `auto`
+profile, show heartbeats/stages and cancellable loading states, render grouped
+document results and safe citation/error details, and use stable transport
+idempotency keys with a new key for explicit retry. UI protocol tests and a
+Playwright smoke cover sequence gaps, terminal events, grouped Search and
+failure-source retention.
+
+Validation completed: `uv run pytest tests/unit -q` (387 passed in the latest
+run), `uv run pytest
+tests/integration/test_eval_runner.py -q` (8 passed), Ruff lint/format and
+Mypy for `src/wikipediarag`, UI Vitest (2), Playwright (1), typecheck, lint and
+production build all passed. The isolated Compose reliability smoke passed on
+2026-08-10 in
+`artifacts/validation/reliability/20260810T130725Z/report.json`: 2/2 uploads
+published across a worker stop/restart, four terminal chat runs (two injected
+Gateway failures followed by two successes), stable SSE sequences and an
+idempotent replay with one `query_run_id`. Its disposable Compose project is
+left intact for inspection; no corpus, existing KB, index or volume was
+removed.
+
+The old `rrncb-public-v1` run remains immutable and was not resumed or mixed
+with this work. No new real 200-question RRNCB baseline was started; it is
+allowed only after the rebuilt runtime uses the intended provider/profile and
+the reliability smoke is green. The valid pinned RRNCB CSV revision in the
+source is the 40-character Hugging Face commit ending in `...acac166` (the
+shorter revision string in the original plan resolves to 404).
+
+Follow-up verification rebuilt `ui`, `api`, `worker` and `model-gateway` from
+the current source without removing data or volumes. The UI now renders the
+safe `degraded` API status as localized `degraded`/`частично готово`, rather
+than `checking`; its accessible label, `auto` retrieval profile and workspace
+tab navigation were verified in the rebuilt browser UI with no console errors.
+`uv run pytest tests/unit -q` passed 387 tests, Ruff and Mypy passed, and the
+UI lint, typecheck, Vitest (3), production build and Playwright smoke passed.
+The rebuilt real-provider Gateway is now ready. The earlier safe
+`provider_smoke_failed`/`MODEL_ALIAS_UNREADY` result was a false canary failure,
+not a missing key, exhausted quota or unavailable model: OpenRouter returned
+HTTP 200, but Qwen 3.6 spent each bounded 64/128/256/512-token diagnostic
+response on its default reasoning and ended with `finish_reason=length` before
+emitting the required JSON. The startup canary now disables optional reasoning
+for this short contract-only request while retaining the production answer
+schema and 64-token output bound. No provider alias, readiness rule or real
+profile was weakened and mock did not replace OpenRouter. After rebuilding only
+the Gateway stack, Gateway `/ready` and API `/ready` both returned `ok`, all five
+OpenRouter aliases were healthy, and `smoke-models --provider openrouter`
+validated 1024-dimensional embeddings, structured chat and rerank ordering.
+
+The repository-wide UI `pnpm format:check` is also green. The Playwright smoke
+and `pnpm-lock.yaml` were formatted, while generated `test-results/` is now
+excluded through `.prettierignore` so later Playwright runs do not reintroduce
+the failure. Final validation on 2026-08-10: `uv run pytest tests/unit -q`
+passed 388 tests; focused Ruff lint/format passed; UI lint, typecheck, Vitest
+(3) and format check passed; `docker compose config --quiet` and
+`git diff --check` passed; the rebuilt live OpenRouter smoke passed.
+
 ## Implemented now
 
 - Local production-shaped RAG MVP with FastAPI API, worker, Model Gateway, React/Vite UI and Docker Compose dependencies.
 - Web UI UX pass: desktop app shell with Chat/Search/Research/Knowledge Base tabs, compact KB context controls, structured Deep Research findings with clickable evidence refs, multi-KB scope selection (up to three), cancellable polling and Markdown/Word/CSV exports.
+- UI read-only browser coverage now includes public smoke, RU/EN switching, offline login errors, mobile overflow checks, keyboard tab navigation and platform-admin model-control rendering. API/network failures are converted to localized safe messages without uncaught `Failed to fetch` console errors; generated Playwright results remain ignored by lint/format tooling. Authenticated suites are opt-in through local environment credentials and skip safely when the API is not running. Current UI validation: Playwright 6 passed/4 skipped (API unavailable), Vitest 3 passed, lint/typecheck/format/build passed.
 - Local auth and OIDC foundation: Argon2id local passwords, opaque HttpOnly session cookie, CSRF, OIDC Authorization Code + PKCE, server-side encrypted provider tokens and `ActorContext`.
 - Tenant and KB authorization foundation: platform, tenant and KB roles; local/OIDC groups; KB grants; route-level server-owned tenant/KB enforcement; safe error envelopes.
 - Wikipedia ingestion from local ZIM/libzim with Kiwix source URLs, deterministic chunks, redirects as provenance and versioned OpenSearch publication; XML multistream fallback remains available.
@@ -95,6 +172,52 @@ remains `45%` until a fresh real-model/local-model matrix safely beats it.
   inside the current tenant/KB scope and merge back through the existing
   retrieval stack.
 - Eval and validation tooling: local-auth eval client, release-gate provider preflight, warm retrieval profiling, MIRACL-RU adapter, document corpus verification, cross-tenant hardening smoke command and Deep Research complex fixture/evaluator/runtime smoke harness.
+- RRNCBPublic document benchmark tooling is implemented as a separate baseline increment:
+  pinned CSV preparation validates 200 rows, 65 PDFs, 53 referenced documents and
+  15 soft-unanswerable rows; deterministic dev/test manifests and SHA-256 source
+  manifests are written under ignored `artifacts/eval/rrncb-public/` and the
+  external CSV cache under `artifacts/eval/external/rrncb-public/cache/`.
+  The public-API-only runner supports resumable five-document batches, bounded
+  presigned uploads, ingestion timing/progress artifacts, KB-scoped retrieval and
+  chat calls, ten-query retrieval preflight, and document-level Recall/MRR/nDCG,
+  citation metrics and ROUGE-L. The historic `rrncb-public-v1` attempt ran on
+  2026-08-10 against the local API after ingestion of all 65 PDFs and
+  terminalized all 200 questions (162 completed, 38 technical failures). It is
+  an immutable comparison point, not a successful baseline.
+- Universal Model Control Plane foundation is now implemented as additive
+  migration `005_model_control_plane`. PostgreSQL stores provider connections,
+  encrypted versioned credentials, model contracts, immutable configuration
+  revisions, stage bindings and safe validation runs; YAML is used only for
+  first-run, no-secret bootstrap. The code-owned stage registry covers
+  ingestion/retrieval, chat and Deep Research stages, keeps vision models
+  catalog-only, and enforces one embedding fingerprint for document/query
+  embeddings.
+- Platform-admin-only model API and the UI Models tab expose connections,
+  catalog, stage registry, draft/validate/activate/history operations, safe
+  credential status, optimistic versions and localized RU/EN explanations.
+  Drivers for OpenRouter, vLLM, llama.cpp, text-generation-webui,
+  OpenAI-compatible endpoints and test-only Mock share one request contract;
+  no driver manages endpoint processes. Thinking mappings, typed parameter
+  precedence, token-envelope checks, tokenizer calibration and schema canary
+  reserve reject unknown or unsafe settings.
+- Model Gateway accepts the stage + immutable revision contract while retaining
+  alias compatibility for CLI/tests. Active revisions control readiness when
+  present; a failed unused catalog model does not degrade readiness, and no
+  mock fallback is performed. Runtime records now have additive revision/hash
+  columns for query, ingestion and research runs.
+- The pre-control-plane comparison point is recorded as `pre-control-plane`
+  with legacy YAML bundle hash
+  `74d714f61305eb80d749f1bf3da0ec51529412030550908db3b82e2fb8c74aff`
+  (`config/models.yaml` + `config/retrieval.yaml`). Any RRNCB run after
+  activation must receive a new run ID and must be compared as a model-routing
+  contract change, not as a pure quality delta.
+- Validation after this increment: `uv run pytest tests/unit -q` -> 397 passed;
+  integration suite -> 14 passed, 1 skipped; `uv run mypy src/wikipediarag` and
+  focused Ruff checks passed; UI lint, typecheck and Prettier passed; `docker
+  compose config --quiet` passed. A live database migration/activation and
+  real local-endpoint conformance smoke remain deployment checks, not silently
+  simulated by the application.
+
 - Deep Research hard target fixtures: `tests/fixtures/deep_research/research_tasks_hard.json`
   covers alias resolution, multi-source bridge chains, policy exceptions, CSV
   evidence and contradiction-after-bridge cases. The fixtures now declare
@@ -106,6 +229,19 @@ remains `45%` until a fresh real-model/local-model matrix safely beats it.
   OpenSearch state so interrupted shared-stack jobs cannot affect a result.
 
 ## In progress
+
+- Reliability Foundation V1 is implemented in the current Compose source tree:
+  chat has one durable terminal `query_run`, monotonic 300-second deadline,
+  disconnect cancellation, 10-second generation heartbeats and additive safe
+  SSE correlation fields; the Model Gateway has alias-scoped circuit breaking
+  and at most one automatic retry before a response; and upload/import/source
+  sync/reprocess/research creation support 24-hour idempotency records. The
+  document worker now persists one classified delayed retry before terminal
+  failure. RRNCB uses stable chat request IDs, asynchronous SSE consumption,
+  immutable run contracts and reports both conditional and end-to-end quality.
+  The next real RRNCB baseline must use a fresh run ID after Compose has been
+  rebuilt and the isolated reliability smoke has been executed; it must not be
+  mixed with the existing 162/200 conditional-result baseline.
 
 - Retrieval Correctness V3 implementation is now present in the shared retrieval
   contract. New ingestion writes scoped document/chunk/index identities, keeps
@@ -157,6 +293,33 @@ remains `45%` until a fresh real-model/local-model matrix safely beats it.
 - External deployment hardening remains planned, not supported production operation.
 
 ## Latest validation
+
+- Reliability Foundation V1/V2 deterministic and UI checks on 2026-08-10 are
+  recorded in the V2 section above. Earlier 378/386-count entries and the
+  initial smoke-only contract mismatch are historical; the isolated fault
+  smoke is now green and no real RRNCB rerun has been started.
+
+- RRNCB benchmark implementation checks on 2026-08-09: `uv run pytest
+  tests/unit/test_eval_document_benchmark.py tests/unit/test_eval_metrics.py
+  tests/unit/test_eval_external.py tests/unit/test_eval_retrieval_profile.py
+  tests/unit/test_eval_progress.py -q` -> 24 passed; `uv run pytest
+  tests/integration/test_eval_runner.py -q` -> 8 passed; focused Ruff format,
+  Ruff lint and mypy checks for `src/wikipediarag/eval` and `cli.py` passed.
+  The historic failed `rrncb-public-v1` RRNCB attempt on 2026-08-10 used dataset hash
+  `874489686ac5f10e598d0380fd2618e4fed9ecb328120ac70ab2526af9857d97`, KB
+  `83f6ac93-18f6-436f-90ac-d3a25652e86f`, and ingestion time 2076.5 s for
+  65/65 published PDFs. Preflight passed 10/10 gold documents in top-10.
+  The RAG run took 11991.4 s; report artifacts are under
+  `artifacts/eval/rrncb-public/rrncb-public-v1/` (`report.json`, `report.md`,
+  `results.csv`, `latest-status.json`). The all-split baseline was document
+  Recall@1/5/10 = 0.926/0.975/0.981, MRR@10 = 0.948, nDCG@10 = 0.957,
+  citation precision/recall = 0.734/0.821, ROUGE-L = 0.213, token F1 =
+  0.256, soft-unanswerable accuracy = 0.375, p50/p95 latency =
+  51.0/105.6 s, and technical error rate = 0.19. This is a baseline, not a
+  release gate; timeout and provider failures require follow-up before using
+  the quality metrics as a release criterion.
+  Repository unit suite afterwards: `uv run pytest tests/unit -q` -> 370 passed
+  (two existing FastAPI deprecation warnings).
 
 - Web UI UX pass on 2026-08-07: `services/ui` `pnpm lint`, `pnpm typecheck`,
   `pnpm build` and `pnpm format:check` all passed. Browser smoke against a
@@ -890,23 +1053,24 @@ remains `45%` until a fresh real-model/local-model matrix safely beats it.
 - Offline Deep Research matrix results are not yet a provider/runtime policy
   benchmark. The current 45% productive-target default should not be changed
   solely from the synthetic packer matrix.
-- API `/ready` currently checks PostgreSQL and Model Gateway readiness; Redis/Valkey, MinIO and OpenSearch are Compose dependencies but are not confirmed readiness checks.
-- Redis/Valkey is configured and present in Compose, but no Redis client usage was found in `src/`; current ingestion job claiming uses PostgreSQL `FOR UPDATE SKIP LOCKED`.
+- API `/ready` checks PostgreSQL, worker heartbeat, Model Gateway, OpenSearch,
+  MinIO and required parser services; Redis/Valkey remains a Compose dependency
+  without a readiness check.
+- Redis/Valkey is used for tenant-scoped public-search windows with uncached
+  fallback; current ingestion job claiming still uses PostgreSQL `FOR UPDATE
+  SKIP LOCKED`, and Redis is not durable or readiness-fatal.
 - Malware scanning, external ACL connector import policy, restore drills, production TLS/secrets, observability retention and resource sizing remain production hardening work.
 - OpenTelemetry collector remains debug-exporter only; optional OpenSearch observability data-stream projection is not implemented.
-- OpenRouter-backed gates depend on provider quota, credits, latency and model behavior.
+- OpenRouter-backed gates still depend on provider quota, credits, latency and model behavior.
 
 ## Next approved task
 
-If Deep Research tuning continues, use the new approved-plan surface to inspect
-the safe telemetry and report artifacts from the 2026-08-05 real-provider
-`alias_reformulation_chain` rerun, identify the remaining
-`planner_invalid_schema` shape, then rerun the focused fixtures
-`within_doc_exception_clause` and `section_alias_owner_chain` before attempting
-the full default hard gate again. Do not run any `35%` candidate comparison
-until the default `45%` real-provider baseline is stable; accept a candidate
-only if hard-fixture pass rate, evidence recall, ACL safety and
-unsupported-claim counts do not regress and average context ratio improves.
+After the Model Gateway provider canary is healthy, run the new immutable RRNCB
+baseline: fresh run ID, 40 dev tasks first, then 160 test tasks, with the same
+KB/PDF hashes and no automatic repair calls. Do not resume or modify
+`rrncb-public-v1`; stop on any readiness, contract, terminal-event or
+`MODEL_OUTPUT_INVALID` gate failure. Deep Research tuning remains a separate
+follow-up and must not change this regression configuration.
 
 ## Related artifacts
 

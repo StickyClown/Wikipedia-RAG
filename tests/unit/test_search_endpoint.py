@@ -13,6 +13,7 @@ from wikipediarag.auth import ActorContext, AuthenticationMethod, KnowledgeBaseR
 from wikipediarag.auth_service import AuthenticationError
 from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.repository import search_public_chunks
+from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import SearchFilters, SearchRequest, SearchResponse, SearchResult
 
 
@@ -101,6 +102,7 @@ async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeyp
                 "filters": search_payload.filters.model_dump(mode="json", exclude_none=True),
             }
         )
+
         return SearchResponse(
             results=[
                 SearchResult(
@@ -126,6 +128,9 @@ async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeyp
             has_more=False,
         )
 
+    async def resolve_profile(_conn: object, **_kwargs: Any) -> Any:
+        return get_retrieval_profile("test_mock")
+
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
     monkeypatch.setattr(api_app, "_load_kb_role_optional", load_kb_role)
@@ -133,6 +138,7 @@ async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeyp
     monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
     monkeypatch.setattr(api_app, "load_index_version_by_read_alias", load_index)
     monkeypatch.setattr(api_app, "run_public_search", run_search)
+    monkeypatch.setattr(api_app, "resolve_retrieval_profile", resolve_profile)
 
     payload = SearchRequest(
         query="verification marker",

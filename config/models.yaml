@@ -9,16 +9,28 @@ models:
     provider: openrouter
     model: qwen/qwen3.5-9b
     operation: chat
+    context_window_tokens: 80000
+    tokenizer: qwen3
+    provider_preferences:
+      require_parameters: true
 
   generator_main:
     provider: openrouter
     model: qwen/qwen3.6-35b-a3b
     operation: chat
+    context_window_tokens: 80000
+    tokenizer: qwen3
+    provider_preferences:
+      require_parameters: true
 
   verifier:
     provider: openrouter
     model: qwen/qwen3.5-9b
     operation: chat
+    context_window_tokens: 80000
+    tokenizer: qwen3
+    provider_preferences:
+      require_parameters: true
 
   rerank_default:
     provider: openrouter
@@ -35,16 +47,22 @@ models:
     provider: mock
     model: generator_fast
     operation: chat
+    context_window_tokens: 80000
+    tokenizer: mock_char_estimate_v1
 
   mock_generator_main:
     provider: mock
     model: generator_fast
     operation: chat
+    context_window_tokens: 80000
+    tokenizer: mock_char_estimate_v1
 
   mock_verifier:
     provider: mock
     model: generator_fast
     operation: chat
+    context_window_tokens: 80000
+    tokenizer: mock_char_estimate_v1
 
   mock_rerank_default:
     provider: mock

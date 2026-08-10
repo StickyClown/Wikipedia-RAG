@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.ids import stable_hash
+from wikipediarag.reliability import safe_failure_from_exception
 from wikipediarag.wiki_dump import Chunk
 
 NORMALIZED_DOCUMENT_SCHEMA_VERSION = "normalized_document_v1"
@@ -69,6 +70,18 @@ class ParserServiceError(RuntimeError):
         self.parser = parser
         self.code = code
         self.safe_message = safe_message
+
+
+def _parser_failure_code(exc: BaseException) -> str:
+    """Map parser transport failures to the public reliability taxonomy."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = int(exc.response.status_code)
+        if status in {429, 502, 503, 504}:
+            return "DEPENDENCY_UNAVAILABLE"
+        if 400 <= status < 500:
+            return "PARSER_REJECTED"
+    failure = safe_failure_from_exception(exc, stage="parsing")
+    return failure.error_code
 
 
 class FileValidation(BaseModel):
@@ -204,9 +217,11 @@ async def extract_metadata(
             )
             response.raise_for_status()
             return DocumentMetadata.model_validate(response.json())
+    except httpx.HTTPStatusError as exc:
+        raise ParserServiceError("xberg", _parser_failure_code(exc), "xberg parser request failed") from exc
     except Exception as exc:
         if resolved.document_parser_services_required:
-            raise ParserServiceError("metadata-service", type(exc).__name__, "metadata service failed") from exc
+            raise ParserServiceError("metadata-service", _parser_failure_code(exc), "metadata service failed") from exc
         return extract_metadata_local(text_sample)
 
 
@@ -534,8 +549,10 @@ async def _call_xberg(
                 response.raise_for_status()
                 payload = response.json()
             parser_latency_ms = _elapsed_ms(parser_started)
+    except httpx.HTTPStatusError as exc:
+        raise ParserServiceError("docling", _parser_failure_code(exc), "docling parser request failed") from exc
     except Exception as exc:
-        raise ParserServiceError("xberg", type(exc).__name__, "xberg parser request failed") from exc
+        raise ParserServiceError("xberg", _parser_failure_code(exc), "xberg parser request failed") from exc
     return await _document_from_parser_payload(
         payload,
         validation=validation,
@@ -577,7 +594,7 @@ async def _call_docling(
                 payload = response.json()
             parser_latency_ms = _elapsed_ms(parser_started)
     except Exception as exc:
-        raise ParserServiceError("docling", type(exc).__name__, "docling parser request failed") from exc
+        raise ParserServiceError("docling", _parser_failure_code(exc), "docling parser request failed") from exc
     return await _document_from_parser_payload(
         payload,
         validation=validation,

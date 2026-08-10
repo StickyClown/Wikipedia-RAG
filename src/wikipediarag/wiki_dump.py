@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from wikipediarag.embedding import embed_text
-from wikipediarag.ids import stable_hash
+from wikipediarag.ids import scoped_id, stable_hash
 from wikipediarag.wikitext import extract_sections
 
 MW_NS = "http://www.mediawiki.org/xml/export-0.11/"
@@ -207,14 +207,39 @@ def chunks_for_page(
     dimensions: int,
     target_words: int = 220,
     max_words: int = 360,
+    *,
+    tenant_id: str | None = None,
+    knowledge_base_id: str | None = None,
 ) -> list[Chunk]:
     if page.namespace != 0:
         return []
-    document_id = f"wiki:{snapshot_id}:{page.page_id}"
+    document_id = (
+        scoped_id(
+            "wiki-document",
+            page.page_id,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            source_type="wikipedia_xml",
+            snapshot_id=snapshot_id,
+        )
+        if tenant_id and knowledge_base_id
+        else f"wiki:{snapshot_id}:{page.page_id}"
+    )
     if page.redirect_target:
         content = f"{page.title} перенаправляет на {page.redirect_target}."
         content_hash = stable_hash([snapshot_id, page.page_id, page.revision_id, content])
-        chunk_id = f"wiki:{stable_hash([snapshot_id, page.page_id, page.revision_id, 'redirect', content_hash], 32)}"
+        chunk_id = (
+            scoped_id(
+                "wiki-chunk",
+                [page.page_id, page.revision_id, "redirect", content_hash],
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                source_type="wikipedia_xml",
+                snapshot_id=snapshot_id,
+            )
+            if tenant_id and knowledge_base_id
+            else f"wiki:{stable_hash([snapshot_id, page.page_id, page.revision_id, 'redirect', content_hash], 32)}"
+        )
         return [
             Chunk(
                 id=chunk_id,
@@ -233,6 +258,8 @@ def chunks_for_page(
                 embedding=embed_text(f"{page.title}\n{content}", dimensions),
                 metadata={
                     "source_type": "wikipedia_xml",
+                    "source_document_id": f"wiki:{snapshot_id}:{page.page_id}",
+                    "source_chunk_id": chunk_id,
                     "snapshot_id": snapshot_id,
                     "chunk_ordinal": 1,
                     "locator": {"page_id": page.page_id, "section_index": 1, "chunk_index": 1},
@@ -247,7 +274,15 @@ def chunks_for_page(
             continue
         start = 0
         sequence = 0
-        parent_id = f"section:{stable_hash([snapshot_id, page.page_id, page.revision_id, *section.path], 24)}"
+        parent_scope = [
+            tenant_id or "legacy",
+            knowledge_base_id or "legacy",
+            snapshot_id,
+            page.page_id,
+            page.revision_id,
+            *section.path,
+        ]
+        parent_id = f"section:{stable_hash(parent_scope, 24)}"
         while start < len(words):
             end = min(start + max_words, len(words))
             if end - start > target_words:
@@ -255,7 +290,7 @@ def chunks_for_page(
             content = " ".join(words[start:end])
             content_hash = stable_hash([content])
             chunk_ordinal = len(chunks) + 1
-            chunk_id = "wiki:" + stable_hash(
+            native_chunk_id = "wiki:" + stable_hash(
                 [
                     snapshot_id,
                     page.page_id,
@@ -265,6 +300,18 @@ def chunks_for_page(
                     content_hash,
                 ],
                 32,
+            )
+            chunk_id = (
+                scoped_id(
+                    "wiki-chunk",
+                    native_chunk_id,
+                    tenant_id=tenant_id,
+                    knowledge_base_id=knowledge_base_id,
+                    source_type="wikipedia_xml",
+                    snapshot_id=snapshot_id,
+                )
+                if tenant_id and knowledge_base_id
+                else native_chunk_id
             )
             section_id = f"section:{stable_hash([snapshot_id, page.page_id, page.revision_id, *section.path], 24)}"
             chunks.append(
@@ -285,6 +332,8 @@ def chunks_for_page(
                     embedding=embed_text(f"{page.title}\n{' / '.join(section.path)}\n{content}", dimensions),
                     metadata={
                         "source_type": "wikipedia_xml",
+                        "source_document_id": f"wiki:{snapshot_id}:{page.page_id}",
+                        "source_chunk_id": native_chunk_id,
                         "snapshot_id": snapshot_id,
                         "chunk_ordinal": chunk_ordinal,
                         "section_id": section_id,

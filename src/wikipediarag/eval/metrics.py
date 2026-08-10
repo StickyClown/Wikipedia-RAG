@@ -61,6 +61,33 @@ def token_f1(answer: str, accepted_answers: list[str]) -> float:
     return best
 
 
+def rouge_l(answer: str, accepted_answers: list[str]) -> float:
+    """Token-level ROUGE-L F1, intentionally dependency-free for eval runs."""
+    answer_tokens = normalize_answer(answer).split()
+    if not answer_tokens:
+        return 0.0
+    best = 0.0
+    for accepted in accepted_answers:
+        gold_tokens = normalize_answer(accepted).split()
+        if not gold_tokens:
+            continue
+        previous = [0] * (len(gold_tokens) + 1)
+        for answer_token in answer_tokens:
+            current = [0]
+            for index, gold_token in enumerate(gold_tokens, start=1):
+                if answer_token == gold_token:
+                    current.append(previous[index - 1] + 1)
+                else:
+                    current.append(max(previous[index], current[-1]))
+            previous = current
+        lcs = previous[-1]
+        precision = lcs / len(answer_tokens)
+        recall = lcs / len(gold_tokens)
+        if precision + recall:
+            best = max(best, 2 * precision * recall / (precision + recall))
+    return best
+
+
 def is_no_answer(answer: str) -> bool:
     normalized = answer.casefold()
     if any(marker in normalized for marker in NO_ANSWER_MARKERS):
@@ -77,7 +104,7 @@ def is_no_answer(answer: str) -> bool:
 def recall_at(candidates: list[str], gold: set[str], k: int) -> float:
     if not gold:
         return 0.0
-    return float(bool(set(candidates[:k]) & gold))
+    return len(set(candidates[:k]) & gold) / len(gold)
 
 
 def mrr_at(candidates: list[str], gold: set[str], k: int = 10) -> float:
@@ -161,16 +188,32 @@ def score_task(
     reranked: list[CandidateRef],
     prefusion: list[CandidateRef],
     cited_chunk_ids: list[str],
+    cited_document_ids: list[str] | None = None,
     kiwix_url_ok: bool,
 ) -> TaskScores:
     pages = [item.document_id for item in reranked]
     sections = [item.section_id for item in reranked]
     chunks = [item.chunk_id for item in reranked]
     prefusion_chunks = [item.chunk_id for item in prefusion]
-    gold_pages = set(task.gold_page_ids)
+    gold_documents = set(task.gold_document_ids or task.gold_page_ids)
+    gold_pages = set(task.gold_page_ids or gold_documents)
     gold_sections = set(task.gold_section_ids)
     gold_chunks = set(task.gold_chunk_ids)
+    documents = _unique_values(item.document_id for item in reranked if item.document_id)
+    prefusion_documents = _unique_values(item.document_id for item in prefusion if item.document_id)
+    document_mode = task.evaluation_granularity == "document" or bool(task.gold_document_ids)
+    cited_documents = list(cited_document_ids or [])
+    cited_document_set = set(cited_documents)
     no_answer = is_no_answer(answer)
+    if task.unanswerable:
+        document_citation_precision = float(not cited_document_set or cited_document_set <= gold_documents)
+        document_citation_recall = float(no_answer)
+        gold_document_citation_hit = float(no_answer and bool(cited_document_set & gold_documents))
+    else:
+        supported_documents = cited_document_set & gold_documents
+        document_citation_precision = len(supported_documents) / len(cited_document_set) if cited_document_set else 0.0
+        document_citation_recall = len(supported_documents) / len(gold_documents) if gold_documents else 0.0
+        gold_document_citation_hit = float(bool(supported_documents))
     cited_hard_negative = (
         0.0
         if task.unanswerable and no_answer
@@ -205,6 +248,14 @@ def score_task(
         unsupported_claim_rate=unsupported,
         cited_hard_negative_rate=cited_hard_negative,
         kiwix_url_ok=float(kiwix_url_ok),
+        document_recall={str(k): recall_at(documents, gold_documents, k) for k in (1, 5, 10, 20)},
+        document_mrr_at_10=mrr_at(documents, gold_documents, 10),
+        document_ndcg_at_10=ndcg_at(documents, gold_documents, 10),
+        document_reranker_gold_delta=rank_delta(prefusion_documents, documents, gold_documents, 10),
+        document_citation_precision=document_citation_precision if document_mode else 0.0,
+        document_citation_recall=document_citation_recall if document_mode else 0.0,
+        gold_document_citation_hit=gold_document_citation_hit if document_mode else 0.0,
+        rouge_l=0.0 if task.unanswerable else rouge_l(answer, [task.reference_answer, *task.accepted_answers]),
     )
 
 
@@ -221,9 +272,12 @@ def score_retrieval_task(
     reranked_chunks = [item.chunk_id for item in reranked]
     prefusion_chunks = [item.chunk_id for item in prefusion]
     gold_pages = set(task.gold_page_ids)
+    gold_documents = set(task.gold_document_ids or gold_pages)
     gold_sections = set(task.gold_section_ids)
     gold_chunks = set(task.gold_chunk_ids)
     hard_negative_pages = set(task.hard_negative_page_ids)
+    document_final = _unique_values(pages)
+    document_reranked = _unique_values(item.document_id for item in reranked if item.document_id)
     return RetrievalTaskScores(
         page_recall={str(k): recall_at(pages, gold_pages, k) for k in (1, 5, 10, 20)},
         section_recall={str(k): recall_at(sections, gold_sections, k) for k in (5, 10, 20)},
@@ -245,12 +299,20 @@ def score_retrieval_task(
         hard_negative_page_hit_at_10=recall_at(pages, hard_negative_pages, 10),
         hard_negative_page_hit_at_20=recall_at(pages, hard_negative_pages, 20),
         gold_vs_hard_negative_rank_margin=_rank_margin(pages, gold_pages, hard_negative_pages, 20),
+        document_recall={str(k): recall_at(document_final, gold_documents, k) for k in (1, 5, 10, 20)},
+        document_mrr_at_10=mrr_at(document_final, gold_documents, 10),
+        document_ndcg_at_10=ndcg_at(document_final, gold_documents, 10),
+        document_reranker_gold_delta=rank_delta(document_reranked, document_final, gold_documents, 10),
     )
 
 
 def aggregate(values: Iterable[float]) -> float:
     items = list(values)
     return sum(items) / len(items) if items else 0.0
+
+
+def _unique_values(values: Iterable[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
 
 
 def percentile(values: list[float], pct: float) -> float:

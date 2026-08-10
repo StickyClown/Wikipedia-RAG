@@ -24,8 +24,13 @@ class _FakeConnection:
     ) -> None:
         return None
 
-    async def execute(self, *_args: object, **_kwargs: object) -> None:
-        return None
+    async def execute(self, *_args: object, **_kwargs: object) -> _FakeResult:
+        return _FakeResult()
+
+
+class _FakeResult:
+    def scalar(self) -> bool:
+        return True
 
 
 class _FakeGatewayClient:
@@ -69,13 +74,12 @@ async def test_api_ready_reports_model_gateway_failed_when_gateway_ready_is_degr
 
     payload: dict[str, Any] = await api_app.ready()
 
-    assert payload == {
-        "status": "degraded",
-        "components": {
-            "postgres": "ok",
-            "model_gateway": "failed",
-        },
-    }
+    assert payload["status"] == "degraded"
+    assert payload["components"]["postgres"] == "ok"
+    assert payload["components"]["worker"] == "ok"
+    assert payload["components"]["model_gateway"] == "failed"
+    assert payload["components"]["opensearch"] == "ok"
+    assert payload["components"]["minio"] == "ok"
 
 
 def test_safe_failure_payload_preserves_stage_trace_and_chunk_ids() -> None:
@@ -121,7 +125,8 @@ def test_safe_failure_payload_preserves_stage_trace_and_chunk_ids() -> None:
     )
 
     assert payload["stage"] == "answer_generation"
-    assert payload["code"] == "TimeoutError"
+    assert payload["code"] == "DEPENDENCY_TIMEOUT"
+    assert payload["retryable"] is True
     assert payload["last_successful_stage"] == "retrieval"
     assert payload["trace_id"] == "trace"
     assert payload["retrieval"]["evidence"][0]["chunk_id"] == "c1"

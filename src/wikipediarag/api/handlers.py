@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -47,7 +48,7 @@ from wikipediarag.auth_service import (
     select_active_tenant,
     test_actor_context,
 )
-from wikipediarag.config import get_settings
+from wikipediarag.config import Settings, get_settings
 from wikipediarag.db import connect, connect_autocommit, ensure_schema
 from wikipediarag.deep_research import (
     build_public_research_report,
@@ -72,8 +73,17 @@ from wikipediarag.extended import run_extended_search, should_start_extended
 from wikipediarag.ids import stable_hash
 from wikipediarag.observability import content_policy, safe_error_code, safe_telemetry_payload
 from wikipediarag.oidc_service import complete_oidc_callback, encrypt_server_tokens, oidc_login_enabled, start_oidc_flow
+from wikipediarag.reliability import (
+    OperationDeadline,
+    OperationDeadlineExceeded,
+    is_retryable_exception,
+    safe_failure_from_exception,
+)
 from wikipediarag.repository import (
     approve_research_plan,
+    cancel_query_run,
+    claim_idempotency_record,
+    complete_idempotency_record,
     complete_query_run,
     create_document_deletion_job,
     create_document_upload_records,
@@ -107,6 +117,7 @@ from wikipediarag.repository import (
     list_research_plans,
     list_research_runs,
     list_source_active_document_refs,
+    list_upload_batch_sessions_private,
     load_actor_document_access_scope,
     load_effective_knowledge_base_role,
     load_index_version_by_read_alias,
@@ -127,8 +138,13 @@ from wikipediarag.repository import (
 )
 from wikipediarag.research_tool_registry import DEFAULT_RESEARCH_TOOL_MODE
 from wikipediarag.retrieval import retrieve, retrieve_multi
-from wikipediarag.retrieval_contract import KnowledgeBaseNotReady, validate_active_retrieval_contract
-from wikipediarag.retrieval_profile import get_retrieval_profile
+from wikipediarag.retrieval_contract import (
+    KnowledgeBaseNotReady,
+    RetrievalProfileIncompatible,
+    validate_active_retrieval_contract,
+)
+from wikipediarag.retrieval_profile import get_profile_catalog, get_retrieval_profile
+from wikipediarag.retrieval_profile_resolver import resolve_retrieval_profile as _resolve_retrieval_profile
 from wikipediarag.schemas import (
     AccessGroupResponse,
     AuthOidcStartResponse,
@@ -170,6 +186,8 @@ from wikipediarag.schemas import (
     ResearchRunDetail,
     ResearchRunListResponse,
     ResearchRunStatus,
+    RetrievalProfileCatalogResponse,
+    RetrievalProfileOption,
     RetrievalResult,
     SearchRequest,
     SearchResponse,
@@ -202,6 +220,21 @@ from wikipediarag.search_index import READ_ALIAS, delete_document_chunks, update
 from wikipediarag.search_service import run_public_search
 from wikipediarag.source_connectors import ConnectorError, connector_for_kind
 from wikipediarag.storage import create_presigned_put_url, head_object, put_bytes
+
+
+async def resolve_retrieval_profile(conn: Any, **kwargs: Any) -> Any:
+    """Resolve against handler-bound repository functions.
+
+    Keeping the callbacks here makes the resolver auditable and allows API
+    tests to substitute the repository boundary without bypassing contract
+    validation in production.
+    """
+    return await _resolve_retrieval_profile(
+        conn,
+        get_knowledge_base_fn=get_knowledge_base,
+        load_index_fn=load_index_version_by_read_alias,
+        **kwargs,
+    )
 
 
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
@@ -269,15 +302,28 @@ async def health() -> dict[str, str]:
 
 
 async def ready() -> dict[str, Any]:
-    """Report API readiness for PostgreSQL and the Model Gateway dependency."""
+    """Report dependency readiness without exposing dependency internals."""
     settings = get_settings()
     components: dict[str, str] = {}
     try:
         async with connect() as conn:
             await conn.execute(text("SELECT 1"))
+            worker = await conn.execute(
+                text(
+                    """
+                    SELECT EXISTS(
+                      SELECT 1 FROM worker_instances
+                      WHERE last_heartbeat_at >= now() - make_interval(secs => :max_age_seconds)
+                    )
+                    """
+                ),
+                {"max_age_seconds": max(30, settings.worker_job_heartbeat_seconds * 2)},
+            )
         components["postgres"] = "ok"
+        components["worker"] = "ok" if bool(worker.scalar()) else "stale"
     except Exception:
         components["postgres"] = "failed"
+        components["worker"] = "failed"
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             response = await client.get(f"{settings.model_gateway_url.rstrip('/')}/ready")
@@ -285,6 +331,25 @@ async def ready() -> dict[str, Any]:
             components["model_gateway"] = "ok" if gateway_ready else "failed"
     except Exception:
         components["model_gateway"] = "failed"
+    checks: dict[str, str] = {
+        "opensearch": f"{settings.opensearch_url.rstrip('/')}/",
+        "minio": f"{settings.minio_endpoint.rstrip('/')}/minio/health/live",
+    }
+    if settings.document_parser_services_required:
+        checks["xberg"] = f"{settings.xberg_url.rstrip('/')}/health"
+        checks["docling"] = f"{settings.docling_url.rstrip('/')}/health"
+        checks["metadata_service"] = f"{settings.metadata_service_url.rstrip('/')}/health"
+
+    async def check_http(component: str, url: str) -> tuple[str, str]:
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                response = await client.get(url)
+            return component, "ok" if response.status_code < 500 else "failed"
+        except Exception:
+            return component, "failed"
+
+    for component, value in await asyncio.gather(*(check_http(name, url) for name, url in checks.items())):
+        components[component] = value
     status = "ok" if all(value == "ok" for value in components.values()) else "degraded"
     return {"status": status, "components": components}
 
@@ -807,6 +872,86 @@ async def get_knowledge_bases(request: Request) -> list[dict[str, Any]]:
         return await list_knowledge_bases(conn, tenant_id)
 
 
+async def retrieval_profiles(
+    request: Request,
+    knowledge_base_ids: Annotated[list[str] | None, Query()] = None,
+) -> RetrievalProfileCatalogResponse:
+    """Return ACL-filtered profile compatibility for a complete retrieval scope."""
+
+    settings = get_settings()
+    actor = await _require_actor(request)
+    tenant_id = require_active_tenant(actor)
+    kb_ids = _kb_scope_ids(knowledge_base_ids or [], settings.default_kb_id)
+    async with connect() as conn:
+        await _load_kb_scope_roles(
+            conn,
+            actor=actor,
+            tenant_id=tenant_id,
+            kb_ids=kb_ids,
+        )
+        rows: list[dict[str, Any]] = []
+        for kb_id in kb_ids:
+            kb = await get_knowledge_base(conn, tenant_id, kb_id)
+            if kb is None or not kb.get("active_index"):
+                raise _kb_not_ready_http(
+                    KnowledgeBaseNotReady("knowledge base has no active retrieval contract"),
+                    actor.request_id,
+                )
+            row = await load_index_version_by_read_alias(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                read_alias=str(kb["active_index"]),
+            )
+            if row is None:
+                raise _kb_not_ready_http(
+                    KnowledgeBaseNotReady("active retrieval contract is unavailable"),
+                    actor.request_id,
+                )
+            rows.append(dict(row))
+        options: list[RetrievalProfileOption] = []
+        for name in sorted(get_profile_catalog(settings).profiles):
+            try:
+                await resolve_retrieval_profile(
+                    conn,
+                    tenant_id=tenant_id,
+                    knowledge_base_ids=kb_ids,
+                    requested=name,
+                    settings=settings,
+                )
+            except RetrievalProfileIncompatible:
+                options.append(
+                    RetrievalProfileOption(
+                        name=name,
+                        compatible=False,
+                        reason_code="RETRIEVAL_PROFILE_INCOMPATIBLE",
+                    )
+                )
+            except KnowledgeBaseNotReady:
+                options.append(RetrievalProfileOption(name=name, compatible=False, reason_code="KB_NOT_READY"))
+            else:
+                options.append(RetrievalProfileOption(name=name, compatible=True))
+        resolved = await resolve_retrieval_profile(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_ids=kb_ids,
+            requested=None,
+            settings=settings,
+        )
+    scope_hash = stable_hash(
+        [
+            *kb_ids,
+            *sorted(f"{row.get('read_alias')}:{row.get('id')}:{row.get('embedding_alias')}" for row in rows),
+        ],
+        64,
+    )
+    return RetrievalProfileCatalogResponse(
+        resolved_default=resolved.name,
+        scope_contract_hash=f"sha256:{scope_hash}",
+        profiles=options,
+    )
+
+
 async def create_knowledge_base(payload: KnowledgeBaseCreate, request: Request) -> dict[str, str]:
     """Create a tenant knowledge base and grant the creator owner access."""
     actor = await _require_actor(request)
@@ -1293,10 +1438,28 @@ async def sync_source(
     request: Request,
 ) -> SourceSyncResponse:
     """Queue a full or incremental source sync job for the worker."""
+    settings = get_settings()
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
     async with connect() as conn:
         await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
+        source = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="source not found")
+    idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+        request=request,
+        actor=actor,
+        tenant_id=tenant_id,
+        route=f"POST:/api/v1/knowledge-bases/{kb_id}/sources/{source_id}:sync",
+        payload={"knowledge_base_id": kb_id, "source_id": source_id, **payload.model_dump(mode="json")},
+        settings=settings,
+    )
+    if not owns_idempotency_record:
+        safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+        if not safe_response:
+            raise HTTPException(status_code=409, detail="idempotent source sync record is missing response")
+        return SourceSyncResponse.model_validate(safe_response)
+    async with connect() as conn:
         source = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
         if source is None:
             raise HTTPException(status_code=404, detail="source not found")
@@ -1317,7 +1480,17 @@ async def sync_source(
             target_id=source_id,
             outcome="success",
         )
-    return SourceSyncResponse(source_id=source_id, run_id=str(run_id), job_id=str(job_id), status="received")
+    response = SourceSyncResponse(source_id=source_id, run_id=str(run_id), job_id=str(job_id), status="received")
+    if idempotency_record is not None:
+        async with connect() as conn:
+            await complete_idempotency_record(
+                conn,
+                record_id=str(idempotency_record["id"]),
+                resource_id=str(job_id),
+                response_status=202,
+                safe_response=response.model_dump(mode="json"),
+            )
+    return response
 
 
 async def get_source_sync_run(run_id: str, request: Request) -> SourceSyncRunResponse:
@@ -1359,6 +1532,20 @@ async def create_wikipedia_import(payload: ImportRequest, request: Request) -> d
             kb_id=settings.default_kb_id,
             role=KnowledgeBaseRole.editor,
         )
+    idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+        request=request,
+        actor=actor,
+        tenant_id=tenant_id,
+        route="POST:/api/v1/imports/wikipedia",
+        payload=payload.model_dump(mode="json"),
+        settings=settings,
+    )
+    if not owns_idempotency_record:
+        safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+        if not safe_response:
+            raise HTTPException(status_code=409, detail="idempotent import record is missing response")
+        return {"job_id": str(safe_response["job_id"])}
+    async with connect() as conn:
         job_id = await create_ingestion_job(
             conn,
             tenant_id,
@@ -1366,7 +1553,17 @@ async def create_wikipedia_import(payload: ImportRequest, request: Request) -> d
             "wikipedia_xml",
             config,
         )
-    return {"job_id": str(job_id)}
+    response = {"job_id": str(job_id)}
+    if idempotency_record is not None:
+        async with connect() as conn:
+            await complete_idempotency_record(
+                conn,
+                record_id=str(idempotency_record["id"]),
+                resource_id=str(job_id),
+                response_status=202,
+                safe_response=response,
+            )
+    return response
 
 
 async def create_zim_import(payload: ZimImportRequest, request: Request) -> dict[str, str]:
@@ -1392,6 +1589,20 @@ async def create_zim_import(payload: ZimImportRequest, request: Request) -> dict
             kb_id=settings.default_kb_id,
             role=KnowledgeBaseRole.editor,
         )
+    idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+        request=request,
+        actor=actor,
+        tenant_id=tenant_id,
+        route="POST:/api/v1/imports/zim",
+        payload=payload.model_dump(mode="json"),
+        settings=settings,
+    )
+    if not owns_idempotency_record:
+        safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+        if not safe_response:
+            raise HTTPException(status_code=409, detail="idempotent import record is missing response")
+        return {"job_id": str(safe_response["job_id"])}
+    async with connect() as conn:
         job_id = await create_ingestion_job(
             conn,
             tenant_id,
@@ -1399,7 +1610,17 @@ async def create_zim_import(payload: ZimImportRequest, request: Request) -> dict
             "wikipedia_zim",
             config,
         )
-    return {"job_id": str(job_id)}
+    response = {"job_id": str(job_id)}
+    if idempotency_record is not None:
+        async with connect() as conn:
+            await complete_idempotency_record(
+                conn,
+                record_id=str(idempotency_record["id"]),
+                resource_id=str(job_id),
+                response_status=202,
+                safe_response=response,
+            )
+    return response
 
 
 async def get_ingestion_job(job_id: str, request: Request) -> dict[str, Any]:
@@ -1471,6 +1692,122 @@ async def resume_ingestion_job(job_id: str, request: Request) -> dict[str, str]:
     return {"status": "resume_requested"}
 
 
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{16,128}$")
+
+
+def _optional_idempotency_key(request: Request) -> str | None:
+    key = request.headers.get("idempotency-key")
+    if key is None:
+        return None
+    normalized = key.strip()
+    if not _IDEMPOTENCY_KEY_RE.fullmatch(normalized):
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "INVALID_IDEMPOTENCY_KEY", "message": "invalid Idempotency-Key"}},
+        )
+    return normalized
+
+
+async def _claim_operation_idempotency(
+    *,
+    request: Request,
+    actor: ActorContext,
+    tenant_id: str,
+    route: str,
+    payload: dict[str, Any],
+    settings: Settings,
+    in_progress_code: str = "OPERATION_IN_PROGRESS",
+    idempotency_key: str | None = None,
+    replay_failed: bool = False,
+) -> tuple[dict[str, Any] | None, bool]:
+    key = idempotency_key or _optional_idempotency_key(request)
+    if key is None:
+        return None, True
+    serialized_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    request_hash = stable_hash([route, serialized_payload], 64)
+    async with connect() as conn:
+        record, owner = await claim_idempotency_record(
+            conn,
+            tenant_id=tenant_id,
+            actor_user_id=actor.user_id,
+            route=route,
+            idempotency_key=key,
+            request_hash=request_hash,
+            ttl_seconds=settings.idempotency_record_ttl_seconds,
+        )
+    if owner:
+        return record, True
+    if str(record.get("request_hash")) != request_hash:
+        raise HTTPException(
+            status_code=409,
+            detail=_error_payload(
+                code="IDEMPOTENCY_KEY_REUSED",
+                message="Idempotency-Key was already used for a different request",
+                request_id=actor.request_id,
+            ),
+        )
+    if str(record.get("status")) == "completed":
+        return record, False
+    if str(record.get("status")) == "failed" and not replay_failed:
+        raise HTTPException(
+            status_code=409,
+            detail=_error_payload(
+                code="IDEMPOTENCY_OPERATION_FAILED",
+                message="the previous operation with this Idempotency-Key failed",
+                request_id=actor.request_id,
+                details={"operation_id": str(record.get("resource_id") or "")},
+            ),
+        )
+    raise HTTPException(
+        status_code=409,
+        detail=_error_payload(
+            code=in_progress_code,
+            message="an operation with this Idempotency-Key is already in progress",
+            request_id=actor.request_id,
+            details={"operation_id": str(record.get("resource_id") or "")},
+        ),
+    )
+
+
+async def _accepted_batch_from_sessions(
+    *,
+    tenant_id: str,
+    batch_id: str,
+    knowledge_base_id: str,
+    settings: Settings,
+) -> UploadBatchAccepted:
+    async with connect() as conn:
+        sessions = await list_upload_batch_sessions_private(conn, tenant_id=tenant_id, batch_id=batch_id)
+    items: list[UploadBatchItemAccepted] = []
+    for session in sessions:
+        upload_url = await asyncio.to_thread(
+            create_presigned_put_url,
+            str(session["object_key"]),
+            content_type=str(session["content_type"]),
+            expires_seconds=settings.upload_session_ttl_seconds,
+            settings=settings,
+        )
+        items.append(
+            UploadBatchItemAccepted(
+                upload_session_id=str(session["id"]),
+                upload_url=upload_url,
+                expires_at=session["expires_at"],
+                required_headers={"Content-Type": str(session["content_type"])},
+                filename=str(session["filename"]),
+                content_type=str(session["content_type"]),
+                size_bytes=int(session["size_bytes"]),
+                checksum_sha256=str(session["checksum_sha256"]),
+            )
+        )
+    return UploadBatchAccepted(
+        batch_id=batch_id,
+        knowledge_base_id=knowledge_base_id,
+        status="received",
+        total_items=len(items),
+        items=items,
+    )
+
+
 async def upload_document_multipart(
     kb_id: str,
     request: Request,
@@ -1508,6 +1845,25 @@ async def upload_document_multipart(
         await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
         if await get_knowledge_base(conn, tenant_id, kb_id) is None:
             raise HTTPException(status_code=404, detail="knowledge base not found")
+    idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+        request=request,
+        actor=actor,
+        tenant_id=tenant_id,
+        route=f"POST:/api/v1/knowledge-bases/{kb_id}/documents",
+        payload={
+            "knowledge_base_id": kb_id,
+            "filename": filename,
+            "checksum_sha256": checksum,
+            "parser_profile": parser_profile,
+            "metadata": metadata,
+        },
+        settings=settings,
+    )
+    if not owns_idempotency_record:
+        safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+        if not safe_response:
+            raise HTTPException(status_code=409, detail="idempotent upload record is missing response")
+        return UploadCompleteResponse.model_validate(safe_response)
     await asyncio.to_thread(put_bytes, object_key, data, content_type=content_type, settings=settings)
     async with connect() as conn:
         session_id, _expires_at = await create_upload_session(
@@ -1551,12 +1907,22 @@ async def upload_document_multipart(
             target_id=document_id,
             outcome="success",
         )
-    return UploadCompleteResponse(
+    response = UploadCompleteResponse(
         document_id=document_id,
         document_version_id=document_version_id,
         job_id=str(job_id),
         status="received",
     )
+    if idempotency_record is not None:
+        async with connect() as conn:
+            await complete_idempotency_record(
+                conn,
+                record_id=str(idempotency_record["id"]),
+                resource_id=str(job_id),
+                response_status=202,
+                safe_response=response.model_dump(mode="json"),
+            )
+    return response
 
 
 async def create_upload_session_endpoint(payload: UploadSessionCreate, request: Request) -> UploadSessionAccepted:
@@ -1574,6 +1940,34 @@ async def create_upload_session_endpoint(payload: UploadSessionCreate, request: 
         kb = await get_knowledge_base(conn, tenant_id, kb_id)
     if kb is None:
         raise HTTPException(status_code=404, detail="knowledge base not found")
+    idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+        request=request,
+        actor=actor,
+        tenant_id=tenant_id,
+        route="POST:/api/v1/uploads/sessions",
+        payload=payload.model_dump(mode="json"),
+        settings=settings,
+    )
+    if not owns_idempotency_record:
+        safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+        replay_session_id = str(safe_response.get("upload_session_id") or "")
+        async with connect() as conn:
+            previous_session = await get_upload_session(conn, tenant_id=tenant_id, upload_session_id=replay_session_id)
+        if previous_session is None:
+            raise HTTPException(status_code=409, detail="idempotent upload session is unavailable")
+        upload_url = await asyncio.to_thread(
+            create_presigned_put_url,
+            str(previous_session["object_key"]),
+            content_type=str(previous_session["content_type"]),
+            expires_seconds=settings.upload_session_ttl_seconds,
+            settings=settings,
+        )
+        return UploadSessionAccepted(
+            upload_session_id=str(previous_session["id"]),
+            upload_url=upload_url,
+            expires_at=previous_session["expires_at"],
+            required_headers={"Content-Type": str(previous_session["content_type"])},
+        )
     object_key = (
         f"uploads/{tenant_id}/{kb_id}/{stable_hash([filename, payload.checksum_sha256], 16)}/{payload.checksum_sha256}"
     )
@@ -1598,12 +1992,22 @@ async def create_upload_session_endpoint(payload: UploadSessionCreate, request: 
         expires_seconds=settings.upload_session_ttl_seconds,
         settings=settings,
     )
-    return UploadSessionAccepted(
+    response = UploadSessionAccepted(
         upload_session_id=str(session_id),
         upload_url=upload_url,
         expires_at=expires_at,
         required_headers={"Content-Type": payload.content_type},
     )
+    if idempotency_record is not None:
+        async with connect() as conn:
+            await complete_idempotency_record(
+                conn,
+                record_id=str(idempotency_record["id"]),
+                resource_id=str(session_id),
+                response_status=202,
+                safe_response={"upload_session_id": str(session_id)},
+            )
+    return response
 
 
 async def create_upload_batch_endpoint(payload: UploadBatchCreate, request: Request) -> UploadBatchAccepted:
@@ -1641,6 +2045,27 @@ async def create_upload_batch_endpoint(payload: UploadBatchCreate, request: Requ
         kb = await get_knowledge_base(conn, tenant_id, kb_id)
     if kb is None:
         raise HTTPException(status_code=404, detail="knowledge base not found")
+
+    idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+        request=request,
+        actor=actor,
+        tenant_id=tenant_id,
+        route="POST:/api/v1/uploads/batches",
+        payload=payload.model_dump(mode="json"),
+        settings=settings,
+    )
+    if not owns_idempotency_record:
+        safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+        replay_batch_id = str(safe_response.get("batch_id") or "")
+        replay_kb_id = str(safe_response.get("knowledge_base_id") or kb_id)
+        if not replay_batch_id:
+            raise HTTPException(status_code=409, detail="idempotent batch record is missing batch id")
+        return await _accepted_batch_from_sessions(
+            tenant_id=tenant_id,
+            batch_id=replay_batch_id,
+            knowledge_base_id=replay_kb_id,
+            settings=settings,
+        )
 
     async with connect() as conn:
         batch_id = await create_upload_batch(
@@ -1691,13 +2116,23 @@ async def create_upload_batch_endpoint(payload: UploadBatchCreate, request: Requ
                     checksum_sha256=checksum,
                 )
             )
-    return UploadBatchAccepted(
+    response = UploadBatchAccepted(
         batch_id=str(batch_id),
         knowledge_base_id=kb_id,
         status="received",
         total_items=len(accepted_items),
         items=accepted_items,
     )
+    if idempotency_record is not None:
+        async with connect() as conn:
+            await complete_idempotency_record(
+                conn,
+                record_id=str(idempotency_record["id"]),
+                resource_id=str(batch_id),
+                response_status=202,
+                safe_response={"batch_id": str(batch_id), "knowledge_base_id": kb_id},
+            )
+    return response
 
 
 async def get_upload_batch_endpoint(batch_id: str, request: Request) -> UploadBatchStatus:
@@ -1744,6 +2179,22 @@ async def complete_upload_session_endpoint(
             )
     if session is None:
         raise HTTPException(status_code=404, detail="upload session not found")
+    idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+        request=request,
+        actor=actor,
+        tenant_id=tenant_id,
+        route=f"POST:/api/v1/uploads/sessions/{upload_session_id}:complete",
+        payload={
+            "upload_session_id": upload_session_id,
+            "metadata": payload.model_dump(mode="json") if payload else {},
+        },
+        settings=settings,
+    )
+    if not owns_idempotency_record:
+        safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+        if not safe_response:
+            raise HTTPException(status_code=409, detail="idempotent completion record is missing response")
+        return UploadCompleteResponse.model_validate(safe_response)
     if str(session["status"]) not in {"created", "uploaded"}:
         raise HTTPException(status_code=409, detail="upload session is not completable")
     expires_at = session["expires_at"]
@@ -1788,12 +2239,22 @@ async def complete_upload_session_endpoint(
             content_hash=str(session["checksum_sha256"]),
             metadata=session_metadata,
         )
-    return UploadCompleteResponse(
+    response = UploadCompleteResponse(
         document_id=document_id,
         document_version_id=document_version_id,
         job_id=str(job_id),
         status="received",
     )
+    if idempotency_record is not None:
+        async with connect() as conn:
+            await complete_idempotency_record(
+                conn,
+                record_id=str(idempotency_record["id"]),
+                resource_id=str(job_id),
+                response_status=202,
+                safe_response=response.model_dump(mode="json"),
+            )
+    return response
 
 
 async def get_document(document_id: str, request: Request) -> dict[str, Any]:
@@ -2049,6 +2510,7 @@ async def delete_document(document_id: str, request: Request) -> DocumentDeleteR
 
 async def reprocess_document(document_id: str, request: Request) -> DocumentReprocessResponse:
     """Queue reprocessing for the current published document version."""
+    settings = get_settings()
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
     async with connect() as conn:
@@ -2062,6 +2524,20 @@ async def reprocess_document(document_id: str, request: Request) -> DocumentRepr
             kb_id=str(document["knowledge_base_id"]),
             role=KnowledgeBaseRole.editor,
         )
+    idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+        request=request,
+        actor=actor,
+        tenant_id=tenant_id,
+        route=f"POST:/api/v1/documents/{document_id}:reprocess",
+        payload={"document_id": document_id, "document_version_id": str(document["current_version_id"])},
+        settings=settings,
+    )
+    if not owns_idempotency_record:
+        safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+        if not safe_response:
+            raise HTTPException(status_code=409, detail="idempotent reprocess record is missing response")
+        return DocumentReprocessResponse.model_validate(safe_response)
+    async with connect() as conn:
         job_id = await create_reprocess_job(
             conn,
             tenant_id=tenant_id,
@@ -2069,12 +2545,22 @@ async def reprocess_document(document_id: str, request: Request) -> DocumentRepr
             document_id=document_id,
             document_version_id=str(document["current_version_id"]),
         )
-    return DocumentReprocessResponse(
+    response = DocumentReprocessResponse(
         document_id=document_id,
         document_version_id=str(document["current_version_id"]),
         job_id=str(job_id),
         status="received",
     )
+    if idempotency_record is not None:
+        async with connect() as conn:
+            await complete_idempotency_record(
+                conn,
+                record_id=str(idempotency_record["id"]),
+                resource_id=str(job_id),
+                response_status=202,
+                safe_response=response.model_dump(mode="json"),
+            )
+    return response
 
 
 async def search(payload: SearchRequest, request: Request) -> SearchResponse:
@@ -2091,7 +2577,14 @@ async def search(payload: SearchRequest, request: Request) -> SearchResponse:
                 tenant_id=tenant_id,
                 kb_ids=kb_ids,
             )
-            await _require_search_scope_ready(conn, tenant_id=tenant_id, kb_ids=kb_ids)
+            resolved_profile = await resolve_retrieval_profile(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_ids=kb_ids,
+                requested=payload.ranking_profile,
+                settings=settings,
+            )
+            payload = payload.model_copy(update={"ranking_profile": resolved_profile.name})
             access_scopes = await _document_access_scopes(
                 conn,
                 actor=actor,
@@ -2119,8 +2612,9 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
     tenant_id = require_active_tenant(actor)
     request_id = str(uuid.uuid4())
     trace_id = stable_hash([request_id, payload.message], 32)
+    deadline = OperationDeadline.after(settings.chat_run_deadline_seconds)
     active_profile = get_retrieval_profile(
-        payload.retrieval_profile,
+        payload.retrieval_profile or settings.retrieval_profile,
         settings,
         payload.retrieval_overrides,
     )
@@ -2150,13 +2644,37 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                 tenant_id=tenant_id,
                 kb_ids=kb_ids,
             )
-            for kb_id in kb_ids:
-                await validate_active_retrieval_contract(
+            if payload.retrieval_profile is None:
+                active_profile = await resolve_retrieval_profile(
                     conn,
                     tenant_id=tenant_id,
-                    knowledge_base_id=kb_id,
+                    knowledge_base_ids=kb_ids,
+                    requested=None,
+                    overrides=payload.retrieval_overrides,
+                    settings=settings,
+                )
+                route_decision = initial_route_decision(
+                    mode=payload.mode.value,
+                    extended_policy=active_profile.postprocess.extended_search,
+                    classifier_suggested_extended=classifier_suggested_extended,
+                )
+                search_plan = build_search_plan(
+                    query=payload.message,
+                    mode=payload.mode.value,
+                    route=route_decision["route"],
+                    route_reason=route_decision["reason"],
+                    knowledge_base_id=primary_kb_id,
+                    knowledge_base_ids=kb_ids,
+                    trace_id=trace_id,
                     profile=active_profile,
-                    retrieval_overrides=payload.retrieval_overrides,
+                )
+            if payload.retrieval_profile is not None:
+                active_profile = await resolve_retrieval_profile(
+                    conn,
+                    tenant_id=tenant_id,
+                    knowledge_base_ids=kb_ids,
+                    requested=payload.retrieval_profile,
+                    overrides=payload.retrieval_overrides,
                     settings=settings,
                 )
             access_scopes = await _document_access_scopes(
@@ -2179,6 +2697,30 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
             trace_id=trace_id,
             settings=settings,
         )
+    idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+        request=request,
+        actor=actor,
+        tenant_id=tenant_id,
+        route="POST:/api/v1/chat",
+        payload=payload.model_dump(mode="json"),
+        settings=settings,
+        in_progress_code="QUERY_IN_PROGRESS",
+        replay_failed=True,
+        idempotency_key=(
+            stable_hash(["chat_client_request", payload.client_request_id], 64) if payload.client_request_id else None
+        ),
+    )
+    if not owns_idempotency_record:
+        safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+        existing_id = str(safe_response.get("query_run_id") or "")
+        if not existing_id:
+            raise HTTPException(status_code=409, detail="idempotent chat record is missing query run id")
+        async with connect() as conn:
+            existing_run = await _load_query_run_for_actor(conn, tenant_id=tenant_id, query_run_id=existing_id)
+        if existing_run is None:
+            raise HTTPException(status_code=409, detail="idempotent chat query run is unavailable")
+        return _replay_query_run_stream(request_id=request_id, query_run=existing_run)
+    async with connect() as conn:
         query_run_id = await create_query_run(
             conn,
             tenant_id=tenant_id,
@@ -2194,6 +2736,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
 
     async def event_stream() -> AsyncIterator[str]:
         """Coordinate the event_stream workflow while preserving tenant and API contracts."""
+        run_started = time.perf_counter()
         sequence = 1
         current_stage = "question_received"
         last_successful_stage = "question_received"
@@ -2205,7 +2748,14 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                 request_id=request_id,
                 query_run_id=str(query_run_id),
                 sequence=sequence,
-                data={"trace_id": trace_id, "search_plan": actual_search_plan},
+                data={
+                    "trace_id": trace_id,
+                    "search_plan": actual_search_plan,
+                    "stage": current_stage,
+                    "attempt": 1,
+                    "elapsed_ms": 0,
+                    "deadline_remaining_ms": deadline.remaining_ms(),
+                },
             )
         )
         try:
@@ -2216,10 +2766,35 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                         event=event_name,
                         request_id=request_id,
                         query_run_id=str(query_run_id),
-                        sequence=0,
-                        data={"stage": stage, "elapsed_ms": elapsed_ms},
+                        sequence=sequence,
+                        data={
+                            "stage": stage,
+                            "elapsed_ms": elapsed_ms,
+                            "attempt": 1,
+                            "deadline_remaining_ms": deadline.remaining_ms(),
+                        },
                     )
                 )
+
+            async def wait_for_stage_task(task: asyncio.Task[Any], *, stage: str, started: float) -> AsyncIterator[str]:
+                """Emit heartbeats while one bounded stage is running."""
+
+                nonlocal sequence
+                try:
+                    while not task.done():
+                        timeout = deadline.timeout_seconds(settings.operation_heartbeat_seconds, stage=stage)
+                        await asyncio.wait({task}, timeout=timeout)
+                        if task.done():
+                            break
+                        if await request.is_disconnected():
+                            raise asyncio.CancelledError
+                        deadline.ensure_remaining(stage=stage)
+                        sequence += 1
+                        yield stage_notice("stage.heartbeat", stage, _elapsed_ms(started))
+                except (asyncio.CancelledError, OperationDeadlineExceeded):
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise
 
             async with connect_autocommit() as conn:
                 current_stage = "path_selected"
@@ -2246,42 +2821,10 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     sequence += 1
                     yield stage_notice("stage.started", current_stage)
                     stage_started = time.perf_counter()
-                    retrieval = await run_extended_search(
-                        conn,
-                        payload.message,
-                        tenant_id=tenant_id,
-                        knowledge_base_id=primary_kb_id,
-                        query_run_id=str(query_run_id),
-                        trace_id=trace_id,
-                        settings=settings,
-                        profile=active_profile,
-                        profile_overrides=payload.retrieval_overrides,
-                        search_filters=search_filters,
-                        knowledge_base_ids=kb_ids,
-                    )
-                    sequence += 1
-                    yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
-                    last_successful_stage = "extended_search"
-                else:
-                    current_stage = "retrieval"
-                    sequence += 1
-                    yield stage_notice("stage.started", current_stage)
-                    stage_started = time.perf_counter()
-                    if len(kb_ids) > 1:
-                        retrieval = await retrieve_multi(
-                            conn,
-                            payload.message,
-                            tenant_id=tenant_id,
-                            knowledge_base_ids=kb_ids,
-                            query_run_id=str(query_run_id),
-                            trace_id=trace_id,
-                            settings=settings,
-                            profile=active_profile,
-                            profile_overrides=payload.retrieval_overrides,
-                            search_filters=search_filters,
-                        )
-                    else:
-                        retrieval = await retrieve(
+                    if await request.is_disconnected():
+                        raise asyncio.CancelledError
+                    retrieval_task = asyncio.create_task(
+                        run_extended_search(
                             conn,
                             payload.message,
                             tenant_id=tenant_id,
@@ -2290,8 +2833,67 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                             trace_id=trace_id,
                             settings=settings,
                             profile=active_profile,
+                            profile_overrides=payload.retrieval_overrides,
                             search_filters=search_filters,
+                            knowledge_base_ids=kb_ids,
+                            deadline=deadline,
                         )
+                    )
+                    async for heartbeat in wait_for_stage_task(
+                        retrieval_task,
+                        stage=current_stage,
+                        started=stage_started,
+                    ):
+                        yield heartbeat
+                    retrieval = await retrieval_task
+                    sequence += 1
+                    yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
+                    last_successful_stage = "extended_search"
+                else:
+                    current_stage = "retrieval"
+                    sequence += 1
+                    yield stage_notice("stage.started", current_stage)
+                    stage_started = time.perf_counter()
+                    if await request.is_disconnected():
+                        raise asyncio.CancelledError
+                    if len(kb_ids) > 1:
+                        retrieval_task = asyncio.create_task(
+                            retrieve_multi(
+                                conn,
+                                payload.message,
+                                tenant_id=tenant_id,
+                                knowledge_base_ids=kb_ids,
+                                query_run_id=str(query_run_id),
+                                trace_id=trace_id,
+                                settings=settings,
+                                profile=active_profile,
+                                profile_overrides=payload.retrieval_overrides,
+                                search_filters=search_filters,
+                                deadline=deadline,
+                            )
+                        )
+                    else:
+                        retrieval_task = asyncio.create_task(
+                            retrieve(
+                                conn,
+                                payload.message,
+                                tenant_id=tenant_id,
+                                knowledge_base_id=primary_kb_id,
+                                query_run_id=str(query_run_id),
+                                trace_id=trace_id,
+                                settings=settings,
+                                profile=active_profile,
+                                search_filters=search_filters,
+                                deadline=deadline,
+                            )
+                        )
+                    async for heartbeat in wait_for_stage_task(
+                        retrieval_task,
+                        stage=current_stage,
+                        started=stage_started,
+                    ):
+                        yield heartbeat
+                    retrieval = await retrieval_task
                     last_successful_stage = "retrieval"
                     sequence += 1
                     yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
@@ -2340,20 +2942,30 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                                 retrieval_overrides=payload.retrieval_overrides,
                             ),
                         )
-                        retrieval = await run_extended_search(
-                            conn,
-                            payload.message,
-                            tenant_id=tenant_id,
-                            knowledge_base_id=primary_kb_id,
-                            query_run_id=str(query_run_id),
-                            trace_id=trace_id,
-                            settings=settings,
-                            profile=active_profile,
-                            profile_overrides=payload.retrieval_overrides,
-                            search_filters=search_filters,
-                            knowledge_base_ids=kb_ids,
-                            seed_result=retrieval,
+                        retrieval_task = asyncio.create_task(
+                            run_extended_search(
+                                conn,
+                                payload.message,
+                                tenant_id=tenant_id,
+                                knowledge_base_id=primary_kb_id,
+                                query_run_id=str(query_run_id),
+                                trace_id=trace_id,
+                                settings=settings,
+                                profile=active_profile,
+                                profile_overrides=payload.retrieval_overrides,
+                                search_filters=search_filters,
+                                knowledge_base_ids=kb_ids,
+                                seed_result=retrieval,
+                                deadline=deadline,
+                            )
                         )
+                        async for heartbeat in wait_for_stage_task(
+                            retrieval_task,
+                            stage=current_stage,
+                            started=stage_started,
+                        ):
+                            yield heartbeat
+                        retrieval = await retrieval_task
                         sequence += 1
                         yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
                         last_successful_stage = "extended_search"
@@ -2361,7 +2973,43 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
             sequence += 1
             yield stage_notice("stage.started", current_stage)
             stage_started = time.perf_counter()
-            answer, validation = await generate_answer(payload.message, retrieval, settings, active_profile)
+            if await request.is_disconnected():
+                raise asyncio.CancelledError
+            generation_task = asyncio.create_task(
+                generate_answer(
+                    payload.message,
+                    retrieval,
+                    settings,
+                    active_profile,
+                    deadline=deadline,
+                    correlation_id=str(query_run_id),
+                )
+            )
+            while True:
+                try:
+                    answer, validation = await asyncio.wait_for(
+                        asyncio.shield(generation_task),
+                        timeout=deadline.timeout_seconds(
+                            settings.operation_heartbeat_seconds,
+                            stage=current_stage,
+                        ),
+                    )
+                    break
+                except TimeoutError:
+                    if generation_task.done():
+                        answer, validation = await generation_task
+                        break
+                    if await request.is_disconnected():
+                        generation_task.cancel()
+                        await asyncio.gather(generation_task, return_exceptions=True)
+                        raise asyncio.CancelledError from None
+                    deadline.ensure_remaining(stage=current_stage)
+                    sequence += 1
+                    yield stage_notice("stage.heartbeat", current_stage, _elapsed_ms(stage_started))
+                except OperationDeadlineExceeded:
+                    generation_task.cancel()
+                    await asyncio.gather(generation_task, return_exceptions=True)
+                    raise
             sequence += 1
             yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
             last_successful_stage = "answer_generation"
@@ -2440,6 +3088,14 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     model_alias=str(validation.get("model_alias") or ""),
                     provider_request_id=str(validation.get("provider_request_id") or ""),
                 )
+                if idempotency_record is not None:
+                    await complete_idempotency_record(
+                        conn,
+                        record_id=str(idempotency_record["id"]),
+                        resource_id=str(query_run_id),
+                        response_status=200,
+                        safe_response={"query_run_id": str(query_run_id), "terminal_status": "completed"},
+                    )
                 last_successful_stage = "query_run_complete"
             sequence += 1
             yield _event(
@@ -2448,12 +3104,27 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     request_id=request_id,
                     query_run_id=str(query_run_id),
                     sequence=sequence,
-                    data={"answer": answer, "root_cause": answer_artifact["root_cause"]},
+                    data={
+                        "answer": answer,
+                        "root_cause": answer_artifact["root_cause"],
+                        "stage": "completed",
+                        "attempt": 1,
+                        "elapsed_ms": _elapsed_ms(run_started),
+                        "deadline_remaining_ms": deadline.remaining_ms(),
+                    },
                 )
             )
         except asyncio.CancelledError:
             async with connect() as conn:
-                await fail_query_run(conn, query_run_id=str(query_run_id), error_code="ClientDisconnected")
+                await cancel_query_run(conn, query_run_id=str(query_run_id), error_code="CLIENT_DISCONNECTED")
+                if idempotency_record is not None:
+                    await complete_idempotency_record(
+                        conn,
+                        record_id=str(idempotency_record["id"]),
+                        resource_id=str(query_run_id),
+                        response_status=499,
+                        safe_response={"query_run_id": str(query_run_id), "terminal_status": "cancelled"},
+                    )
             raise
         except Exception as exc:
             async with connect() as conn:
@@ -2471,13 +3142,27 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                         retrieval=retrieval,
                     ),
                 )
-                await fail_query_run(conn, query_run_id=str(query_run_id), error_code=type(exc).__name__)
+                await fail_query_run(conn, query_run_id=str(query_run_id), error_code=safe_error_code(exc))
+                if idempotency_record is not None:
+                    await complete_idempotency_record(
+                        conn,
+                        record_id=str(idempotency_record["id"]),
+                        resource_id=str(query_run_id),
+                        response_status=500,
+                        safe_response={
+                            "query_run_id": str(query_run_id),
+                            "terminal_status": "failed",
+                            "error_code": safe_error_code(exc),
+                        },
+                    )
             sequence += 1
             failure = _safe_failure_payload(
                 exc,
                 stage=current_stage,
                 last_successful_stage=last_successful_stage,
                 trace_id=trace_id,
+                request_id=request_id,
+                elapsed_ms=_elapsed_ms(run_started),
                 retrieval=retrieval,
                 query_run_id=str(query_run_id),
                 knowledge_base_id=primary_kb_id,
@@ -2492,6 +3177,66 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     data=failure,
                 )
             )
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+def _replay_query_run_stream(*, request_id: str, query_run: dict[str, Any]) -> StreamingResponse:
+    """Replay a terminal chat run without repeating retrieval or model generation."""
+    query_run_id = str(query_run["id"])
+    trace_id = str(query_run.get("trace_id") or "")
+    terminal_status = str(query_run.get("status") or "failed")
+
+    async def event_stream() -> AsyncIterator[str]:
+        sequence = 1
+        yield _event(
+            SseEvent(
+                event="run.started",
+                request_id=request_id,
+                query_run_id=query_run_id,
+                sequence=sequence,
+                data={"trace_id": trace_id, "stage": "replayed", "elapsed_ms": 0, "replayed": True},
+            )
+        )
+        sequence += 1
+        if terminal_status == "completed":
+            answer = str(query_run.get("answer") or "")
+            yield _event(
+                SseEvent(
+                    event="message.delta",
+                    request_id=request_id,
+                    query_run_id=query_run_id,
+                    sequence=sequence,
+                    data={"text": answer, "stage": "answer_generation", "elapsed_ms": 0, "replayed": True},
+                )
+            )
+            sequence += 1
+            yield _event(
+                SseEvent(
+                    event="run.completed",
+                    request_id=request_id,
+                    query_run_id=query_run_id,
+                    sequence=sequence,
+                    data={"answer": answer, "stage": "completed", "elapsed_ms": 0, "replayed": True},
+                )
+            )
+            return
+        event_name = "run.cancelled" if terminal_status == "cancelled" else "run.failed"
+        yield _event(
+            SseEvent(
+                event=event_name,
+                request_id=request_id,
+                query_run_id=query_run_id,
+                sequence=sequence,
+                data={
+                    "code": str(query_run.get("error_code") or terminal_status.upper()),
+                    "stage": "replayed_terminal",
+                    "elapsed_ms": 0,
+                    "retryable": False,
+                    "replayed": True,
+                },
+            )
+        )
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -2654,7 +3399,11 @@ async def create_research_plan_endpoint(
     settings = get_settings()
     kb_ids = _kb_scope_ids(payload.knowledge_base_ids, payload.knowledge_base_id or settings.default_kb_id)
     kb_id = kb_ids[0]
-    profile = get_retrieval_profile(payload.retrieval_profile, settings, payload.retrieval_overrides)
+    profile = get_retrieval_profile(
+        payload.retrieval_profile or settings.retrieval_profile,
+        settings,
+        payload.retrieval_overrides,
+    )
     try:
         async with connect() as conn:
             for scoped_kb_id in kb_ids:
@@ -2900,12 +3649,16 @@ async def create_research_run_endpoint(payload: ResearchRunCreate, request: Requ
             retrieval_overrides = (
                 dict(plan.get("retrieval_overrides") or {}) if plan is not None else payload.retrieval_overrides
             )
-            profile = get_retrieval_profile(
-                str(plan.get("retrieval_profile") or settings.retrieval_profile)
-                if plan is not None
-                else payload.retrieval_profile,
-                settings,
-                retrieval_overrides,
+            requested_profile = (
+                str(plan.get("retrieval_profile") or "") if plan is not None else payload.retrieval_profile
+            ) or None
+            profile = await resolve_retrieval_profile(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_ids=kb_ids,
+                requested=requested_profile,
+                overrides=retrieval_overrides,
+                settings=settings,
             )
             tool_mode = (
                 str(plan.get("tool_mode") or DEFAULT_RESEARCH_TOOL_MODE) if plan is not None else payload.tool_mode
@@ -2933,14 +3686,24 @@ async def create_research_run_endpoint(payload: ResearchRunCreate, request: Requ
                     kb_id=scoped_kb_id,
                     role=KnowledgeBaseRole.viewer,
                 )
-                await validate_active_retrieval_contract(
-                    conn,
-                    tenant_id=tenant_id,
-                    knowledge_base_id=scoped_kb_id,
-                    profile=profile,
-                    retrieval_overrides=retrieval_overrides,
-                    settings=settings,
-                )
+            idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
+                request=request,
+                actor=actor,
+                tenant_id=tenant_id,
+                route="POST:/api/v1/research-runs",
+                payload=payload.model_dump(mode="json"),
+                settings=settings,
+                idempotency_key=(
+                    stable_hash(["research_client_request", payload.client_request_id], 64)
+                    if payload.client_request_id
+                    else None
+                ),
+            )
+            if not owns_idempotency_record:
+                safe_response = dict((idempotency_record or {}).get("safe_response") or {})
+                if not safe_response:
+                    raise HTTPException(status_code=409, detail="idempotent research run record is missing response")
+                return ResearchRunActionResponse.model_validate(safe_response)
             run_id, job_id = await create_research_run(
                 conn,
                 tenant_id=tenant_id,
@@ -2971,9 +3734,22 @@ async def create_research_run_endpoint(payload: ResearchRunCreate, request: Requ
                     "research_plan_id": payload.research_plan_id,
                 },
             )
+            response = ResearchRunActionResponse(
+                run_id=str(run_id),
+                status=ResearchRunStatus.received,
+                job_id=str(job_id),
+            )
+            if idempotency_record is not None:
+                await complete_idempotency_record(
+                    conn,
+                    record_id=str(idempotency_record["id"]),
+                    resource_id=str(job_id),
+                    response_status=202,
+                    safe_response=response.model_dump(mode="json"),
+                )
     except KnowledgeBaseNotReady as exc:
         raise _kb_not_ready_http(exc, request_id) from exc
-    return ResearchRunActionResponse(run_id=str(run_id), status=ResearchRunStatus.received, job_id=str(job_id))
+    return response
 
 
 async def list_research_runs_endpoint(
@@ -3154,6 +3930,26 @@ async def run_debug_search(payload: DebugSearchRequest, request: Request) -> dic
             tenant_id=tenant_id,
             kb_ids=kb_ids,
             kb_roles=kb_roles,
+        )
+        profile = await resolve_retrieval_profile(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_ids=kb_ids,
+            requested=payload.retrieval_profile,
+            overrides=payload.retrieval_overrides,
+            settings=settings,
+        )
+        search_plan = build_search_plan(
+            query=payload.message,
+            mode="debug",
+            route=route_decision["route"],
+            route_reason=route_decision["reason"],
+            knowledge_base_id=primary_kb_id,
+            knowledge_base_ids=kb_ids,
+            trace_id=trace_id,
+            profile=profile,
+            top_k=payload.top_k,
+            include_generation=False,
         )
         created = await create_query_run(
             conn,
@@ -4155,7 +4951,7 @@ def _failure_stage_event(
         "last_successful_stage": last_successful_stage,
         "error": {
             "code": code,
-            "type": type(exc).__name__,
+            "retryable": is_retryable_exception(exc),
         },
         "model_call": model_call,
         "context_source_summary": _context_source_summary(retrieval, []),
@@ -4195,13 +4991,21 @@ def _safe_failure_payload(
     stage: str,
     last_successful_stage: str,
     trace_id: str,
+    request_id: str = "",
+    elapsed_ms: int = 0,
     retrieval: Any | None,
     query_run_id: str | None = None,
     knowledge_base_id: str = "",
     search_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a redacted stream failure payload for chat clients."""
-    retryable = _retryable_error(exc)
+    safe_failure = safe_failure_from_exception(
+        exc,
+        stage=stage,
+        request_id=request_id or trace_id,
+        operation_id=query_run_id or "",
+    )
+    retryable = safe_failure.retryable
     safe_search_plan = search_plan or {}
     typed_retrieval = cast(RetrievalResult | None, retrieval)
     artifact = build_failure_artifact(
@@ -4211,19 +5015,22 @@ def _safe_failure_payload(
         retrieval=typed_retrieval,
         stage=stage,
         last_successful_stage=last_successful_stage,
-        code=type(exc).__name__,
+        code=safe_failure.error_code,
         retryable=retryable,
         trace_id=trace_id,
     )
     return {
         "error": "chat run failed",
         "stage": stage,
-        "code": type(exc).__name__,
+        "code": safe_failure.error_code,
         "retryable": retryable,
         "attempt": 1,
         "last_successful_stage": last_successful_stage,
         "trace_id": trace_id,
-        "safe_message": type(exc).__name__,
+        "request_id": request_id or trace_id,
+        "elapsed_ms": max(0, int(elapsed_ms)),
+        "safe_message": safe_failure.error_code,
+        "operation_id": query_run_id,
         "retrieval": _safe_retrieval_snapshot(retrieval),
         "search_plan": safe_search_plan,
         "root_cause": artifact["root_cause"],
@@ -4232,7 +5039,7 @@ def _safe_failure_payload(
 
 
 def _retryable_error(exc: Exception) -> bool:
-    return type(exc).__name__ not in {"ValueError", "ValidationError", "KnowledgeBaseNotReady"}
+    return is_retryable_exception(exc)
 
 
 def _safe_retrieval_snapshot(retrieval: Any | None) -> dict[str, Any]:

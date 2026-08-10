@@ -20,7 +20,7 @@ from wikipediarag.document_ingestion import (
     sha256_hex,
     validate_upload_bytes,
 )
-from wikipediarag.ingestion import _parser_runtime_progress
+from wikipediarag.ingestion import _parser_runtime_progress, _upload_profile_name_for_settings
 
 
 def _settings(
@@ -207,6 +207,13 @@ def test_parser_runtime_progress_uses_safe_numeric_fields_only() -> None:
         "parser_endpoint_pool_size": 3,
     }
     assert "endpoint_url" not in progress
+
+
+def test_upload_index_target_keeps_upload_sota_profile() -> None:
+    assert _upload_profile_name_for_settings(Settings(retrieval_profile="sota_mvp")) == "upload_sota_mvp"
+    assert _upload_profile_name_for_settings(Settings(retrieval_profile="sota_mvp_verified")) == "upload_sota_mvp"
+    assert _upload_profile_name_for_settings(Settings(retrieval_profile="upload_sota_mvp")) == "upload_sota_mvp"
+    assert _upload_profile_name_for_settings(Settings(retrieval_profile="test_mock")) == "upload_mock"
 
 
 def test_normalized_hash_and_chunk_ids_are_deterministic() -> None:

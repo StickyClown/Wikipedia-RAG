@@ -18,6 +18,11 @@ goal from [docs/STATUS.md](docs/STATUS.md).
 - Do not add GraphRAG, multi-agent swarm, ColBERT, learned sparse retrieval or proposition indexing without a separate approved research plan.
 - Do not create synchronous ingestion of large files inside an HTTP request.
 - Business code must use the Model Gateway contract for model calls.
+- The project target is fully local/private model usage. OpenRouter-backed Qwen
+  aliases in `config/models.yaml` are a development/proxy simulation of local
+  model behavior until the local runtime is ready; business code must still call
+  only Model Gateway aliases and must not call OpenRouter or any provider
+  directly.
 - Architecture invariants are maintained in [docs/architecture.md](docs/architecture.md).
 
 ## Work Protocol

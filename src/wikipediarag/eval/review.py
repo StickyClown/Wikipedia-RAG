@@ -31,6 +31,7 @@ from wikipediarag.eval.schemas import (
     RetrievalTaskResult,
 )
 from wikipediarag.eval.settings import adapt_eval_settings
+from wikipediarag.reliability import safe_failure_from_exception
 
 ReviewDecision = Literal["AUTO_ACCEPT", "REVIEW", "REJECT"]
 ReviewStatus = Literal["unreviewed", "reviewed", "rejected"]
@@ -395,17 +396,18 @@ async def eval_release_gate(
         _emit_release_gate(progress_callback, status, "run_completed")
         return report
     except Exception as exc:
+        failure = safe_failure_from_exception(exc, stage=status.phase)
         timings["total"] = int((time.perf_counter() - started) * 1000)
         status = _advance_release_gate_status(status, started=started, timings=timings).model_copy(
             update={
                 "state": "failed",
                 "phase": "failed",
                 "updated_at": utc_now_iso(),
-                "error_message": type(exc).__name__ + ": " + str(exc),
+                "error_message": failure.error_code,
             }
         )
         _write_release_gate_status(status)
-        _log_release_gate_event(run_dir, "run_failed", status=status, errors=[status.error_message])
+        _log_release_gate_event(run_dir, "run_failed", status=status, errors=[failure.error_code])
         _emit_release_gate(progress_callback, status, "run_failed")
         raise
 
@@ -747,11 +749,12 @@ def _reviewed_task_from_candidate(row: dict[str, Any], *, source_dataset_hash: s
     source = _task_payload(row)
     task = _eval_task_from_payload(source, row)
     provenance = _review_provenance(row, source, task, source_dataset_hash)
+    task_payload = task.model_dump(mode="json")
+    task_payload["split"] = _split(row, source)
     return ReviewedEvalTask(
-        **task.model_dump(mode="json"),
+        **task_payload,
         decision_status=decision,
         review_status=status,
-        split=_split(row, source),
         provenance=provenance,
         source_candidate_id=str(row.get("candidate_id") or source.get("task_id") or task.task_id),
         review_notes=(

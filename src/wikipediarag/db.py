@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
+from uuid import uuid4
 
+import yaml
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -12,6 +15,11 @@ from wikipediarag.config import Settings, get_settings
 
 SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS citext;
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version text PRIMARY KEY,
+  applied_at timestamptz NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS tenants (
   id uuid PRIMARY KEY,
@@ -203,6 +211,7 @@ CREATE TABLE IF NOT EXISTS index_versions (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE index_versions ADD COLUMN IF NOT EXISTS identity_scope text NOT NULL DEFAULT 'legacy';
 CREATE INDEX IF NOT EXISTS ix_index_versions_tenant ON index_versions(tenant_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -216,6 +225,8 @@ CREATE TABLE IF NOT EXISTS documents (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_document_id text NULL;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS identity_scope text NOT NULL DEFAULT 'legacy';
 CREATE INDEX IF NOT EXISTS ix_documents_tenant ON documents(tenant_id, created_at DESC);
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS lifecycle_state text NOT NULL DEFAULT 'active';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at timestamptz NULL;
@@ -225,6 +236,19 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS deletion_reason text NULL;
 CREATE INDEX IF NOT EXISTS ix_documents_purge
   ON documents(tenant_id, purge_after)
   WHERE lifecycle_state IN ('deleting','purge_failed');
+
+CREATE TABLE IF NOT EXISTS legacy_id_mappings (
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+  entity_kind text NOT NULL CHECK (entity_kind IN ('document','chunk','index_version')),
+  legacy_id text NOT NULL,
+  scoped_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, knowledge_base_id, entity_kind, legacy_id),
+  UNIQUE (tenant_id, knowledge_base_id, entity_kind, scoped_id)
+);
+CREATE INDEX IF NOT EXISTS ix_legacy_id_mappings_scoped
+  ON legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, scoped_id);
 
 CREATE TABLE IF NOT EXISTS knowledge_sources (
   id uuid PRIMARY KEY,
@@ -448,6 +472,9 @@ CREATE TABLE IF NOT EXISTS chunks (
   metadata jsonb NOT NULL DEFAULT '{}',
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS source_chunk_id text NULL;
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_unit_id text NULL;
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS identity_scope text NOT NULL DEFAULT 'legacy';
 CREATE INDEX IF NOT EXISTS ix_chunks_tenant ON chunks(tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_chunks_page ON chunks(tenant_id, page_id);
 
@@ -503,6 +530,8 @@ CREATE TABLE IF NOT EXISTS query_runs (
 CREATE INDEX IF NOT EXISTS ix_query_runs_tenant ON query_runs(tenant_id, created_at DESC);
 ALTER TABLE query_runs ADD COLUMN IF NOT EXISTS knowledge_base_id uuid NULL REFERENCES knowledge_bases(id);
 
+CREATE SEQUENCE IF NOT EXISTS retrieval_events_sequence;
+
 CREATE TABLE IF NOT EXISTS retrieval_events (
   id uuid PRIMARY KEY,
   tenant_id uuid NOT NULL REFERENCES tenants(id),
@@ -511,9 +540,15 @@ CREATE TABLE IF NOT EXISTS retrieval_events (
   event_type text NOT NULL,
   stage text NOT NULL,
   payload jsonb NOT NULL DEFAULT '{}',
+  sequence bigint NOT NULL DEFAULT nextval('retrieval_events_sequence'),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE retrieval_events ADD COLUMN IF NOT EXISTS sequence bigint;
+UPDATE retrieval_events SET sequence = nextval('retrieval_events_sequence') WHERE sequence IS NULL;
+ALTER TABLE retrieval_events ALTER COLUMN sequence SET DEFAULT nextval('retrieval_events_sequence');
+ALTER TABLE retrieval_events ALTER COLUMN sequence SET NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_retrieval_events_tenant ON retrieval_events(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_retrieval_events_run_sequence ON retrieval_events(query_run_id, sequence);
 
 CREATE TABLE IF NOT EXISTS agent_runs (
   id uuid PRIMARY KEY,
@@ -527,6 +562,30 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 );
 CREATE INDEX IF NOT EXISTS ix_agent_runs_tenant ON agent_runs(tenant_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS research_plans (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+  user_id uuid NULL REFERENCES users(id),
+  topic text NOT NULL,
+  knowledge_base_ids jsonb NOT NULL DEFAULT '[]',
+  retrieval_profile text NOT NULL,
+  tool_mode text NOT NULL DEFAULT 'all_local_tools'
+    CHECK (tool_mode IN ('all_local_tools','extended_search_only','search_plus_document_tools')),
+  retrieval_overrides jsonb NOT NULL DEFAULT '{}',
+  context_policy jsonb NOT NULL DEFAULT '{}',
+  notes text NOT NULL DEFAULT '',
+  questions jsonb NOT NULL DEFAULT '[]',
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','approved','archived')),
+  approved_run_id uuid NULL,
+  approved_at timestamptz NULL,
+  approved_by_user_id uuid NULL REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_research_plans_tenant ON research_plans(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_research_plans_kb ON research_plans(tenant_id, knowledge_base_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS research_runs (
   id uuid PRIMARY KEY,
   tenant_id uuid NOT NULL REFERENCES tenants(id),
@@ -535,6 +594,8 @@ CREATE TABLE IF NOT EXISTS research_runs (
   active_job_id uuid NULL REFERENCES ingestion_jobs(id),
   topic text NOT NULL,
   retrieval_profile text NOT NULL,
+  tool_mode text NOT NULL DEFAULT 'all_local_tools'
+    CHECK (tool_mode IN ('all_local_tools','extended_search_only','search_plus_document_tools')),
   retrieval_overrides jsonb NOT NULL DEFAULT '{}',
   status text NOT NULL CHECK (status IN ('received','running','paused','completed','failed','cancelled')),
   progress jsonb NOT NULL DEFAULT '{}',
@@ -553,6 +614,20 @@ CREATE TABLE IF NOT EXISTS research_runs (
 );
 CREATE INDEX IF NOT EXISTS ix_research_runs_tenant ON research_runs(tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_research_runs_kb ON research_runs(tenant_id, knowledge_base_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_run_scopes (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+  ordinal int NOT NULL,
+  access_snapshot jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(research_run_id, knowledge_base_id),
+  UNIQUE(research_run_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS ix_research_run_scopes_tenant
+  ON research_run_scopes(tenant_id, research_run_id, ordinal);
 
 CREATE TABLE IF NOT EXISTS research_episodes (
   id uuid PRIMARY KEY,
@@ -582,7 +657,17 @@ CREATE TABLE IF NOT EXISTS research_questions (
   question text NOT NULL,
   ordinal int NOT NULL,
   kind text NOT NULL DEFAULT 'primary',
-  status text NOT NULL CHECK (status IN ('open','running','covered','partial','missing','conflicting')),
+  status text NOT NULL CHECK (
+    status IN ('open','running','covered','partial','missing','conflicting','exhausted','failed')
+  ),
+  execution_state text NOT NULL DEFAULT 'pending'
+    CHECK (execution_state IN ('pending','running','done')),
+  outcome text NULL CHECK (outcome IN ('covered','partial','exhausted','failed')),
+  CHECK ((execution_state = 'done') = (outcome IS NOT NULL)),
+  attempt_count int NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  rewrite_count int NOT NULL DEFAULT 0 CHECK (rewrite_count >= 0),
+  depth int NOT NULL DEFAULT 0 CHECK (depth >= 0),
+  budget jsonb NOT NULL DEFAULT '{}',
   acceptance jsonb NOT NULL DEFAULT '{}',
   metadata jsonb NOT NULL DEFAULT '{}',
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -590,6 +675,30 @@ CREATE TABLE IF NOT EXISTS research_questions (
   UNIQUE(research_run_id, ordinal)
 );
 CREATE INDEX IF NOT EXISTS ix_research_questions_run ON research_questions(tenant_id, research_run_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS research_tool_calls (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  episode_id uuid NULL REFERENCES research_episodes(id),
+  question_id uuid NULL REFERENCES research_questions(id),
+  query_run_id uuid NULL REFERENCES query_runs(id),
+  tool_name text NOT NULL CHECK (tool_name IN ('extended_search')),
+  tool_query_hash text NOT NULL,
+  status text NOT NULL CHECK (status IN ('running','completed','failed','cancelled')),
+  result_summary jsonb NOT NULL DEFAULT '{}',
+  safe_metadata jsonb NOT NULL DEFAULT '{}',
+  error_code text NULL,
+  error_message text NULL,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_research_tool_calls_run
+  ON research_tool_calls(tenant_id, research_run_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_research_tool_calls_episode
+  ON research_tool_calls(tenant_id, episode_id, created_at);
 
 CREATE TABLE IF NOT EXISTS research_evidence_records (
   id uuid PRIMARY KEY,
@@ -605,6 +714,7 @@ CREATE TABLE IF NOT EXISTS research_evidence_records (
   source_url text NOT NULL,
   section_path text[] NOT NULL DEFAULT ARRAY[]::text[],
   content_abstract text NOT NULL,
+  evidence_fingerprint text NULL,
   support_status text NOT NULL CHECK (support_status IN ('supports','partial','contradicts','unknown')),
   score double precision NULL,
   metadata jsonb NOT NULL DEFAULT '{}',
@@ -660,7 +770,272 @@ CREATE TABLE IF NOT EXISTS research_reflections (
 );
 CREATE INDEX IF NOT EXISTS ix_research_reflections_run
   ON research_reflections(tenant_id, research_run_id, created_at DESC);
+
+ALTER TABLE research_runs ADD COLUMN IF NOT EXISTS last_heartbeat_at timestamptz NULL;
+ALTER TABLE research_runs ADD COLUMN IF NOT EXISTS controller_lease_id text NULL;
+ALTER TABLE research_runs ADD COLUMN IF NOT EXISTS controller_lease_expires_at timestamptz NULL;
+ALTER TABLE research_runs ADD COLUMN IF NOT EXISTS controller_lease_epoch bigint NOT NULL DEFAULT 0;
+ALTER TABLE research_runs ADD COLUMN IF NOT EXISTS research_plan_id uuid NULL REFERENCES research_plans(id);
+ALTER TABLE research_runs ADD COLUMN IF NOT EXISTS tool_mode text NOT NULL DEFAULT 'all_local_tools';
+ALTER TABLE research_runs DROP CONSTRAINT IF EXISTS research_runs_tool_mode_check;
+ALTER TABLE research_runs ADD CONSTRAINT research_runs_tool_mode_check
+  CHECK (tool_mode IN ('all_local_tools','extended_search_only','search_plus_document_tools'));
+ALTER TABLE research_plans DROP CONSTRAINT IF EXISTS research_plans_tool_mode_check;
+ALTER TABLE research_plans ADD CONSTRAINT research_plans_tool_mode_check
+  CHECK (tool_mode IN ('all_local_tools','extended_search_only','search_plus_document_tools'));
+ALTER TABLE research_episodes ADD COLUMN IF NOT EXISTS step_index int NOT NULL DEFAULT 1;
+ALTER TABLE research_questions DROP CONSTRAINT IF EXISTS research_questions_status_check;
+ALTER TABLE research_questions ADD CONSTRAINT research_questions_status_check
+  CHECK (status IN ('open','running','covered','partial','missing','conflicting','exhausted','failed'));
+ALTER TABLE research_questions ADD COLUMN IF NOT EXISTS execution_state text NOT NULL DEFAULT 'pending';
+ALTER TABLE research_questions ADD COLUMN IF NOT EXISTS outcome text NULL;
+ALTER TABLE research_questions ADD COLUMN IF NOT EXISTS attempt_count int NOT NULL DEFAULT 0;
+ALTER TABLE research_questions ADD COLUMN IF NOT EXISTS rewrite_count int NOT NULL DEFAULT 0;
+ALTER TABLE research_questions ADD COLUMN IF NOT EXISTS depth int NOT NULL DEFAULT 0;
+ALTER TABLE research_questions ADD COLUMN IF NOT EXISTS budget jsonb NOT NULL DEFAULT '{}';
+ALTER TABLE research_questions DROP CONSTRAINT IF EXISTS research_questions_execution_state_check;
+ALTER TABLE research_questions ADD CONSTRAINT research_questions_execution_state_check
+  CHECK (execution_state IN ('pending','running','done'));
+ALTER TABLE research_questions DROP CONSTRAINT IF EXISTS research_questions_outcome_check;
+ALTER TABLE research_questions ADD CONSTRAINT research_questions_outcome_check
+  CHECK (outcome IN ('covered','partial','exhausted','failed') OR outcome IS NULL);
+ALTER TABLE research_questions DROP CONSTRAINT IF EXISTS research_questions_lifecycle_check;
+ALTER TABLE research_questions ADD CONSTRAINT research_questions_lifecycle_check
+  CHECK ((execution_state = 'done') = (outcome IS NOT NULL));
+UPDATE research_questions
+SET execution_state = CASE
+      WHEN status IN ('covered','partial','exhausted','failed') THEN 'done'
+      ELSE execution_state
+    END,
+    outcome = CASE
+      WHEN status = 'covered' THEN 'covered'
+      WHEN status = 'partial' THEN 'partial'
+      WHEN status = 'exhausted' THEN 'exhausted'
+      WHEN status = 'failed' THEN 'failed'
+      ELSE outcome
+    END
+WHERE execution_state = 'pending' AND status IN ('covered','partial','exhausted','failed');
+ALTER TABLE research_evidence_records ADD COLUMN IF NOT EXISTS evidence_fingerprint text NULL;
+ALTER TABLE research_tool_calls ADD COLUMN IF NOT EXISTS tool_args_hash text NULL;
+ALTER TABLE research_tool_calls ADD COLUMN IF NOT EXISTS last_heartbeat_at timestamptz NULL;
+ALTER TABLE research_tool_calls ADD COLUMN IF NOT EXISTS validated_args jsonb NOT NULL DEFAULT '{}';
+ALTER TABLE research_tool_calls ADD COLUMN IF NOT EXISTS execution_attempts int NOT NULL DEFAULT 0;
+ALTER TABLE research_tool_calls DROP CONSTRAINT IF EXISTS research_tool_calls_tool_name_check;
+ALTER TABLE research_tool_calls ADD CONSTRAINT research_tool_calls_tool_name_check
+  CHECK (tool_name IN (
+    'extended_search', 'document_section_lookup', 'search_within_document', 'table_csv_lookup', 'metadata_lookup'
+  ));
+ALTER TABLE research_tool_calls DROP CONSTRAINT IF EXISTS research_tool_calls_status_check;
+ALTER TABLE research_tool_calls ADD CONSTRAINT research_tool_calls_status_check
+  CHECK (status IN ('running','completed','failed','cancelled','stalled'));
+ALTER TABLE research_claim_records ADD COLUMN IF NOT EXISTS verification_input_hash text NULL;
+
+CREATE TABLE IF NOT EXISTS research_decisions (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  episode_id uuid NULL REFERENCES research_episodes(id),
+  question_id uuid NULL REFERENCES research_questions(id),
+  decision_type text NOT NULL,
+  selected_strategy text NOT NULL,
+  reason text NOT NULL,
+  evidence_gain int NOT NULL DEFAULT 0,
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_research_decisions_run
+  ON research_decisions(tenant_id, research_run_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_claim_relations (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL REFERENCES tenants(id),
+  research_run_id uuid NOT NULL REFERENCES research_runs(id),
+  source_claim_id uuid NOT NULL REFERENCES research_claim_records(id),
+  target_claim_id uuid NOT NULL REFERENCES research_claim_records(id),
+  relation text NOT NULL CHECK (relation IN ('supports','contradicts','depends_on')),
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(research_run_id, source_claim_id, target_claim_id, relation)
+);
+CREATE INDEX IF NOT EXISTS ix_research_claim_relations_run
+  ON research_claim_relations(tenant_id, research_run_id, created_at);
 """
+
+# Additive migrations are deliberately kept separate from the bootstrap schema.
+# This lets an already-running installation converge without rewriting the
+# historical schema marker or losing existing rows.
+ADDITIVE_MIGRATIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "002_research_evidence_refs_and_job_leases",
+        (
+            "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS worker_lease_id text NULL",
+            "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS worker_lease_expires_at timestamptz NULL",
+            "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS worker_last_heartbeat_at timestamptz NULL",
+            "CREATE INDEX IF NOT EXISTS ix_ingestion_jobs_claim_lease "
+            "ON ingestion_jobs(kind, status, worker_lease_expires_at, created_at)",
+            "UPDATE research_evidence_records SET evidence_ref = 'E-' || replace(id::text, '-', '') "
+            "WHERE evidence_ref IS DISTINCT FROM ('E-' || replace(id::text, '-', ''))",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_research_evidence_run_ref "
+            "ON research_evidence_records(research_run_id, evidence_ref)",
+        ),
+    ),
+    (
+        "003_reliability_idempotency_records",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS idempotency_records (
+              id uuid PRIMARY KEY,
+              tenant_id uuid NOT NULL REFERENCES tenants(id),
+              actor_user_id uuid NOT NULL REFERENCES users(id),
+              route text NOT NULL,
+              idempotency_key text NOT NULL,
+              request_hash text NOT NULL,
+              status text NOT NULL CHECK (status IN ('in_progress','completed','failed')),
+              resource_id text NULL,
+              response_status int NULL,
+              safe_response jsonb NOT NULL DEFAULT '{}',
+              expires_at timestamptz NOT NULL,
+              created_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now(),
+              UNIQUE(tenant_id, actor_user_id, route, idempotency_key)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_idempotency_records_expiry ON idempotency_records(expires_at)",
+            """
+            CREATE TABLE IF NOT EXISTS worker_instances (
+              id text PRIMARY KEY,
+              lane text NOT NULL,
+              last_heartbeat_at timestamptz NOT NULL DEFAULT now(),
+              started_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_worker_instances_heartbeat ON worker_instances(last_heartbeat_at DESC)",
+        ),
+    ),
+    (
+        "004_reliability_ingestion_item_retry",
+        (
+            "ALTER TABLE ingestion_job_items ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz NULL",
+            "CREATE INDEX IF NOT EXISTS ix_ingestion_job_items_retry "
+            "ON ingestion_job_items(job_id, status, next_attempt_at)",
+        ),
+    ),
+    (
+        "005_model_control_plane",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS model_provider_connections (
+              id uuid PRIMARY KEY,
+              name text UNIQUE NOT NULL,
+              driver text NOT NULL CHECK (
+                driver IN ('openrouter','vllm','llamacpp','textgen_webui','openai_compatible','mock')
+              ),
+              base_url text NOT NULL,
+              endpoint_paths jsonb NOT NULL DEFAULT '{}',
+              safe_headers jsonb NOT NULL DEFAULT '{}',
+              tls_verify boolean NOT NULL DEFAULT true,
+              enabled boolean NOT NULL DEFAULT true,
+              row_version bigint NOT NULL DEFAULT 1,
+              last_status jsonb NOT NULL DEFAULT '{}',
+              last_checked_at timestamptz NULL,
+              created_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_model_provider_connections_enabled "
+            "ON model_provider_connections(enabled, name)",
+            """
+            CREATE TABLE IF NOT EXISTS model_connection_credentials (
+              id uuid PRIMARY KEY,
+              connection_id uuid NOT NULL REFERENCES model_provider_connections(id) ON DELETE CASCADE,
+              version bigint NOT NULL,
+              encrypted_payload text NOT NULL,
+              state text NOT NULL CHECK (state IN ('pending','active','retired')),
+              source text NOT NULL DEFAULT 'database' CHECK (source IN ('database','env','secret_file')),
+              created_at timestamptz NOT NULL DEFAULT now(),
+              activated_at timestamptz NULL,
+              UNIQUE(connection_id, version)
+            )
+            """,
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_connection_credentials_active "
+            "ON model_connection_credentials(connection_id) WHERE state = 'active'",
+            """
+            ALTER TABLE model_aliases
+              ADD COLUMN IF NOT EXISTS connection_id uuid NULL REFERENCES model_provider_connections(id),
+              ADD COLUMN IF NOT EXISTS input_modalities jsonb NOT NULL DEFAULT '["text"]',
+              ADD COLUMN IF NOT EXISTS capabilities jsonb NOT NULL DEFAULT '{}',
+              ADD COLUMN IF NOT EXISTS context_window_tokens int NULL,
+              ADD COLUMN IF NOT EXISTS max_output_tokens int NULL,
+              ADD COLUMN IF NOT EXISTS dimensions int NULL,
+              ADD COLUMN IF NOT EXISTS tokenizer_contract jsonb NOT NULL DEFAULT '{}',
+              ADD COLUMN IF NOT EXISTS model_defaults jsonb NOT NULL DEFAULT '{}',
+              ADD COLUMN IF NOT EXISTS thinking_capabilities jsonb NOT NULL DEFAULT '{}',
+              ADD COLUMN IF NOT EXISTS catalog_snapshot jsonb NOT NULL DEFAULT '{}',
+              ADD COLUMN IF NOT EXISTS canary_status jsonb NOT NULL DEFAULT '{}',
+              ADD COLUMN IF NOT EXISTS row_version bigint NOT NULL DEFAULT 1
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_model_aliases_connection ON model_aliases(connection_id, is_enabled)",
+            """
+            CREATE TABLE IF NOT EXISTS model_configuration_revisions (
+              id uuid PRIMARY KEY,
+              revision bigint NOT NULL,
+              status text NOT NULL CHECK (status IN ('draft','validated','active','archived')),
+              config_hash text NOT NULL,
+              resolved_snapshot jsonb NOT NULL DEFAULT '{}',
+              row_version bigint NOT NULL DEFAULT 1,
+              created_by uuid NULL REFERENCES users(id),
+              validation_report jsonb NOT NULL DEFAULT '{}',
+              validated_at timestamptz NULL,
+              activated_at timestamptz NULL,
+              created_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now(),
+              UNIQUE(revision)
+            )
+            """,
+            "ALTER TABLE model_configuration_revisions ADD COLUMN IF NOT EXISTS row_version bigint NOT NULL DEFAULT 1",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_configuration_active "
+            "ON model_configuration_revisions(status) WHERE status = 'active'",
+            """
+            CREATE TABLE IF NOT EXISTS model_stage_bindings (
+              id uuid PRIMARY KEY,
+              revision_id uuid NOT NULL REFERENCES model_configuration_revisions(id) ON DELETE CASCADE,
+              stage_key text NOT NULL,
+              model_alias text NOT NULL REFERENCES model_aliases(alias),
+              parameter_overrides jsonb NOT NULL DEFAULT '{}',
+              token_policy jsonb NOT NULL DEFAULT '{}',
+              thinking_policy jsonb NOT NULL DEFAULT '{}',
+              created_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now(),
+              UNIQUE(revision_id, stage_key)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS model_validation_runs (
+              id uuid PRIMARY KEY,
+              target_type text NOT NULL CHECK (target_type IN ('connection','model','stage','revision')),
+              target_id text NOT NULL,
+              config_hash text NOT NULL,
+              status text NOT NULL CHECK (status IN ('passed','failed','skipped')),
+              safe_error_code text NULL,
+              measurements jsonb NOT NULL DEFAULT '{}',
+              created_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_model_validation_runs_target "
+            "ON model_validation_runs(target_type, target_id, created_at DESC)",
+            "ALTER TABLE query_runs ADD COLUMN IF NOT EXISTS model_config_revision_id "
+            "uuid NULL REFERENCES model_configuration_revisions(id)",
+            "ALTER TABLE query_runs ADD COLUMN IF NOT EXISTS model_config_hash text NULL",
+            "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS model_config_revision_id "
+            "uuid NULL REFERENCES model_configuration_revisions(id)",
+            "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS model_config_hash text NULL",
+            "ALTER TABLE research_runs ADD COLUMN IF NOT EXISTS model_config_revision_id "
+            "uuid NULL REFERENCES model_configuration_revisions(id)",
+            "ALTER TABLE research_runs ADD COLUMN IF NOT EXISTS model_config_hash text NULL",
+        ),
+    ),
+)
 
 
 _engine: AsyncEngine | None = None
@@ -687,6 +1062,22 @@ async def connect(settings: Settings | None = None) -> AsyncIterator[AsyncConnec
         yield conn
 
 
+@asynccontextmanager
+async def connect_autocommit(settings: Settings | None = None) -> AsyncIterator[AsyncConnection]:
+    """Open a connection without holding a transaction across external work.
+
+    Deep Research retrieval can call the Model Gateway and perform several
+    bounded searches.  Those calls must not keep a PostgreSQL transaction open
+    while they wait.  Individual statements still run through SQLAlchemy, but
+    each statement is committed independently and a failed later stage can be
+    resumed from the durable ledger.
+    """
+    engine = get_engine(settings)
+    async with engine.connect() as conn:
+        await conn.execution_options(isolation_level="AUTOCOMMIT")
+        yield conn
+
+
 async def ensure_schema(settings: Settings | None = None) -> None:
     resolved = settings or get_settings()
     engine = get_engine(resolved)
@@ -695,6 +1086,34 @@ async def ensure_schema(settings: Settings | None = None) -> None:
         for statement in SCHEMA_SQL.split(";"):
             if statement.strip():
                 await conn.execute(text(statement))
+        await conn.execute(
+            text(
+                """
+                INSERT INTO schema_migrations(version)
+                VALUES ('001_retrieval_correctness_v3')
+                ON CONFLICT (version) DO NOTHING
+                """
+            )
+        )
+        for version, statements in ADDITIVE_MIGRATIONS:
+            already_applied = await conn.execute(
+                text("SELECT 1 FROM schema_migrations WHERE version = :version"),
+                {"version": version},
+            )
+            if already_applied.first() is not None:
+                continue
+            for statement in statements:
+                await conn.execute(text(statement))
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO schema_migrations(version)
+                    VALUES (:version)
+                    ON CONFLICT (version) DO NOTHING
+                    """
+                ),
+                {"version": version},
+            )
         await seed_development_data(conn, resolved)
 
 
@@ -761,6 +1180,120 @@ async def seed_development_data(conn: AsyncConnection, settings: Settings) -> No
             "subject": str(settings.default_user_id),
             "identity_key": f"local:{settings.default_user_id}",
         },
+    )
+    await seed_model_control_plane(conn, settings)
+
+
+async def seed_model_control_plane(conn: AsyncConnection, settings: Settings) -> None:
+    """Import legacy YAML exactly once, without importing any secret fields."""
+    existing = await conn.execute(text("SELECT EXISTS (SELECT 1 FROM model_aliases)"))
+    if bool(existing.scalar_one()):
+        return
+    try:
+        with settings.models_config_path.open("r", encoding="utf-8") as file:
+            models_payload = yaml.safe_load(file) or {}
+        with settings.retrieval_config_path.open("r", encoding="utf-8") as file:
+            retrieval_payload = yaml.safe_load(file) or {}
+    except (OSError, yaml.YAMLError):
+        return
+    connections: dict[str, str] = {}
+    for provider in sorted({str(value.get("provider")) for value in (models_payload.get("models") or {}).values()}):
+        if provider not in {"openrouter", "mock"}:
+            continue
+        connection_id = uuid4()
+        name = f"bootstrap-{provider}"
+        base_url = settings.openrouter_base_url if provider == "openrouter" else settings.mock_provider_url
+        await conn.execute(
+            text(
+                "INSERT INTO model_provider_connections(id,name,driver,base_url) "
+                "VALUES (:id,:name,:driver,:base_url) ON CONFLICT (name) DO NOTHING"
+            ),
+            {"id": str(connection_id), "name": name, "driver": provider, "base_url": str(base_url).rstrip("/")},
+        )
+        row = await conn.execute(text("SELECT id FROM model_provider_connections WHERE name=:name"), {"name": name})
+        connections[provider] = str(row.scalar_one())
+    alias_ids: dict[str, str] = {}
+    for alias, value in (models_payload.get("models") or {}).items():
+        if not isinstance(value, dict) or value.get("operation") not in {"chat", "embedding", "rerank"}:
+            continue
+        alias_id = uuid4()
+        alias_ids[str(alias)] = str(alias_id)
+        capability = {str(value["operation"]): True}
+        if value.get("provider_preferences", {}).get("require_parameters"):
+            capability["structured_output"] = True
+        await conn.execute(
+            text(
+                "INSERT INTO model_aliases(id,alias,provider,provider_model,operation,connection_id,"
+                "capabilities,input_modalities,context_window_tokens,dimensions,"
+                "tokenizer_contract,model_defaults,thinking_capabilities) "
+                "VALUES (:id,:alias,:provider,:provider_model,:operation,:connection_id,CAST(:capabilities AS jsonb),"
+                "CAST(:modalities AS jsonb),:context,:dimensions,"
+                "CAST(:tokenizer AS jsonb),CAST(:defaults AS jsonb),"
+                "CAST(:thinking AS jsonb))"
+            ),
+            {
+                "id": str(alias_id),
+                "alias": str(alias),
+                "provider": str(value["provider"]),
+                "provider_model": str(value["model"]),
+                "operation": str(value["operation"]),
+                "connection_id": connections.get(str(value["provider"])),
+                "capabilities": json_dumps(capability),
+                "modalities": json_dumps(["text"]),
+                "context": value.get("context_window_tokens"),
+                "dimensions": value.get("dimensions"),
+                "tokenizer": json_dumps({"name": value.get("tokenizer")} if value.get("tokenizer") else {}),
+                "defaults": json_dumps({"provider": value.get("provider_preferences", {})}),
+                "thinking": json_dumps({"reasoning_control": str(value["provider"]) in {"openrouter", "mock"}}),
+            },
+        )
+    profile = (retrieval_payload.get("profiles") or {}).get("sota_mvp") or {}
+    aliases = profile.get("model_aliases") or {}
+    deep_research = profile.get("deep_research") or {}
+    stages: dict[str, Any] = {
+        "ingestion.embedding": {
+            "model_alias": aliases.get("embed"),
+            "thinking_policy": {"mode": "off", "effort": "none"},
+        },
+        "retrieval.query_embedding": {
+            "model_alias": aliases.get("embed"),
+            "thinking_policy": {"mode": "off", "effort": "none"},
+        },
+        "retrieval.rerank": {
+            "model_alias": aliases.get("rerank"),
+            "thinking_policy": {"mode": "off", "effort": "none"},
+        },
+        "chat.answer": {
+            "model_alias": aliases.get("generator_main"),
+            "thinking_policy": {"mode": "off", "effort": "none"},
+        },
+        "chat.claim_verification": {
+            "model_alias": aliases.get("verifier"),
+            "thinking_policy": {"mode": "off", "effort": "none"},
+        },
+    }
+    for stage_name, key in (
+        ("planner", "deep_research.planner"),
+        ("verifier", "deep_research.verifier"),
+        ("synthesis", "deep_research.synthesis"),
+    ):
+        stage = deep_research.get(stage_name) or {}
+        stages[key] = {"model_alias": stage.get("model_alias"), "thinking_policy": {"mode": "off", "effort": "none"}}
+    legacy_bundle = hashlib.sha256(
+        settings.models_config_path.read_bytes() + settings.retrieval_config_path.read_bytes()
+    ).hexdigest()
+    snapshot = {
+        "stages": stages,
+        "source": "yaml-bootstrap-v2",
+        "pre_control_plane_hash": legacy_bundle,
+    }
+    encoded = json_dumps(snapshot).encode("utf-8")
+    await conn.execute(
+        text(
+            "INSERT INTO model_configuration_revisions(id,revision,status,config_hash,resolved_snapshot) "
+            "VALUES (:id,1,'draft',:hash,CAST(:snapshot AS jsonb)) ON CONFLICT (revision) DO NOTHING"
+        ),
+        {"id": str(uuid4()), "hash": hashlib.sha256(encoded).hexdigest(), "snapshot": encoded.decode("utf-8")},
     )
     await conn.execute(
         text(

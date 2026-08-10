@@ -27,6 +27,7 @@ _STOPWORDS = {
     "какие",
     "какой",
     "какое",
+    "каков",
     "какую",
     "когда",
     "которого",
@@ -110,7 +111,6 @@ _PART_MARKERS = (" и ", " vs ", " versus ", ";")
 _CONFLICT_MARKERS = (
     "конфликт",
     "противореч",
-    "расход",
     "разные данные",
     "какой источник верен",
     "which source is correct",
@@ -134,22 +134,27 @@ def decide_answerability(
     covered_names = [name for name in key_names if normalize_for_embedding(name) in all_text]
     missing_names = [name for name in key_names if name not in covered_names]
     exact_title_match = _has_exact_or_redirect_title_match(query, evidence)
+    definition_query = _is_definition_query(query)
+    entity_alignment = _has_entity_alignment(query, evidence)
+    ambiguous_entity = _has_ambiguous_entity_candidates(query, evidence)
     answer_terms, covered_answer_terms, missing_answer_terms = _answer_bearing_terms(query, evidence)
     top_score = _top_relevance_score(evidence)
     page_diversity = _page_diversity(evidence)
     conflicting = _has_explicit_conflict(query, evidence)
     required_count = len(required_parts)
     coverage_ratio = len(covered_parts) / max(required_count, 1)
-    score_threshold = 0.65
     values_ok = len(covered_values) == len(key_values)
     names_ok = len(covered_names) == len(key_names)
-    strong_match = exact_title_match or top_score >= score_threshold
+    rank_confidence = _rank_confidence(evidence)
+    strong_match = exact_title_match or (not definition_query and entity_alignment and rank_confidence >= 0.75)
     enough_diversity = page_diversity >= min(required_count, 2)
 
     signals: dict[str, Any] = {
         "exact_title_match": exact_title_match,
+        "entity_alignment": entity_alignment,
+        "ambiguous_entity": ambiguous_entity,
         "top_relevance_score": top_score,
-        "top_score_threshold": score_threshold,
+        "rank_confidence": rank_confidence,
         "page_diversity": page_diversity,
         "required_part_count": required_count,
         "covered_part_count": len(covered_parts),
@@ -211,12 +216,13 @@ def decide_answerability(
             missing_parts=missing_parts,
             signals=signals,
         )
-    if covered_parts or exact_title_match or top_score >= score_threshold:
+    reason = "ambiguous_entity" if definition_query and ambiguous_entity else "partial_context_coverage"
+    if covered_parts or exact_title_match or entity_alignment or evidence:
         return AnswerabilityDecision(
             version=GATE_VERSION,
             status=AnswerabilityStatus.partial,
             confidence=max(0.35, min(0.75, coverage_ratio)),
-            reason="partial_context_coverage",
+            reason=reason,
             required_parts=required_parts,
             covered_parts=covered_parts,
             missing_parts=missing_parts or missing_names,
@@ -294,21 +300,73 @@ def _part_is_covered(part: str, evidence: Sequence[Evidence]) -> bool:
 
 
 def _has_exact_or_redirect_title_match(query: str, evidence: Sequence[Evidence]) -> bool:
-    normalized_query = normalize_for_embedding(query)
-    query_terms = set(normalized_query.split())
+    query_titles = _query_title_candidates(query)
+    if not query_titles:
+        return False
     for item in evidence:
         for title in _candidate_titles(item).split("\n"):
             normalized_title = normalize_for_embedding(title)
-            title_terms = set(normalized_title.split())
-            if not normalized_title or not title_terms:
+            if not normalized_title:
                 continue
-            if (
-                normalized_title in normalized_query
-                or title_terms <= query_terms
-                or _terms_overlap(title_terms, query_terms)
-            ):
+            if normalized_title in query_titles:
                 return True
     return False
+
+
+def _query_title_candidates(query: str) -> set[str]:
+    candidates = {
+        normalize_for_embedding(item)
+        for item in re.findall(r"[«\"]([^»\"]+)[»\"]", query)
+        if normalize_for_embedding(item)
+    }
+    normalized = normalize_for_embedding(query)
+    for prefix in (
+        "что такое ",
+        "кто такой ",
+        "кто такая ",
+        "расскажи о ",
+        "what is ",
+        "who is ",
+    ):
+        if normalized.startswith(prefix):
+            tail = normalized.removeprefix(prefix).strip(" ?!.,")
+            if tail:
+                candidates.add(tail)
+    candidates.update(normalize_for_embedding(item) for item in _extract_names(query))
+    return {item for item in candidates if item}
+
+
+def _is_definition_query(query: str) -> bool:
+    normalized = normalize_for_embedding(query)
+    return normalized.startswith(("что такое ", "кто такой ", "кто такая ", "what is ", "who is "))
+
+
+def _has_entity_alignment(query: str, evidence: Sequence[Evidence]) -> bool:
+    names = {normalize_for_embedding(item) for item in _extract_names(query)}
+    if not names:
+        return False
+    for item in evidence:
+        title_terms = set(normalize_for_embedding(_candidate_titles(item)).split())
+        if any(_terms_overlap({name}, title_terms) for name in names):
+            return True
+    return False
+
+
+def _has_ambiguous_entity_candidates(query: str, evidence: Sequence[Evidence]) -> bool:
+    candidates = _query_title_candidates(query)
+    if not candidates:
+        return False
+    matched_titles = {
+        normalize_for_embedding(title)
+        for item in evidence
+        for title in _candidate_titles(item).split("\n")
+        if normalize_for_embedding(title)
+        and (
+            normalize_for_embedding(title) in candidates
+            or any(candidate in normalize_for_embedding(title) for candidate in candidates)
+        )
+    }
+    return len(matched_titles) > 1 and not _has_exact_or_redirect_title_match(query, evidence)
 
 
 def _answer_bearing_terms(query: str, evidence: Sequence[Evidence]) -> tuple[set[str], set[str], set[str]]:
@@ -371,6 +429,23 @@ def _top_relevance_score(evidence: Sequence[Evidence]) -> float:
     return 0.0
 
 
+def _rank_confidence(evidence: Sequence[Evidence]) -> float:
+    if not evidence:
+        return 0.0
+    ranks = evidence[0].ranks
+    for key, scale in (("rerank", 20.0), ("fusion", 30.0), ("dense", 50.0), ("bm25", 50.0)):
+        raw = ranks.get(key)
+        if isinstance(raw, int) and raw >= 1:
+            return max(0.0, 1.0 - (raw - 1) / scale)
+    # Test/mock providers may not attach ranks. Treat a rerank score as a
+    # stage-local confidence only when the complete evidence set is otherwise
+    # requirement-covered; it is never compared with BM25/dense scores.
+    score = evidence[0].scores.get("rerank")
+    if isinstance(score, int | float):
+        return max(0.0, min(0.9, float(score) + 0.1))
+    return 0.0
+
+
 def _page_diversity(evidence: Sequence[Evidence]) -> int:
     pages: set[str] = set()
     for item in evidence:
@@ -429,14 +504,24 @@ def _evidence_text(evidence: Sequence[Evidence]) -> str:
 
 
 def _has_explicit_conflict(query: str, evidence: Sequence[Evidence]) -> bool:
-    normalized_query = query.casefold()
-    if not any(marker in normalized_query for marker in _CONFLICT_MARKERS):
+    normalized_query = normalize_for_embedding(query)
+    explicit = any(marker in normalized_query for marker in _CONFLICT_MARKERS)
+    # Ordinary fact questions often contain tables with many legitimate
+    # values. Only an explicit conflict request can activate the hard gate.
+    if not explicit:
         return False
-    per_evidence_values = [
-        set(_extract_values(f"{item.title} {' '.join(item.section_path)} {item.content}")) for item in evidence
-    ]
-    non_empty = [values for values in per_evidence_values if values]
+    by_document: dict[str, set[str]] = {}
+    for item in evidence:
+        document_key = str(item.document_id or item.metadata.get("document_id") or item.source_url or item.title)
+        by_document.setdefault(document_key, set()).update(
+            _extract_values(f"{item.title} {' '.join(item.section_path)} {item.content}")
+        )
+    non_empty = [values for values in by_document.values() if values]
     if len(non_empty) < 2:
         return False
-    first = non_empty[0]
-    return any(values.isdisjoint(first) for values in non_empty[1:])
+    values = {value.casefold() for group in non_empty for value in group}
+    if len(values) < 2:
+        return False
+    if explicit:
+        return any(values_group.isdisjoint(non_empty[0]) for values_group in non_empty[1:])
+    return False

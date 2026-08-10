@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal, TextIO
 
@@ -11,7 +11,6 @@ from wikipediarag.answerability import GATE_VERSION as ANSWERABILITY_GATE_VERSIO
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.eval.api_client import EvalApiClient, HttpEvalApiClient
 from wikipediarag.eval.artifacts import ARTIFACT_ROOT, append_jsonl, read_json, read_jsonl, utc_now_iso, write_json
-from wikipediarag.eval.corpus import load_chunk_refs
 from wikipediarag.eval.diagnostics import answer_result_diagnosis, diagnose_answer_task, root_cause_count_metrics
 from wikipediarag.eval.hashing import stable_json_hash
 from wikipediarag.eval.metrics import aggregate, percentile, score_task
@@ -26,12 +25,13 @@ from wikipediarag.eval.schemas import (
     EvalTaskResult,
     TaskScores,
 )
+from wikipediarag.reliability import RetryPolicy, safe_failure_from_exception
 from wikipediarag.retrieval_profile import get_retrieval_profile
 
 type EvalRunProgressCallback = Callable[[EvalRunStatus, str], None]
 
 DEFAULT_ANSWER_EVAL_BATCH_SIZE = 6
-ANSWER_EVAL_MAX_ATTEMPTS = 3
+ANSWER_EVAL_MAX_ATTEMPTS = 2
 EVAL_SEMANTICS_VERSION = "reviewed_gate_semantics_v4"
 
 
@@ -329,6 +329,7 @@ async def run_suite(
         _emit(progress_callback, status, "run_completed")
         return run_manifest
     except Exception as exc:
+        failure = safe_failure_from_exception(exc, stage=status.phase)
         status = _advance_status(
             status,
             started=started,
@@ -345,7 +346,7 @@ async def run_suite(
                 "state": "failed",
                 "phase": "failed",
                 "updated_at": utc_now_iso(),
-                "error_message": type(exc).__name__ + ": " + str(exc),
+                "error_message": failure.error_code,
             }
         )
         _write_status(status)
@@ -366,25 +367,39 @@ async def run_task(
     report_id: str = "",
     run_started_at: str = "",
     root_run_contract_id: str = "",
+    max_attempts: int = ANSWER_EVAL_MAX_ATTEMPTS,
+    retry_slot_acquire: Callable[[dict[str, Any]], Awaitable[bool]] | None = None,
 ) -> EvalTaskResult:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
     started = time.perf_counter()
     attempt_records: list[dict[str, Any]] = []
-    for attempt in range(1, ANSWER_EVAL_MAX_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
+        chat_kwargs: dict[str, Any] = {
+            "api": api,
+            "retrieval_profile": config.retrieval_profile,
+            "retrieval_overrides": config.retrieval_overrides,
+            "mode": config.mode,
+        }
+        if task.knowledge_base_ids:
+            chat_kwargs["knowledge_base_ids"] = task.knowledge_base_ids
         try:
-            payload = await asyncio.to_thread(
-                client.run_chat,
-                task.question,
-                api=api,
-                retrieval_profile=config.retrieval_profile,
-                retrieval_overrides=config.retrieval_overrides,
-                mode=config.mode,
-            )
+            async_run_chat = getattr(client, "run_chat_async", None)
+            if callable(async_run_chat):
+                payload = await async_run_chat(task.question, **chat_kwargs)
+            else:
+                # Compatibility for deterministic test clients. Production
+                # HttpEvalApiClient uses the cancellable async path above.
+                payload = await asyncio.to_thread(client.run_chat, task.question, **chat_kwargs)
         except Exception as exc:
             total_ms = int((time.perf_counter() - started) * 1000)
             failure = _failure_from_exception(exc, attempt=attempt)
             attempt_records.append(failure)
-            if attempt < ANSWER_EVAL_MAX_ATTEMPTS:
-                await asyncio.sleep(min(2.0, 0.5 * attempt))
+            retry_allowed = attempt < max_attempts and bool(failure.get("retryable", True))
+            if retry_allowed and retry_slot_acquire is not None:
+                retry_allowed = await retry_slot_acquire(failure)
+            if retry_allowed:
+                await asyncio.sleep(RetryPolicy().delay_seconds(attempt))
                 continue
             return _failed_result(
                 task,
@@ -403,8 +418,11 @@ async def run_task(
         if payload.get("failed"):
             failure = _failure_from_payload(payload, attempt=attempt)
             attempt_records.append(failure)
-            if attempt < ANSWER_EVAL_MAX_ATTEMPTS:
-                await asyncio.sleep(min(2.0, 0.5 * attempt))
+            retry_allowed = attempt < max_attempts and bool(failure.get("retryable", True))
+            if retry_allowed and retry_slot_acquire is not None:
+                retry_allowed = await retry_slot_acquire(failure)
+            if retry_allowed:
+                await asyncio.sleep(RetryPolicy().delay_seconds(attempt))
                 continue
             return _failed_result(
                 task,
@@ -431,10 +449,14 @@ async def run_task(
         if effective_run_contract_id:
             contract_ids["run_contract_id"] = effective_run_contract_id
         answer = str(payload.get("answer") or "")
-        prefusion, reranked = await _extract_candidates(retrieval, settings)
+        # The benchmark client is intentionally public-API-only.  The chat
+        # response already carries document/chunk provenance in its evidence
+        # and stage events, so do not resolve chunk IDs through PostgreSQL.
+        prefusion, reranked = _extract_candidates(retrieval)
         evidence = list(retrieval.get("evidence") or [])
         cited_ids = [str(item) for item in validation.get("citations", [])]
         cited_chunk_ids = _cited_chunk_ids(cited_ids, evidence)
+        cited_document_ids = _cited_document_ids(cited_ids, evidence)
         cited_urls = _cited_urls(cited_ids, evidence)
         gold_urls = [item.source_url for item in task.gold_evidence if item.source_url]
         kiwix_ok = await asyncio.to_thread(_all_urls_ok, client, [*gold_urls, *cited_urls])
@@ -444,18 +466,22 @@ async def run_task(
             reranked=reranked,
             prefusion=prefusion,
             cited_chunk_ids=cited_chunk_ids,
+            cited_document_ids=cited_document_ids,
             kiwix_url_ok=kiwix_ok,
         )
         diagnosis = diagnose_answer_task(task, status="completed", scores=scores)
         retrieval_latency = _retrieval_latency_ms(retrieval)
         timings_ms = _combined_timings_ms(usage_data, retrieval, validation)
-        model_calls = _estimate_model_calls(config, retrieval)
+        model_call_ids = _model_call_ids(validation, retrieval)
+        reported_cost = _cost(validation)
         usage = {
             "input_tokens": _usage_int(validation.get("usage"), "prompt_tokens"),
             "output_tokens": _usage_int(validation.get("usage"), "completion_tokens"),
             "total_tokens": _usage_int(validation.get("usage"), "total_tokens"),
-            "estimated_cost_usd": _cost(validation),
-            "model_calls": model_calls,
+            "provider_cost_usd": reported_cost,
+            "provider_cost_source": "reported" if reported_cost is not None else None,
+            "model_calls": len(model_call_ids) if model_call_ids else None,
+            "model_call_ids": model_call_ids,
             "attempts": attempt,
             "retry_errors": [str(record.get("safe_message") or record.get("code") or "") for record in attempt_records],
             "attempt_records": attempt_records,
@@ -476,6 +502,7 @@ async def run_task(
             answer=answer,
             citations=cited_ids,
             cited_chunk_ids=cited_chunk_ids,
+            cited_document_ids=cited_document_ids,
             retrieved_candidates=prefusion,
             reranked_candidates=reranked,
             mode_selected="harness" if _used_harness(retrieval) else "normal",
@@ -494,6 +521,8 @@ async def run_task(
             errors=[],
             query_run_id=str(payload.get("query_run_id")) if payload.get("query_run_id") else None,
             trace_id=str(payload.get("trace_id")) if payload.get("trace_id") else None,
+            server_terminal_event=bool(payload.get("server_terminal_event", False)),
+            last_sequence=int(payload.get("last_sequence") or 0),
             corpus={
                 "snapshot_id": manifest.snapshot_id,
                 "index_version": manifest.index_version,
@@ -520,7 +549,7 @@ async def run_task(
             "retryable": True,
             "safe_message": "chat failed without result",
             "last_successful_stage": "",
-            "attempt": ANSWER_EVAL_MAX_ATTEMPTS,
+            "attempt": max_attempts,
         },
     )
 
@@ -691,10 +720,7 @@ def summarize_config(config: EvalConfig, tasks: list[EvalTask], results: list[Ev
     )
 
 
-async def _extract_candidates(
-    retrieval: dict[str, Any],
-    settings: Settings,
-) -> tuple[list[CandidateRef], list[CandidateRef]]:
+def _extract_candidates(retrieval: dict[str, Any]) -> tuple[list[CandidateRef], list[CandidateRef]]:
     events = [dict(item) for item in retrieval.get("events", []) if isinstance(item, dict)]
     prefusion_raw = (
         _stage_candidates(events, "rrf") or _stage_candidates(events, "bm25") or _stage_candidates(events, "dense")
@@ -703,27 +729,33 @@ async def _extract_candidates(
     evidence_raw = _evidence_candidates(retrieval)
     reranked_raw = _stage_candidates(events, "rerank") or context_raw or evidence_raw or prefusion_raw
     prefusion_raw = prefusion_raw or context_raw or evidence_raw
-    ids = [str(item.get("chunk_id")) for item in [*prefusion_raw, *reranked_raw] if item.get("chunk_id")]
-    refs = await load_chunk_refs(ids, settings=settings)
-    return _candidate_refs(prefusion_raw, refs, "prefusion"), _candidate_refs(reranked_raw, refs, "rerank")
+    evidence_by_chunk = {
+        str(item.get("chunk_id")): item
+        for item in retrieval.get("evidence", [])
+        if isinstance(item, dict) and item.get("chunk_id")
+    }
+    return (
+        _candidate_refs(prefusion_raw, evidence_by_chunk, "prefusion"),
+        _candidate_refs(reranked_raw, evidence_by_chunk, "rerank"),
+    )
 
 
 def _candidate_refs(
     candidates: list[dict[str, Any]],
-    refs: dict[str, Any],
+    evidence_by_chunk: dict[str, dict[str, Any]],
     stage: str,
 ) -> list[CandidateRef]:
     output: list[CandidateRef] = []
     for rank, item in enumerate(candidates[:20], start=1):
         chunk_id = str(item.get("chunk_id") or "")
-        ref = refs.get(chunk_id)
+        ref = evidence_by_chunk.get(chunk_id, {})
         output.append(
             CandidateRef(
                 chunk_id=chunk_id,
-                document_id=ref.document_id if ref else "",
-                section_id=ref.section_id if ref else "",
-                title=str(item.get("title") or (ref.title if ref else "")),
-                source_url=str(item.get("source_url") or (ref.source_url if ref else "")),
+                document_id=str(item.get("document_id") or ref.get("document_id") or ""),
+                section_id=str(item.get("section_id") or ref.get("section_id") or ""),
+                title=str(item.get("title") or ref.get("title") or ""),
+                source_url=str(item.get("source_url") or ref.get("source_url") or ""),
                 rank=rank,
                 stage=stage,
                 scores={key: float(value) for key, value in dict(item.get("scores") or {}).items()},
@@ -766,6 +798,13 @@ def _cited_chunk_ids(cited_ids: list[str], evidence: list[Any]) -> list[str]:
     return [by_id[item] for item in cited_ids if item in by_id]
 
 
+def _cited_document_ids(cited_ids: list[str], evidence: list[Any]) -> list[str]:
+    by_id = {
+        str(item.get("evidence_id")): str(item.get("document_id") or "") for item in evidence if isinstance(item, dict)
+    }
+    return [by_id[item] for item in cited_ids if item in by_id and by_id[item]]
+
+
 def _cited_urls(cited_ids: list[str], evidence: list[Any]) -> list[str]:
     by_id = {str(item.get("evidence_id")): str(item.get("source_url")) for item in evidence if isinstance(item, dict)}
     return [by_id[item] for item in cited_ids if item in by_id and by_id[item]]
@@ -784,7 +823,8 @@ def _eval_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
             "fusion_top_k": 60,
             "rerank_top_k": 50,
         },
-        "postprocess": {"final_evidence_max": 20},
+        # Keep generation context aligned with the profile default. The
+        # benchmark still measures top-20 retrieval candidates separately.
     }
     return _deep_merge(merged, overrides)
 
@@ -824,6 +864,14 @@ def _aggregate_results(
         "page_recall_at_5": aggregate(score.page_recall["5"] for score in retrieval_scores),
         "page_recall_at_10": aggregate(score.page_recall["10"] for score in retrieval_scores),
         "page_recall_at_20": aggregate(score.page_recall["20"] for score in retrieval_scores),
+        "document_recall_at_1": aggregate(score.document_recall.get("1", 0.0) for score in retrieval_scores),
+        "document_recall_at_5": aggregate(score.document_recall.get("5", 0.0) for score in retrieval_scores),
+        "document_recall_at_10": aggregate(score.document_recall.get("10", 0.0) for score in retrieval_scores),
+        "document_mrr_at_10": aggregate(score.document_mrr_at_10 for score in retrieval_scores),
+        "document_reranker_gold_delta": aggregate(
+            score.document_reranker_gold_delta or 0.0 for score in retrieval_scores
+        ),
+        "document_ndcg_at_10": aggregate(score.document_ndcg_at_10 for score in retrieval_scores),
         "section_recall_at_5": aggregate(score.section_recall["5"] for score in retrieval_scores),
         "section_recall_at_10": aggregate(score.section_recall["10"] for score in retrieval_scores),
         "section_recall_at_20": aggregate(score.section_recall["20"] for score in retrieval_scores),
@@ -839,16 +887,31 @@ def _aggregate_results(
         ),
         "exact_match": aggregate(score.exact_match for score in scores),
         "token_f1": aggregate(score.token_f1 for score in scores),
+        "rouge_l": aggregate(score.rouge_l for score in scores),
         "citation_precision": aggregate(score.citation_precision for score in scores),
         "citation_recall": aggregate(score.citation_recall for score in scores),
+        "document_citation_precision": aggregate(score.document_citation_precision for score in scores),
+        "document_citation_recall": aggregate(score.document_citation_recall for score in scores),
         "unsupported_claim_rate": aggregate(score.unsupported_claim_rate for score in scores),
         "cited_hard_negative_rate": aggregate(score.cited_hard_negative_rate for score in scores),
         "kiwix_url_ok": aggregate(score.kiwix_url_ok for score in scores),
         "latency_p50_ms": percentile(latencies, 50),
         "latency_p95_ms": percentile(latencies, 95),
-        "model_calls": aggregate(float(result.usage.get("model_calls", 0)) for result in results),
-        "tokens": aggregate(float(result.usage.get("total_tokens", 0)) for result in results),
-        "openrouter_cost_usd": aggregate(float(result.usage.get("estimated_cost_usd", 0.0)) for result in results),
+        "model_calls": aggregate(
+            float(result.usage["model_calls"])
+            for result in results
+            if isinstance(result.usage.get("model_calls"), int | float)
+        ),
+        "tokens": aggregate(
+            float(result.usage["total_tokens"])
+            for result in results
+            if isinstance(result.usage.get("total_tokens"), int | float)
+        ),
+        "openrouter_cost_usd": aggregate(
+            float(result.usage["provider_cost_usd"])
+            for result in results
+            if isinstance(result.usage.get("provider_cost_usd"), int | float)
+        ),
     }
     if unanswerable_scores:
         metrics["unanswerable_accuracy"] = aggregate(score.unanswerable_accuracy for score in unanswerable_scores)
@@ -864,6 +927,8 @@ def _task_failed_threshold(task: EvalTask | None, scores: TaskScores | None) -> 
         return True
     if task.unanswerable:
         return scores.unanswerable_accuracy < 1.0
+    if task.evaluation_granularity == "document" or task.gold_document_ids:
+        return scores.document_recall.get("10", 0.0) < 1.0 or scores.document_citation_precision < 1.0
     return (
         scores.page_recall["10"] < 1.0
         or scores.chunk_recall["20"] < 1.0
@@ -892,12 +957,26 @@ def _failed_result(
     usage_event = dict(payload.get("usage") or {})
     usage_data = dict(usage_event.get("data") or {})
     failed_event = dict(payload.get("failed_event") or {})
-    failed_data = dict(failed_event.get("data") or {})
+    failed_envelope = dict(failed_event.get("data") or {})
+    failed_data = dict(failed_envelope.get("data") or failed_envelope)
     retrieval = dict(usage_data.get("retrieval") or failed_data.get("retrieval") or {})
     prefusion = _candidate_refs_sync(_safe_candidates_from_retrieval(retrieval, "prefusion"), "prefusion")
     reranked = _candidate_refs_sync(_safe_candidates_from_retrieval(retrieval, "rerank"), "rerank")
     failure_stage = str(failure.get("stage") or failed_data.get("stage") or "chat")
     failure_code = str(failure.get("code") or failed_data.get("code") or "chat_failed")
+    retrieval_scores = (
+        score_task(
+            task,
+            answer="",
+            reranked=reranked,
+            prefusion=prefusion,
+            cited_chunk_ids=[],
+            cited_document_ids=[],
+            kiwix_url_ok=True,
+        )
+        if retrieval
+        else None
+    )
     last_successful_stage = str(failure.get("last_successful_stage") or failed_data.get("last_successful_stage") or "")
     attempts = max(
         int(failure.get("attempt") or failed_data.get("attempt") or 1),
@@ -929,14 +1008,30 @@ def _failed_result(
         ),
         attempts=attempts,
         last_successful_stage=last_successful_stage,
-        latency_ms={"total": latency_ms},
-        usage={"attempts": attempts, "attempt_records": attempt_records or []},
+        latency_ms={"total": latency_ms, "retrieval": _retrieval_latency_ms(retrieval)},
+        usage={
+            "attempts": attempts,
+            "attempt_records": attempt_records or [],
+            "retrieval_snapshot": _safe_retrieval_snapshot(retrieval),
+            "failure": {
+                "stage": failure_stage,
+                "code": failure_code,
+                "retryable": bool(
+                    failure.get("retryable") if "retryable" in failure else failed_data.get("retryable", True)
+                ),
+                "attempt": attempts,
+                "last_successful_stage": last_successful_stage,
+            },
+        },
         diagnosis=diagnose_answer_task(task, status="failed", scores=None),
+        retrieval_scores=retrieval_scores,
         errors=[error],
         query_run_id=str(payload.get("query_run_id")) if payload.get("query_run_id") else None,
         trace_id=str(payload.get("trace_id") or failed_data.get("trace_id"))
         if payload.get("trace_id") or failed_data.get("trace_id")
         else None,
+        server_terminal_event=bool(payload.get("server_terminal_event", False)),
+        last_sequence=int(payload.get("last_sequence") or 0),
         corpus={
             "snapshot_id": manifest.snapshot_id,
             "index_version": manifest.index_version,
@@ -952,6 +1047,53 @@ def _retrieval_latency_ms(retrieval: dict[str, Any]) -> int:
         if isinstance(event, dict) and event.get("stage") == "context" and event.get("latency_ms") is not None:
             return int(event["latency_ms"])
     return 0
+
+
+def _model_call_ids(validation: dict[str, Any], retrieval: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    metadata = validation.get("model_gateway")
+    if isinstance(metadata, dict):
+        value = metadata.get("provider_request_id") or metadata.get("call_id")
+        if isinstance(value, str) and value:
+            ids.append(value)
+    for event in retrieval.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        metadata = event.get("model_gateway")
+        if isinstance(metadata, dict):
+            value = metadata.get("provider_request_id") or metadata.get("call_id")
+            if isinstance(value, str) and value:
+                ids.append(value)
+    return sorted(set(ids))
+
+
+def _safe_retrieval_snapshot(retrieval: dict[str, Any]) -> dict[str, Any]:
+    """Keep provenance useful for failed generation without persisting content."""
+
+    if not retrieval:
+        return {}
+    evidence = []
+    for item in list(retrieval.get("evidence") or [])[:20]:
+        if not isinstance(item, dict):
+            continue
+        evidence.append(
+            {
+                key: item.get(key)
+                for key in ("evidence_id", "chunk_id", "document_id", "document_version_id", "title", "source_url")
+                if item.get(key) is not None
+            }
+        )
+    return {
+        "index_contract_id": retrieval.get("index_contract_id"),
+        "run_contract_id": retrieval.get("run_contract_id"),
+        "evidence": evidence,
+        "candidate_count": sum(
+            len(event.get("candidates") or []) for event in retrieval.get("events", []) if isinstance(event, dict)
+        ),
+        "answerability_status": (retrieval.get("answerability") or {}).get("status")
+        if isinstance(retrieval.get("answerability"), dict)
+        else None,
+    }
 
 
 def _combined_timings_ms(
@@ -994,7 +1136,8 @@ def _step_events_from_payload(
     usage_event = dict(payload.get("usage") or {})
     usage_data = dict(usage_event.get("data") or {})
     failed_event = dict(payload.get("failed_event") or {})
-    failed_data = dict(failed_event.get("data") or {})
+    failed_envelope = dict(failed_event.get("data") or {})
+    failed_data = dict(failed_envelope.get("data") or failed_envelope)
     retrieval = dict(usage_data.get("retrieval") or failed_data.get("retrieval") or {})
     events = list(retrieval.get("events") or [])
     output: list[dict[str, Any]] = [
@@ -1085,23 +1228,49 @@ def _step_event_from_retrieval_event(name: str, event: dict[str, Any], *, attemp
 
 
 def _failure_from_exception(exc: Exception, *, attempt: int) -> dict[str, Any]:
-    return {
-        "stage": "api_request",
-        "code": type(exc).__name__,
-        "retryable": True,
+    failure = safe_failure_from_exception(exc, stage="api_request", attempt=attempt)
+    output: dict[str, Any] = {
+        "stage": failure.stage,
+        "code": failure.error_code,
+        "retryable": failure.retryable,
         "attempt": attempt,
         "last_successful_stage": "",
-        "safe_message": type(exc).__name__,
+        "safe_message": failure.error_code,
     }
+    metadata = getattr(exc, "metadata", None)
+    if isinstance(metadata, dict):
+        output["model_call_metadata"] = {
+            key: metadata.get(key)
+            for key in (
+                "model_alias",
+                "provider_request_id",
+                "finish_reason",
+                "max_output_tokens",
+                "latency_ms",
+                "usage",
+            )
+            if metadata.get(key) is not None
+        }
+    return output
 
 
 def _failure_from_payload(payload: dict[str, Any], *, attempt: int) -> dict[str, Any]:
     failed_event = dict(payload.get("failed_event") or {})
-    data = dict(failed_event.get("data") or {})
+    envelope = dict(failed_event.get("data") or {})
+    data = dict(envelope.get("data") or envelope)
+    nested_failure = dict(payload.get("failure") or {})
+    code = str(data.get("code") or nested_failure.get("code") or payload.get("error") or "run_failed")
+    non_retryable = {
+        "CONTRACT_MISMATCH",
+        "CHECKSUM_MISMATCH",
+        "PARSER_REJECTED",
+        "KB_NOT_READY",
+        "VALIDATION_ERROR",
+    }
     return {
-        "stage": str(data.get("stage") or "chat"),
-        "code": str(data.get("code") or payload.get("error") or "run_failed"),
-        "retryable": bool(data.get("retryable", True)),
+        "stage": str(data.get("stage") or nested_failure.get("stage") or "chat"),
+        "code": code,
+        "retryable": bool(data.get("retryable", nested_failure.get("retryable", code not in non_retryable))),
         "attempt": int(data.get("attempt") or attempt),
         "last_successful_stage": str(data.get("last_successful_stage") or ""),
         "safe_message": str(data.get("safe_message") or data.get("error") or payload.get("error") or "run failed"),
@@ -1425,14 +1594,14 @@ def _estimate_model_calls(config: EvalConfig, retrieval: dict[str, Any]) -> int:
     return 1 + retrieval_calls + verifier_calls
 
 
-def _usage_int(usage: Any, key: str) -> int:
+def _usage_int(usage: Any, key: str) -> int | None:
     if not isinstance(usage, dict):
-        return 0
+        return None
     value = usage.get(key)
-    return int(value) if isinstance(value, int | float | str) and str(value).replace(".", "", 1).isdigit() else 0
+    return int(value) if isinstance(value, int | float | str) and str(value).replace(".", "", 1).isdigit() else None
 
 
-def _cost(validation: dict[str, Any]) -> float:
+def _cost(validation: dict[str, Any]) -> float | None:
     for key in ("provider_cost", "cost", "total_cost"):
         value = validation.get(key)
         if isinstance(value, int | float | str):
@@ -1449,4 +1618,4 @@ def _cost(validation: dict[str, Any]) -> float:
                     return float(value)
                 except ValueError:
                     return 0.0
-    return 0.0
+    return None

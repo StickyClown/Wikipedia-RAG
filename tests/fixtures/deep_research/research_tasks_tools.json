@@ -1,0 +1,304 @@
+{
+  "schema_version": "deep_research_fixture_v1",
+  "tasks": [
+    {
+      "task_id": "section_alias_owner_chain",
+      "topic": "Кто утверждает emergency change для инициативы Silver Quarry?",
+      "documents": [
+        {
+          "id": "silver_overview",
+          "filename": "silver-overview.md",
+          "content_type": "text/markdown",
+          "content": "# Silver overview\n\nDR_TOOL_SECTION_ALIAS Silver Quarry в change catalog проходит как SQ-7. Детали утверждения смотри в разделе Owner Matrix документа SQ-7 operations dossier."
+        },
+        {
+          "id": "sq7_dossier",
+          "filename": "sq7-dossier.md",
+          "content_type": "text/markdown",
+          "content": "# SQ-7 operations dossier\n\n## Summary\n\nDR_TOOL_SECTION_SUMMARY SQ-7 covers the Harbor Mesh rollout. Approval path uses the Owner Matrix section.\n\n## Owner Matrix\n\nDR_TOOL_SECTION_OWNER Owner Matrix: emergency changes для Harbor Mesh утверждает team Delta Pier."
+        },
+        {
+          "id": "harbor_mesh_map",
+          "filename": "harbor-mesh-map.md",
+          "content_type": "text/markdown",
+          "content": "# Service map\n\nDR_TOOL_SECTION_SERVICE Harbor Mesh is the service name linked to SQ-7."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Silver Quarry", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "SQ-7", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "Owner Matrix", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "Harbor Mesh", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "silver_overview", "marker": "DR_TOOL_SECTION_ALIAS" },
+        { "document_id": "sq7_dossier", "marker": "DR_TOOL_SECTION_OWNER" },
+        { "document_id": "harbor_mesh_map", "marker": "DR_TOOL_SECTION_SERVICE" }
+      ],
+      "expected_coverage": { "min_total": 3, "min_covered": 2, "allow_partial": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 3,
+        "min_document_tool_calls": 1,
+        "min_derived_questions": 3,
+        "required_tool_names": ["extended_search", "document_section_lookup"],
+        "derived_question_contains": ["SQ-7", "Owner Matrix", "Harbor Mesh"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["hard", "multi_source_chain", "section_lookup", "query_reformulation", "tool_loop_required"]
+    },
+    {
+      "task_id": "within_doc_exception_clause",
+      "topic": "Какой SLA rollback применяется к кейсу Ember-Lane?",
+      "documents": [
+        {
+          "id": "ember_case",
+          "filename": "ember-case.md",
+          "content_type": "text/markdown",
+          "content": "# Case register\n\nDR_TOOL_WITHIN_CASE Ember-Lane относится к policy sheet EL-9."
+        },
+        {
+          "id": "el9_policy",
+          "filename": "el9-policy.md",
+          "content_type": "text/markdown",
+          "content": "# Policy EL-9\n\n## Default\n\nDR_TOOL_WITHIN_DEFAULT EL-9 default rollback SLA is 4 hours.\n\n## Exceptions\n\nDR_TOOL_WITHIN_EXCEPTION Exceptions: for cold-start migrations rollback SLA is 12 hours."
+        },
+        {
+          "id": "ember_migration",
+          "filename": "ember-migration.md",
+          "content_type": "text/markdown",
+          "content": "# Migration note\n\nDR_TOOL_WITHIN_MIGRATION Ember-Lane is a cold-start migration."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Ember-Lane", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "EL-9", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "Exceptions", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "cold-start", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "ember_case", "marker": "DR_TOOL_WITHIN_CASE" },
+        { "document_id": "el9_policy", "marker": "DR_TOOL_WITHIN_EXCEPTION" },
+        { "document_id": "ember_migration", "marker": "DR_TOOL_WITHIN_MIGRATION" }
+      ],
+      "expected_coverage": { "min_total": 3, "min_covered": 2, "allow_partial": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 3,
+        "min_document_tool_calls": 1,
+        "min_derived_questions": 3,
+        "required_tool_names": ["extended_search", "search_within_document"],
+        "derived_question_contains": ["EL-9", "Exceptions", "cold-start"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["hard", "multi_source_chain", "search_within_document", "query_reformulation", "tool_loop_required"]
+    },
+    {
+      "task_id": "csv_budget_reconciliation",
+      "topic": "Какой бюджет подтвержден для программы Northwind Orchard?",
+      "documents": [
+        {
+          "id": "northwind_alias",
+          "filename": "northwind-alias.md",
+          "content_type": "text/markdown",
+          "content": "# Portfolio alias\n\nDR_TOOL_CSV_ALIAS Northwind Orchard maps to cost center NW-314."
+        },
+        {
+          "id": "northwind_budget",
+          "filename": "northwind-budget.csv",
+          "content_type": "text/csv",
+          "content": "marker,cost_center,approved_budget,currency,period\nDR_TOOL_CSV_ROW,NW-314,1250000,USD,2026-H2\n"
+        },
+        {
+          "id": "northwind_scope",
+          "filename": "northwind-scope.md",
+          "content_type": "text/markdown",
+          "content": "# Scope note\n\nDR_TOOL_CSV_SCOPE NW-314 covers Northwind Orchard delivery and excludes partner rebates."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Northwind Orchard", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "NW-314", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "budget", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "rebates", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "northwind_alias", "marker": "DR_TOOL_CSV_ALIAS" },
+        { "document_id": "northwind_budget", "marker": "DR_TOOL_CSV_ROW" },
+        { "document_id": "northwind_scope", "marker": "DR_TOOL_CSV_SCOPE" }
+      ],
+      "expected_coverage": { "min_total": 3, "min_covered": 2, "allow_partial": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 3,
+        "min_document_tool_calls": 1,
+        "min_derived_questions": 3,
+        "required_tool_names": ["extended_search", "table_csv_lookup"],
+        "derived_question_contains": ["NW-314", "budget", "rebates"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["hard", "multi_source_chain", "csv_evidence", "query_reformulation", "tool_loop_required"]
+    },
+    {
+      "task_id": "metadata_effective_policy",
+      "topic": "Какой memo сейчас считается актуальным для Glacier Echo?",
+      "documents": [
+        {
+          "id": "glacier_index",
+          "filename": "glacier-index.md",
+          "content_type": "text/markdown",
+          "content": "# Policy index\n\nDR_TOOL_META_INDEX Glacier Echo must cite the latest published memo. Candidate memos: GE-Red and GE-Blue."
+        },
+        {
+          "id": "ge_red",
+          "filename": "ge-red-memo.md",
+          "content_type": "text/markdown",
+          "content": "# GE-Red memo\n\nDR_TOOL_META_RED GE-Red keeps pager review manual."
+        },
+        {
+          "id": "ge_blue",
+          "filename": "ge-blue-memo.md",
+          "content_type": "text/markdown",
+          "content": "# GE-Blue memo\n\nDR_TOOL_META_BLUE GE-Blue automates pager review."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Glacier Echo", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "GE-Red", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "GE-Blue", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "latest published", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "glacier_index", "marker": "DR_TOOL_META_INDEX" },
+        { "document_id": "ge_red", "marker": "DR_TOOL_META_RED" },
+        { "document_id": "ge_blue", "marker": "DR_TOOL_META_BLUE" }
+      ],
+      "expected_coverage": { "min_total": 3, "min_covered": 2, "allow_partial": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 3,
+        "min_document_tool_calls": 1,
+        "min_derived_questions": 3,
+        "required_tool_names": ["extended_search", "metadata_lookup"],
+        "derived_question_contains": ["GE-Red", "GE-Blue", "latest"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["hard", "multi_source_chain", "metadata_lookup", "query_reformulation", "tool_loop_required"]
+    },
+    {
+      "task_id": "mixed_tool_contradiction",
+      "topic": "Готов ли релиз Cobalt Drift к запуску?",
+      "documents": [
+        {
+          "id": "cobalt_ticket",
+          "filename": "cobalt-ticket.md",
+          "content_type": "text/markdown",
+          "content": "# Launch ticket\n\nDR_TOOL_CONFLICT_TICKET Cobalt Drift uses checklist CD-11 and service Ember Gate."
+        },
+        {
+          "id": "cobalt_checklist",
+          "filename": "cobalt-checklist.md",
+          "content_type": "text/markdown",
+          "content": "# Checklist CD-11\n\n## Launch status\n\nDR_TOOL_CONFLICT_CHECKLIST CD-11 says launch approved."
+        },
+        {
+          "id": "ember_gate_blockers",
+          "filename": "ember-gate-blockers.md",
+          "content_type": "text/markdown",
+          "content": "# Ember Gate blockers\n\n## Launch blockers\n\nDR_TOOL_CONFLICT_BLOCKER Ember Gate blocked: residency waiver pending."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Cobalt Drift", "allowed_statuses": ["covered", "partial", "conflicting"] },
+        { "question_contains": "CD-11", "allowed_statuses": ["covered", "partial", "conflicting"] },
+        { "question_contains": "Ember Gate", "allowed_statuses": ["covered", "partial", "conflicting"] },
+        { "question_contains": "residency", "allowed_statuses": ["conflicting", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "cobalt_ticket", "marker": "DR_TOOL_CONFLICT_TICKET" },
+        { "document_id": "cobalt_checklist", "marker": "DR_TOOL_CONFLICT_CHECKLIST" },
+        { "document_id": "ember_gate_blockers", "marker": "DR_TOOL_CONFLICT_BLOCKER" }
+      ],
+      "expected_coverage": { "min_total": 3, "min_covered": 1, "allow_partial": true, "requires_conflicting": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 3,
+        "min_document_tool_calls": 1,
+        "min_derived_questions": 3,
+        "required_tool_names": ["extended_search", "document_section_lookup"],
+        "derived_question_contains": ["CD-11", "Ember Gate", "residency"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": ["launch approved conflicts with Ember Gate blocked by pending residency waiver"],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["hard", "multi_source_chain", "contradiction", "query_reformulation", "tool_loop_required"]
+    },
+    {
+      "task_id": "acl_visible_handle_only",
+      "topic": "Что может подтвердить исследователь о проекте Cedar Veil без скрытых приложений?",
+      "documents": [
+        {
+          "id": "cedar_public",
+          "filename": "cedar-public.md",
+          "content_type": "text/markdown",
+          "content": "# Cedar public\n\nDR_TOOL_ACL_VISIBLE Cedar Veil has a visible component Lantern Dock.\n\n## Public Appendix\n\nDR_TOOL_ACL_VISIBLE_APPENDIX Public appendix confirms Lantern Dock is the only visible component."
+        },
+        {
+          "id": "cedar_secret",
+          "filename": "cedar-secret.md",
+          "content_type": "text/markdown",
+          "content": "# Cedar secret\n\nDR_TOOL_ACL_HIDDEN Cedar Veil secret component is Vault Spine.",
+          "access": {
+            "policy": "restricted",
+            "user_ids": ["00000000-0000-4000-8000-000000000000"],
+            "group_ids": []
+          },
+          "expected_visible": false
+        },
+        {
+          "id": "cedar_worklog",
+          "filename": "cedar-worklog.md",
+          "content_type": "text/markdown",
+          "content": "# Worklog\n\nDR_TOOL_ACL_CASE Viewer must rely on a visible handle only."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Cedar Veil", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "Lantern Dock", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "visible", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "cedar_public", "marker": "DR_TOOL_ACL_VISIBLE" },
+        { "document_id": "cedar_public", "marker": "DR_TOOL_ACL_VISIBLE_APPENDIX" },
+        { "document_id": "cedar_worklog", "marker": "DR_TOOL_ACL_CASE" }
+      ],
+      "expected_coverage": { "min_total": 2, "min_covered": 1, "allow_partial": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 2,
+        "min_document_tool_calls": 1,
+        "min_derived_questions": 2,
+        "required_tool_names": ["extended_search", "document_section_lookup"],
+        "derived_question_contains": ["Lantern Dock", "visible"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": [],
+      "hidden_markers": ["DR_TOOL_ACL_HIDDEN"],
+      "acl_setup": { "mode": "mixed_visibility" },
+      "quality_tags": ["hard", "acl", "security", "query_reformulation", "tool_loop_required"]
+    }
+  ]
+}

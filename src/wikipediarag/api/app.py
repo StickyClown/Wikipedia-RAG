@@ -17,7 +17,9 @@ from wikipediarag.api.routers import (
     health,
     ingestion_jobs,
     knowledge_bases,
+    model_control,
     query_runs,
+    research_plans,
     research_runs,
     search,
     sources,
@@ -25,11 +27,13 @@ from wikipediarag.api.routers import (
 )
 from wikipediarag.auth import AuthorizationError
 from wikipediarag.auth_service import AuthenticationError
+from wikipediarag.model_client import close_http_client
 
 ROUTERS = (
     health.router,
     auth.router,
     admin.router,
+    model_control.router,
     knowledge_bases.router,
     sources.router,
     ingestion_jobs.router,
@@ -38,6 +42,7 @@ ROUTERS = (
     search.router,
     chat.router,
     query_runs.router,
+    research_plans.router,
     research_runs.router,
 )
 
@@ -60,6 +65,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(AuthenticationError, cast(ExceptionHandler, handlers.authentication_exception_handler))
     app.add_exception_handler(AuthorizationError, cast(ExceptionHandler, handlers.authorization_exception_handler))
     app.router.add_event_handler("startup", handlers.startup)
+    app.router.add_event_handler("shutdown", close_http_client)
     for router in ROUTERS:
         app.include_router(router)
     return app

@@ -91,11 +91,11 @@ sequenceDiagram
 
     B->>UI: Select one or more files
     UI-->>UI: Compute SHA-256 in browser memory
-    UI->>API: POST /api/v1/uploads/batches
-    API->>DB: Create upload_batch and upload_sessions
+    UI->>API: POST /api/v1/uploads/batches with Idempotency-Key
+    API->>DB: Claim idempotency record, create upload_batch and upload_sessions
     API-->>UI: Presigned URLs and required headers
     UI->>MinIO: PUT file bytes to presigned URL
-    UI->>API: POST /api/v1/uploads/sessions/{id}:complete
+    UI->>API: POST /api/v1/uploads/sessions/{id}:complete with Idempotency-Key
     API->>DB: Create document, version, artifact metadata, job and job item
     API-->>UI: document_id, version_id and job_id
     UI->>API: GET /api/v1/uploads/batches/{batch_id}
@@ -104,7 +104,9 @@ sequenceDiagram
 ```
 
 Failure boundary: unsafe filename, duplicate batch item, checksum mismatch or
-missing object fails with a safe error before publication.
+missing object fails with a safe error before publication. Repeating the same
+key and body returns the saved safe session/job response; a changed body gets
+`409 IDEMPOTENCY_KEY_REUSED`.
 
 ## Parsing, Chunking, Embedding And Publication
 
@@ -152,22 +154,26 @@ sequenceDiagram
     participant OS as OpenSearch
     participant GW as Model Gateway
 
-    UI->>API: POST /api/v1/chat with cookie, CSRF and KB scope
+    UI->>API: POST /api/v1/chat with cookie, CSRF, KB scope and idempotency key
     API->>DB: Resolve ActorContext and require VIEWER on every KB
     API->>DB: Check active compatible index for every requested KB
-    API-->>UI: SSE run.started with safe search_plan
+    API->>DB: Create durable running query_run before external calls
+    API-->>UI: SSE run.started with safe search_plan and deadline fields
     API->>OS: BM25 and vector searches with tenant and KB filters
     API->>GW: Embedding and rerank alias calls
     API-->>API: Fuse, rerank, dedup, expand parents and assess answerability
     API->>GW: Chat completion alias call
-    API->>DB: Insert query_run and retrieval_events
+    API-->>UI: SSE stage.heartbeat every 10 s while generation is pending
+    API->>DB: Persist retrieval_events and exactly one terminal query_run state
     API-->>UI: SSE message.delta with answer and evidence
     API-->>UI: SSE usage.updated with safe diagnostics
     API-->>UI: SSE run.completed
 ```
 
 Failure boundary: missing role or not-ready KB fails safely before partial
-retrieval. User sees stream failure only where the UI renders it.
+retrieval. Disconnect cancels the stream/model task and persists `cancelled`;
+completion/failure has one terminal SSE event. A repeated completed
+`client_request_id` replays its terminal result without another model call.
 
 ## Extended Search
 
@@ -215,13 +221,17 @@ sequenceDiagram
     W->>DB: Claim ingestion_job kind deep_research
     loop One open question per episode
         W->>DB: Create research_episode and query_run
-        W->>OS: Run Extended Search retrieval for the single KB
-        W->>GW: Use Model Gateway aliases through retrieval stack when configured
+        W->>DB: Load ACL-visible evidence, coverage and compact checkpoint
+        W->>GW: Planner decision through alias or deterministic mock fallback
+        W->>DB: Persist safe tool metadata with normalized query hash
+        W->>OS: Run planner-approved Extended Search for the single KB
         W->>DB: Persist retrieval_events on query_run
-        W->>DB: Upsert evidence, coverage, claim and reflection records
+        W->>GW: Verify claims through Model Gateway alias when profile requires
+        W->>DB: Upsert evidence, verified claims, coverage and reflection records
+        W->>DB: Append deduplicated derived questions with evidence lineage
         W->>DB: Complete episode and checkpoint run progress
     end
-    W->>DB: Build final_report from typed visible evidence state
+    W->>DB: Build final_report from ACL-visible evidence and verified claims
     UI->>API: GET /api/v1/research-runs/{id}
     API->>DB: Reapply current document ACL trimming
     API-->>UI: Progress, coverage, evidence, reflections and report
@@ -231,6 +241,12 @@ Pause and cancel requests are cooperative. The API marks the run and active job
 as requested; the worker stops at an episode boundary and records the stop
 reason. Resume enqueues a new `deep_research` job that continues from open
 questions and existing typed memory.
+
+The planner is bounded and can select only the internal `extended_search` tool
+in this version. Its raw tool query is not returned in public API detail or
+validation artifacts; the durable ledger contains only a normalized hash and
+safe result metadata. `conflicting` coverage appends a repair-style derived
+question before the report can present confident synthesis.
 
 Failure boundary: missing KB role or incompatible active index fails before run
 creation. If the original run creator later loses `VIEWER`, worker execution
@@ -310,6 +326,7 @@ sequenceDiagram
     API-->>Client: ok or degraded
 ```
 
-API `/ready` currently checks PostgreSQL and Model Gateway readiness. Redis,
-MinIO and OpenSearch readiness checks were not confirmed in the API
-implementation.
+API `/ready` checks PostgreSQL, worker heartbeat, Model Gateway, MinIO and
+OpenSearch, plus required parser services when configured. Redis/Valkey is a
+non-fatal cache dependency and is intentionally not part of the hard readiness
+set.

@@ -8,7 +8,14 @@ import pytest
 from wikipediarag.answering import generate_answer, validate_citations, validate_citations_with_policy
 from wikipediarag.config import Settings
 from wikipediarag.observability import safe_telemetry_payload
-from wikipediarag.retrieval import _snapshot_candidates, build_stage_events, postprocess_candidates, rrf_fuse
+from wikipediarag.retrieval import (
+    _snapshot_candidates,
+    apply_page_quota,
+    build_stage_events,
+    page_scope_key,
+    postprocess_candidates,
+    rrf_fuse,
+)
 from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import AnswerabilityDecision, AnswerabilityStatus, Evidence, RetrievalResult
 
@@ -204,6 +211,47 @@ def test_postprocess_keeps_quoted_title_without_negative_marker() -> None:
 
     assert [item["title"] for item in selected] == ["Россия", "Канада"]
     assert not [event for event in events if event.get("reason") == "EXPLICIT_NEGATIVE_TITLE"]
+
+
+def test_page_quota_is_scoped_by_knowledge_base_and_document() -> None:
+    candidates = [
+        {**_candidate("a", "A", page_id=1), "knowledge_base_id": "kb-1", "document_id": "doc-1"},
+        {**_candidate("b", "B", page_id=1), "knowledge_base_id": "kb-1", "document_id": "doc-2"},
+        {**_candidate("c", "C", page_id=1), "knowledge_base_id": "kb-2", "document_id": "doc-1"},
+    ]
+
+    selected = apply_page_quota(candidates, max_per_page=1)
+
+    assert [item["chunk_id"] for item in selected] == ["a", "b", "c"]
+
+
+def test_page_quota_applies_within_one_document_page() -> None:
+    candidates = [
+        {**_candidate("a", "A", page_id=1), "knowledge_base_id": "kb", "document_id": "doc"},
+        {**_candidate("b", "B", page_id=1), "knowledge_base_id": "kb", "document_id": "doc"},
+    ]
+
+    assert [item["chunk_id"] for item in apply_page_quota(candidates, max_per_page=1)] == ["a"]
+
+
+def test_missing_page_locator_falls_back_to_chunk_identity() -> None:
+    first = {"chunk_id": "c1", "knowledge_base_id": "kb", "document_id": "doc", "metadata": {}}
+    second = {"chunk_id": "c2", "knowledge_base_id": "kb", "document_id": "doc", "metadata": {}}
+
+    assert page_scope_key(first) != page_scope_key(second)
+
+
+def test_token_budget_drop_does_not_consume_page_quota() -> None:
+    profile = get_retrieval_profile("test_mock", Settings())
+    constrained_postprocess = profile.postprocess.model_copy(update={"max_context_tokens": 256, "page_quota": 1})
+    constrained = profile.model_copy(update={"postprocess": constrained_postprocess})
+    first = {**_candidate("a", "A", page_id=1), "content": "word " * 300}
+    second = {**_candidate("b", "B", page_id=1), "content": "short"}
+
+    selected, events = postprocess_candidates([first, second], constrained, requested_top_k=2)
+
+    assert [item["chunk_id"] for item in selected] == ["b"]
+    assert any(event.get("reason") == "TOKEN_BUDGET" for event in events)
 
 
 def test_safe_telemetry_projection_masks_content_by_default() -> None:

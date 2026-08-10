@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -13,6 +14,7 @@ from wikipediarag.embedding import embed_text, normalize_for_embedding
 app = FastAPI(title="WikipediaRag Mock OpenAI-compatible Provider")
 
 EVIDENCE_RE = re.compile(r"\[(S\d+)\]\s+([^\n]+)\n(.+?)(?=\n\n\[S\d+\]|\Z)", re.DOTALL)
+_delayed_chat_requests = 0
 
 
 @app.get("/health")
@@ -59,11 +61,55 @@ async def rerank(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(payload: dict[str, Any]) -> dict[str, Any]:
+    global _delayed_chat_requests
+    settings = get_settings()
+    if (
+        settings.mock_provider_chat_delay_seconds > 0
+        and _delayed_chat_requests < settings.mock_provider_chat_delay_requests
+    ):
+        _delayed_chat_requests += 1
+        await asyncio.sleep(settings.mock_provider_chat_delay_seconds)
     messages = payload.get("messages", [])
     user_text = "\n".join(str(item.get("content", "")) for item in messages if item.get("role") == "user")
     evidences = EVIDENCE_RE.findall(user_text)
     response_format = payload.get("response_format")
-    if isinstance(response_format, dict) and response_format.get("type") == "json_object" and not evidences:
+    output_mode = settings.mock_provider_output_mode
+    if output_mode == "malformed_json":
+        answer = "this is not JSON"
+    elif output_mode == "truncated_json":
+        answer = '{"answer_markdown": "truncated", "claims": ['
+    elif output_mode == "schema_mismatch":
+        answer = json.dumps({"ok": True}, ensure_ascii=False)
+    elif isinstance(response_format, dict) and response_format.get("type") == "json_schema":
+        if evidences:
+            first_id, title, body = evidences[0]
+            sentence = _first_sentence(body)
+            answer = json.dumps(
+                {
+                    "answer_markdown": f"{sentence} [{first_id}]",
+                    "claims": [
+                        {
+                            "claim_id": "mock-claim-1",
+                            "text": sentence,
+                            "evidence_ids": [first_id],
+                            "type": "fact",
+                        }
+                    ],
+                    "insufficient_evidence": False,
+                },
+                ensure_ascii=False,
+            )
+        else:
+            answer = json.dumps(
+                {
+                    "answer_markdown": "Недостаточно доказательств в локальной базе.",
+                    "claims": [],
+                    "insufficient_evidence": True,
+                    "insufficient_evidence_reason": "insufficient_context",
+                },
+                ensure_ascii=False,
+            )
+    elif isinstance(response_format, dict) and response_format.get("type") == "json_object" and not evidences:
         answer = json.dumps({"ok": True}, ensure_ascii=False)
     elif not evidences:
         answer = "Недостаточно доказательств в локальной базе, чтобы надёжно ответить на вопрос."

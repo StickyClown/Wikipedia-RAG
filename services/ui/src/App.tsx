@@ -19,6 +19,7 @@ import {
 import {
   FormEvent,
   KeyboardEvent,
+  ReactNode,
   useEffect,
   useMemo,
   useRef,
@@ -187,12 +188,23 @@ type QueryRunSummary = {
 
 type SsePayload = {
   query_run_id?: string;
+  sequence?: number;
   data?: {
     text?: string;
     evidence?: Evidence[];
     answer?: string;
     code?: string;
     safe_message?: string;
+    stage?: string;
+    elapsed_ms?: number;
+    deadline_remaining_ms?: number;
+    attempt?: number;
+    data?: {
+      code?: string;
+      stage?: string;
+      answer?: string;
+      [key: string]: unknown;
+    };
     [key: string]: unknown;
   };
 };
@@ -295,6 +307,18 @@ type AuthSession = {
 type KnowledgeBase = {
   id: string;
   name: string;
+};
+
+type RetrievalProfileOption = {
+  name: string;
+  compatible: boolean;
+  reason_code?: string | null;
+};
+
+type RetrievalProfileCatalog = {
+  resolved_default: string;
+  scope_contract_hash: string;
+  profiles: RetrievalProfileOption[];
 };
 
 type DocumentAccessPolicy = "kb" | "tenant" | "restricted";
@@ -425,6 +449,18 @@ type SearchFacet = {
   buckets: { value: string; count: number }[];
 };
 
+type SearchDocumentGroup = {
+  document_id: string;
+  document_version_id?: string | null;
+  knowledge_base_id: string;
+  title: string;
+  source_url: string;
+  source_type: string;
+  best_score: number;
+  hit_count: number;
+  hits: SearchResult[];
+};
+
 type SearchResponse = {
   results: SearchResult[];
   limit: number;
@@ -432,6 +468,7 @@ type SearchResponse = {
   has_more: boolean;
   next_cursor?: string | null;
   facets?: SearchFacet[];
+  groups?: SearchDocumentGroup[];
 };
 
 type DocumentSection = {
@@ -649,7 +686,35 @@ type ResearchRunListResponse = {
   runs: ResearchRunSummary[];
 };
 
-type WorkspaceTab = "chat" | "search" | "research" | "knowledge";
+type WorkspaceTab = "chat" | "search" | "research" | "knowledge" | "models";
+
+type ModelConnection = {
+  id: string;
+  name: string;
+  driver: string;
+  base_url: string;
+  enabled: boolean;
+  has_credentials: boolean;
+  row_version: number;
+  last_status?: { status?: string; safe_error_code?: string };
+};
+
+type ModelCatalogEntry = {
+  id: string;
+  alias: string;
+  provider_model: string;
+  operation: string;
+  input_modalities?: string[];
+  capabilities?: Record<string, unknown>;
+  is_enabled: boolean;
+  canary_status?: Record<string, unknown>;
+};
+
+type ModelConfiguration = {
+  active?: Record<string, unknown> | null;
+  draft?: Record<string, unknown> | null;
+  stages?: Array<{ key: string; operation: string }>;
+};
 
 function HelpTooltip({ text }: { text: string }) {
   return (
@@ -676,6 +741,22 @@ export function App() {
   const [session, setSession] = useState<AuthSession>({
     authenticated: false,
   });
+  const [modelConnections, setModelConnections] = useState<ModelConnection[]>(
+    [],
+  );
+  const [modelCatalog, setModelCatalog] = useState<ModelCatalogEntry[]>([]);
+  const [modelConfiguration, setModelConfiguration] =
+    useState<ModelConfiguration | null>(null);
+  const [modelControlError, setModelControlError] = useState("");
+  const [modelControlBusy, setModelControlBusy] = useState(false);
+  const [newModelConnectionName, setNewModelConnectionName] = useState("");
+  const [newModelConnectionDriver, setNewModelConnectionDriver] =
+    useState("openrouter");
+  const [newModelConnectionUrl, setNewModelConnectionUrl] = useState("");
+  const [newModelAlias, setNewModelAlias] = useState("");
+  const [newModelProviderId, setNewModelProviderId] = useState("");
+  const [newModelOperation, setNewModelOperation] = useState("chat");
+  const [newModelConnectionId, setNewModelConnectionId] = useState("");
   const [authUsername, setAuthUsername] = useState("admin");
   const [authPassword, setAuthPassword] = useState("");
   const [authError, setAuthError] = useState("");
@@ -690,7 +771,10 @@ export function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [question, setQuestion] = useState("Что такое Россия?");
   const [mode, setMode] = useState<"normal" | "extended">("normal");
-  const [retrievalProfile, setRetrievalProfile] = useState("sota_mvp");
+  const [retrievalProfile, setRetrievalProfile] = useState("auto");
+  const [retrievalProfiles, setRetrievalProfiles] = useState<
+    RetrievalProfileOption[]
+  >([]);
   const [debugTopK, setDebugTopK] = useState(12);
   const [bm25Enabled, setBm25Enabled] = useState(true);
   const [denseEnabled, setDenseEnabled] = useState(true);
@@ -706,6 +790,11 @@ export function App() {
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [queryRunId, setQueryRunId] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
+  const [chatStage, setChatStage] = useState("idle");
+  const [chatElapsedMs, setChatElapsedMs] = useState(0);
+  const [chatDeadlineRemainingMs, setChatDeadlineRemainingMs] = useState<
+    number | null
+  >(null);
   const [chatError, setChatError] = useState("");
   const [events, setEvents] = useState<RetrievalEvent[]>([]);
   const [debuggerRun, setDebuggerRun] = useState<QueryRunSummary | null>(null);
@@ -744,7 +833,10 @@ export function App() {
   );
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searchGroups, setSearchGroups] = useState<SearchDocumentGroup[]>([]);
   const [searchBusy, setSearchBusy] = useState(false);
+  const [searchElapsedMs, setSearchElapsedMs] = useState(0);
+  const searchControllerRef = useRef<AbortController | null>(null);
   const [searchError, setSearchError] = useState("");
   const [searchHasMore, setSearchHasMore] = useState(false);
   const [searchNextCursor, setSearchNextCursor] = useState<string | null>(null);
@@ -811,26 +903,32 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     async function loadInitialSession() {
-      const response = await fetch(`${API_BASE}/api/v1/auth/session`, {
-        credentials: "include",
-      });
-      if (!response.ok || cancelled) return;
-      const nextSession = (await response.json()) as AuthSession;
-      setSession(nextSession);
-      if (!nextSession.authenticated) return;
-      const kbResponse = await fetch(`${API_BASE}/api/v1/knowledge-bases`, {
-        credentials: "include",
-      });
-      if (!kbResponse.ok || cancelled) return;
-      const items = (await kbResponse.json()) as KnowledgeBase[];
-      setKnowledgeBases(items);
-      if (items[0]) {
-        setSelectedKnowledgeBaseId(items[0].id);
-        setSelectedRetrievalKnowledgeBaseIds([items[0].id]);
-        setResearchKnowledgeBaseIds([items[0].id]);
-        setActiveTab("chat");
-      } else {
-        setActiveTab("knowledge");
+      try {
+        const response = await fetch(`${API_BASE}/api/v1/auth/session`, {
+          credentials: "include",
+        });
+        if (!response.ok || cancelled) return;
+        const nextSession = (await response.json()) as AuthSession;
+        setSession(nextSession);
+        if (!nextSession.authenticated) return;
+        const kbResponse = await fetch(`${API_BASE}/api/v1/knowledge-bases`, {
+          credentials: "include",
+        });
+        if (!kbResponse.ok || cancelled) return;
+        const items = (await kbResponse.json()) as KnowledgeBase[];
+        setKnowledgeBases(items);
+        if (items[0]) {
+          setSelectedKnowledgeBaseId(items[0].id);
+          setSelectedRetrievalKnowledgeBaseIds([items[0].id]);
+          setResearchKnowledgeBaseIds([items[0].id]);
+          setActiveTab("chat");
+        } else {
+          setActiveTab("knowledge");
+        }
+      } catch {
+        // A missing API is represented by the readiness badge. Keep the shell
+        // usable for diagnostics without leaking a browser network exception.
+        if (!cancelled) setSession({ authenticated: false });
       }
     }
     void loadInitialSession();
@@ -971,13 +1069,62 @@ export function App() {
       : selectedKnowledgeBaseId
         ? [selectedKnowledgeBaseId]
         : [];
+  const retrievalScopeKey = searchKnowledgeBaseIds.join(",");
+
+  useEffect(() => {
+    if (!session.authenticated || searchKnowledgeBaseIds.length === 0) {
+      setRetrievalProfiles([]);
+      return;
+    }
+    const params = new URLSearchParams();
+    searchKnowledgeBaseIds.forEach((id) =>
+      params.append("knowledge_base_ids", id),
+    );
+    let cancelled = false;
+    void apiFetch(`/api/v1/retrieval-profiles?${params.toString()}`)
+      .then(async (response) => {
+        if (!response.ok) return null;
+        return (await response.json()) as RetrievalProfileCatalog;
+      })
+      .then((catalog) => {
+        if (cancelled || !catalog) return;
+        setRetrievalProfiles(catalog.profiles);
+        if (
+          retrievalProfile !== "auto" &&
+          !catalog.profiles.some(
+            (item) => item.name === retrievalProfile && item.compatible,
+          )
+        ) {
+          setRetrievalProfile("auto");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setRetrievalProfiles([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // apiFetch is intentionally component-local and reads the current session/CSRF token.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.authenticated, retrievalScopeKey, retrievalProfile]);
 
   const workspaceTabs: Array<{ id: WorkspaceTab; label: string }> = [
     { id: "chat", label: t("chat") },
     { id: "search", label: t("search") },
     { id: "research", label: t("research") },
     { id: "knowledge", label: t("knowledge_base") },
+    ...(session.user?.platform_role === "PLATFORM_ADMIN"
+      ? [{ id: "models" as const, label: t("models") }]
+      : []),
   ];
+  const readinessText =
+    ready === "ok"
+      ? t("ready_ok")
+      : ready === "degraded"
+        ? t("ready_degraded")
+        : ready === "offline"
+          ? t("ready_offline")
+          : t("ready_checking");
 
   function handleWorkspaceKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
     const currentIndex = workspaceTabs.findIndex((tab) => tab.id === activeTab);
@@ -1003,6 +1150,12 @@ export function App() {
     if (method !== "GET" && session.csrf_token) {
       headers.set("X-CSRF-Token", session.csrf_token);
     }
+    if (
+      ["POST", "PUT", "PATCH", "DELETE"].includes(method) &&
+      !headers.has("Idempotency-Key")
+    ) {
+      headers.set("Idempotency-Key", createUiIdempotencyKey());
+    }
     return fetch(`${API_BASE}${path}`, {
       ...init,
       credentials: "include",
@@ -1010,51 +1163,226 @@ export function App() {
     });
   }
 
-  async function refreshSession() {
-    const response = await fetch(`${API_BASE}/api/v1/auth/session`, {
-      credentials: "include",
-    });
-    if (response.ok) {
-      const nextSession = (await response.json()) as AuthSession;
-      setSession(nextSession);
-      if (nextSession.authenticated) {
-        await loadKnowledgeBases();
+  async function loadModelControl() {
+    if (session.user?.platform_role !== "PLATFORM_ADMIN") return;
+    setModelControlError("");
+    setModelControlBusy(true);
+    try {
+      const [connections, catalog, configuration] = await Promise.all([
+        apiFetch("/api/v1/admin/model-connections"),
+        apiFetch("/api/v1/admin/models"),
+        apiFetch("/api/v1/admin/model-configuration"),
+      ]);
+      if (!connections.ok || !catalog.ok || !configuration.ok) {
+        throw new Error(
+          locale === "ru"
+            ? "Не удалось загрузить управление моделями"
+            : "Model control-plane could not be loaded",
+        );
       }
+      setModelConnections((await connections.json()) as ModelConnection[]);
+      setModelCatalog((await catalog.json()) as ModelCatalogEntry[]);
+      setModelConfiguration((await configuration.json()) as ModelConfiguration);
+    } catch (error) {
+      setModelControlError(safeClientErrorMessage(error, t, "request_failed"));
+    } finally {
+      setModelControlBusy(false);
+    }
+  }
+
+  async function validateModelDraft() {
+    setModelControlBusy(true);
+    setModelControlError("");
+    try {
+      const response = await apiFetch(
+        "/api/v1/admin/model-configuration/draft/validate",
+        { method: "POST" },
+      );
+      if (!response.ok)
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      await loadModelControl();
+    } catch (error) {
+      setModelControlError(safeClientErrorMessage(error, t, "request_failed"));
+    } finally {
+      setModelControlBusy(false);
+    }
+  }
+
+  async function activateModelDraft() {
+    setModelControlBusy(true);
+    setModelControlError("");
+    try {
+      const response = await apiFetch(
+        "/api/v1/admin/model-configuration/draft/activate",
+        { method: "POST" },
+      );
+      if (!response.ok)
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      await loadModelControl();
+    } catch (error) {
+      setModelControlError(safeClientErrorMessage(error, t, "request_failed"));
+    } finally {
+      setModelControlBusy(false);
+    }
+  }
+
+  async function testModelConnection(connectionId: string) {
+    setModelControlBusy(true);
+    setModelControlError("");
+    try {
+      const response = await apiFetch(
+        `/api/v1/admin/model-connections/${encodeURIComponent(connectionId)}/test`,
+        { method: "POST" },
+      );
+      if (!response.ok)
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      await loadModelControl();
+    } catch (error) {
+      setModelControlError(safeClientErrorMessage(error, t, "request_failed"));
+    } finally {
+      setModelControlBusy(false);
+    }
+  }
+
+  async function createModelConnection(event: FormEvent) {
+    event.preventDefault();
+    setModelControlBusy(true);
+    setModelControlError("");
+    try {
+      const response = await apiFetch("/api/v1/admin/model-connections", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: newModelConnectionName,
+          driver: newModelConnectionDriver,
+          base_url: newModelConnectionUrl,
+        }),
+      });
+      if (!response.ok)
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      setNewModelConnectionName("");
+      setNewModelConnectionUrl("");
+      await loadModelControl();
+    } catch (error) {
+      setModelControlError(safeClientErrorMessage(error, t, "request_failed"));
+    } finally {
+      setModelControlBusy(false);
+    }
+  }
+
+  async function createCatalogModel(event: FormEvent) {
+    event.preventDefault();
+    setModelControlBusy(true);
+    setModelControlError("");
+    try {
+      const response = await apiFetch("/api/v1/admin/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          alias: newModelAlias,
+          provider_model: newModelProviderId,
+          operation: newModelOperation,
+          connection_id: newModelConnectionId || null,
+          capabilities: { [newModelOperation]: true },
+          input_modalities: ["text"],
+        }),
+      });
+      if (!response.ok)
+        throw new Error(
+          await responseErrorMessage(response, t, "request_failed"),
+        );
+      setNewModelAlias("");
+      setNewModelProviderId("");
+      await loadModelControl();
+    } catch (error) {
+      setModelControlError(safeClientErrorMessage(error, t, "request_failed"));
+    } finally {
+      setModelControlBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab === "models" && session.authenticated)
+      void loadModelControl();
+    // apiFetch reads the current session and is intentionally local to App.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, session.authenticated, session.user?.platform_role]);
+
+  function createUiIdempotencyKey() {
+    const entropy =
+      typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return `ui-${entropy}`;
+  }
+
+  async function refreshSession() {
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/auth/session`, {
+        credentials: "include",
+      });
+      if (response.ok) {
+        const nextSession = (await response.json()) as AuthSession;
+        setSession(nextSession);
+        if (nextSession.authenticated) {
+          await loadKnowledgeBases();
+        }
+      } else {
+        throw new Error("session_refresh_failed");
+      }
+    } catch {
+      throw new Error(t("request_failed"));
     }
   }
 
   async function localLogin(event: FormEvent) {
     event.preventDefault();
     setAuthError("");
-    const response = await fetch(`${API_BASE}/api/v1/auth/local/login`, {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username: authUsername,
-        password: authPassword,
-      }),
-    });
-    if (!response.ok) {
-      setAuthError(await response.text());
-      return;
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/auth/local/login`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: authUsername,
+          password: authPassword,
+        }),
+      });
+      if (!response.ok) {
+        setAuthError(await responseErrorMessage(response, t, "request_failed"));
+        return;
+      }
+      setAuthPassword("");
+      await refreshSession();
+    } catch {
+      setAuthError(t("request_failed"));
     }
-    setAuthPassword("");
-    await refreshSession();
   }
 
   async function oidcLogin() {
     setAuthError("");
-    const response = await fetch(`${API_BASE}/api/v1/auth/oidc/start`, {
-      method: "POST",
-      credentials: "include",
-    });
-    if (!response.ok) {
-      setAuthError(await response.text());
-      return;
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/auth/oidc/start`, {
+        method: "POST",
+        credentials: "include",
+      });
+      if (!response.ok) {
+        setAuthError(await responseErrorMessage(response, t, "request_failed"));
+        return;
+      }
+      const started = (await response.json()) as { authorization_url: string };
+      window.location.assign(started.authorization_url);
+    } catch {
+      setAuthError(t("request_failed"));
     }
-    const started = (await response.json()) as { authorization_url: string };
-    window.location.assign(started.authorization_url);
   }
 
   async function logout() {
@@ -1323,27 +1651,38 @@ export function App() {
     setEvidence([]);
     setQueryRunId("");
     setEvents([]);
+    setChatStage("question_received");
+    setChatElapsedMs(0);
+    setChatDeadlineRemainingMs(null);
     setDebuggerRun(null);
     setChatError("");
     setChatBusy(true);
     const controller = new AbortController();
     chatControllerRef.current = controller;
+    const clientRequestId = createUiIdempotencyKey();
+    const scopedKnowledgeBaseIds =
+      selectedRetrievalKnowledgeBaseIds.length > 0
+        ? selectedRetrievalKnowledgeBaseIds
+        : selectedKnowledgeBaseId
+          ? [selectedKnowledgeBaseId]
+          : [];
     try {
       const response = await apiFetch("/api/v1/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": clientRequestId,
+        },
         signal: controller.signal,
         body: JSON.stringify({
           message: question,
-          knowledge_base_ids:
-            selectedRetrievalKnowledgeBaseIds.length > 0
-              ? selectedRetrievalKnowledgeBaseIds
-              : selectedKnowledgeBaseId
-                ? [selectedKnowledgeBaseId]
-                : [],
+          knowledge_base_ids: scopedKnowledgeBaseIds,
           mode,
           stream: true,
-          retrieval_profile: retrievalProfile,
+          client_request_id: clientRequestId,
+          ...(retrievalProfile !== "auto"
+            ? { retrieval_profile: retrievalProfile }
+            : {}),
           retrieval_overrides: buildRetrievalOverrides({
             bm25Enabled,
             denseEnabled,
@@ -1364,6 +1703,7 @@ export function App() {
       let buffer = "";
       let terminalEvent = false;
       let hasAnswer = false;
+      let expectedSequence = 1;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -1373,9 +1713,31 @@ export function App() {
         for (const part of parts) {
           const parsed = parseSse(part);
           if (!parsed) continue;
+          if (
+            typeof parsed.data.sequence === "number" &&
+            parsed.data.sequence !== expectedSequence
+          ) {
+            throw new Error("STREAM_PROTOCOL_ERROR");
+          }
+          if (typeof parsed.data.sequence === "number") expectedSequence += 1;
+          if (terminalEvent) throw new Error("STREAM_PROTOCOL_ERROR");
+          const body = parsed.data.data;
+          if (parsed.data.query_run_id) setQueryRunId(parsed.data.query_run_id);
+          if (body?.stage) setChatStage(body.stage);
+          if (typeof body?.elapsed_ms === "number")
+            setChatElapsedMs(body.elapsed_ms);
+          if (typeof body?.deadline_remaining_ms === "number")
+            setChatDeadlineRemainingMs(body.deadline_remaining_ms);
+          if (
+            parsed.event === "stage.started" ||
+            parsed.event === "stage.heartbeat" ||
+            parsed.event === "stage.completed"
+          ) {
+            continue;
+          }
           if (parsed.event === "message.delta") {
-            setAnswer(parsed.data.data?.text ?? "");
-            setEvidence(parsed.data.data?.evidence ?? []);
+            setAnswer(body?.text ?? "");
+            setEvidence(body?.evidence ?? []);
             hasAnswer = true;
             if (parsed.data.query_run_id)
               setQueryRunId(parsed.data.query_run_id);
@@ -1386,11 +1748,15 @@ export function App() {
               setQueryRunId(parsed.data.query_run_id);
             setChatError(sseFailureMessage(parsed.data, t));
           }
+          if (parsed.event === "run.cancelled") {
+            terminalEvent = true;
+            setChatError(t("chat_stopped"));
+          }
           if (parsed.event === "run.completed") {
             terminalEvent = true;
             if (parsed.data.query_run_id)
               setQueryRunId(parsed.data.query_run_id);
-            const completedAnswer = parsed.data.data?.answer;
+            const completedAnswer = body?.answer;
             if (typeof completedAnswer === "string" && !hasAnswer) {
               setAnswer(completedAnswer);
             }
@@ -1401,6 +1767,11 @@ export function App() {
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         setChatError(t("chat_stopped"));
+      } else if (
+        error instanceof SyntaxError ||
+        (error instanceof Error && error.message === "STREAM_PROTOCOL_ERROR")
+      ) {
+        setChatError(localizedError("STREAM_PROTOCOL_ERROR", t, "chat_failed"));
       } else {
         setChatError(error instanceof Error ? error.message : t("chat_failed"));
       }
@@ -1429,9 +1800,15 @@ export function App() {
     const query = searchQuery.trim();
     if (!query || searchKnowledgeBaseIds.length === 0) return;
     setSearchBusy(true);
+    setSearchElapsedMs(0);
     setSearchError("");
+    const searchStartedAt = performance.now();
+    searchControllerRef.current?.abort();
+    const controller = new AbortController();
+    searchControllerRef.current = controller;
     if (offset === 0) {
       setSearchResults([]);
+      setSearchGroups([]);
       setSearchHasMore(false);
       setSearchNextCursor(null);
       setSearchFacets([]);
@@ -1447,6 +1824,7 @@ export function App() {
       const response = await apiFetch("/api/v1/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           query,
           knowledge_base_ids: searchKnowledgeBaseIds,
@@ -1468,14 +1846,26 @@ export function App() {
       setSearchResults((items) =>
         offset === 0 ? payload.results : [...items, ...payload.results],
       );
+      setSearchGroups(offset === 0 ? (payload.groups ?? []) : []);
       setSearchHasMore(payload.has_more);
       setSearchNextCursor(payload.next_cursor ?? null);
       setSearchFacets(payload.facets ?? []);
     } catch (error) {
-      setSearchError(error instanceof Error ? error.message : String(error));
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setSearchError("");
+      } else {
+        setSearchError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
+      if (searchControllerRef.current === controller)
+        searchControllerRef.current = null;
+      setSearchElapsedMs(Math.round(performance.now() - searchStartedAt));
       setSearchBusy(false);
     }
+  }
+
+  function stopSearch() {
+    searchControllerRef.current?.abort();
   }
 
   async function loadResearchRuns() {
@@ -2159,15 +2549,12 @@ export function App() {
         <div className="header-actions">
           <span
             className={`status ${ready}`}
+            data-testid="readiness-status"
             title={t("tooltip_readiness")}
-            aria-label={`${t("status")}: ${ready}`}
+            aria-label={`${t("status")}: ${readinessText}`}
           >
             <span className="status-dot" aria-hidden="true" />
-            {ready === "ok"
-              ? t("ready_ok")
-              : ready === "offline"
-                ? t("ready_offline")
-                : t("ready_checking")}
+            {readinessText}
             <HelpTooltip text={t("tooltip_readiness")} />
           </span>
           {session.authenticated ? (
@@ -2218,7 +2605,7 @@ export function App() {
       </header>
 
       {!session.authenticated && (
-        <section className="band auth-band">
+        <section className="band auth-band" data-testid="auth-panel">
           <form className="auth-panel" onSubmit={localLogin}>
             <h2>
               <KeyRound size={18} /> {t("sign_in")}
@@ -2263,6 +2650,7 @@ export function App() {
         <>
           <nav
             className="workspace-tabs"
+            data-testid="workspace-tabs"
             aria-label={locale === "ru" ? "Рабочая область" : "Workspace"}
             role="tablist"
           >
@@ -2270,6 +2658,7 @@ export function App() {
               <button
                 key={tab.id}
                 id={`tab-${tab.id}`}
+                data-testid={`tab-${tab.id}`}
                 type="button"
                 role="tab"
                 aria-selected={activeTab === tab.id}
@@ -2284,46 +2673,60 @@ export function App() {
             ))}
           </nav>
           <section className="band kb-toolbar">
-            <label>
-              {t("primary_kb")}
-              <select
-                aria-label={t("primary_kb")}
-                value={selectedKnowledgeBaseId}
-                onChange={(event) =>
-                  setSelectedKnowledgeBaseId(event.target.value)
-                }
-              >
-                {knowledgeBases.map((kb) => (
-                  <option key={kb.id} value={kb.id}>
-                    {kb.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <details className="scope-details">
-              <summary>
-                {interpolate(t("scope_summary"), {
-                  count: selectedRetrievalKnowledgeBaseIds.length,
-                })}
-                <HelpTooltip text={t("tooltip_scope")} />
-              </summary>
-              <fieldset className="kb-scope">
-                <legend>{t("retrieval_scope")}</legend>
-                {knowledgeBases.map((kb) => (
-                  <label key={kb.id}>
-                    <input
-                      type="checkbox"
-                      aria-label={kb.name}
-                      checked={selectedRetrievalKnowledgeBaseIds.includes(
-                        kb.id,
-                      )}
-                      onChange={() => toggleRetrievalKnowledgeBase(kb.id)}
-                    />
-                    <span>{kb.name}</span>
-                  </label>
-                ))}
-              </fieldset>
-            </details>
+            {activeTab !== "chat" &&
+              activeTab !== "search" &&
+              activeTab !== "models" && (
+                <label>
+                  {t("primary_kb")}
+                  <select
+                    aria-label={t("primary_kb")}
+                    value={selectedKnowledgeBaseId}
+                    onChange={(event) =>
+                      setSelectedKnowledgeBaseId(event.target.value)
+                    }
+                  >
+                    {knowledgeBases.map((kb) => (
+                      <option key={kb.id} value={kb.id}>
+                        {kb.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            {(activeTab === "chat" || activeTab === "search") && (
+              <details className="scope-details" open>
+                <summary>
+                  {interpolate(t("scope_summary"), {
+                    count: selectedRetrievalKnowledgeBaseIds.length,
+                  })}
+                  <HelpTooltip text={t("tooltip_scope")} />
+                </summary>
+                <fieldset className="kb-scope">
+                  <legend>{t("retrieval_scope")}</legend>
+                  {knowledgeBases.map((kb) => (
+                    <label key={kb.id}>
+                      <input
+                        type="checkbox"
+                        aria-label={kb.name}
+                        checked={selectedRetrievalKnowledgeBaseIds.includes(
+                          kb.id,
+                        )}
+                        onChange={() => toggleRetrievalKnowledgeBase(kb.id)}
+                      />
+                      <span>{kb.name}</span>
+                    </label>
+                  ))}
+                </fieldset>
+              </details>
+            )}
+            {(activeTab === "chat" || activeTab === "search") &&
+              searchKnowledgeBaseIds.length === 0 && (
+                <span className="status" role="status">
+                  {locale === "ru"
+                    ? "Выберите хотя бы одну базу знаний"
+                    : "Select at least one knowledge base"}
+                </span>
+              )}
             {activeTab === "knowledge" && (
               <form className="row kb-create" onSubmit={createKnowledgeBase}>
                 <input
@@ -2347,6 +2750,7 @@ export function App() {
         <>
           <div
             id="panel-knowledge"
+            data-testid="panel-knowledge"
             className="tab-panel is-active"
             role="tabpanel"
             aria-labelledby="tab-knowledge"
@@ -2721,8 +3125,217 @@ export function App() {
             </section>
           </div>
 
+          {session.user?.platform_role === "PLATFORM_ADMIN" && (
+            <div
+              id="panel-models"
+              data-testid="panel-models"
+              className="tab-panel"
+              role="tabpanel"
+              aria-labelledby="tab-models"
+              hidden={activeTab !== "models"}
+            >
+              <section className="band grid model-control-panel">
+                <div className="panel" data-testid="model-connections">
+                  <h2>
+                    <Plug size={18} /> {t("models")}
+                  </h2>
+                  <p className="muted">{t("model_control_description")}</p>
+                  <div className="row">
+                    <button
+                      type="button"
+                      onClick={() => void loadModelControl()}
+                      disabled={modelControlBusy}
+                    >
+                      <RotateCw size={15} /> {t("refresh")}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void validateModelDraft()}
+                      disabled={modelControlBusy || !modelConfiguration?.draft}
+                    >
+                      <ShieldCheck size={15} /> {t("validate_models")}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void activateModelDraft()}
+                      disabled={
+                        modelControlBusy ||
+                        modelConfiguration?.draft?.status !== "validated"
+                      }
+                    >
+                      <SlidersHorizontal size={15} /> {t("activate_models")}
+                    </button>
+                  </div>
+                  {modelControlError && (
+                    <p className="error" role="alert">
+                      {modelControlError}
+                    </p>
+                  )}
+                </div>
+                <div className="panel" data-testid="model-catalog">
+                  <h3>{t("model_connections")}</h3>
+                  <form
+                    className="model-create-form"
+                    onSubmit={createModelConnection}
+                  >
+                    <input
+                      value={newModelConnectionName}
+                      onChange={(event) =>
+                        setNewModelConnectionName(event.target.value)
+                      }
+                      placeholder={t("connection_name")}
+                      required
+                    />
+                    <select
+                      value={newModelConnectionDriver}
+                      onChange={(event) =>
+                        setNewModelConnectionDriver(event.target.value)
+                      }
+                      aria-label={t("driver")}
+                    >
+                      <option value="openrouter">OpenRouter</option>
+                      <option value="vllm">vLLM</option>
+                      <option value="llamacpp">llama.cpp</option>
+                      <option value="textgen_webui">
+                        text-generation-webui
+                      </option>
+                      <option value="openai_compatible">Custom OpenAI</option>
+                      <option value="mock">Mock (tests)</option>
+                    </select>
+                    <input
+                      value={newModelConnectionUrl}
+                      onChange={(event) =>
+                        setNewModelConnectionUrl(event.target.value)
+                      }
+                      placeholder={t("base_url")}
+                      type="url"
+                      required
+                    />
+                    <button type="submit" disabled={modelControlBusy}>
+                      {t("add_connection")}
+                    </button>
+                  </form>
+                  {modelConnections.length === 0 && (
+                    <p className="muted">{t("no_model_connections")}</p>
+                  )}
+                  <div className="model-cards">
+                    {modelConnections.map((connection) => (
+                      <article className="model-card" key={connection.id}>
+                        <div className="row spread">
+                          <strong>{connection.name}</strong>
+                          <span className="status">{connection.driver}</span>
+                        </div>
+                        <code>{connection.base_url}</code>
+                        <p className="muted">
+                          {connection.has_credentials
+                            ? t("credentials_configured")
+                            : t("credentials_missing")}{" "}
+                          · {connection.enabled ? t("enabled") : t("disabled")}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void testModelConnection(connection.id)
+                          }
+                          disabled={modelControlBusy}
+                        >
+                          <Plug size={14} /> {t("test_connection")}
+                        </button>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+                <div className="panel" data-testid="model-stage-assignments">
+                  <h3>{t("model_catalog")}</h3>
+                  <form
+                    className="model-create-form"
+                    onSubmit={createCatalogModel}
+                  >
+                    <input
+                      value={newModelAlias}
+                      onChange={(event) => setNewModelAlias(event.target.value)}
+                      placeholder={t("model_alias")}
+                      required
+                    />
+                    <input
+                      value={newModelProviderId}
+                      onChange={(event) =>
+                        setNewModelProviderId(event.target.value)
+                      }
+                      placeholder={t("provider_model_id")}
+                      required
+                    />
+                    <select
+                      value={newModelOperation}
+                      onChange={(event) =>
+                        setNewModelOperation(event.target.value)
+                      }
+                      aria-label={t("operation")}
+                    >
+                      <option value="chat">Chat</option>
+                      <option value="embedding">Embedding</option>
+                      <option value="rerank">Rerank</option>
+                    </select>
+                    <select
+                      value={newModelConnectionId}
+                      onChange={(event) =>
+                        setNewModelConnectionId(event.target.value)
+                      }
+                      aria-label={t("connection")}
+                    >
+                      <option value="">{t("select_connection")}</option>
+                      {modelConnections.map((connection) => (
+                        <option key={connection.id} value={connection.id}>
+                          {connection.name}
+                        </option>
+                      ))}
+                    </select>
+                    <button type="submit" disabled={modelControlBusy}>
+                      {t("add_model")}
+                    </button>
+                  </form>
+                  {modelCatalog.length === 0 && (
+                    <p className="muted">{t("no_models")}</p>
+                  )}
+                  <div className="model-table" role="table">
+                    {modelCatalog.map((model) => (
+                      <div className="model-row" role="row" key={model.id}>
+                        <strong>{model.alias}</strong>
+                        <span>{model.operation}</span>
+                        <span>{model.provider_model}</span>
+                        {model.input_modalities?.includes("image") && (
+                          <span className="badge">{t("catalog_only")}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="panel">
+                  <h3>{t("stage_assignments")}</h3>
+                  <p className="muted">{t("stage_assignments_description")}</p>
+                  <div className="stage-list">
+                    {(modelConfiguration?.stages ?? []).map((stage) => (
+                      <div className="stage-row" key={stage.key}>
+                        <strong>{stage.key}</strong>
+                        <span>{stage.operation}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <small className="muted">
+                    {t("active_revision")}:{" "}
+                    {String(
+                      modelConfiguration?.active?.revision ??
+                        t("not_configured"),
+                    )}
+                  </small>
+                </div>
+              </section>
+            </div>
+          )}
+
           <div
             id="panel-search"
+            data-testid="panel-search"
             className="tab-panel"
             role="tabpanel"
             aria-labelledby="tab-search"
@@ -2750,7 +3363,23 @@ export function App() {
                   >
                     <Search size={16} /> {t("search")}
                   </button>
+                  {searchBusy && (
+                    <button type="button" onClick={stopSearch}>
+                      <X size={16} /> {t("chat_stop")}
+                    </button>
+                  )}
                 </div>
+                {searchBusy && (
+                  <p
+                    className="status"
+                    role="status"
+                    aria-live="polite"
+                    aria-busy="true"
+                  >
+                    {t("loading")} · {searchKnowledgeBaseIds.length} KB ·{" "}
+                    {(searchElapsedMs / 1000).toFixed(1)}s
+                  </p>
+                )}
                 <details className="filter-details">
                   <summary>{t("filters")}</summary>
                   <div className="search-filters">
@@ -2837,56 +3466,102 @@ export function App() {
                   searchResults.length === 0 && (
                     <p className="empty-state">{t("no_results")}</p>
                   )}
-                {searchResults.map((item, index) => (
-                  <article
-                    key={`${item.chunk_id}-${index}`}
-                    className="search-result"
-                  >
-                    <div>
-                      <h3>{item.title}</h3>
-                      <p>
-                        {item.highlights?.[0]?.fragments?.[0] ?? item.snippet}
-                      </p>
-                    </div>
-                    <div className="search-meta">
-                      <span>
-                        {knowledgeBaseName(
-                          knowledgeBases,
-                          item.knowledge_base_id,
-                        )}
-                      </span>
-                      <span>
-                        {item.section_path.join(" / ") || "No section"}
-                      </span>
-                      <span>{item.document_date ?? "No date"}</span>
-                      <span>{item.document_type ?? item.source_type}</span>
-                      <span>{item.language ?? "No language"}</span>
-                      <span>{formatScore(item.score)}</span>
-                    </div>
-                    <div className="search-actions">
-                      <button
-                        type="button"
-                        onClick={() => void openDocumentViewer(item)}
+                {searchGroups.length > 0
+                  ? searchGroups.map((group) => (
+                      <article
+                        key={group.document_id}
+                        className="search-result"
                       >
-                        <BookOpen size={15} />{" "}
-                        {locale === "ru"
-                          ? "Открыть просмотр"
-                          : "Open in viewer"}
-                      </button>
-                      {item.source_url ? (
-                        <a
-                          href={item.source_url}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          <ExternalLink size={15} /> {t("source")}
-                        </a>
-                      ) : (
-                        <span>Document {item.document_id}</span>
-                      )}
-                    </div>
-                  </article>
-                ))}
+                        <div>
+                          <h3>{group.title}</h3>
+                          <p>
+                            {group.hits[0]?.highlights?.[0]?.fragments?.[0] ??
+                              group.hits[0]?.snippet}
+                          </p>
+                          <details>
+                            <summary>{group.hit_count} snippets</summary>
+                            {group.hits.slice(0, 5).map((hit) => (
+                              <p key={hit.chunk_id}>{hit.snippet}</p>
+                            ))}
+                          </details>
+                        </div>
+                        <div className="search-meta">
+                          <span>
+                            {knowledgeBaseName(
+                              knowledgeBases,
+                              group.knowledge_base_id,
+                            )}
+                          </span>
+                          <span>{formatScore(group.best_score)}</span>
+                        </div>
+                        {group.hits[0] && (
+                          <div className="search-actions">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void openDocumentViewer(group.hits[0])
+                              }
+                            >
+                              <BookOpen size={15} />{" "}
+                              {locale === "ru"
+                                ? "Открыть просмотр"
+                                : "Open in viewer"}
+                            </button>
+                          </div>
+                        )}
+                      </article>
+                    ))
+                  : searchResults.map((item, index) => (
+                      <article
+                        key={`${item.chunk_id}-${index}`}
+                        className="search-result"
+                      >
+                        <div>
+                          <h3>{item.title}</h3>
+                          <p>
+                            {item.highlights?.[0]?.fragments?.[0] ??
+                              item.snippet}
+                          </p>
+                        </div>
+                        <div className="search-meta">
+                          <span>
+                            {knowledgeBaseName(
+                              knowledgeBases,
+                              item.knowledge_base_id,
+                            )}
+                          </span>
+                          <span>
+                            {item.section_path.join(" / ") || "No section"}
+                          </span>
+                          <span>{item.document_date ?? "No date"}</span>
+                          <span>{item.document_type ?? item.source_type}</span>
+                          <span>{item.language ?? "No language"}</span>
+                          <span>{formatScore(item.score)}</span>
+                        </div>
+                        <div className="search-actions">
+                          <button
+                            type="button"
+                            onClick={() => void openDocumentViewer(item)}
+                          >
+                            <BookOpen size={15} />{" "}
+                            {locale === "ru"
+                              ? "Открыть просмотр"
+                              : "Open in viewer"}
+                          </button>
+                          {item.source_url ? (
+                            <a
+                              href={item.source_url}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              <ExternalLink size={15} /> {t("source")}
+                            </a>
+                          ) : (
+                            <span>Document {item.document_id}</span>
+                          )}
+                        </div>
+                      </article>
+                    ))}
                 {searchHasMore && (
                   <button
                     type="button"
@@ -2935,6 +3610,7 @@ export function App() {
 
           <div
             id="panel-research"
+            data-testid="panel-research"
             className="tab-panel"
             role="tabpanel"
             aria-labelledby="tab-research"
@@ -3422,6 +4098,7 @@ export function App() {
 
           <div
             id="panel-chat"
+            data-testid="panel-chat"
             className="tab-panel"
             role="tabpanel"
             aria-labelledby="tab-chat"
@@ -3452,15 +4129,17 @@ export function App() {
                           setRetrievalProfile(event.target.value)
                         }
                       >
-                        <option value="sota_mvp">sota_mvp</option>
-                        <option value="test_mock">test_mock</option>
-                        <option value="upload_mock">upload_mock</option>
-                        <option value="upload_sota_mvp">upload_sota_mvp</option>
-                        <option value="bm25_only">bm25_only</option>
-                        <option value="rewrite_off">rewrite_off</option>
-                        <option value="parent_expansion_off">
-                          parent_expansion_off
-                        </option>
+                        <option value="auto">auto (server default)</option>
+                        {retrievalProfiles.map((profile) => (
+                          <option
+                            key={profile.name}
+                            value={profile.name}
+                            disabled={!profile.compatible}
+                          >
+                            {profile.name}
+                            {profile.compatible ? "" : " (incompatible)"}
+                          </option>
+                        ))}
                       </select>
                     </label>
                     <label>
@@ -3580,7 +4259,10 @@ export function App() {
                       <option value="extended">{t("extended")}</option>
                     </select>
                   </label>
-                  <button type="submit" disabled={chatBusy}>
+                  <button
+                    type="submit"
+                    disabled={chatBusy || searchKnowledgeBaseIds.length === 0}
+                  >
                     <Search size={16} /> {chatBusy ? t("loading") : t("ask")}
                   </button>
                   {chatBusy && (
@@ -3607,7 +4289,10 @@ export function App() {
                 </div>
                 {chatBusy && (
                   <p className="status" role="status" aria-live="polite">
-                    {t("chat_waiting")}
+                    {chatStage} · {(chatElapsedMs / 1000).toFixed(1)}s
+                    {chatDeadlineRemainingMs !== null
+                      ? ` · ${(chatDeadlineRemainingMs / 1000).toFixed(1)}s left`
+                      : ""}
                   </p>
                 )}
                 {chatError && (
@@ -3620,11 +4305,16 @@ export function App() {
               {answer && (
                 <div className="answer">
                   <h2>{t("answer")}</h2>
-                  <p>{answer}</p>
+                  <div className="answer-markdown">
+                    {renderSafeAnswer(answer, evidence)}
+                  </div>
                   <h3>{t("sources")}</h3>
                   <div className="sources">
                     {evidence.map((item) => (
-                      <article key={item.evidence_id}>
+                      <article
+                        key={item.evidence_id}
+                        id={`evidence-${item.evidence_id}`}
+                      >
                         <a
                           href={item.source_url}
                           target="_blank"
@@ -3668,6 +4358,25 @@ function buildRetrievalOverrides(state: RetrievalOverrideState) {
       extended_search: state.extendedSearchMode,
     },
   };
+}
+
+function renderSafeAnswer(answer: string, evidence: Evidence[]): ReactNode {
+  const known = new Set(evidence.map((item) => item.evidence_id));
+  return answer.split(/(\[S\d+\])/g).map((part, index) => {
+    const match = /^\[(S\d+)\]$/.exec(part);
+    if (match && known.has(match[1])) {
+      return (
+        <a
+          key={`${part}-${index}`}
+          href={`#evidence-${match[1]}`}
+          className="citation-button"
+        >
+          {part}
+        </a>
+      );
+    }
+    return <span key={`${part}-${index}`}>{part}</span>;
+  });
 }
 
 function buildSearchFilters(values: {
@@ -3744,6 +4453,22 @@ function localizedError(
   return `${message} (${translate("error_code")}: ${code})`;
 }
 
+function safeClientErrorMessage(
+  error: unknown,
+  translate: Translate,
+  fallbackKey: string,
+): string {
+  if (!(error instanceof Error)) return translate(fallbackKey);
+  const message = error.message.trim();
+  if (
+    !message ||
+    /failed to fetch|networkerror|load failed|fetch failed/i.test(message)
+  ) {
+    return translate(fallbackKey);
+  }
+  return message;
+}
+
 async function responseErrorMessage(
   response: Response,
   translate: Translate,
@@ -3755,7 +4480,18 @@ async function responseErrorMessage(
 }
 
 function sseFailureMessage(payload: SsePayload, translate: Translate): string {
-  const code = payload.data?.code;
+  const code = payload.data?.code ?? payload.data?.data?.code;
+  const messages: Record<string, string> = {
+    MODEL_OUTPUT_INVALID:
+      "Модель вернула ответ в неподдерживаемом формате. Автоматический повтор не выполнялся",
+    MODEL_OUTPUT_TRUNCATED:
+      "Ответ модели был обрезан до завершения структурированного формата",
+    DEPENDENCY_TIMEOUT: "Сервис ответа не успел завершить запрос",
+    CLIENT_DISCONNECTED: "Запрос отменён после отключения клиента",
+    STREAM_PROTOCOL_ERROR: "Поток ответа повреждён; повторите запрос вручную",
+  };
+  if (typeof code === "string" && messages[code])
+    return `${messages[code]} (${translate("error_code")}: ${code})`;
   return localizedError(
     typeof code === "string" ? code : undefined,
     translate,
@@ -4656,15 +5392,21 @@ function rankScore(row: CandidateRow, key: string): string {
   return `${rank ?? ""}${score === undefined ? "" : ` / ${score.toFixed(3)}`}`;
 }
 
-function parseSse(block: string): { event: string; data: SsePayload } | null {
-  const event = block
-    .split("\n")
-    .find((line) => line.startsWith("event: "))
-    ?.replace("event: ", "");
-  const data = block
-    .split("\n")
-    .find((line) => line.startsWith("data: "))
-    ?.replace("data: ", "");
-  if (!event || !data) return null;
-  return { event, data: JSON.parse(data) };
+// eslint-disable-next-line react-refresh/only-export-components
+export function parseSse(
+  block: string,
+): { event: string; data: SsePayload } | null {
+  let event = "";
+  const dataLines: string[] = [];
+  for (const rawLine of block.split(/\r?\n/)) {
+    if (!rawLine || rawLine.startsWith(":")) continue;
+    if (rawLine.startsWith("event:")) event = rawLine.slice(6).trim();
+    if (rawLine.startsWith("data:"))
+      dataLines.push(rawLine.slice(5).trimStart());
+  }
+  if (!event || dataLines.length === 0) return null;
+  const data = JSON.parse(dataLines.join("\n")) as SsePayload;
+  if (!data || typeof data !== "object")
+    throw new SyntaxError("invalid SSE payload");
+  return { event, data };
 }

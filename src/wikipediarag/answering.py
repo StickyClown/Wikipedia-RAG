@@ -3,16 +3,66 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from wikipediarag.claim_verifier import claim_verification_blocks, verify_claims
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.model_client import chat_completion
+from wikipediarag.reliability import OperationDeadline
 from wikipediarag.retrieval_profile import CitationValidationMode, RetrievalProfile, get_retrieval_profile
 from wikipediarag.schemas import AnswerabilityStatus, Evidence, RetrievalResult
 from wikipediarag.zim_dump import build_kiwix_source_url
 
 CITATION_RE = re.compile(r"\[(S\d+)\]")
+
+
+class ModelOutputError(ValueError):
+    """Safe, non-retryable failure for a provider response contract violation."""
+
+    def __init__(self, message: str, *, code: str = "MODEL_OUTPUT_INVALID") -> None:
+        super().__init__(message)
+        self.safe_code = code
+        self.retryable = False
+        self.metadata: dict[str, Any] = {}
+
+
+class ClaimDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=4000)
+    evidence_ids: list[str] = Field(min_length=1, max_length=32)
+    type: str = Field(pattern="^(fact|inference)$")
+
+
+InsufficientEvidenceReason = Literal[
+    "no_evidence",
+    "insufficient_context",
+    "missing_attribute",
+    "ambiguous_entity",
+    "conflicting_sources",
+    "unsupported_claim",
+]
+
+
+class AnswerDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer_markdown: str = Field(min_length=1, max_length=20000)
+    claims: list[ClaimDraft] = Field(default_factory=list, max_length=32)
+    insufficient_evidence: bool
+    insufficient_evidence_reason: InsufficientEvidenceReason | None = None
+
+    @field_validator("claims")
+    @classmethod
+    def unique_claim_ids(cls, value: list[ClaimDraft]) -> list[ClaimDraft]:
+        identifiers = [item.claim_id for item in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("claim_id values must be unique")
+        return value
+
 
 ANSWER_JSON_SCHEMA: dict[str, Any] = {
     "type": "json_schema",
@@ -26,6 +76,18 @@ ANSWER_JSON_SCHEMA: dict[str, Any] = {
             "properties": {
                 "answer_markdown": {"type": "string"},
                 "insufficient_evidence": {"type": "boolean"},
+                "insufficient_evidence_reason": {
+                    "type": ["string", "null"],
+                    "enum": [
+                        "no_evidence",
+                        "insufficient_context",
+                        "missing_attribute",
+                        "ambiguous_entity",
+                        "conflicting_sources",
+                        "unsupported_claim",
+                        None,
+                    ],
+                },
                 "claims": {
                     "type": "array",
                     "items": {
@@ -51,6 +113,8 @@ async def generate_answer(
     retrieval: RetrievalResult,
     settings: Settings | None = None,
     profile: RetrievalProfile | None = None,
+    deadline: OperationDeadline | None = None,
+    correlation_id: str = "",
 ) -> tuple[str, dict[str, object]]:
     started = time.perf_counter()
     timings_ms: dict[str, int] = {
@@ -124,14 +188,58 @@ async def generate_answer(
         resolved,
         alias=active_profile.model_aliases.generator_main,
         response_format=ANSWER_JSON_SCHEMA,
+        max_output_tokens=active_profile.answer.max_output_tokens,
+        deadline=deadline,
+        correlation_id=correlation_id,
     )
     timings_ms["model_chat"] = _elapsed_ms(model_started)
-    content = str(payload["choices"][0]["message"]["content"])
+    choice = dict(payload.get("choices", [{}])[0] or {})
+    message = dict(choice.get("message") or {})
+    content = str(message.get("content") or "")
     usage = dict(payload.get("usage") or {})
+    validation_metadata = {
+        "model_alias": active_profile.model_aliases.generator_main,
+        "provider": payload.get("provider"),
+        "provider_request_id": payload.get("id"),
+        "model_gateway": dict(payload.get("_gateway_metadata") or {}),
+        "finish_reason": choice.get("finish_reason"),
+        "max_output_tokens": active_profile.answer.max_output_tokens,
+    }
     parse_started = time.perf_counter()
-    draft = _parse_answer_draft(content, retrieval.evidence, strict=active_profile.requires_real_provider)
+    try:
+        draft = _parse_answer_draft(
+            content,
+            retrieval.evidence,
+            strict=active_profile.requires_real_provider,
+            truncated=choice.get("finish_reason") == "length",
+        )
+    except ModelOutputError as exc:
+        exc.metadata = validation_metadata
+        raise
     timings_ms["answer_parse"] = _elapsed_ms(parse_started)
     answer = str(draft["answer_markdown"])
+    draft_insufficient_evidence = bool(draft.get("insufficient_evidence"))
+    if active_profile.answer.insufficient_evidence_mode and draft_insufficient_evidence:
+        citation = f" [{retrieval.evidence[0].evidence_id}]" if retrieval.evidence else ""
+        answer = (
+            "В предоставленных источниках нет достаточного подтверждения, чтобы надёжно ответить на вопрос. "
+            "Я не буду делать неподтверждённый вывод."
+            f"{citation}"
+        )
+        validation = validate_citations_with_policy(
+            answer,
+            retrieval.evidence,
+            claims=[],
+            mode=active_profile.answer.verification.citation_validation,
+            settings=resolved,
+        )
+        validation["usage"] = usage
+        validation.update(validation_metadata)
+        validation["provider_cost"] = payload.get("cost") or usage.get("cost") or usage.get("total_cost")
+        validation["answerability_status"] = answerability_status.value if answerability_status else None
+        validation["insufficient_evidence"] = True
+        validation["timings_ms"] = {**timings_ms, "generation_total": _elapsed_ms(started)}
+        return answer, validation
     validation_started = time.perf_counter()
     validation = validate_citations_with_policy(
         answer,
@@ -142,38 +250,21 @@ async def generate_answer(
     )
     timings_ms["citation_validation"] = _elapsed_ms(validation_started)
     validation["usage"] = usage
-    validation["model_alias"] = active_profile.model_aliases.generator_main
-    validation["provider"] = payload.get("provider")
-    validation["provider_request_id"] = payload.get("id")
-    validation["model_gateway"] = dict(payload.get("_gateway_metadata") or {})
+    validation.update(validation_metadata)
     validation["provider_cost"] = payload.get("cost") or usage.get("cost") or usage.get("total_cost")
     validation["answerability_status"] = answerability_status.value if answerability_status else None
-    validation["insufficient_evidence"] = retrieval.insufficient_evidence
+    validation["insufficient_evidence"] = bool(retrieval.insufficient_evidence or draft_insufficient_evidence)
     if not validation["valid"]:
-        if active_profile.requires_real_provider:
-            raise ValueError(f"generated answer failed citation validation: {validation}")
-        repaired = (
-            "Найденные источники релевантны, но сгенерированный ответ не прошёл проверку ссылок. "
-            f"Краткий подтверждённый фрагмент: {retrieval.evidence[0].content[:500]} [S1]"
-        )
-        validation_started = time.perf_counter()
-        validation = validate_citations_with_policy(
-            repaired,
-            retrieval.evidence,
-            claims=[],
-            mode=active_profile.answer.verification.citation_validation,
-            settings=resolved,
-        )
-        timings_ms["citation_validation"] += _elapsed_ms(validation_started)
-        validation["usage"] = usage
-        validation["model_gateway"] = dict(payload.get("_gateway_metadata") or {})
-        validation["timings_ms"] = {**timings_ms, "generation_total": _elapsed_ms(started)}
-        return repaired, validation
+        error = ModelOutputError("generated answer failed citation validation")
+        error.metadata = validation_metadata
+        raise error
     claim_payload = await verify_claims(
         list(draft.get("claims") or []),
         retrieval.evidence,
         settings=resolved,
         profile=active_profile,
+        deadline=deadline,
+        correlation_id=correlation_id,
     )
     timings_ms["claim_verification"] = int(dict(claim_payload.get("timings_ms") or {}).get("claim_verification", 0))
     validation["claim_verification"] = claim_payload
@@ -268,23 +359,72 @@ def validate_citations_with_policy(
     return validation
 
 
-def _parse_answer_draft(content: str, evidence: list[Evidence], *, strict: bool) -> dict[str, Any]:
+def _parse_answer_draft(
+    content: str,
+    evidence: list[Evidence],
+    *,
+    strict: bool,
+    truncated: bool = False,
+) -> dict[str, Any]:
+    normalized = _extract_structured_json(content, truncated=truncated)
     try:
-        payload = json.loads(content)
-    except json.JSONDecodeError:
-        if strict:
-            raise
-        return {"answer_markdown": content, "claims": [], "insufficient_evidence": False}
+        payload = json.loads(normalized)
+    except json.JSONDecodeError as exc:
+        raise ModelOutputError(
+            "structured model output is not valid JSON",
+            code="MODEL_OUTPUT_TRUNCATED" if truncated or _looks_truncated(normalized) else "MODEL_OUTPUT_INVALID",
+        ) from exc
     if not isinstance(payload, dict):
-        if strict:
-            raise ValueError("answer draft is not a JSON object")
-        return {"answer_markdown": content, "claims": [], "insufficient_evidence": False}
-    if "answer_markdown" not in payload:
-        if strict:
-            raise ValueError("answer draft missing answer_markdown")
-        first = evidence[0].evidence_id if evidence else "S1"
-        return {"answer_markdown": f"{content} [{first}]", "claims": [], "insufficient_evidence": False}
-    return payload
+        raise ModelOutputError("structured model output is not a JSON object")
+    try:
+        draft = AnswerDraft.model_validate(payload)
+    except ValueError as exc:
+        raise ModelOutputError("structured model output failed schema validation") from exc
+    allowed = {item.evidence_id for item in evidence}
+    unknown = {
+        evidence_id for claim in draft.claims for evidence_id in claim.evidence_ids if evidence_id not in allowed
+    }
+    if unknown:
+        raise ModelOutputError("structured model output referenced unknown evidence")
+    declared_citations = {evidence_id for claim in draft.claims for evidence_id in claim.evidence_ids}
+    answer_citations = set(CITATION_RE.findall(draft.answer_markdown))
+    if not draft.insufficient_evidence and answer_citations - declared_citations:
+        raise ModelOutputError("structured model output citation is not declared by a claim")
+    if not draft.insufficient_evidence and declared_citations - answer_citations:
+        raise ModelOutputError("structured model output claim evidence is not cited in the answer")
+    if draft.insufficient_evidence and len(answer_citations) > 1:
+        raise ModelOutputError("insufficient-evidence draft may contain at most one citation")
+    if not draft.insufficient_evidence and not draft.claims:
+        raise ModelOutputError("non-abstaining answer must contain claims")
+    return draft.model_dump(mode="json")
+
+
+def _extract_structured_json(content: str, *, truncated: bool = False) -> str:
+    normalized = content.lstrip("\ufeff").strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", normalized, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        normalized = fenced.group(1).strip()
+    if not normalized:
+        raise ModelOutputError("structured model output is empty")
+    if normalized.startswith("{") and normalized.endswith("}"):
+        return normalized
+    if normalized.startswith("{"):
+        try:
+            _, end = json.JSONDecoder().raw_decode(normalized)
+        except json.JSONDecodeError:
+            end = -1
+        if end > 0 and normalized[end:].strip():
+            raise ModelOutputError("structured model output contains commentary outside JSON")
+    raise ModelOutputError(
+        "structured model output is truncated"
+        if truncated or _looks_truncated(normalized)
+        else "structured model output contains commentary outside JSON",
+        code="MODEL_OUTPUT_TRUNCATED" if truncated or _looks_truncated(normalized) else "MODEL_OUTPUT_INVALID",
+    )
+
+
+def _looks_truncated(content: str) -> bool:
+    return content.startswith("{") and not content.endswith("}")
 
 
 def _zim_source_url_valid(evidence: Evidence, settings: Settings) -> bool:

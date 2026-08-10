@@ -28,6 +28,7 @@ from wikipediarag.document_ingestion import (
 from wikipediarag.ids import scoped_id, stable_hash
 from wikipediarag.model_client import embeddings
 from wikipediarag.model_registry import get_model_registry
+from wikipediarag.reliability import is_retryable_exception, safe_failure_from_exception
 from wikipediarag.repository import (
     claim_next_ingestion_job_item,
     create_document_deletion_job,
@@ -47,6 +48,7 @@ from wikipediarag.repository import (
     mark_document_purged,
     mark_document_version_chunks_deleted,
     mark_source_document_tombstone,
+    next_ingestion_job_item_retry_delay_seconds,
     replace_document_sections_from_chunks,
     save_index_version,
     set_knowledge_base_active_index,
@@ -89,6 +91,11 @@ from wikipediarag.zim_dump import ZimArchiveAdapter, ZimPage, ZimRedirect, chunk
 EMBEDDING_INPUT_BATCH_SIZE = 96
 EMBEDDING_REQUEST_CONCURRENCY = 8
 ZIM_IMPORT_PAGE_BATCH_SIZE = 384
+
+
+def _safe_ingestion_error_code(exc: BaseException, *, stage: str) -> str:
+    """Return a canonical, content-free code for persisted worker failures."""
+    return safe_failure_from_exception(exc, stage=stage).error_code
 
 
 async def process_wiki_import(job: dict[str, Any], settings: Settings | None = None) -> None:
@@ -272,7 +279,7 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
                     "chunks_indexed": chunks_indexed,
                 },
                 checkpoint=checkpoint,
-                error_code=type(exc).__name__,
+                error_code=_safe_ingestion_error_code(exc, stage="wiki_import"),
                 error_message=str(exc),
             )
         raise
@@ -523,7 +530,7 @@ async def process_zim_import(job: dict[str, Any], settings: Settings | None = No
                     "skipped_entries": skipped_entries,
                 },
                 checkpoint=checkpoint,
-                error_code=type(exc).__name__,
+                error_code=_safe_ingestion_error_code(exc, stage="zim_import"),
                 error_message=str(exc),
             )
         raise
@@ -840,6 +847,11 @@ async def process_document_upload(job: dict[str, Any], settings: Settings | None
                     break
                 items.append(item)
         if not items:
+            async with connect() as conn:
+                retry_delay = await next_ingestion_job_item_retry_delay_seconds(conn, job_id)
+            if retry_delay is not None:
+                await asyncio.sleep(min(3.0, max(0.1, retry_delay)))
+                continue
             await _finalize_document_upload_job(job_id)
             return
         await asyncio.gather(*(_process_document_upload_item(item, resolved) for item in items))
@@ -1057,11 +1069,21 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
     except UploadValidationError as exc:
         await _fail_document_upload_item(item_id, document_version_id, stage, exc.code, exc.safe_message)
     except ParserServiceError as exc:
-        await _fail_document_upload_item(item_id, document_version_id, stage, exc.code, exc.safe_message)
+        if _retryable_document_ingestion_error(exc, item=item, settings=settings):
+            await _retry_document_upload_item(item, stage, exc.code)
+        else:
+            await _fail_document_upload_item(item_id, document_version_id, stage, exc.code, exc.safe_message)
     except Exception as exc:
-        await _fail_document_upload_item(
-            item_id, document_version_id, stage, type(exc).__name__, "document ingestion failed"
-        )
+        if _retryable_document_ingestion_error(exc, item=item, settings=settings):
+            await _retry_document_upload_item(item, stage, _safe_ingestion_error_code(exc, stage=stage))
+        else:
+            await _fail_document_upload_item(
+                item_id,
+                document_version_id,
+                stage,
+                _safe_ingestion_error_code(exc, stage=stage),
+                "document ingestion failed",
+            )
 
 
 async def _resolve_upload_index_target(tenant_id: str, kb_id: str, settings: Settings) -> dict[str, Any]:
@@ -1179,6 +1201,43 @@ async def _fail_document_upload_item(
             progress={"stage": stage, "safe_error_code": code},
             error_code=code,
             error_message=safe_message,
+        )
+
+
+def _retryable_document_ingestion_error(exc: BaseException, *, item: dict[str, Any], settings: Settings) -> bool:
+    """Allow one durable retry only for a classified transport/provider failure."""
+    if int(item.get("attempts") or 0) >= max(1, settings.safe_external_retry_attempts):
+        return False
+    if isinstance(exc, ParserServiceError):
+        return exc.code in {
+            "ConnectError",
+            "ConnectTimeout",
+            "ReadTimeout",
+            "ReadError",
+            "PoolTimeout",
+            "HTTP_429",
+            "HTTP_502",
+            "HTTP_503",
+            "HTTP_504",
+        }
+    return is_retryable_exception(exc)
+
+
+async def _retry_document_upload_item(item: dict[str, Any], stage: str, code: str) -> None:
+    """Checkpoint the transient failure before making the item claimable again."""
+    attempts = max(1, int(item.get("attempts") or 1))
+    delay_seconds = min(15.0, float(2 ** max(0, attempts - 1)))
+    async with connect() as conn:
+        await update_ingestion_job_item(
+            conn,
+            str(item["id"]),
+            status=JobStatus.received,
+            stage="retry_wait",
+            progress={"stage": "retry_wait", "safe_error_code": code, "attempt": attempts},
+            checkpoint={"last_stage": stage, "last_error_code": code, "retry_scheduled": True},
+            error_code=code,
+            error_message="transient document ingestion dependency failure",
+            retry_after_seconds=delay_seconds,
         )
 
 
@@ -1512,7 +1571,7 @@ async def process_source_sync(job: dict[str, Any], settings: Settings | None = N
             cursor_after,
             stats,
             refresh_interval_seconds,
-            type(exc).__name__,
+            _safe_ingestion_error_code(exc, stage="source_sync"),
             "source sync failed",
         )
 
@@ -1883,7 +1942,7 @@ async def process_document_delete(job: dict[str, Any], settings: Settings | None
                 },
             )
     except Exception as exc:
-        safe_error_code = type(exc).__name__
+        safe_error_code = _safe_ingestion_error_code(exc, stage="purge")
         async with connect() as conn:
             await mark_document_purge_failed(
                 conn,

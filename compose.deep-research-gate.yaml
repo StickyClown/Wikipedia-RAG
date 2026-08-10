@@ -1,0 +1,51 @@
+# Isolated runtime profile for the OpenRouter Deep Research hard gate. The
+# project name is supplied by the CLI, so each run receives fresh named volumes.
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:${DEEP_RESEARCH_GATE_POSTGRES_PORT}:5432"
+
+  redis:
+    ports: !reset []
+
+  minio:
+    ports: !override
+      - "127.0.0.1:${DEEP_RESEARCH_GATE_MINIO_PORT}:9000"
+
+  opensearch:
+    ports: !reset []
+
+  mock-provider:
+    ports: !reset []
+
+  model-gateway:
+    ports: !reset []
+
+  metadata-service:
+    ports: !reset []
+
+  xberg:
+    ports: !reset []
+
+  docling:
+    ports: !reset []
+
+  api:
+    ports: !override
+      - "127.0.0.1:${DEEP_RESEARCH_GATE_API_PORT}:8000"
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      model-gateway:
+        condition: service_started
+
+  worker:
+    depends_on: !override
+      api:
+        condition: service_started

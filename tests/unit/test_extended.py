@@ -125,6 +125,64 @@ async def test_extended_search_records_tool_and_total_timings(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_partial_extended_search_never_reports_evidence_sufficient_and_repairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeConnection:
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    calls: list[str] = []
+
+    async def fake_retrieve(_conn: object, query: str, **_kwargs: object) -> RetrievalResult:
+        calls.append(query)
+        return RetrievalResult(
+            query=query,
+            trace_id="trace",
+            evidence=[
+                Evidence(
+                    evidence_id="S1",
+                    chunk_id=f"chunk-{len(calls)}",
+                    title="Service owner",
+                    section_path=["Ownership"],
+                    content="The service owner is the platform team.",
+                    source_url="http://localhost/owner",
+                    scores={"rerank": 0.9},
+                )
+            ],
+            events=[],
+        )
+
+    monkeypatch.setattr("wikipediarag.extended.retrieve", fake_retrieve)
+
+    async def fake_fetch_chunk_by_id(*_args: object, **_kwargs: object) -> dict[str, object] | None:
+        return None
+
+    monkeypatch.setattr("wikipediarag.extended.fetch_chunk_by_id", fake_fetch_chunk_by_id)
+
+    result = await run_extended_search(
+        FakeConnection(),  # type: ignore[arg-type]
+        "Which team owns service and what is retention period?",
+        tenant_id="tenant",
+        knowledge_base_id="kb",
+        query_run_id="run",
+        trace_id="trace",
+        settings=Settings(),
+        profile=get_retrieval_profile("test_mock", Settings()),
+    )
+
+    harness = next(event for event in result.events if event["stage"] == "harness")
+    search_events = [
+        event for event in result.events if event.get("stage") == "harness_tool" and event.get("tool") == "search"
+    ]
+    assert result.answerability is not None
+    assert result.answerability.status.value == "PARTIAL"
+    assert harness["stop_reason"] != "evidence_sufficient"
+    assert any(int(event.get("gap_queries_added") or 0) > 0 for event in search_events)
+    assert len(calls) <= 8
+
+
+@pytest.mark.asyncio
 async def test_extended_bridge_context_keeps_film_and_series_hops(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeConnection:
         async def execute(self, *_args: object, **_kwargs: object) -> None:

@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import re
-import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -199,12 +198,12 @@ async def _run_research_stage[StageResult](
             exc=exc,
         )
         logger.error(
-            "deep_research_stage_failed operation=%s stage=%s exception_class=%s sqlstate=%s "
+            "deep_research_stage_failed operation=%s stage=%s error_code=%s sqlstate=%s "
             "constraint=%s table=%s column=%s "
-            "run_id=%s question_id=%s attempt_id=%s episode_id=%s tool_call_id=%s traceback_frames=%s",
+            "run_id=%s question_id=%s attempt_id=%s episode_id=%s tool_call_id=%s",
             operation,
             stage,
-            type(exc).__name__,
+            safe_error_code(exc),
             _safe_db_exception_field(exc, "sqlstate", "pgcode", "code"),
             _safe_db_exception_field(exc, "constraint_name"),
             _safe_db_exception_field(exc, "table_name"),
@@ -214,7 +213,6 @@ async def _run_research_stage[StageResult](
             identifiers["attempt_id"],
             identifiers["episode_id"],
             identifiers["tool_call_id"],
-            _safe_traceback_frames(exc),
         )
         raise ControllerStageError(failure, exc) from exc
     logger.info(
@@ -248,7 +246,7 @@ def _safe_stage_failure(
     return {
         "operation": operation,
         "stage": stage,
-        "exception_class": type(exc).__name__,
+        "error_code": safe_error_code(exc),
         "sqlstate": _safe_db_exception_field(exc, "sqlstate", "pgcode", "code"),
         "constraint": _safe_db_exception_field(exc, "constraint_name"),
         "table": _safe_db_exception_field(exc, "table_name"),
@@ -258,7 +256,6 @@ def _safe_stage_failure(
         "attempt_id": attempt_id,
         "episode_id": episode_id,
         "tool_call_id": tool_call_id,
-        "traceback_frames": _safe_traceback_frames(exc),
     }
 
 
@@ -324,9 +321,9 @@ async def _persist_research_stage_failure(
             )
     except Exception as persistence_exc:
         logger.error(
-            "deep_research_stage_failure_persistence_failed exception_class=%s "
+            "deep_research_stage_failure_persistence_failed error_code=%s "
             "run_id=%s question_id=%s attempt_id=%s episode_id=%s tool_call_id=%s",
-            type(persistence_exc).__name__,
+            safe_error_code(persistence_exc),
             research_run_id,
             question_id,
             attempt_id,
@@ -388,14 +385,6 @@ def _safe_db_exception_field(exc: BaseException, *names: str) -> str | None:
             if chained is not None:
                 pending.append(chained)
     return None
-
-
-def _safe_traceback_frames(exc: BaseException) -> list[str]:
-    """Return frame locations only; source lines and exception text are excluded."""
-    return [
-        f"{frame.filename.rsplit('\\\\', 1)[-1].rsplit('/', 1)[-1]}:{frame.lineno}:{frame.name}"
-        for frame in traceback.extract_tb(exc.__traceback__)
-    ][-24:]
 
 
 @dataclass(frozen=True, slots=True)

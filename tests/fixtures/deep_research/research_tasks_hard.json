@@ -1,0 +1,197 @@
+{
+  "schema_version": "deep_research_fixture_v1",
+  "tasks": [
+    {
+      "task_id": "alias_reformulation_chain",
+      "topic": "Кто отвечает за инцидентную готовность инициативы, указанной в отчете как Project Lantern?",
+      "documents": [
+        {
+          "id": "lantern_summary",
+          "filename": "lantern-summary.md",
+          "content_type": "text/markdown",
+          "content": "# Quarterly initiative summary\n\nDR_HARD_LANTERN_ALIAS Project Lantern в операционном каталоге переименован в LTN-42. Для проверки инцидентной готовности используется runbook RB-17."
+        },
+        {
+          "id": "runbook_index",
+          "filename": "runbook-index.md",
+          "content_type": "text/markdown",
+          "content": "# Runbook index\n\nDR_HARD_LANTERN_RUNBOOK RB-17 относится к сервису Night Harbor. Для SLA и on-call владельца нужно смотреть карточку сервиса Night Harbor."
+        },
+        {
+          "id": "night_harbor_ops",
+          "filename": "night-harbor-ops.md",
+          "content_type": "text/markdown",
+          "content": "# Night Harbor operations\n\nDR_HARD_LANTERN_OWNER Сервис Night Harbor поддерживает команда Borealis. Инцидентная готовность: on-call 24/7, первичная эскалация за 15 минут."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Project Lantern", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "LTN-42", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "RB-17", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "Night Harbor", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "lantern_summary", "marker": "DR_HARD_LANTERN_ALIAS" },
+        { "document_id": "runbook_index", "marker": "DR_HARD_LANTERN_RUNBOOK" },
+        { "document_id": "night_harbor_ops", "marker": "DR_HARD_LANTERN_OWNER" }
+      ],
+      "expected_coverage": { "min_total": 3, "min_covered": 2, "allow_partial": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 3,
+        "min_derived_questions": 3,
+        "required_tool_names": ["extended_search"],
+        "derived_question_contains": ["LTN-42", "RB-17", "Night Harbor"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["hard", "multi_source_chain", "alias_resolution", "query_reformulation", "tool_loop_required"]
+    },
+    {
+      "task_id": "policy_exception_bridge",
+      "topic": "Какой срок удержания логов применить к кейсу Aster-North и почему?",
+      "documents": [
+        {
+          "id": "aster_case",
+          "filename": "aster-case.md",
+          "content_type": "text/markdown",
+          "content": "# Case register\n\nDR_HARD_ASTER_CASE Кейс Aster-North относится к региону North-7 и классу данных telemetry."
+        },
+        {
+          "id": "telemetry_global_policy",
+          "filename": "telemetry-global-policy.md",
+          "content_type": "text/markdown",
+          "content": "# Global telemetry policy\n\nDR_HARD_ASTER_GLOBAL По умолчанию telemetry logs удерживаются 30 дней, если для региона нет действующего override."
+        },
+        {
+          "id": "north7_exception",
+          "filename": "north7-exception.md",
+          "content_type": "text/markdown",
+          "content": "# Regional exceptions\n\nDR_HARD_ASTER_EXCEPTION Для региона North-7 действует override: telemetry logs удерживаются 90 дней до 2026-12-31."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Aster-North", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "North-7", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "telemetry", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "override", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "aster_case", "marker": "DR_HARD_ASTER_CASE" },
+        { "document_id": "telemetry_global_policy", "marker": "DR_HARD_ASTER_GLOBAL" },
+        { "document_id": "north7_exception", "marker": "DR_HARD_ASTER_EXCEPTION" }
+      ],
+      "expected_coverage": { "min_total": 3, "min_covered": 2, "allow_partial": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 3,
+        "min_derived_questions": 3,
+        "required_tool_names": ["extended_search"],
+        "derived_question_contains": ["North-7", "telemetry", "override"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["hard", "multi_source_chain", "policy_exception", "query_reformulation", "tool_loop_required"]
+    },
+    {
+      "task_id": "contradiction_after_bridge",
+      "topic": "Можно ли считать заявку VX-9 готовой к запуску?",
+      "documents": [
+        {
+          "id": "vx9_ticket",
+          "filename": "vx9-ticket.md",
+          "content_type": "text/markdown",
+          "content": "# Launch ticket\n\nDR_HARD_VX9_TICKET Заявка VX-9 относится к компоненту Prism Edge и чеклисту CHK-18."
+        },
+        {
+          "id": "chk18_security",
+          "filename": "chk18-security.md",
+          "content_type": "text/markdown",
+          "content": "# Checklist CHK-18\n\nDR_HARD_VX9_CHECKLIST CHK-18 имеет статус security approved и performance approved."
+        },
+        {
+          "id": "prism_release_blocker",
+          "filename": "prism-release-blocker.md",
+          "content_type": "text/markdown",
+          "content": "# Prism Edge release note\n\nDR_HARD_VX9_BLOCKER Prism Edge blocked: data residency waiver missing. Запуск запрещен до DPO waiver."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "VX-9", "allowed_statuses": ["covered", "partial", "conflicting"] },
+        { "question_contains": "Prism Edge", "allowed_statuses": ["covered", "partial", "conflicting"] },
+        { "question_contains": "CHK-18", "allowed_statuses": ["covered", "partial", "conflicting"] },
+        { "question_contains": "data residency", "allowed_statuses": ["conflicting", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "vx9_ticket", "marker": "DR_HARD_VX9_TICKET" },
+        { "document_id": "chk18_security", "marker": "DR_HARD_VX9_CHECKLIST" },
+        { "document_id": "prism_release_blocker", "marker": "DR_HARD_VX9_BLOCKER" }
+      ],
+      "expected_coverage": { "min_total": 3, "min_covered": 1, "allow_partial": true, "requires_conflicting": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 3,
+        "min_derived_questions": 3,
+        "required_tool_names": ["extended_search"],
+        "derived_question_contains": ["Prism Edge", "CHK-18", "data residency"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": ["security approved conflicts with launch blocked by missing data residency waiver"],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["hard", "multi_source_chain", "contradiction_after_bridge", "query_reformulation", "tool_loop_required"]
+    },
+    {
+      "task_id": "finance_alias_chain",
+      "topic": "Какой утвержденный бюджет у инициативы Omega Meridian?",
+      "documents": [
+        {
+          "id": "omega_portfolio",
+          "filename": "omega-portfolio.md",
+          "content_type": "text/markdown",
+          "content": "# Portfolio notes\n\nDR_HARD_OMEGA_ALIAS Инициатива Omega Meridian в финансовой системе проходит как cost center CC-204."
+        },
+        {
+          "id": "cc204_budget",
+          "filename": "cc204-budget.csv",
+          "content_type": "text/csv",
+          "content": "marker,cost_center,approved_budget,currency,period\nDR_HARD_OMEGA_BUDGET,CC-204,480000,EUR,2026-H2\n"
+        },
+        {
+          "id": "finance_commentary",
+          "filename": "finance-commentary.md",
+          "content_type": "text/markdown",
+          "content": "# Finance commentary\n\nDR_HARD_OMEGA_SCOPE CC-204 covers the Omega Meridian platform migration scope only; shared infrastructure reserve is excluded."
+        }
+      ],
+      "expected_questions": [
+        { "question_contains": "Omega Meridian", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "CC-204", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "budget", "allowed_statuses": ["covered", "partial"] },
+        { "question_contains": "scope", "allowed_statuses": ["covered", "partial"] }
+      ],
+      "gold_evidence": [
+        { "document_id": "omega_portfolio", "marker": "DR_HARD_OMEGA_ALIAS" },
+        { "document_id": "cc204_budget", "marker": "DR_HARD_OMEGA_BUDGET" },
+        { "document_id": "finance_commentary", "marker": "DR_HARD_OMEGA_SCOPE" }
+      ],
+      "expected_coverage": { "min_total": 3, "min_covered": 2, "allow_partial": true },
+      "trajectory_expectations": {
+        "min_completed_tool_calls": 3,
+        "min_derived_questions": 3,
+        "required_tool_names": ["extended_search"],
+        "derived_question_contains": ["CC-204", "budget", "scope"],
+        "require_tool_query_hash": true,
+        "forbid_raw_tool_query": true
+      },
+      "expected_contradictions": [],
+      "hidden_markers": [],
+      "acl_setup": { "mode": "kb" },
+      "quality_tags": ["hard", "multi_source_chain", "csv_evidence", "query_reformulation", "tool_loop_required"]
+    }
+  ]
+}

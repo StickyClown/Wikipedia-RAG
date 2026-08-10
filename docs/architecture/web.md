@@ -14,8 +14,9 @@ drafts survive tab changes.
   default when at least one KB is available; Knowledge Base is the default for
   an authenticated tenant with no KBs.
 - Sign in: local username/password form and OIDC start button.
-- Knowledge-base context bar: primary KB selector and collapsible retrieval
-  scope; create-KB form is shown in the Knowledge Base workspace.
+- Knowledge-base context bar: shared multi-KB scope picker for Chat/Search;
+  Knowledge and Research keep their own single-KB selectors. The create-KB
+  form is shown in the Knowledge Base workspace.
 - Wikipedia Import: bounded ZIM import trigger and polled ingestion job progress.
 - Upload: multi-file picker, batch upload status, per-file progress, retry for failed ingestion jobs and public metadata for the first completed document.
 - Search: ordinary viewer-scoped search with metadata filters, result snippets and a document viewer open action.
@@ -24,7 +25,8 @@ drafts survive tab changes.
   listing runs, reading progress, coverage, evidence, reflections and report,
   and pausing, resuming, cancelling or opening the latest episode in the
   retrieval debugger.
-- Chat: question input, mode selector, retrieval profile and advanced retrieval override controls.
+- Chat: question input, mode selector and advanced retrieval override controls;
+  the profile defaults to backend `auto` and is not hardcoded in the browser.
 - Answer and sources: generated answer plus cited evidence returned by chat SSE events.
 - Retrieval Debugger: query-run retrieval events loaded after a chat run.
 
@@ -50,8 +52,9 @@ Active tenant is stored server-side in the app session. The UI displays
 `active_tenant_id` from the session response but does not choose tenants in the
 current screen. Knowledge bases are selected in browser memory:
 
-- `selectedKnowledgeBaseId` is the primary KB for import/upload.
-- `selectedRetrievalKnowledgeBaseIds` is the chat/debug retrieval scope.
+- `selectedKnowledgeBaseId` is the single-KB selector for Knowledge/Research.
+- `selectedRetrievalKnowledgeBaseIds` is the shared Chat/Search retrieval scope;
+  an empty scope disables Ask/Search with an explanatory status.
 
 The backend still enforces tenant and KB access through `ActorContext`; UI
 choices are not trusted authority.
@@ -68,20 +71,28 @@ The chat form posts to `POST /api/v1/chat` with:
 - retrieval override settings for BM25, dense, fusion, rerank, parent expansion, Extended Search and top K.
 
 The client reads the SSE response using `fetch(...).body.getReader()` and a
-local `parseSse` function. Browser `EventSource` is not used.
+local `parseSse` function. Browser `EventSource` is not used. The decoder
+accepts CRLF/multiple `data:` lines and validates continuous sequence numbers
+and exactly one terminal event.
 
 Handled chat events in the UI:
 
 - `message.delta`: updates answer text, evidence and query run id.
-- `run.completed`: updates query run id.
+- `stage.started`, `stage.heartbeat`, `stage.completed`: update the visible
+  stage, elapsed time and liveness status.
+- `run.completed`, `run.failed`, `run.cancelled`: close the request with a
+  safe localized message while retaining sources, query-run ID and technical
+  details.
 
-Other SSE events are emitted by the backend but are not rendered by the current
-UI.
+Transport retries preserve the same `client_request_id`/idempotency key;
+explicit user retry creates a new logical request. Markdown is rendered by a
+safe component and citation buttons open the selected evidence/document
+fragment.
 
 ## Deep Research Panel
 
-The Deep Research panel uses the selected primary KB, current retrieval profile
-and current retrieval override controls. Starting a run calls
+The Deep Research panel uses its own selected single KB, current backend-resolved
+retrieval profile and current retrieval override controls. Starting a run calls
 `POST /api/v1/research-runs`; listing/detail calls use
 `GET /api/v1/research-runs` and `GET /api/v1/research-runs/{id}`.
 
@@ -121,7 +132,8 @@ Batch status exposes safe per-file progress only. Object keys are not returned.
 ## Search And Document Viewer
 
 Ordinary search calls `POST /api/v1/search` with selected KB ids, query, paging
-and metadata filters. Results include `chunk_id`, `document_id`,
+and metadata filters. Results are rendered from server-provided document groups
+with expandable snippets and include `chunk_id`, `document_id`,
 `section_path`, safe snippet metadata and locator data. The UI opens the inline
 document viewer by calling:
 
@@ -160,13 +172,31 @@ The UI uses a local `apiFetch` helper:
 
 Direct presigned MinIO `PUT` calls do not use the app API cookie or CSRF token.
 
+## Reliability & UX Correction V2
+
+Chat/Search call `GET /api/v1/retrieval-profiles` for the selected scope and
+send no profile name when using `auto`; incompatible profiles remain disabled.
+Transport retries preserve the same `client_request_id` and idempotency key,
+while explicit retry creates a new logical request. The SSE decoder accepts
+CRLF and multiple `data:` lines, validates continuous sequence numbers and
+exactly one terminal event, and renders stage heartbeats. Markdown uses a safe
+renderer; citation buttons open the corresponding evidence/document fragment.
+Protocol tests and the Playwright smoke are in
+`services/ui/src/App.protocol.test.ts` and `services/ui/playwright/`.
+
 ## UI States
 
-- Loading: readiness starts as `checking`; upload items move through preparing, hashing, uploading, completing, queued and polled states.
+- Loading: readiness starts as `checking`; Chat/Search immediately expose
+  `aria-busy`, elapsed time and an AbortController-backed cancel action; upload
+  items move through preparing, hashing, uploading, completing, queued and
+  polled states.
 - Empty: if no authenticated session exists, only the sign-in band is shown; if no KB exists, selectors render with no options.
 - Degraded: `/ready` status is displayed in the header as returned by the API.
-- Forbidden: failed API calls usually surface as raw response text in auth/upload error areas; some KB operations fail silently by returning early.
-- Failed: upload item and batch errors show safe error code/message when provided; chat stream failure events are not fully rendered in the current UI.
+- Forbidden: API failures use localized safe envelopes; technical code/request ID
+  details are expandable rather than raw response text.
+- Failed: upload, Search and Chat preserve canonical error code, query-run ID
+  and last stage; Chat keeps retrieved sources when generation fails and Stop
+  produces a neutral cancelled state.
 
 ## Data The Browser Must Never Receive
 
@@ -188,11 +218,11 @@ Direct presigned MinIO `PUT` calls do not use the app API cookie or CSRF token.
 | Import Wikipedia subset | Wikipedia Import panel | `POST /api/v1/wikipedia/zim-imports`, poll `GET /api/v1/ingestion-jobs/{job_id}` | `job` | Job `error_message` displayed |
 | Multi-file upload | Upload panel | `POST /api/v1/uploads/batches`, presigned MinIO `PUT`, complete sessions, poll batch | `uploadBatch`, `uploadItems`, `uploadDocument` | Upload/batch errors in item or panel |
 | Retry failed ingestion | Upload item Retry button | `POST /api/v1/ingestion-jobs/{job_id}:resume`, poll batch | Item status and batch status | Response text on item |
-| Ordinary search | Search form | `POST /api/v1/search` with selected KB scope and filters | `searchResults`, `searchHasMore` | Response text in `searchError` |
+| Ordinary search | Search form | `POST /api/v1/search` with selected KB scope and filters | grouped `searchResults`, `searchHasMore`, busy/abort state | localized safe error with technical details |
 | Open document hit | Search result button | `GET /api/v1/documents/{document_id}/structure`, then context by `chunk_id` | `viewerStructure`, `viewerContext` | Response text in `viewerError` |
 | Search inside document | Document viewer form | `POST /api/v1/documents/{document_id}/search` | `viewerSearchResults` | Response text in `viewerError` |
 | Deep Research | Deep Research panel | `POST/GET /api/v1/research-runs`, action endpoints and latest episode debugger lookup | `researchRuns`, `researchDetail`, `researchError` | Response text in `researchError` |
-| Chat | Chat form | `POST /api/v1/chat` SSE; backend calls retrieval and Model Gateway | `answer`, `evidence`, `queryRunId` | Stream failure event not fully rendered |
+| Chat | Chat form | `POST /api/v1/chat` SSE; backend calls retrieval and Model Gateway | `answer`, `evidence`, `queryRunId`, stage/heartbeat/sequence | safe terminal failure, sources and query-run ID retained |
 | Retrieval debug | Debug button | `GET /api/v1/query-runs/{query_run_id}/retrieval` | `events` | Not displayed when request fails |
 
 ## Main Web Interaction

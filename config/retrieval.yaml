@@ -39,6 +39,47 @@ profiles:
       max_context_tokens: 30000
       claim_support_checker: false
       extended_search: conditional
+    deep_research:
+      max_questions: 8
+      max_derived_per_episode: 2
+      max_episodes: 12
+      max_tool_calls: 12
+      heartbeat_seconds: 120
+      tool_timeout_seconds: 120
+      deadline_seconds: 900
+      report_reserve_seconds: 30
+      planner_mode: deterministic
+      question_budget:
+        max_attempts: 3
+        max_rewrites: 2
+        max_depth: 3
+      planner:
+        model_alias: generator_fast
+        max_context_tokens: 80000
+        productive_target: 0.45
+        soft_limit: 0.55
+        hard_input_limit: 0.70
+        output_reserve: 0.15
+        safety_reserve: 0.15
+        max_output_tokens: 12000
+      verifier:
+        model_alias: generator_main
+        max_context_tokens: 24000
+        productive_target: 0.45
+        soft_limit: 0.55
+        hard_input_limit: 0.70
+        output_reserve: 0.10
+        safety_reserve: 0.20
+        max_output_tokens: 2000
+      synthesis:
+        model_alias: generator_main
+        max_context_tokens: 80000
+        productive_target: 0.45
+        soft_limit: 0.55
+        hard_input_limit: 0.70
+        output_reserve: 0.15
+        safety_reserve: 0.15
+        max_output_tokens: 12000
     answer:
       citations_required: true
       deterministic_citation_validation: true
@@ -94,6 +135,40 @@ profiles:
       max_context_tokens: 12000
       claim_support_checker: false
       extended_search: "off"
+    deep_research:
+      max_questions: 8
+      max_derived_per_episode: 2
+      max_episodes: 12
+      max_tool_calls: 12
+      heartbeat_seconds: 120
+      planner_mode: deterministic
+      planner:
+        model_alias: mock_generator_fast
+        max_context_tokens: 80000
+        productive_target: 0.45
+        soft_limit: 0.55
+        hard_input_limit: 0.70
+        output_reserve: 0.15
+        safety_reserve: 0.15
+        max_output_tokens: 12000
+      verifier:
+        model_alias: mock_generator_main
+        max_context_tokens: 24000
+        productive_target: 0.45
+        soft_limit: 0.55
+        hard_input_limit: 0.70
+        output_reserve: 0.10
+        safety_reserve: 0.20
+        max_output_tokens: 2000
+      synthesis:
+        model_alias: mock_generator_main
+        max_context_tokens: 80000
+        productive_target: 0.45
+        soft_limit: 0.55
+        hard_input_limit: 0.70
+        output_reserve: 0.15
+        safety_reserve: 0.15
+        max_output_tokens: 12000
     answer:
       citations_required: true
       deterministic_citation_validation: true
@@ -123,6 +198,9 @@ profiles:
   upload_sota_mvp:
     based_on: sota_mvp
     source: upload
+    postprocess:
+      final_evidence_max: 10
+      max_context_tokens: 12000
 
   upload_mock:
     based_on: test_mock

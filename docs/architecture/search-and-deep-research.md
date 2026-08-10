@@ -721,7 +721,8 @@ The backend is not expected to satisfy these requirements yet:
 - Multi-KB Extended Search;
 - tuned real-provider Deep Research quality gates;
 - production external deployment guarantees;
-- full dependency readiness checks for Redis/Valkey, MinIO and OpenSearch from
+- Redis/Valkey as a hard readiness dependency; it remains a non-fatal search
+  cache with uncached fallback, while MinIO and OpenSearch are checked by
   API `/ready`;
 - malware scanning or production restore drills.
 

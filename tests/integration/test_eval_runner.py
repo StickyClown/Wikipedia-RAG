@@ -49,13 +49,40 @@ class FakeEvalClient:
                             {
                                 "evidence_id": "S1",
                                 "chunk_id": "c1",
+                                "document_id": "p1",
+                                "section_id": "s1",
+                                "title": "Статья",
                                 "source_url": "http://localhost/source",
                             }
                         ],
                         "events": [
-                            {"stage": "rrf", "candidates": [{"chunk_id": "c1", "scores": {"rrf_total": 1.0}}]},
-                            {"stage": "rerank", "candidates": [{"chunk_id": "c1", "scores": {"rerank": 1.0}}]},
-                            {"stage": "context", "latency_ms": 7, "candidates": [{"chunk_id": "c1"}]},
+                            {
+                                "stage": "rrf",
+                                "candidates": [
+                                    {
+                                        "chunk_id": "c1",
+                                        "document_id": "p1",
+                                        "section_id": "s1",
+                                        "scores": {"rrf_total": 1.0},
+                                    }
+                                ],
+                            },
+                            {
+                                "stage": "rerank",
+                                "candidates": [
+                                    {
+                                        "chunk_id": "c1",
+                                        "document_id": "p1",
+                                        "section_id": "s1",
+                                        "scores": {"rerank": 1.0},
+                                    }
+                                ],
+                            },
+                            {
+                                "stage": "context",
+                                "latency_ms": 7,
+                                "candidates": [{"chunk_id": "c1", "document_id": "p1", "section_id": "s1"}],
+                            },
                         ],
                     },
                     "citation_validation": {
@@ -99,6 +126,8 @@ class EvidenceOnlyEvalClient(FakeEvalClient):
                             {
                                 "evidence_id": "S1",
                                 "chunk_id": "c1",
+                                "document_id": "p1",
+                                "section_id": "s1",
                                 "title": "Статья",
                                 "source_url": "http://localhost/source",
                                 "scores": {"rerank": 0.9},
@@ -346,7 +375,6 @@ async def test_answer_eval_scores_extended_payload_from_final_evidence(
         retrieval_overrides={"postprocess": {"extended_search": "conditional"}},
         config_hash="hash-answer",
     )
-    monkeypatch.setattr("wikipediarag.eval.runner.load_chunk_refs", fake_refs)
     monkeypatch.setattr("wikipediarag.eval.runner.eval_configs", lambda settings=None: [config])
     monkeypatch.setattr("wikipediarag.eval.runner.ARTIFACT_ROOT", tmp_path / "eval")
     manifest = EvalDatasetManifest(
@@ -402,7 +430,6 @@ async def test_answer_eval_retries_transient_run_failed(
         retrieval_overrides={"postprocess": {"extended_search": "conditional"}},
         config_hash="hash-answer",
     )
-    monkeypatch.setattr("wikipediarag.eval.runner.load_chunk_refs", fake_refs)
     monkeypatch.setattr("wikipediarag.eval.runner.eval_configs", lambda settings=None: [config])
     monkeypatch.setattr("wikipediarag.eval.runner.ARTIFACT_ROOT", tmp_path / "eval")
     manifest = EvalDatasetManifest(
@@ -532,7 +559,6 @@ async def test_runner_keeps_config_results_separate_and_reuses_completed(
         ),
     ]
 
-    monkeypatch.setattr("wikipediarag.eval.runner.load_chunk_refs", fake_refs)
     monkeypatch.setattr("wikipediarag.eval.runner.eval_configs", lambda settings=None: configs)
     monkeypatch.setattr("wikipediarag.eval.runner.ARTIFACT_ROOT", tmp_path / "eval")
 
@@ -615,7 +641,6 @@ async def test_runner_strict_report_ignores_stale_rows_with_other_eval_run_id(
         retrieval_overrides={"postprocess": {"extended_search": "conditional"}},
         config_hash="hash-answer",
     )
-    monkeypatch.setattr("wikipediarag.eval.runner.load_chunk_refs", fake_refs)
     monkeypatch.setattr("wikipediarag.eval.runner.eval_configs", lambda settings=None: [config])
     monkeypatch.setattr("wikipediarag.eval.runner.ARTIFACT_ROOT", tmp_path / "eval")
     manifest = EvalDatasetManifest(
@@ -707,7 +732,6 @@ async def test_runner_uses_one_root_contract_for_normal_and_harness_paths(
         retrieval_overrides={"postprocess": {"extended_search": "conditional"}},
         config_hash="hash-answer",
     )
-    monkeypatch.setattr("wikipediarag.eval.runner.load_chunk_refs", fake_refs)
     monkeypatch.setattr("wikipediarag.eval.runner.eval_configs", lambda settings=None: [config])
     monkeypatch.setattr("wikipediarag.eval.runner.ARTIFACT_ROOT", tmp_path / "eval")
     manifest = EvalDatasetManifest(
@@ -778,7 +802,7 @@ async def test_runner_failed_row_preserves_safe_failure_stage_and_retrieved_chun
 
     run = await run_suite(manifest, [_task("t1")], api="http://api", client=client, reuse_completed=False)
 
-    assert client.calls == 3
+    assert client.calls == 2
     summary = run.config_summaries[0]
     assert summary.failed_task_ids == ["t1"]
     result_path = Path(run.run_dir) / "results" / "sota_mvp_normal-hash-answer.jsonl"
@@ -786,7 +810,7 @@ async def test_runner_failed_row_preserves_safe_failure_stage_and_retrieved_chun
     assert result.failure_stage == "answer_generation"
     assert result.failure_code == "TimeoutError"
     assert result.failure_retryable is True
-    assert result.attempts == 3
+    assert result.attempts == 2
     assert result.last_successful_stage == "retrieval"
     assert result.query_run_id == "run-failed"
     assert result.trace_id == "trace-failed"
@@ -825,7 +849,6 @@ async def test_runner_batch_size_is_bounded_in_flight_backfill_scheduler(
         retrieval_overrides={"postprocess": {"extended_search": "off"}},
         config_hash="hash-answer",
     )
-    monkeypatch.setattr("wikipediarag.eval.runner.load_chunk_refs", fake_refs)
     monkeypatch.setattr("wikipediarag.eval.runner.eval_configs", lambda settings=None: [config])
     monkeypatch.setattr("wikipediarag.eval.runner.ARTIFACT_ROOT", tmp_path / "eval")
     manifest = EvalDatasetManifest(

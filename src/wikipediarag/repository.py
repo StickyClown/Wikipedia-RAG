@@ -58,14 +58,18 @@ async def create_ingestion_job(
     knowledge_base_id: str,
     kind: str,
     config: dict[str, Any],
+    model_config_revision_id: str | None = None,
+    model_config_hash: str | None = None,
 ) -> uuid.UUID:
     job_id = new_uuid()
     await conn.execute(
         text(
             """  # noqa: S608
-            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress)
+            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress,
+              model_config_revision_id, model_config_hash)
             VALUES (:id, :tenant_id, :knowledge_base_id, :kind, 'received',
-                    CAST(:config AS jsonb), CAST(:progress AS jsonb))
+                    CAST(:config AS jsonb), CAST(:progress AS jsonb),
+                    :model_config_revision_id, :model_config_hash)
             """
         ),
         {
@@ -75,6 +79,8 @@ async def create_ingestion_job(
             "kind": kind,
             "config": json_dumps(config),
             "progress": json_dumps({"pages_seen": 0, "pages_imported": 0, "chunks_indexed": 0}),
+            "model_config_revision_id": model_config_revision_id,
+            "model_config_hash": model_config_hash,
         },
     )
     return job_id
@@ -358,7 +364,7 @@ async def request_resume(conn: AsyncConnection, job_id: str) -> None:
             SET cancel_requested = false,
                 status = CASE WHEN status IN ('cancelled','failed') THEN 'received' ELSE status END,
                 updated_at = now()
-            WHERE id = :id
+            WHERE id = :id AND status IN ('received', 'running')
             """
         ),
         {"id": job_id},
@@ -1481,6 +1487,7 @@ async def claim_next_ingestion_job_item(conn: AsyncConnection, job_id: str) -> d
             WHERE job_id = :job_id
               AND (
                 status = 'received'
+                AND (next_attempt_at IS NULL OR next_attempt_at <= now())
                 OR (status = 'running' AND claimed_at < now() - interval '30 minutes')
               )
             ORDER BY created_at
@@ -1499,14 +1506,33 @@ async def claim_next_ingestion_job_item(conn: AsyncConnection, job_id: str) -> d
             UPDATE ingestion_job_items
             SET status = 'running',
                 attempts = attempts + 1,
-                claimed_at = COALESCE(claimed_at, now()),
+                claimed_at = now(),
+                next_attempt_at = NULL,
                 updated_at = now()
-            WHERE id = :id
-            """
+            WHERE id = :id AND status IN ('received', 'running')
+        """
         ),
         {"id": row["id"]},
     )
-    return dict(row)
+    claimed = dict(row)
+    claimed["attempts"] = int(claimed.get("attempts") or 0) + 1
+    return claimed
+
+
+async def next_ingestion_job_item_retry_delay_seconds(conn: AsyncConnection, job_id: str) -> float | None:
+    """Return the bounded wait until a received item becomes claimable."""
+    result = await conn.execute(
+        text(
+            """
+            SELECT EXTRACT(EPOCH FROM min(next_attempt_at) - now()) AS delay_seconds
+            FROM ingestion_job_items
+            WHERE job_id = :job_id AND status = 'received' AND next_attempt_at IS NOT NULL
+            """
+        ),
+        {"job_id": job_id},
+    )
+    value = result.scalar()
+    return max(0.0, float(value)) if value is not None else None
 
 
 async def update_ingestion_job_item(
@@ -1519,6 +1545,7 @@ async def update_ingestion_job_item(
     checkpoint: dict[str, Any] | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    retry_after_seconds: float | None = None,
 ) -> None:
     assignments = ["updated_at = now()"]
     params: dict[str, Any] = {"id": item_id}
@@ -1546,6 +1573,9 @@ async def update_ingestion_job_item(
     if error_message is not None:
         assignments.append("error_message = :error_message")
         params["error_message"] = error_message[:1000]
+    if retry_after_seconds is not None:
+        assignments.append("next_attempt_at = now() + make_interval(secs => :retry_after_seconds)")
+        params["retry_after_seconds"] = max(0.0, float(retry_after_seconds))
     await conn.execute(
         text(f"UPDATE ingestion_job_items SET {', '.join(assignments)} WHERE id = :id"),  # noqa: S608
         params,
@@ -3117,6 +3147,8 @@ async def create_query_run(
     input_text: str,
     trace_id: str,
     usage: dict[str, Any] | None = None,
+    model_config_revision_id: str | None = None,
+    model_config_hash: str | None = None,
 ) -> uuid.UUID:
     # The request identifies the logical episode, not a model attempt.  A
     # retry after a failure before episode creation must find the same row.
@@ -3126,10 +3158,11 @@ async def create_query_run(
             """
             INSERT INTO query_runs(
               id, tenant_id, knowledge_base_id, user_id, request_id, client_request_id, mode, status,
-              input_text, usage, trace_id, started_at
+              input_text, usage, trace_id, started_at, model_config_revision_id, model_config_hash
             )
             VALUES (:id, :tenant_id, :knowledge_base_id, :user_id, :request_id, :client_request_id, :mode,
-                    'running', :input_text, CAST(:usage AS jsonb), :trace_id, now())
+                    'running', :input_text, CAST(:usage AS jsonb), :trace_id, now(),
+                    :model_config_revision_id, :model_config_hash)
             ON CONFLICT (request_id) DO NOTHING
             RETURNING id
             """
@@ -3145,6 +3178,8 @@ async def create_query_run(
             "input_text": input_text,
             "usage": json_dumps(usage or {}),
             "trace_id": trace_id,
+            "model_config_revision_id": model_config_revision_id,
+            "model_config_hash": model_config_hash,
         },
     )
     mappings = getattr(result, "mappings", None)
@@ -3160,6 +3195,144 @@ async def create_query_run(
     if existing_row is not None and existing_row.get("id") is not None:
         return uuid.UUID(str(existing_row["id"]))
     return query_run_id
+
+
+async def claim_idempotency_record(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    actor_user_id: str,
+    route: str,
+    idempotency_key: str,
+    request_hash: str,
+    ttl_seconds: int,
+) -> tuple[dict[str, Any], bool]:
+    """Atomically claim an optional client idempotency key.
+
+    The returned boolean is true only for the request that may perform side
+    effects.  Callers must persist their safe response with
+    ``complete_idempotency_record`` before returning it to the client.
+    """
+    result = await conn.execute(
+        text(
+            """
+            INSERT INTO idempotency_records(
+              id, tenant_id, actor_user_id, route, idempotency_key, request_hash, status, expires_at
+            )
+            VALUES (
+              :id, :tenant_id, :actor_user_id, :route, :idempotency_key, :request_hash, 'in_progress',
+              now() + make_interval(secs => :ttl_seconds)
+            )
+            ON CONFLICT (tenant_id, actor_user_id, route, idempotency_key) DO NOTHING
+            RETURNING *
+            """
+        ),
+        {
+            "id": str(new_uuid()),
+            "tenant_id": tenant_id,
+            "actor_user_id": actor_user_id,
+            "route": route,
+            "idempotency_key": idempotency_key,
+            "request_hash": request_hash,
+            "ttl_seconds": max(1, int(ttl_seconds)),
+        },
+    )
+    row = result.mappings().first()
+    if row is not None:
+        return dict(row), True
+    existing_result = await conn.execute(
+        text(
+            """
+            SELECT *
+            FROM idempotency_records
+            WHERE tenant_id = :tenant_id AND actor_user_id = :actor_user_id
+              AND route = :route AND idempotency_key = :idempotency_key
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "actor_user_id": actor_user_id,
+            "route": route,
+            "idempotency_key": idempotency_key,
+        },
+    )
+    existing = existing_result.mappings().first()
+    if existing is None:
+        raise RuntimeError("idempotency record was not persisted")
+    return dict(existing), False
+
+
+async def complete_idempotency_record(
+    conn: AsyncConnection,
+    *,
+    record_id: str,
+    resource_id: str | None,
+    response_status: int,
+    safe_response: dict[str, Any],
+) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE idempotency_records
+            SET status = 'completed', resource_id = :resource_id, response_status = :response_status,
+                safe_response = CAST(:safe_response AS jsonb), updated_at = now()
+            WHERE id = :id AND status = 'in_progress'
+            """
+        ),
+        {
+            "id": record_id,
+            "resource_id": resource_id,
+            "response_status": int(response_status),
+            "safe_response": json_dumps(safe_response),
+        },
+    )
+
+
+async def list_upload_batch_sessions_private(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    batch_id: str,
+) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT *
+            FROM upload_sessions
+            WHERE tenant_id = :tenant_id AND batch_id = CAST(:batch_id AS uuid)
+            ORDER BY created_at, id
+            """
+        ),
+        {"tenant_id": tenant_id, "batch_id": batch_id},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def touch_worker_heartbeat(conn: AsyncConnection, *, worker_id: str, lane: str) -> None:
+    await conn.execute(
+        text(
+            """
+            INSERT INTO worker_instances(id, lane, last_heartbeat_at, started_at, updated_at)
+            VALUES (:id, :lane, now(), now(), now())
+            ON CONFLICT (id) DO UPDATE
+            SET lane = EXCLUDED.lane, last_heartbeat_at = now(), updated_at = now()
+            """
+        ),
+        {"id": worker_id, "lane": lane},
+    )
+
+
+async def fail_idempotency_record(conn: AsyncConnection, *, record_id: str, safe_response: dict[str, Any]) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE idempotency_records
+            SET status = 'failed', safe_response = CAST(:safe_response AS jsonb), updated_at = now()
+            WHERE id = :id AND status = 'in_progress'
+            """
+        ),
+        {"id": record_id, "safe_response": json_dumps(safe_response)},
+    )
 
 
 async def insert_audit_event(
@@ -3399,7 +3572,7 @@ async def complete_query_run(
                 provider_request_id = :provider_request_id,
                 usage = usage || CAST(:usage AS jsonb),
                 completed_at = now()
-            WHERE id = :id
+            WHERE id = :id AND status IN ('received', 'running')
             """
         ),
         {
@@ -3431,7 +3604,20 @@ async def fail_query_run(conn: AsyncConnection, *, query_run_id: str, error_code
             """
             UPDATE query_runs
             SET status = 'failed', error_code = :error_code, completed_at = now()
-            WHERE id = :id
+            WHERE id = :id AND status IN ('received', 'running')
+            """
+        ),
+        {"id": query_run_id, "error_code": error_code},
+    )
+
+
+async def cancel_query_run(conn: AsyncConnection, *, query_run_id: str, error_code: str = "CANCELLED") -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE query_runs
+            SET status = 'cancelled', error_code = :error_code, completed_at = now()
+            WHERE id = :id AND status IN ('received', 'running')
             """
         ),
         {"id": query_run_id, "error_code": error_code},
@@ -3607,6 +3793,8 @@ async def create_research_run(
     context_policy: dict[str, Any],
     questions: list[str],
     research_plan_id: str | None = None,
+    model_config_revision_id: str | None = None,
+    model_config_hash: str | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     run_id = new_uuid()
     job_id = new_uuid()
@@ -3618,9 +3806,11 @@ async def create_research_run(
     await conn.execute(
         text(
             """
-            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress)
+            INSERT INTO ingestion_jobs(id, tenant_id, knowledge_base_id, kind, status, config, progress,
+              model_config_revision_id, model_config_hash)
             VALUES (:id, :tenant_id, :kb_id, 'deep_research', 'received',
-                    CAST(:config AS jsonb), CAST(:progress AS jsonb))
+                    CAST(:config AS jsonb), CAST(:progress AS jsonb),
+                    :model_config_revision_id, :model_config_hash)
             """
         ),
         {
@@ -3644,6 +3834,8 @@ async def create_research_run(
                     "research_plan_id": research_plan_id,
                 }
             ),
+            "model_config_revision_id": model_config_revision_id,
+            "model_config_hash": model_config_hash,
         },
     )
     await conn.execute(
@@ -3651,12 +3843,14 @@ async def create_research_run(
             """
             INSERT INTO research_runs(
               id, tenant_id, knowledge_base_id, user_id, active_job_id, topic, retrieval_profile,
-              tool_mode, retrieval_overrides, status, progress, checkpoint, context_policy, research_plan_id
+              tool_mode, retrieval_overrides, status, progress, checkpoint, context_policy, research_plan_id,
+              model_config_revision_id, model_config_hash
             )
             VALUES (
               :id, :tenant_id, :kb_id, :user_id, :job_id, :topic, :profile,
               :tool_mode, CAST(:overrides AS jsonb), 'received', CAST(:progress AS jsonb),
-              CAST(:checkpoint AS jsonb), CAST(:context_policy AS jsonb), :research_plan_id
+              CAST(:checkpoint AS jsonb), CAST(:context_policy AS jsonb), :research_plan_id,
+              :model_config_revision_id, :model_config_hash
             )
             """
         ),
@@ -3681,6 +3875,8 @@ async def create_research_run(
             "checkpoint": json_dumps({}),
             "context_policy": json_dumps(context_policy),
             "research_plan_id": research_plan_id,
+            "model_config_revision_id": model_config_revision_id,
+            "model_config_hash": model_config_hash,
         },
     )
     for ordinal, scope_id in enumerate(scope_ids, start=1):
