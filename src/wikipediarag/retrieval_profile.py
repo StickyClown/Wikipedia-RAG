@@ -55,6 +55,7 @@ class RetrievalConfig(BaseModel):
     dense_top_k: int = Field(default=100, ge=1)
     fusion_top_k: int = Field(default=60, ge=1)
     rerank: bool = True
+    rerank_input_k: int = Field(default=24, ge=1)
     rerank_top_k: int = Field(default=50, ge=1)
     query_rewrite: TransformMode = "conditional"
     query_decomposition: TransformMode = "conditional"
@@ -144,10 +145,11 @@ class VerificationPolicy(BaseModel):
 
 
 class AnswerConfig(BaseModel):
+    ambiguity_mode: Literal["off", "auto", "always"] = "auto"
     citations_required: bool = True
     deterministic_citation_validation: bool = True
     insufficient_evidence_mode: bool = True
-    max_output_tokens: int = Field(default=768, ge=64, le=2048)
+    max_output_tokens: int = Field(default=4096, ge=64, le=8192)
     verification: VerificationPolicy = Field(default_factory=VerificationPolicy)
 
     @model_validator(mode="before")

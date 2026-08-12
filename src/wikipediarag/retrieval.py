@@ -216,10 +216,12 @@ async def retrieve(
     fused_snapshot = _snapshot_candidates(fused)
 
     rerank_started = time.perf_counter()
+    rerank_candidates = fused[: profile.retrieval.rerank_input_k]
+    ambiguity_mode = profile.answer.ambiguity_mode
     if profile.retrieval.rerank:
         reranked, rerank_model_event = await rerank(
             normalized_query,
-            fused,
+            rerank_candidates,
             resolved,
             profile,
             top_k=profile.retrieval.rerank_top_k,
@@ -234,7 +236,11 @@ async def retrieve(
     reranked_snapshot = _snapshot_candidates(reranked)
     context_started = time.perf_counter()
     selected, policy_events = postprocess_candidates(
-        reranked[: profile.retrieval.rerank_top_k], profile, requested_top_k, query=normalized_query
+        _order_ambiguity_candidates(reranked[: profile.retrieval.rerank_top_k], requested_top_k, ambiguity_mode),
+        profile,
+        requested_top_k,
+        query=normalized_query,
+        ambiguity_mode=ambiguity_mode,
     )
     timings_ms["context"] = _elapsed_ms(context_started)
     timings_ms["retrieval_total"] = _elapsed_ms(started)
@@ -288,10 +294,11 @@ async def retrieve(
         # Deepening only changes deterministic selection, never calls the gateway again.
         deepened = reranked[:deepening_limit]
         selected, deepening_policy_events = postprocess_candidates(
-            deepened,
+            _order_ambiguity_candidates(deepened, requested_top_k, ambiguity_mode),
             profile,
             requested_top_k,
             query=normalized_query,
+            ambiguity_mode=ambiguity_mode,
         )
         evidence = [
             Evidence(
@@ -520,10 +527,12 @@ async def retrieve_multi(
     timings_ms["fusion"] = _elapsed_ms(fusion_started)
 
     rerank_started = time.perf_counter()
+    rerank_candidates = fused[: active_profile.retrieval.rerank_input_k]
+    ambiguity_mode = active_profile.answer.ambiguity_mode
     if active_profile.retrieval.rerank:
         reranked, rerank_model_event = await rerank(
             normalized_query,
-            fused,
+            rerank_candidates,
             resolved,
             active_profile,
             top_k=active_profile.retrieval.rerank_top_k,
@@ -538,7 +547,11 @@ async def retrieve_multi(
     reranked_snapshot = _snapshot_candidates(reranked)
     context_started = time.perf_counter()
     selected, policy_events = postprocess_candidates(
-        reranked[: active_profile.retrieval.rerank_top_k], active_profile, requested_top_k, query=normalized_query
+        _order_ambiguity_candidates(reranked[: active_profile.retrieval.rerank_top_k], requested_top_k, ambiguity_mode),
+        active_profile,
+        requested_top_k,
+        query=normalized_query,
+        ambiguity_mode=ambiguity_mode,
     )
     timings_ms["context"] = _elapsed_ms(context_started)
     timings_ms["retrieval_total"] = _elapsed_ms(started)
@@ -603,7 +616,11 @@ async def retrieve_multi(
         )
         deepened = reranked[:deepening_limit]
         selected, deepening_policy_events = postprocess_candidates(
-            deepened, active_profile, requested_top_k, query=normalized_query
+            _order_ambiguity_candidates(deepened, requested_top_k, ambiguity_mode),
+            active_profile,
+            requested_top_k,
+            query=normalized_query,
+            ambiguity_mode=ambiguity_mode,
         )
         evidence = [
             Evidence(
@@ -1028,6 +1045,7 @@ async def rerank(
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     if not candidates:
         return [], None
+    candidates = candidates[: profile.retrieval.rerank_input_k]
     model_event: dict[str, Any] | None = None
     documents = [f"{item['title']}\n{' / '.join(item['section_path'])}\n{item['content']}" for item in candidates]
     try:
@@ -1114,6 +1132,7 @@ def postprocess_candidates(
     requested_top_k: int,
     *,
     query: str = "",
+    ambiguity_mode: str = "off",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     events: list[dict[str, Any]] = []
     selected: list[dict[str, Any]] = []
@@ -1123,7 +1142,8 @@ def postprocess_candidates(
     seen_units: dict[str, dict[str, Any]] = {}
     deferred_by_quota: list[dict[str, Any]] = []
     negative_titles = extract_explicit_negative_titles(query)
-    max_evidence = min(requested_top_k, profile.postprocess.final_evidence_max)
+    max_evidence = min(requested_top_k, profile.postprocess.final_evidence_max, 12)
+    document_limit = 2 if ambiguity_mode in {"auto", "always"} else 3
     token_budget = profile.postprocess.max_context_tokens
     used_tokens = 0
     for candidate in candidates:
@@ -1190,7 +1210,7 @@ def postprocess_candidates(
         page_key = page_scope_key(candidate)
         document_key = str(candidate.get("document_id") or candidate.get("source_url") or candidate.get("title") or "")
         document_quota_reached = (
-            document_counts.get(document_key, 0) >= 3
+            document_counts.get(document_key, 0) >= document_limit
             and not metadata.get("parent_expanded")
             and not metadata.get("adjacent_expansion")
         )
@@ -1210,7 +1230,7 @@ def postprocess_candidates(
                     "stage": "context_selection",
                     "decision": "deferred",
                     "reason": "DOCUMENT_UNIT_QUOTA",
-                    "document_unit_quota": 3,
+                    "document_unit_quota": document_limit,
                 }
             )
             continue
@@ -1297,7 +1317,7 @@ def postprocess_candidates(
                 candidate.get("document_id") or candidate.get("source_url") or candidate.get("title") or ""
             )
             if (
-                document_counts.get(document_key, 0) >= 3
+                document_counts.get(document_key, 0) >= document_limit
                 and not dict(candidate.get("metadata") or {}).get("parent_expanded")
                 and not dict(candidate.get("metadata") or {}).get("adjacent_expansion")
             ):
@@ -1336,6 +1356,26 @@ def postprocess_candidates(
         }
     )
     return selected, events
+
+
+def _order_ambiguity_candidates(
+    candidates: list[dict[str, Any]], requested_top_k: int, ambiguity_mode: str
+) -> list[dict[str, Any]]:
+    """Deterministically expose multiple document meanings in the first pass."""
+    if ambiguity_mode not in {"auto", "always"} or len(candidates) <= 1:
+        return candidates
+    first_pass_limit = min(8, requested_top_k, 12)
+    selected: list[dict[str, Any]] = []
+    seen_documents: set[str] = set()
+    remaining: list[dict[str, Any]] = []
+    for candidate in candidates:
+        document_key = str(candidate.get("document_id") or candidate.get("source_url") or candidate.get("title") or "")
+        if document_key not in seen_documents and len(selected) < first_pass_limit:
+            selected.append(candidate)
+            seen_documents.add(document_key)
+        else:
+            remaining.append(candidate)
+    return [*selected, *remaining]
 
 
 def _count_context_tokens(content: str) -> int:

@@ -24,11 +24,23 @@ async def _run_lane(
     worker_id: str,
     enqueue_sources: bool = False,
 ) -> None:
-    async def runner() -> None:
+    lane = "/".join(allowed_kinds)
+
+    async def heartbeat() -> None:
+        interval = max(int(settings.worker_job_heartbeat_seconds), 1)
         while True:
             try:
                 async with connect(settings) as conn:
-                    await touch_worker_heartbeat(conn, worker_id=worker_id, lane="/".join(allowed_kinds))
+                    await touch_worker_heartbeat(conn, worker_id=worker_id, lane=lane)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("worker heartbeat failed lane=%s", lane)
+            await asyncio.sleep(interval)
+
+    async def runner() -> None:
+        while True:
+            try:
                 if enqueue_sources:
                     async with connect(settings) as conn:
                         await enqueue_due_source_sync_jobs(conn)
@@ -46,6 +58,7 @@ async def _run_lane(
                 await asyncio.sleep(2)
 
     async with asyncio.TaskGroup() as group:
+        group.create_task(heartbeat())
         for _ in range(max(int(concurrency), 1)):
             group.create_task(runner())
 

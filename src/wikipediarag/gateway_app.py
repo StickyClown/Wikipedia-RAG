@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,9 +14,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
-from wikipediarag.answering import ANSWER_JSON_SCHEMA
+from wikipediarag.answering import ANSWER_JSON_SCHEMA, ModelOutputError, _parse_answer_draft
 from wikipediarag.config import Settings, get_settings, resolve_openrouter_api_key
 from wikipediarag.db import connect
+from wikipediarag.model_control import ModelControlError, compile_provider_payload, config_hash, resolve_output_budget
 from wikipediarag.model_control_repository import active_revision, get_revision, list_models
 from wikipediarag.model_registry import (
     ModelAlias,
@@ -25,8 +28,11 @@ from wikipediarag.model_registry import (
 from wikipediarag.oidc_service import decrypt_server_tokens
 from wikipediarag.reliability import DependencyCircuit, DependencyCircuitOpen
 from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profile
+from wikipediarag.schemas import Evidence
 
 app = FastAPI(title="WikipediaRag Model Gateway")
+logger = logging.getLogger(__name__)
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", flags=re.IGNORECASE | re.DOTALL)
 
 
 @dataclass
@@ -47,9 +53,10 @@ class StructuredSmokeError(RuntimeError):
 
     safe_code = "MODEL_ALIAS_UNREADY"
 
-    def __init__(self, alias: str, message: str) -> None:
+    def __init__(self, alias: str, message: str, *, reason: str) -> None:
         super().__init__(message)
         self.alias = alias
+        self.reason = reason
 
 
 _readiness_state = GatewayReadinessState()
@@ -61,19 +68,37 @@ _structured_schema_invalid_streak: dict[str, int] = {}
 # `{ok: true}` schema would only prove that the provider supports JSON mode,
 # not that it can satisfy the grounded answer shape used by Chat/RAG.
 _STRUCTURED_SMOKE_SCHEMA: dict[str, Any] = dict(ANSWER_JSON_SCHEMA["json_schema"]["schema"])
-_STRUCTURED_SMOKE_MAX_TOKENS = 64
+_STRUCTURED_SMOKE_MAX_TOKENS = 4096
+_STRUCTURED_SMOKE_EVIDENCE = [
+    Evidence(
+        evidence_id="S1",
+        chunk_id="gateway-smoke",
+        title="Gateway structured-output smoke",
+        section_path=[],
+        content="Синтетический проверочный факт подтверждён.",
+        source_url="https://example.invalid/gateway-smoke",
+    )
+]
 
 
-def _structured_smoke_request(model: str) -> dict[str, Any]:
-    return {
+def _structured_smoke_request(
+    model: str,
+    *,
+    request_adapter: dict[str, Any] | None = None,
+    request_defaults: dict[str, Any] | None = None,
+    provider_preferences: dict[str, Any] | None = None,
+    max_tokens: int = _STRUCTURED_SMOKE_MAX_TOKENS,
+) -> dict[str, Any]:
+    internal: dict[str, Any] = {
         "model": model,
         "messages": [
             {
                 "role": "user",
                 "content": (
                     "Верни строго JSON по схеме grounded_answer. "
-                    "В контексте нет доказательств, поэтому используй "
-                    "insufficient_evidence=true и claims=[]."
+                    "Синтетический источник S1 подтверждает факт: «Проверочный факт подтверждён». "
+                    "Верни insufficient_evidence=false, answer_mode=single, interpretations=[], "
+                    'answer_markdown с [S1] после этого факта и один claims с evidence_ids=["S1"].'
                 ),
             }
         ],
@@ -81,13 +106,63 @@ def _structured_smoke_request(model: str) -> dict[str, Any]:
             "type": "json_schema",
             "json_schema": {"name": "gateway_smoke", "strict": True, "schema": _STRUCTURED_SMOKE_SCHEMA},
         },
-        # Qwen 3.6 enables reasoning by default. The bounded canary checks the
-        # structured answer contract, so spending its entire output budget on
-        # hidden reasoning would create a false readiness failure.
-        "reasoning": {"effort": "none"},
-        "max_tokens": _STRUCTURED_SMOKE_MAX_TOKENS,
+        "thinking": {"mode": "off", "effort": "none", "return_reasoning": False},
+        "max_output_tokens": max_tokens,
         "stream": False,
     }
+    if provider_preferences:
+        internal["provider"] = dict(provider_preferences)
+    thinking = internal.pop("thinking")
+    return compile_provider_payload(
+        internal,
+        connection_defaults=request_defaults,
+        request_adapter=request_adapter,
+        thinking=thinking,
+    )
+
+
+def _validate_structured_smoke_response(
+    payload: dict[str, Any], *, alias: str, max_tokens: int = _STRUCTURED_SMOKE_MAX_TOKENS
+) -> None:
+    """Validate the canary without retaining provider content in diagnostics."""
+
+    if _provider_output_truncated(payload):
+        raise StructuredSmokeError(
+            alias,
+            "structured canary output was truncated",
+            reason="structured_output_truncated",
+        )
+    try:
+        _validate_structured_provider_response(payload, _STRUCTURED_SMOKE_SCHEMA)
+    except ValueError as exc:
+        raise StructuredSmokeError(
+            alias,
+            "structured canary violated schema",
+            reason="structured_schema_invalid",
+        ) from exc
+    try:
+        content = _structured_response_content(payload)
+        draft = _parse_answer_draft(content, _STRUCTURED_SMOKE_EVIDENCE, strict=True)
+        normalizations = set(draft.get("model_output_normalizations") or [])
+        if (
+            draft.get("insufficient_evidence")
+            or draft.get("answer_mode") != "single"
+            or not draft.get("claims")
+            or "claims_derived_from_citations" in normalizations
+        ):
+            raise ValueError("structured canary did not return the required grounded claim")
+    except (ModelOutputError, ValueError) as exc:
+        raise StructuredSmokeError(
+            alias,
+            "structured canary violated grounded answer contract",
+            reason="structured_grounded_contract_invalid",
+        ) from exc
+    if _provider_exceeded_output_limit({"max_tokens": max_tokens}, payload):
+        raise StructuredSmokeError(
+            alias,
+            "structured canary exceeded the output limit",
+            reason="structured_output_limit_exceeded",
+        )
 
 
 @app.on_event("startup")
@@ -114,21 +189,8 @@ async def startup_smoke() -> None:
     smoke_mode = settings.model_gateway_startup_smoke
     if smoke_mode == "off":
         return
-    active_control_plane = await _active_control_plane_readiness(settings)
-    if active_control_plane is not None:
-        _readiness_state = GatewayReadinessState(
-            status="ok" if active_control_plane else "degraded",
-            checks=[]
-            if active_control_plane
-            else [
-                ReadinessCheck(
-                    component="model_control_plane.active_revision",
-                    status="failed",
-                    reason="active_revision_validation_failed",
-                )
-            ],
-        )
-        return
+    # A persisted validation report is useful evidence, but never substitutes
+    # for a live canary after a process restart or model/adapter change.
     try:
         openrouter_api_key = resolve_openrouter_api_key(settings)
     except RuntimeError:
@@ -156,7 +218,12 @@ async def startup_smoke() -> None:
             await _openrouter_startup_smoke(settings, profile, api_key=openrouter_api_key)
         except Exception as exc:
             if isinstance(exc, StructuredSmokeError):
-                _structured_alias_unready[exc.alias] = "MODEL_ALIAS_UNREADY"
+                for alias_name in {
+                    profile.model_aliases.generator_fast,
+                    profile.model_aliases.generator_main,
+                    profile.model_aliases.verifier,
+                }:
+                    _structured_alias_unready[alias_name] = "MODEL_ALIAS_UNREADY"
             failure = ReadinessCheck(
                 component="openrouter.startup_smoke",
                 status="failed",
@@ -178,6 +245,15 @@ async def ready() -> dict[str, Any]:
         ReadinessCheck(component=f"structured.{alias}", status="failed", reason=reason)
         for alias, reason in sorted(_structured_alias_unready.items())
     ]
+    dynamic_checks.extend(
+        ReadinessCheck(
+            component=f"runtime.{alias}",
+            status="failed",
+            reason="DEPENDENCY_CIRCUIT_OPEN" if circuit.is_open else "DEPENDENCY_RUNTIME_FAILURE",
+        )
+        for alias, circuit in sorted(_dependency_circuits.items())
+        if circuit.is_degraded
+    )
     checks = [*_readiness_state.checks, *dynamic_checks]
     return {
         "status": "degraded" if checks else _readiness_state.status,
@@ -218,6 +294,9 @@ async def models() -> dict[str, Any]:
             "dimensions": model.dimensions,
             "context_window_tokens": model.context_window_tokens,
             "tokenizer": model.tokenizer,
+            "resolved_provider_model": model.model,
+            "connection_id": None,
+            "adapter_hash": config_hash(model.request_adapter),
             "healthy": _alias_available(model),
         }
         for alias, model in sorted(registry.models.items())
@@ -234,6 +313,9 @@ async def models() -> dict[str, Any]:
                 "dimensions": row.get("dimensions"),
                 "context_window_tokens": row.get("context_window_tokens"),
                 "tokenizer": (row.get("tokenizer_contract") or {}).get("name"),
+                "resolved_provider_model": row.get("provider_model"),
+                "connection_id": str(row.get("connection_id")) if row.get("connection_id") else None,
+                "adapter_hash": config_hash(row.get("request_adapter") or {}),
                 "healthy": bool(row.get("is_enabled", True)),
             }
             for row in db_catalog
@@ -241,9 +323,19 @@ async def models() -> dict[str, Any]:
         )
     except Exception:  # noqa: BLE001 - legacy YAML catalog remains available if DB is offline.
         return {"object": "list", "data": data}
+    active = None
+    try:
+        async with connect(settings) as conn:
+            active = await active_revision(conn)
+    except Exception:  # noqa: BLE001 - catalog remains useful while DB is offline.
+        active = None
     return {
         "object": "list",
         "data": data,
+        "configuration": {
+            "active_revision_id": str(active["id"]) if active else None,
+            "active_revision_hash": str(active["config_hash"]) if active else None,
+        },
     }
 
 
@@ -335,8 +427,8 @@ async def _resolve_stage_payload(payload: dict[str, Any], operation: str) -> dic
         alias_name = str(binding.get("model_alias") or binding.get("alias") or "")
         model_result = await conn.execute(
             text(
-                "SELECT m.*, c.base_url AS connection_base_url, c.endpoint_paths, c.safe_headers, "
-                "c.tls_verify, c.driver AS connection_driver, cr.encrypted_payload "
+                "SELECT m.*, c.base_url AS connection_base_url, c.endpoint_paths, c.request_adapter, "
+                "c.request_defaults, c.safe_headers, c.tls_verify, c.driver AS connection_driver, cr.encrypted_payload "
                 "FROM model_aliases m LEFT JOIN model_provider_connections c ON c.id=m.connection_id "
                 "LEFT JOIN model_connection_credentials cr ON cr.connection_id=c.id AND cr.state='active' "
                 "WHERE m.alias=:alias AND m.is_enabled=true"
@@ -353,31 +445,23 @@ async def _resolve_stage_payload(payload: dict[str, Any], operation: str) -> dic
                 },
             )
         overrides = binding.get("parameter_overrides") or binding.get("parameters") or {}
-        provider_parameters = dict(model.get("model_defaults") or {})
-        provider_parameters.update(overrides)
         thinking_policy = binding.get("thinking_policy") or binding.get("thinking")
         from wikipediarag.model_control import (
-            ModelDriver,
             ThinkingPolicy,
             compile_token_envelope,
-            map_thinking_parameters,
         )
 
         resolved_thinking = ThinkingPolicy.from_mapping(thinking_policy)
-        if thinking_policy:
-            provider_driver = ModelDriver(str(model.get("connection_driver") or model.get("provider")))
-            provider_parameters.update(map_thinking_parameters(provider_driver, resolved_thinking))
+        provider_parameters = dict(overrides)
         requested_limit = payload.get("max_tokens", payload.get("max_output_tokens"))
         configured_limit = model.get("max_output_tokens")
-        if "max_output_tokens" in provider_parameters and "max_tokens" not in provider_parameters:
-            provider_parameters["max_tokens"] = provider_parameters.pop("max_output_tokens")
         if configured_limit is not None:
-            provider_parameters["max_tokens"] = (
+            provider_parameters["max_output_tokens"] = (
                 min(int(requested_limit), int(configured_limit))
                 if requested_limit is not None
                 else int(configured_limit)
             )
-        if model.get("context_window_tokens") and provider_parameters.get("max_tokens"):
+        if model.get("context_window_tokens") and provider_parameters.get("max_output_tokens"):
             input_tokens = sum(
                 max(1, len(str(message.get("content") or "")) // 4)
                 for message in payload.get("messages") or []
@@ -387,7 +471,7 @@ async def _resolve_stage_payload(payload: dict[str, Any], operation: str) -> dic
                 compile_token_envelope(
                     max_input=input_tokens,
                     context_window=int(model["context_window_tokens"]),
-                    final_output_reserve=int(provider_parameters["max_tokens"]),
+                    final_output_reserve=int(provider_parameters["max_output_tokens"]),
                     thinking=resolved_thinking,
                 )
             except ValueError as exc:
@@ -400,6 +484,13 @@ async def _resolve_stage_payload(payload: dict[str, Any], operation: str) -> dic
         result.pop("config_revision_id", None)
         result.pop("config_hash", None)
         result.update(provider_parameters)
+        result["thinking"] = resolved_thinking.as_dict()
+        result["_gateway_request_adapter"] = dict(
+            model.get("request_adapter") or model.get("connection_request_adapter") or {}
+        )
+        result["_gateway_request_defaults"] = dict(model.get("request_defaults") or {})
+        result["_gateway_model_defaults"] = dict(model.get("model_defaults") or {})
+        result["_gateway_stage_overrides"] = dict(overrides)
         if model.get("connection_base_url"):
             result["_gateway_base_url"] = str(model["connection_base_url"])
             result["_gateway_paths"] = model.get("endpoint_paths") or {}
@@ -435,20 +526,44 @@ async def proxy(path: str, payload: dict[str, Any], *, correlation_id: str = "")
             context_window_tokens=db_contract.get("context_window_tokens"),
             tokenizer=db_contract.get("tokenizer"),
             provider_preferences=db_contract.get("provider_preferences") or {},
+            model_defaults=db_contract.get("model_defaults") or {},
+            request_adapter=payload.get("_gateway_request_adapter") or {},
+            request_defaults=payload.get("_gateway_request_defaults") or {},
+            startup_canary=db_contract.get("startup_canary") or {},
         )
     else:
         alias = get_model_registry(settings).require(model_alias, _operation_for_path(path))
-    provider_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
-    provider_payload["model"] = alias.model
-    if alias.provider_preferences and "provider" not in provider_payload:
-        provider_payload["provider"] = dict(alias.provider_preferences)
+    internal_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
+    if alias.provider_preferences and "provider" not in internal_payload:
+        internal_payload["provider"] = dict(alias.provider_preferences)
     if alias.dimensions is not None and path == "embeddings":
-        provider_payload.setdefault("dimensions", alias.dimensions)
+        internal_payload.setdefault("dimensions", alias.dimensions)
+    thinking = payload.get("thinking")
+    if thinking is None and _is_structured_request(internal_payload):
+        thinking = {"mode": "off", "effort": "none", "return_reasoning": False}
+    provider_payload = compile_provider_payload(
+        internal_payload,
+        connection_defaults=payload.get("_gateway_request_defaults") or alias.request_defaults,
+        model_defaults=payload.get("_gateway_model_defaults") or alias.model_defaults,
+        stage_overrides=payload.get("_gateway_stage_overrides"),
+        request_adapter=payload.get("_gateway_request_adapter") or alias.request_adapter,
+        thinking=thinking,
+    )
+    provider_payload["model"] = alias.model
+    budget_metadata = _apply_provider_request_defaults(
+        provider_payload,
+        alias,
+        stage_cap=payload.get("_stage_output_cap"),
+        safety_reserve=payload.get("_stage_safety_reserve"),
+    )
 
     runtime_base_url = payload.get("_gateway_base_url")
     runtime_headers = payload.get("_gateway_headers")
     runtime_paths_value = payload.get("_gateway_paths")
     runtime_paths: dict[str, Any] = runtime_paths_value if isinstance(runtime_paths_value, dict) else {}
+    adapter_paths = (payload.get("_gateway_request_adapter") or alias.request_adapter).get("endpoint_paths")
+    if isinstance(adapter_paths, dict):
+        runtime_paths = {**adapter_paths, **runtime_paths}
     path_key = "chat" if path == "chat/completions" else path
     provider_path = str(runtime_paths.get(path_key) or runtime_paths.get(path) or path)
     if alias.provider == "mock":
@@ -488,7 +603,11 @@ async def proxy(path: str, payload: dict[str, Any], *, correlation_id: str = "")
         raise HTTPException(
             status_code=503,
             detail={
-                "error": {"code": "DEPENDENCY_CIRCUIT_OPEN", "message": "model dependency temporarily unavailable"}
+                "error": {
+                    "code": "DEPENDENCY_CIRCUIT_OPEN",
+                    "message": "model dependency temporarily unavailable",
+                    "retryable": True,
+                }
             },
             headers={"Retry-After": str(max(1, int(exc.retry_after_seconds)))},
         ) from exc
@@ -513,18 +632,29 @@ async def proxy(path: str, payload: dict[str, Any], *, correlation_id: str = "")
         result = dict(response.json())
     except (ValueError, TypeError) as exc:
         circuit.record_failure()
-        raise _structured_http_error("MODEL_OUTPUT_INVALID", "model provider returned invalid JSON") from exc
+        raise _structured_http_error(
+            "MODEL_OUTPUT_INVALID", "model provider returned invalid JSON", retryable=False
+        ) from exc
     if _is_structured_request(provider_payload):
         try:
             schema = _structured_schema(provider_payload)
             _validate_structured_provider_response(result, schema)
         except ValueError as exc:
             circuit.record_failure()
+            logger.warning(
+                "structured model output rejected alias=%s reason=%s",
+                model_alias,
+                str(exc),
+            )
             _structured_schema_invalid_streak[model_alias] = _structured_schema_invalid_streak.get(model_alias, 0) + 1
             if _structured_schema_invalid_streak[model_alias] >= 3:
                 _structured_alias_unready[model_alias] = "MODEL_ALIAS_UNREADY"
             code = "MODEL_OUTPUT_TRUNCATED" if _provider_output_truncated(result) else "MODEL_OUTPUT_INVALID"
-            raise _structured_http_error(code, "model provider violated structured-output contract") from exc
+            raise _structured_http_error(
+                code,
+                "model provider violated structured-output contract",
+                retryable=code == "MODEL_OUTPUT_TRUNCATED",
+            ) from exc
         if _provider_exceeded_output_limit(provider_payload, result):
             circuit.record_failure()
             _structured_schema_invalid_streak[model_alias] = _structured_schema_invalid_streak.get(model_alias, 0) + 1
@@ -535,12 +665,56 @@ async def proxy(path: str, payload: dict[str, Any], *, correlation_id: str = "")
     circuit.record_success()
     result.setdefault("model_alias", model_alias)
     result.setdefault("provider", alias.provider)
+    if budget_metadata:
+        result["_gateway_budget_metadata"] = budget_metadata
     return result
 
 
 def _is_structured_request(payload: dict[str, Any]) -> bool:
     response_format = payload.get("response_format")
     return isinstance(response_format, dict) and response_format.get("type") == "json_schema"
+
+
+def _apply_provider_request_defaults(
+    payload: dict[str, Any],
+    alias: ModelAlias,
+    *,
+    stage_cap: Any = None,
+    safety_reserve: Any = None,
+) -> dict[str, int]:
+    """Keep bounded structured output from being consumed by hidden reasoning.
+
+    OpenRouter Qwen aliases may enable reasoning by default.  Structured RAG
+    calls need their output budget for the required JSON contract, matching the
+    startup canary.  Explicit control-plane or caller policy always wins.
+    """
+
+    if alias.operation != "chat" or not isinstance(payload.get("max_tokens"), int):
+        return {}
+    if alias.context_window_tokens is None:
+        return {}
+    input_tokens = sum(
+        max(1, len(str(message.get("content") or "")) // 4)
+        for message in payload.get("messages") or []
+        if isinstance(message, dict)
+    )
+    reasoning_reserve = 0
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict) and isinstance(reasoning.get("max_tokens"), int):
+        reasoning_reserve = max(0, int(reasoning["max_tokens"]))
+    try:
+        budget = resolve_output_budget(
+            int(payload["max_tokens"]),
+            input_tokens=input_tokens,
+            context_window=int(alias.context_window_tokens),
+            stage_cap=int(stage_cap) if isinstance(stage_cap, int) else int(payload["max_tokens"]),
+            reasoning_reserve=reasoning_reserve,
+            safety_reserve=int(safety_reserve) if isinstance(safety_reserve, int) else 32,
+        )
+    except ModelControlError as exc:
+        raise _structured_http_error(str(exc), "model token budget exceeds context window", status_code=422) from exc
+    payload["max_tokens"] = budget.effective_tokens
+    return budget.as_metadata()
 
 
 def _structured_schema(payload: dict[str, Any]) -> dict[str, Any]:
@@ -558,14 +732,37 @@ def _validate_structured_provider_response(payload: dict[str, Any], schema: dict
     if not isinstance(choices, list) or not choices:
         raise ValueError("provider response has no choices")
     message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(message, dict):
+        raise ValueError("provider response has no message content")
+    content = message.get("content")
     if not isinstance(content, str):
         raise ValueError("provider response has no message content")
     try:
-        value = json.loads(content)
+        value = _structured_json_value(content)
     except json.JSONDecodeError as exc:
         raise ValueError("provider structured content is not JSON") from exc
     _validate_json_schema_value(value, schema, path="$", root=schema)
+    message["content"] = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _structured_response_content(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    message = (
+        choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+    )
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str):
+        raise ValueError("provider response has no message content")
+    return content
+
+
+def _structured_json_value(content: str) -> Any:
+    """Decode strict JSON and the common fully-fenced JSON transport wrapper."""
+
+    normalized = content.lstrip("\ufeff").strip()
+    if fenced := _JSON_FENCE_RE.fullmatch(normalized):
+        normalized = fenced.group(1).strip()
+    return json.loads(normalized)
 
 
 def _validate_json_schema_value(value: Any, schema: dict[str, Any], *, path: str, root: dict[str, Any]) -> None:
@@ -591,13 +788,26 @@ def _validate_json_schema_value(value: Any, schema: dict[str, Any], *, path: str
     if "array" in types:
         if not isinstance(value, list):
             raise ValueError(f"{path} must be an array")
+        min_items = schema.get("minItems")
+        max_items = schema.get("maxItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            raise ValueError(f"{path} has fewer items than required")
+        if isinstance(max_items, int) and len(value) > max_items:
+            raise ValueError(f"{path} has too many items")
         item_schema = schema.get("items")
         if isinstance(item_schema, dict):
             for index, item in enumerate(value):
                 _validate_json_schema_value(item, dict(item_schema), path=f"{path}[{index}]", root=schema)
         return
-    if "string" in types and not isinstance(value, str):
-        raise ValueError(f"{path} must be a string")
+    if "string" in types:
+        if not isinstance(value, str):
+            raise ValueError(f"{path} must be a string")
+        min_length = schema.get("minLength")
+        max_length = schema.get("maxLength")
+        if isinstance(min_length, int) and len(value) < min_length:
+            raise ValueError(f"{path} is shorter than required")
+        if isinstance(max_length, int) and len(value) > max_length:
+            raise ValueError(f"{path} is longer than allowed")
     if "boolean" in types and not isinstance(value, bool):
         raise ValueError(f"{path} must be a boolean")
     if "number" in types and (not isinstance(value, int | float) or isinstance(value, bool)):
@@ -626,8 +836,23 @@ def _provider_exceeded_output_limit(request: dict[str, Any], payload: dict[str, 
     return isinstance(limit, int) and isinstance(completion, int) and completion > limit
 
 
-def _structured_http_error(code: str, message: str, *, status_code: int = 502) -> HTTPException:
-    return HTTPException(status_code=status_code, detail={"error": {"code": code, "message": message}})
+def _structured_http_error(
+    code: str,
+    message: str,
+    *,
+    status_code: int = 502,
+    retryable: bool | None = None,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "error": {
+                "code": code,
+                "message": message,
+                "retryable": status_code in {429, 502, 503, 504} if retryable is None else retryable,
+            }
+        },
+    )
 
 
 async def proxy_stream(path: str, payload: dict[str, Any], *, correlation_id: str = "") -> StreamingResponse:
@@ -643,17 +868,41 @@ async def proxy_stream(path: str, payload: dict[str, Any], *, correlation_id: st
             context_window_tokens=db_contract.get("context_window_tokens"),
             tokenizer=db_contract.get("tokenizer"),
             provider_preferences=db_contract.get("provider_preferences") or {},
+            model_defaults=db_contract.get("model_defaults") or {},
+            request_adapter=payload.get("_gateway_request_adapter") or {},
+            request_defaults=payload.get("_gateway_request_defaults") or {},
+            startup_canary=db_contract.get("startup_canary") or {},
         )
     else:
         alias = get_model_registry(settings).require(model_alias, _operation_for_path(path))
-    provider_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
+    internal_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
+    if alias.provider_preferences and "provider" not in internal_payload:
+        internal_payload["provider"] = dict(alias.provider_preferences)
+    thinking = payload.get("thinking")
+    if thinking is None and _is_structured_request(internal_payload):
+        thinking = {"mode": "off", "effort": "none", "return_reasoning": False}
+    provider_payload = compile_provider_payload(
+        internal_payload,
+        connection_defaults=payload.get("_gateway_request_defaults") or alias.request_defaults,
+        model_defaults=payload.get("_gateway_model_defaults") or alias.model_defaults,
+        stage_overrides=payload.get("_gateway_stage_overrides"),
+        request_adapter=payload.get("_gateway_request_adapter") or alias.request_adapter,
+        thinking=thinking,
+    )
     provider_payload["model"] = alias.model
-    if alias.provider_preferences and "provider" not in provider_payload:
-        provider_payload["provider"] = dict(alias.provider_preferences)
+    _apply_provider_request_defaults(
+        provider_payload,
+        alias,
+        stage_cap=payload.get("_stage_output_cap"),
+        safety_reserve=payload.get("_stage_safety_reserve"),
+    )
     runtime_base_url = payload.get("_gateway_base_url")
     runtime_headers = payload.get("_gateway_headers")
     runtime_paths_value = payload.get("_gateway_paths")
     runtime_paths: dict[str, Any] = runtime_paths_value if isinstance(runtime_paths_value, dict) else {}
+    adapter_paths = (payload.get("_gateway_request_adapter") or alias.request_adapter).get("endpoint_paths")
+    if isinstance(adapter_paths, dict):
+        runtime_paths = {**adapter_paths, **runtime_paths}
     path_key = "chat" if path == "chat/completions" else path
     provider_path = str(runtime_paths.get(path_key) or runtime_paths.get(path) or path)
     if alias.provider == "mock":
@@ -691,7 +940,11 @@ async def proxy_stream(path: str, payload: dict[str, Any], *, correlation_id: st
         raise HTTPException(
             status_code=503,
             detail={
-                "error": {"code": "DEPENDENCY_CIRCUIT_OPEN", "message": "model dependency temporarily unavailable"}
+                "error": {
+                    "code": "DEPENDENCY_CIRCUIT_OPEN",
+                    "message": "model dependency temporarily unavailable",
+                    "retryable": True,
+                }
             },
             headers={"Retry-After": str(max(1, int(exc.retry_after_seconds)))},
         ) from exc
@@ -774,6 +1027,8 @@ def _provider_degraded(provider: str) -> bool:
 
 
 def _safe_smoke_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, StructuredSmokeError):
+        return exc.reason
     if isinstance(exc, httpx.HTTPStatusError):
         return "DEPENDENCY_UNAVAILABLE" if exc.response.status_code in {429, 502, 503, 504} else "INTERNAL_ERROR"
     if isinstance(exc, httpx.TimeoutException):
@@ -797,6 +1052,7 @@ def _provider_http_error(response: httpx.Response, *, stream: bool = False) -> H
     retry_after = response.headers.get("Retry-After")
     if retry_after:
         headers = {"Retry-After": retry_after}
+    retryable = response.status_code in {429, 502, 503, 504, 529}
     if response.status_code == 429:
         status_code = 429
     elif response.status_code in {503, 529}:
@@ -806,9 +1062,10 @@ def _provider_http_error(response: httpx.Response, *, stream: bool = False) -> H
     else:
         status_code = 502
     detail = "model dependency stream failed" if stream else "model dependency request failed"
+    code = "DEPENDENCY_UNAVAILABLE" if retryable else "MODEL_PROVIDER_REJECTED"
     return HTTPException(
         status_code=status_code,
-        detail={"error": {"code": "DEPENDENCY_UNAVAILABLE", "message": detail}},
+        detail={"error": {"code": code, "message": detail, "retryable": retryable}},
         headers=headers,
     )
 
@@ -854,23 +1111,25 @@ async def _openrouter_startup_smoke(settings: Settings, profile: RetrievalProfil
 
         fast_alias = aliases[profile.model_aliases.generator_fast]
         main_alias = aliases[profile.model_aliases.generator_main]
+        canary_tokens = int((main_alias.startup_canary or {}).get("max_tokens") or _STRUCTURED_SMOKE_MAX_TOKENS)
         typed = await client.post(
             f"{base_url}/chat/completions",
-            json=_structured_smoke_request(main_alias.model),
+            json=_structured_smoke_request(
+                main_alias.model,
+                request_adapter=main_alias.request_adapter,
+                request_defaults=main_alias.request_defaults,
+                provider_preferences=main_alias.provider_preferences,
+                max_tokens=canary_tokens,
+            ),
             headers=headers,
         )
         typed.raise_for_status()
         typed_payload = typed.json()
-        try:
-            _validate_structured_provider_response(typed_payload, _STRUCTURED_SMOKE_SCHEMA)
-        except ValueError as exc:
-            raise StructuredSmokeError(
-                profile.model_aliases.generator_main, "structured canary violated schema"
-            ) from exc
-        if _provider_exceeded_output_limit({"max_tokens": _STRUCTURED_SMOKE_MAX_TOKENS}, typed_payload):
-            raise StructuredSmokeError(
-                profile.model_aliases.generator_main, "structured generator ignored max token cap"
-            )
+        _validate_structured_smoke_response(
+            typed_payload,
+            alias=profile.model_aliases.generator_main,
+            max_tokens=canary_tokens,
+        )
 
         async with client.stream(
             "POST",

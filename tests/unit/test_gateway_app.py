@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -10,6 +11,8 @@ from fastapi import HTTPException
 import wikipediarag.gateway_app as gateway_app
 from wikipediarag.answering import ANSWER_JSON_SCHEMA
 from wikipediarag.config import Settings, resolve_openrouter_api_key
+from wikipediarag.model_registry import ModelAlias
+from wikipediarag.reliability import DependencyCircuit
 
 
 def _settings(*, startup_smoke: Literal["required", "warn", "off"], api_key: str = "test-key") -> Settings:
@@ -89,13 +92,185 @@ def test_structured_startup_canary_uses_production_answer_schema() -> None:
     assert "insufficient_evidence" in gateway_app._STRUCTURED_SMOKE_SCHEMA["required"]
 
 
+def test_gateway_enforces_structured_length_and_item_constraints() -> None:
+    schema = ANSWER_JSON_SCHEMA["json_schema"]["schema"]
+    invalid = {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "answer_markdown": "",
+                            "answer_mode": "single",
+                            "interpretations": [],
+                            "clarification_question": None,
+                            "claims": [],
+                            "insufficient_evidence": True,
+                        }
+                    )
+                }
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="shorter than required"):
+        gateway_app._validate_structured_provider_response(invalid, schema)
+
+
+def test_gateway_canonicalizes_fully_fenced_structured_json() -> None:
+    schema = ANSWER_JSON_SCHEMA["json_schema"]["schema"]
+    payload = _valid_structured_smoke_response()
+    message = payload["choices"][0]["message"]
+    message["content"] = f"```json\n{message['content']}\n```"
+
+    gateway_app._validate_structured_provider_response(payload, schema)
+
+    assert message["content"].startswith("{")
+    assert not message["content"].startswith("```")
+
+
 def test_structured_startup_canary_disables_default_reasoning_with_bounded_output() -> None:
-    payload = gateway_app._structured_smoke_request("qwen/example")
+    payload = gateway_app._structured_smoke_request("qwen/example", provider_preferences={"require_parameters": True})
 
     assert payload["model"] == "qwen/example"
-    assert payload["reasoning"] == {"effort": "none"}
-    assert payload["max_tokens"] == 64
+    assert payload["max_tokens"] == 4096
     assert payload["stream"] is False
+    assert "S1" in payload["messages"][0]["content"]
+    assert payload["provider"] == {"require_parameters": True}
+
+
+def _valid_structured_smoke_response(*, completion_tokens: int | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "answer_markdown": "Проверочный факт подтверждён [S1]",
+                            "answer_mode": "single",
+                            "interpretations": [],
+                            "clarification_question": None,
+                            "claims": [
+                                {
+                                    "claim_id": "smoke-claim",
+                                    "text": "Проверочный факт подтверждён",
+                                    "evidence_ids": ["S1"],
+                                    "type": "fact",
+                                }
+                            ],
+                            "insufficient_evidence": False,
+                        }
+                    )
+                }
+            }
+        ]
+    }
+    if completion_tokens is not None:
+        payload["usage"] = {"completion_tokens": completion_tokens}
+    return payload
+
+
+def test_structured_startup_canary_requires_a_grounded_claim() -> None:
+    payload = _valid_structured_smoke_response()
+
+    gateway_app._validate_structured_smoke_response(payload, alias="generator_main")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "answer_markdown": "Недостаточно данных.",
+                                "answer_mode": "single",
+                                "interpretations": [],
+                                "clarification_question": None,
+                                "claims": [],
+                                "insufficient_evidence": True,
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "answer_markdown": "Проверочный факт подтверждён [S1]",
+                                "answer_mode": "single",
+                                "interpretations": [],
+                                "clarification_question": None,
+                                "claims": [
+                                    {
+                                        "claim_id": "wrong-evidence",
+                                        "text": "Проверочный факт подтверждён",
+                                        "evidence_ids": ["S2"],
+                                        "type": "fact",
+                                    }
+                                ],
+                                "insufficient_evidence": False,
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+    ],
+)
+def test_structured_startup_canary_rejects_semantic_contract_violations(payload: dict[str, Any]) -> None:
+    with pytest.raises(gateway_app.StructuredSmokeError) as error:
+        gateway_app._validate_structured_smoke_response(payload, alias="generator_main")
+
+    assert error.value.reason == "structured_grounded_contract_invalid"
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        (
+            {"choices": [{"finish_reason": "length", "message": {"content": "{"}}]},
+            "structured_output_truncated",
+        ),
+        ({"choices": [{"message": {"content": "{}"}}]}, "structured_schema_invalid"),
+        (
+            _valid_structured_smoke_response(completion_tokens=4097),
+            "structured_output_limit_exceeded",
+        ),
+    ],
+)
+def test_structured_startup_canary_classifies_contract_failures_safely(payload: dict[str, Any], reason: str) -> None:
+    with pytest.raises(gateway_app.StructuredSmokeError) as exc_info:
+        gateway_app._validate_structured_smoke_response(payload, alias="generator_main")
+
+    assert exc_info.value.alias == "generator_main"
+    assert exc_info.value.reason == reason
+    assert gateway_app._safe_smoke_failure_reason(exc_info.value) == reason
+
+
+def test_structured_requests_use_explicit_adapter_thinking_policy() -> None:
+    alias = ModelAlias(provider="openrouter", model="qwen/example", operation="chat", context_window_tokens=1024)
+    defaulted = {"response_format": ANSWER_JSON_SCHEMA, "max_tokens": 800, "messages": [{"content": "x" * 3072}]}
+    explicit = {
+        "response_format": ANSWER_JSON_SCHEMA,
+        "reasoning": {"effort": "high"},
+        "max_tokens": 800,
+        "messages": [{"content": "x" * 3072}],
+    }
+
+    metadata = gateway_app._apply_provider_request_defaults(defaulted, alias)
+    gateway_app._apply_provider_request_defaults(explicit, alias)
+
+    assert "reasoning" not in defaulted
+    assert explicit["reasoning"] == {"effort": "high"}
+    assert defaulted["max_tokens"] == 224
+    assert metadata["effective_output_tokens"] == 224
 
 
 @pytest.mark.asyncio
@@ -125,6 +300,33 @@ async def test_gateway_warn_mode_starts_degraded_when_openrouter_smoke_fails(
 
 
 @pytest.mark.asyncio
+async def test_gateway_warn_mode_reports_safe_structured_canary_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_smoke(*_args: object, **_kwargs: object) -> None:
+        raise gateway_app.StructuredSmokeError(
+            "generator_main",
+            "provider response content must never reach readiness",
+            reason="structured_schema_invalid",
+        )
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: _settings(startup_smoke="warn"))
+    monkeypatch.setattr(gateway_app, "_openrouter_startup_smoke", fail_smoke)
+
+    await gateway_app.startup_smoke()
+
+    ready = await gateway_app.ready()
+    assert {
+        "component": "openrouter.startup_smoke",
+        "status": "failed",
+        "reason": "structured_schema_invalid",
+    } in ready["checks"]
+    assert {"component": "structured.generator_main", "status": "failed", "reason": "MODEL_ALIAS_UNREADY"} in ready[
+        "checks"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_gateway_models_marks_openrouter_aliases_unhealthy_after_smoke_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -142,6 +344,31 @@ async def test_gateway_models_marks_openrouter_aliases_unhealthy_after_smoke_fai
     assert by_alias["embed_default"]["healthy"] is False
     assert by_alias["rerank_default"]["healthy"] is False
     assert by_alias["mock_generator_fast"]["healthy"] is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_ready_exposes_recent_runtime_alias_failure_until_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    circuit = DependencyCircuit(
+        "generator_fast",
+        cooldown_seconds=10,
+        now=lambda: clock[0],
+    )
+    circuit.record_failure()
+    monkeypatch.setattr(gateway_app, "_dependency_circuits", {"generator_fast": circuit})
+
+    ready = await gateway_app.ready()
+
+    assert ready["status"] == "degraded"
+    assert {
+        "component": "runtime.generator_fast",
+        "status": "failed",
+        "reason": "DEPENDENCY_RUNTIME_FAILURE",
+    } in ready["checks"]
+    circuit.record_success()
+    assert all(check["component"] != "runtime.generator_fast" for check in (await gateway_app.ready())["checks"])
 
 
 @pytest.mark.asyncio
@@ -192,7 +419,11 @@ async def test_gateway_proxy_maps_provider_timeout_without_raw_details(monkeypat
 
     assert exc_info.value.status_code == 504
     assert cast(Any, exc_info.value.detail) == {
-        "error": {"code": "DEPENDENCY_TIMEOUT", "message": "model dependency did not respond before the deadline"}
+        "error": {
+            "code": "DEPENDENCY_TIMEOUT",
+            "message": "model dependency did not respond before the deadline",
+            "retryable": True,
+        }
     }
     assert _TimeoutAsyncClient.captured_timeout == 222
 
@@ -231,9 +462,42 @@ def test_provider_http_error_preserves_retry_after_header() -> None:
 
     assert exc.status_code == 429
     assert cast(Any, exc.detail) == {
-        "error": {"code": "DEPENDENCY_UNAVAILABLE", "message": "model dependency request failed"}
+        "error": {
+            "code": "DEPENDENCY_UNAVAILABLE",
+            "message": "model dependency request failed",
+            "retryable": True,
+        }
     }
     assert exc.headers == {"Retry-After": "11"}
+
+
+def test_provider_http_error_classifies_auth_rejection_as_non_retryable() -> None:
+    response = httpx.Response(
+        401,
+        request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        text="provider body must not be exposed",
+    )
+
+    exc = gateway_app._provider_http_error(response)
+
+    assert exc.status_code == 502
+    assert cast(Any, exc.detail) == {
+        "error": {
+            "code": "MODEL_PROVIDER_REJECTED",
+            "message": "model dependency request failed",
+            "retryable": False,
+        }
+    }
+
+
+def test_structured_schema_invalid_is_not_retryable() -> None:
+    exc = gateway_app._structured_http_error("MODEL_OUTPUT_INVALID", "safe", retryable=False)
+
+    assert cast(Any, exc.detail)["error"] == {
+        "code": "MODEL_OUTPUT_INVALID",
+        "message": "safe",
+        "retryable": False,
+    }
 
 
 @pytest.mark.asyncio

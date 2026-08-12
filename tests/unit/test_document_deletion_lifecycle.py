@@ -122,6 +122,27 @@ def test_storage_delete_objects_raises_safe_error_for_blocking_failure(monkeypat
     assert error["Message"] == "object deletion failed"
 
 
+def test_storage_delete_objects_falls_back_for_legacy_minio_md5_requirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deleted_keys: list[str] = []
+
+    class Client:
+        def delete_objects(self, **_kwargs: Any) -> dict[str, Any]:
+            raise ClientError({"Error": {"Code": "MissingContentMD5", "Message": "required"}}, "DeleteObjects")
+
+        def delete_object(self, **kwargs: Any) -> dict[str, Any]:
+            deleted_keys.append(str(kwargs["Key"]))
+            return {}
+
+    monkeypatch.setattr("wikipediarag.storage._client", lambda _settings: Client())
+
+    deleted = delete_objects(["first.json", "second.json"], Settings(minio_bucket="bucket"))
+
+    assert deleted == 2
+    assert deleted_keys == ["first.json", "second.json"]
+
+
 async def test_delete_document_endpoint_returns_safe_lifecycle_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     actor = ActorContext(
         user_id="22222222-2222-4222-8222-222222222222",

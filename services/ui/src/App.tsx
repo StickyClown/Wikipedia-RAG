@@ -193,12 +193,18 @@ type SsePayload = {
     text?: string;
     evidence?: Evidence[];
     answer?: string;
+    conversation_id?: string;
+    ambiguity_mode?: "off" | "auto" | "always";
+    answer_mode?: "single" | "multiple";
+    interpretations?: Interpretation[];
+    clarification_question?: string | null;
     code?: string;
     safe_message?: string;
     stage?: string;
     elapsed_ms?: number;
     deadline_remaining_ms?: number;
     attempt?: number;
+    attempts?: number;
     data?: {
       code?: string;
       stage?: string;
@@ -207,6 +213,14 @@ type SsePayload = {
     };
     [key: string]: unknown;
   };
+};
+
+type Interpretation = {
+  interpretation_id: string;
+  label: string;
+  answer_markdown: string;
+  claims: Array<{ claim_id: string; text: string; evidence_ids: string[]; type: string }>;
+  evidence_ids: string[];
 };
 
 type RetrievalOverrideState = {
@@ -316,9 +330,10 @@ type RetrievalProfileOption = {
 };
 
 type RetrievalProfileCatalog = {
-  resolved_default: string;
+  resolved_default: string | null;
   scope_contract_hash: string;
   profiles: RetrievalProfileOption[];
+  scope_error_code?: string | null;
 };
 
 type DocumentAccessPolicy = "kb" | "tenant" | "restricted";
@@ -696,7 +711,11 @@ type ModelConnection = {
   enabled: boolean;
   has_credentials: boolean;
   row_version: number;
-  last_status?: { status?: string; safe_error_code?: string };
+  last_status?: {
+    status?: string;
+    safe_error_code?: string;
+  };
+  last_checked_at?: string | null;
 };
 
 type ModelCatalogEntry = {
@@ -748,6 +767,7 @@ export function App() {
   const [modelConfiguration, setModelConfiguration] =
     useState<ModelConfiguration | null>(null);
   const [modelControlError, setModelControlError] = useState("");
+  const [modelControlNotice, setModelControlNotice] = useState("");
   const [modelControlBusy, setModelControlBusy] = useState(false);
   const [newModelConnectionName, setNewModelConnectionName] = useState("");
   const [newModelConnectionDriver, setNewModelConnectionDriver] =
@@ -775,6 +795,7 @@ export function App() {
   const [retrievalProfiles, setRetrievalProfiles] = useState<
     RetrievalProfileOption[]
   >([]);
+  const [retrievalScopeError, setRetrievalScopeError] = useState("");
   const [debugTopK, setDebugTopK] = useState(12);
   const [bm25Enabled, setBm25Enabled] = useState(true);
   const [denseEnabled, setDenseEnabled] = useState(true);
@@ -787,6 +808,7 @@ export function App() {
     "off" | "conditional" | "always"
   >("conditional");
   const [answer, setAnswer] = useState("");
+  const [answerMode, setAnswerMode] = useState<"single" | "multiple">("single");
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [queryRunId, setQueryRunId] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
@@ -1069,15 +1091,27 @@ export function App() {
       : selectedKnowledgeBaseId
         ? [selectedKnowledgeBaseId]
         : [];
-  const retrievalScopeKey = searchKnowledgeBaseIds.join(",");
+  const researchScopeKnowledgeBaseIds = Array.from(
+    new Set(
+      [selectedKnowledgeBaseId, ...researchKnowledgeBaseIds].filter(Boolean),
+    ),
+  ).slice(0, 3);
+  const profileScopeKnowledgeBaseIds =
+    activeTab === "research"
+      ? researchScopeKnowledgeBaseIds
+      : searchKnowledgeBaseIds;
+  const retrievalScopeKey = profileScopeKnowledgeBaseIds.join(",");
+  const retrievalScopeCompatible =
+    profileScopeKnowledgeBaseIds.length > 0 && !retrievalScopeError;
 
   useEffect(() => {
-    if (!session.authenticated || searchKnowledgeBaseIds.length === 0) {
+    if (!session.authenticated || profileScopeKnowledgeBaseIds.length === 0) {
       setRetrievalProfiles([]);
+      setRetrievalScopeError("");
       return;
     }
     const params = new URLSearchParams();
-    searchKnowledgeBaseIds.forEach((id) =>
+    profileScopeKnowledgeBaseIds.forEach((id) =>
       params.append("knowledge_base_ids", id),
     );
     let cancelled = false;
@@ -1089,6 +1123,13 @@ export function App() {
       .then((catalog) => {
         if (cancelled || !catalog) return;
         setRetrievalProfiles(catalog.profiles);
+        setRetrievalScopeError(
+          catalog.scope_error_code === "RETRIEVAL_PROFILE_INCOMPATIBLE"
+            ? locale === "ru"
+              ? "Выбранные базы знаний несовместимы: нет общего профиля поиска. Измените scope."
+              : "The selected knowledge bases have no compatible shared retrieval profile. Change the scope."
+            : "",
+        );
         if (
           retrievalProfile !== "auto" &&
           !catalog.profiles.some(
@@ -1099,14 +1140,17 @@ export function App() {
         }
       })
       .catch(() => {
-        if (!cancelled) setRetrievalProfiles([]);
+        if (!cancelled) {
+          setRetrievalProfiles([]);
+          setRetrievalScopeError("");
+        }
       });
     return () => {
       cancelled = true;
     };
     // apiFetch is intentionally component-local and reads the current session/CSRF token.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.authenticated, retrievalScopeKey, retrievalProfile]);
+  }, [session.authenticated, retrievalScopeKey, retrievalProfile, locale]);
 
   const workspaceTabs: Array<{ id: WorkspaceTab; label: string }> = [
     { id: "chat", label: t("chat") },
@@ -1233,6 +1277,7 @@ export function App() {
   async function testModelConnection(connectionId: string) {
     setModelControlBusy(true);
     setModelControlError("");
+    setModelControlNotice("");
     try {
       const response = await apiFetch(
         `/api/v1/admin/model-connections/${encodeURIComponent(connectionId)}/test`,
@@ -1242,6 +1287,17 @@ export function App() {
         throw new Error(
           await responseErrorMessage(response, t, "request_failed"),
         );
+      const result = (await response.json()) as {
+        status?: string;
+        safe_error_code?: string | null;
+      };
+      setModelControlNotice(
+        result.status === "passed"
+          ? locale === "ru"
+            ? "Подключение проверено успешно."
+            : "Connection test passed."
+          : `${locale === "ru" ? "Проверка подключения не пройдена" : "Connection test failed"}${result.safe_error_code ? `: ${result.safe_error_code}` : ""}`,
+      );
       await loadModelControl();
     } catch (error) {
       setModelControlError(safeClientErrorMessage(error, t, "request_failed"));
@@ -1641,14 +1697,38 @@ export function App() {
     }
   }
 
-  async function submitChat(event: FormEvent) {
+  const [ambiguityMode, setAmbiguityMode] = useState<"off" | "auto" | "always">("auto");
+  const [conversationId, setConversationId] = useState("");
+  const [, setSelectedInterpretationId] = useState("");
+  const [interpretations, setInterpretations] = useState<Interpretation[]>([]);
+  const [clarificationQuestion, setClarificationQuestion] = useState("");
+
+  async function submitChat(
+    event: FormEvent,
+    override?: { question: string; selectedInterpretationId?: string },
+  ) {
     event.preventDefault();
-    if (!question.trim()) {
+    const requestedQuestion = override?.question ?? question;
+    const activeSelectedInterpretationId = override?.selectedInterpretationId;
+    setSelectedInterpretationId(activeSelectedInterpretationId ?? "");
+    if (!requestedQuestion.trim()) {
       setChatError(t("chat_empty"));
       return;
     }
+    if (!retrievalScopeCompatible) {
+      setChatError(
+        retrievalScopeError ||
+          (locale === "ru"
+            ? "Выберите совместимую область поиска."
+            : "Choose a compatible retrieval scope."),
+      );
+      return;
+    }
     setAnswer("");
+    setAnswerMode("single");
     setEvidence([]);
+    setInterpretations([]);
+    setClarificationQuestion("");
     setQueryRunId("");
     setEvents([]);
     setChatStage("question_received");
@@ -1675,7 +1755,12 @@ export function App() {
         },
         signal: controller.signal,
         body: JSON.stringify({
-          message: question,
+          message: requestedQuestion,
+          ...(conversationId ? { conversation_id: conversationId } : {}),
+          ambiguity_mode: ambiguityMode,
+          ...(activeSelectedInterpretationId
+            ? { selected_interpretation_id: activeSelectedInterpretationId }
+            : {}),
           knowledge_base_ids: scopedKnowledgeBaseIds,
           mode,
           stream: true,
@@ -1738,6 +1823,10 @@ export function App() {
           if (parsed.event === "message.delta") {
             setAnswer(body?.text ?? "");
             setEvidence(body?.evidence ?? []);
+            setAnswerMode(body?.answer_mode ?? "single");
+            if (body?.conversation_id) setConversationId(body.conversation_id);
+            setInterpretations(body?.interpretations ?? []);
+            setClarificationQuestion(body?.clarification_question ?? "");
             hasAnswer = true;
             if (parsed.data.query_run_id)
               setQueryRunId(parsed.data.query_run_id);
@@ -1757,6 +1846,7 @@ export function App() {
             if (parsed.data.query_run_id)
               setQueryRunId(parsed.data.query_run_id);
             const completedAnswer = body?.answer;
+            if (body?.answer_mode) setAnswerMode(body.answer_mode);
             if (typeof completedAnswer === "string" && !hasAnswer) {
               setAnswer(completedAnswer);
             }
@@ -1799,6 +1889,15 @@ export function App() {
   async function runSearch(offset: number, cursor: string | null = null) {
     const query = searchQuery.trim();
     if (!query || searchKnowledgeBaseIds.length === 0) return;
+    if (!retrievalScopeCompatible) {
+      setSearchError(
+        retrievalScopeError ||
+          (locale === "ru"
+            ? "Выберите совместимую область поиска."
+            : "Choose a compatible retrieval scope."),
+      );
+      return;
+    }
     setSearchBusy(true);
     setSearchElapsedMs(0);
     setSearchError("");
@@ -1950,6 +2049,10 @@ export function App() {
 
   async function createResearchPlanFromDraft() {
     if (!researchTopic.trim() || !selectedKnowledgeBaseId) return;
+    if (!retrievalScopeCompatible) {
+      setResearchError(retrievalScopeError);
+      return;
+    }
     setResearchBusy(true);
     setResearchError("");
     try {
@@ -1959,8 +2062,10 @@ export function App() {
         body: JSON.stringify({
           topic: researchTopic,
           knowledge_base_id: selectedKnowledgeBaseId,
-          knowledge_base_ids: researchKnowledgeBaseIds.slice(0, 3),
-          retrieval_profile: retrievalProfile,
+          knowledge_base_ids: researchScopeKnowledgeBaseIds,
+          ...(retrievalProfile !== "auto"
+            ? { retrieval_profile: retrievalProfile }
+            : {}),
           retrieval_overrides: buildRetrievalOverrides({
             bm25Enabled,
             denseEnabled,
@@ -2058,6 +2163,10 @@ export function App() {
   async function submitResearchRun(event: FormEvent) {
     event.preventDefault();
     if (!researchTopic.trim() || !selectedKnowledgeBaseId) return;
+    if (!retrievalScopeCompatible) {
+      setResearchError(retrievalScopeError);
+      return;
+    }
     setResearchBusy(true);
     setResearchError("");
     try {
@@ -2067,8 +2176,10 @@ export function App() {
         body: JSON.stringify({
           topic: researchTopic,
           knowledge_base_id: selectedKnowledgeBaseId,
-          knowledge_base_ids: researchKnowledgeBaseIds.slice(0, 3),
-          retrieval_profile: retrievalProfile,
+          knowledge_base_ids: researchScopeKnowledgeBaseIds,
+          ...(retrievalProfile !== "auto"
+            ? { retrieval_profile: retrievalProfile }
+            : {}),
           retrieval_overrides: buildRetrievalOverrides({
             bm25Enabled,
             denseEnabled,
@@ -2256,6 +2367,16 @@ export function App() {
     }
   }
 
+  useEffect(() => {
+    if (!viewerStructure) return;
+    const frame = window.requestAnimationFrame(() => {
+      const heading = document.getElementById("document-viewer-heading");
+      heading?.scrollIntoView({ behavior: "smooth", block: "start" });
+      heading?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [viewerStructure]);
+
   async function loadDocumentContext(
     documentId: string,
     options: { chunkId?: string; sectionId?: string } = {},
@@ -2367,6 +2488,16 @@ export function App() {
       selected.includes(kbId)
         ? selected.filter((candidate) => candidate !== kbId)
         : [...selected, kbId],
+    );
+  }
+
+  function selectPrimaryKnowledgeBase(kbId: string): void {
+    setSelectedKnowledgeBaseId(kbId);
+    setResearchKnowledgeBaseIds((current) =>
+      Array.from(new Set([kbId, ...current.filter((id) => id !== kbId)])).slice(
+        0,
+        3,
+      ),
     );
   }
 
@@ -2682,7 +2813,7 @@ export function App() {
                     aria-label={t("primary_kb")}
                     value={selectedKnowledgeBaseId}
                     onChange={(event) =>
-                      setSelectedKnowledgeBaseId(event.target.value)
+                      selectPrimaryKnowledgeBase(event.target.value)
                     }
                   >
                     {knowledgeBases.map((kb) => (
@@ -2694,7 +2825,7 @@ export function App() {
                 </label>
               )}
             {(activeTab === "chat" || activeTab === "search") && (
-              <details className="scope-details" open>
+              <details className="scope-details">
                 <summary>
                   {interpolate(t("scope_summary"), {
                     count: selectedRetrievalKnowledgeBaseIds.length,
@@ -3211,10 +3342,22 @@ export function App() {
                       type="url"
                       required
                     />
-                    <button type="submit" disabled={modelControlBusy}>
+                    <button
+                      type="submit"
+                      disabled={
+                        modelControlBusy ||
+                        !newModelConnectionName.trim() ||
+                        !newModelConnectionUrl.trim()
+                      }
+                    >
                       {t("add_connection")}
                     </button>
                   </form>
+                  <p className="muted">
+                    {locale === "ru"
+                      ? "Укажите имя и URL подключения."
+                      : "Enter a connection name and URL."}
+                  </p>
                   {modelConnections.length === 0 && (
                     <p className="muted">{t("no_model_connections")}</p>
                   )}
@@ -3232,6 +3375,17 @@ export function App() {
                             : t("credentials_missing")}{" "}
                           · {connection.enabled ? t("enabled") : t("disabled")}
                         </p>
+                        {connection.last_status?.status && (
+                          <p className="muted" role="status">
+                            {connection.last_status.status}
+                            {connection.last_status.safe_error_code
+                              ? ` · ${connection.last_status.safe_error_code}`
+                              : ""}
+                            {connection.last_checked_at
+                              ? ` · ${new Date(connection.last_checked_at).toLocaleString(locale)}`
+                              : ""}
+                          </p>
+                        )}
                         <button
                           type="button"
                           onClick={() =>
@@ -3290,10 +3444,28 @@ export function App() {
                         </option>
                       ))}
                     </select>
-                    <button type="submit" disabled={modelControlBusy}>
+                    <button
+                      type="submit"
+                      disabled={
+                        modelControlBusy ||
+                        !newModelAlias.trim() ||
+                        !newModelProviderId.trim() ||
+                        !newModelConnectionId
+                      }
+                    >
                       {t("add_model")}
                     </button>
                   </form>
+                  <p className="muted">
+                    {locale === "ru"
+                      ? "Укажите alias, provider model ID и подключение."
+                      : "Enter an alias, provider model ID, and connection."}
+                  </p>
+                  {modelControlNotice && (
+                    <p className="status" role="status">
+                      {modelControlNotice}
+                    </p>
+                  )}
                   {modelCatalog.length === 0 && (
                     <p className="muted">{t("no_models")}</p>
                   )}
@@ -3358,7 +3530,8 @@ export function App() {
                     disabled={
                       searchBusy ||
                       !searchQuery.trim() ||
-                      searchKnowledgeBaseIds.length === 0
+                      searchKnowledgeBaseIds.length === 0 ||
+                      !retrievalScopeCompatible
                     }
                   >
                     <Search size={16} /> {t("search")}
@@ -3378,6 +3551,11 @@ export function App() {
                   >
                     {t("loading")} · {searchKnowledgeBaseIds.length} KB ·{" "}
                     {(searchElapsedMs / 1000).toFixed(1)}s
+                  </p>
+                )}
+                {retrievalScopeError && (
+                  <p className="error" role="alert">
+                    {retrievalScopeError}
                   </p>
                 )}
                 <details className="filter-details">
@@ -3576,6 +3754,18 @@ export function App() {
                   </button>
                 )}
               </div>
+              {(viewerBusy || viewerError) && !viewerStructure && (
+                <p
+                  className={viewerError ? "error" : "status"}
+                  role={viewerError ? "alert" : "status"}
+                  aria-live="polite"
+                >
+                  {viewerError ||
+                    (locale === "ru"
+                      ? "Открывается документ…"
+                      : "Opening document…")}
+                </p>
+              )}
               {viewerStructure && (
                 <DocumentViewer
                   structure={viewerStructure}
@@ -3654,7 +3844,8 @@ export function App() {
                     disabled={
                       researchBusy ||
                       !researchTopic.trim() ||
-                      !selectedKnowledgeBaseId
+                      !selectedKnowledgeBaseId ||
+                      !retrievalScopeCompatible
                     }
                   >
                     <Play size={16} /> {t("quick_run")}
@@ -3664,7 +3855,8 @@ export function App() {
                     disabled={
                       researchBusy ||
                       !researchTopic.trim() ||
-                      !selectedKnowledgeBaseId
+                      !selectedKnowledgeBaseId ||
+                      !retrievalScopeCompatible
                     }
                     onClick={() => void createResearchPlanFromDraft()}
                   >
@@ -3689,6 +3881,11 @@ export function App() {
                 {researchError && (
                   <p className="error" role="alert">
                     {researchError}
+                  </p>
+                )}
+                {retrievalScopeError && (
+                  <p className="error" role="alert">
+                    {retrievalScopeError}
                   </p>
                 )}
               </form>
@@ -4259,9 +4456,29 @@ export function App() {
                       <option value="extended">{t("extended")}</option>
                     </select>
                   </label>
+                  <label className="compact-field">
+                    {locale === "ru" ? "Неоднозначность" : "Ambiguity"}
+                    <select
+                      aria-label={locale === "ru" ? "Неоднозначность" : "Ambiguity"}
+                      value={ambiguityMode}
+                      onChange={(event) =>
+                        setAmbiguityMode(event.target.value as "off" | "auto" | "always")
+                      }
+                    >
+                      <option value="off">{locale === "ru" ? "Обычный" : "Normal"}</option>
+                      <option value="auto">{locale === "ru" ? "Авто" : "Auto"}</option>
+                      <option value="always">
+                        {locale === "ru" ? "Показать разные значения" : "Show different meanings"}
+                      </option>
+                    </select>
+                  </label>
                   <button
                     type="submit"
-                    disabled={chatBusy || searchKnowledgeBaseIds.length === 0}
+                    disabled={
+                      chatBusy ||
+                      searchKnowledgeBaseIds.length === 0 ||
+                      !retrievalScopeCompatible
+                    }
                   >
                     <Search size={16} /> {chatBusy ? t("loading") : t("ask")}
                   </button>
@@ -4300,6 +4517,11 @@ export function App() {
                     {chatError}
                   </p>
                 )}
+                {retrievalScopeError && (
+                  <p className="error" role="alert">
+                    {retrievalScopeError}
+                  </p>
+                )}
               </form>
 
               {answer && (
@@ -4308,6 +4530,35 @@ export function App() {
                   <div className="answer-markdown">
                     {renderSafeAnswer(answer, evidence)}
                   </div>
+                  {answerMode === "multiple" && interpretations.length > 0 && (
+                    <div className="interpretations">
+                      <h3>{locale === "ru" ? "Возможные значения" : "Possible meanings"}</h3>
+                      {interpretations.map((interpretation) => (
+                        <article key={interpretation.interpretation_id} className="interpretation-card">
+                          <h4>{interpretation.label}</h4>
+                          <div className="answer-markdown">
+                            {renderSafeAnswer(interpretation.answer_markdown, evidence)}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedInterpretationId(interpretation.interpretation_id);
+                              void submitChat(
+                                { preventDefault: () => undefined } as FormEvent,
+                                {
+                                  question: clarificationQuestion || interpretation.label,
+                                  selectedInterpretationId: interpretation.interpretation_id,
+                                },
+                              );
+                            }}
+                          >
+                            {locale === "ru" ? "Уточнить это значение" : "Clarify this meaning"}
+                          </button>
+                        </article>
+                      ))}
+                      {clarificationQuestion && <p>{clarificationQuestion}</p>}
+                    </div>
+                  )}
                   <h3>{t("sources")}</h3>
                   <div className="sources">
                     {evidence.map((item) => (
@@ -4481,6 +4732,7 @@ async function responseErrorMessage(
 
 function sseFailureMessage(payload: SsePayload, translate: Translate): string {
   const code = payload.data?.code ?? payload.data?.data?.code;
+  const attempts = payload.data?.attempts ?? payload.data?.data?.attempts;
   const messages: Record<string, string> = {
     MODEL_OUTPUT_INVALID:
       "Модель вернула ответ в неподдерживаемом формате. Автоматический повтор не выполнялся",
@@ -4490,8 +4742,13 @@ function sseFailureMessage(payload: SsePayload, translate: Translate): string {
     CLIENT_DISCONNECTED: "Запрос отменён после отключения клиента",
     STREAM_PROTOCOL_ERROR: "Поток ответа повреждён; повторите запрос вручную",
   };
-  if (typeof code === "string" && messages[code])
-    return `${messages[code]} (${translate("error_code")}: ${code})`;
+  if (typeof code === "string" && messages[code]) {
+    const retryNote =
+      code === "MODEL_OUTPUT_TRUNCATED" && typeof attempts === "number" && attempts > 1
+        ? `; выполнен ограниченный повтор (${attempts} попытки)`
+        : "";
+    return `${messages[code]}${retryNote} (${translate("error_code")}: ${code})`;
+  }
   return localizedError(
     typeof code === "string" ? code : undefined,
     translate,
@@ -4838,7 +5095,7 @@ function DocumentViewer({
     <section className="document-viewer" aria-live="polite">
       <div className="document-viewer-header">
         <div>
-          <h2>
+          <h2 id="document-viewer-heading" tabIndex={-1}>
             <BookOpen size={18} /> {structure.title}
           </h2>
           <div className="search-meta">

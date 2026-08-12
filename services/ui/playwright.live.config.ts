@@ -1,22 +1,21 @@
 import { defineConfig } from "@playwright/test";
+import { UI_BASE_URL } from "./playwright/test-helpers";
 
 export default defineConfig({
   testDir: "./playwright",
-  testIgnore: "**/live-*.spec.ts",
+  testMatch: "**/live-*.spec.ts",
   forbidOnly: !!process.env.CI,
-  timeout: 30_000,
+  fullyParallel: false,
+  workers: 1,
+  timeout: 300_000,
   expect: {
-    timeout: 10_000,
+    timeout: 20_000,
   },
+  globalSetup: "./playwright/live-global-setup.ts",
   use: {
-    baseURL: "http://localhost:5173",
+    baseURL: UI_BASE_URL,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",
-  },
-  webServer: {
-    command: "pnpm dev --host 127.0.0.1",
-    url: "http://localhost:5173",
-    reuseExistingServer: true,
   },
 });

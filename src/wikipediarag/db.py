@@ -1035,6 +1035,14 @@ ADDITIVE_MIGRATIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "ALTER TABLE research_runs ADD COLUMN IF NOT EXISTS model_config_hash text NULL",
         ),
     ),
+    (
+        "006_model_gateway_request_adapter",
+        (
+            "ALTER TABLE model_provider_connections ADD COLUMN IF NOT EXISTS request_adapter jsonb NOT NULL DEFAULT '{}'",
+            "ALTER TABLE model_provider_connections ADD COLUMN IF NOT EXISTS request_defaults jsonb NOT NULL DEFAULT '{}'",
+            "ALTER TABLE model_aliases ADD COLUMN IF NOT EXISTS startup_canary jsonb NOT NULL DEFAULT '{}'",
+        ),
+    ),
 )
 
 

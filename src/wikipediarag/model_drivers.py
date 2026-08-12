@@ -18,8 +18,7 @@ from wikipediarag.model_control import (
     ModelDriver,
     ModelOperation,
     ThinkingPolicy,
-    map_thinking_parameters,
-    schema_canary_reserve,
+    compile_provider_payload,
 )
 
 
@@ -42,6 +41,8 @@ class DriverRequest:
     headers: Mapping[str, str] = field(default_factory=dict)
     tls_verify: bool = True
     timeout: float = 30.0
+    request_adapter: Mapping[str, Any] = field(default_factory=dict)
+    request_defaults: Mapping[str, Any] = field(default_factory=dict)
 
 
 class EndpointDriver:
@@ -53,7 +54,10 @@ class EndpointDriver:
         self._client = client
 
     def _path(self, request: DriverRequest, operation: str) -> str:
-        return request.paths.get(operation, self.default_paths[operation])
+        adapter_paths = (
+            request.request_adapter.get("endpoint_paths") if isinstance(request.request_adapter, Mapping) else {}
+        )
+        return request.paths.get(operation) or (adapter_paths or {}).get(operation) or self.default_paths[operation]
 
     async def _request(
         self, request: DriverRequest, operation: str, payload: Mapping[str, Any] | None = None
@@ -87,10 +91,7 @@ class EndpointDriver:
         return [item for item in models if isinstance(item, dict)][:200]
 
     def map_parameters(self, parameters: Mapping[str, Any], thinking: ThinkingPolicy | None = None) -> dict[str, Any]:
-        mapped = dict(parameters)
-        if thinking is not None:
-            mapped.update(map_thinking_parameters(self.driver, thinking))
-        return mapped
+        return dict(parameters)
 
     async def chat(
         self,
@@ -101,8 +102,12 @@ class EndpointDriver:
         response_format: Mapping[str, Any] | None = None,
         thinking: ThinkingPolicy | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"model": request.model, "messages": messages}
-        payload.update(self.map_parameters(parameters or {}, thinking))
+        payload: dict[str, Any] = compile_provider_payload(
+            {"model": request.model, "messages": messages, **dict(parameters or {})},
+            connection_defaults=request.request_defaults,
+            request_adapter=request.request_adapter,
+            thinking=thinking,
+        )
         if response_format:
             payload["response_format"] = dict(response_format)
             if self.driver is ModelDriver.openrouter:
@@ -119,8 +124,12 @@ class EndpointDriver:
         thinking: ThinkingPolicy | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         url = f"{request.base_url.rstrip('/')}/{self._path(request, 'chat').lstrip('/')}"
-        payload: dict[str, Any] = {"model": request.model, "messages": messages, "stream": True}
-        payload.update(self.map_parameters(parameters or {}, thinking))
+        payload: dict[str, Any] = compile_provider_payload(
+            {"model": request.model, "messages": messages, "stream": True, **dict(parameters or {})},
+            connection_defaults=request.request_defaults,
+            request_adapter=request.request_adapter,
+            thinking=thinking,
+        )
         if response_format:
             payload["response_format"] = dict(response_format)
         close_client = self._client is None
@@ -152,7 +161,14 @@ class EndpointDriver:
     async def embed(
         self, request: DriverRequest, *, inputs: list[str], parameters: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
-        if self.driver is ModelDriver.textgen_webui and "embeddings" not in request.paths:
+        adapter_paths = (
+            request.request_adapter.get("endpoint_paths") if isinstance(request.request_adapter, Mapping) else {}
+        )
+        if (
+            self.driver is ModelDriver.textgen_webui
+            and "embeddings" not in request.paths
+            and "embeddings" not in (adapter_paths or {})
+        ):
             raise UnsupportedOperationError(ModelOperation.embedding.value)
         payload: dict[str, Any] = {"model": request.model, "input": inputs}
         payload.update(parameters or {})
@@ -180,12 +196,10 @@ class EndpointDriver:
         return {"code": "MODEL_DRIVER_ERROR", "message": "model endpoint request failed"}
 
     async def run_capability_canary(
-        self, request: DriverRequest, *, thinking: ThinkingPolicy | None = None
+        self, request: DriverRequest, *, thinking: ThinkingPolicy | None = None, max_output_tokens: int = 4096
     ) -> dict[str, Any]:
         policy = thinking or ThinkingPolicy()
-        minimal_json = '{"ok":true}'
-        output_reserve = schema_canary_reserve(max(len(minimal_json) // 4, 1))
-        parameters = {"max_output_tokens": output_reserve}
+        parameters = {"max_output_tokens": max(64, int(max_output_tokens))}
         try:
             response = await self.chat(
                 request,

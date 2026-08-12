@@ -13,6 +13,10 @@ from wikipediarag.schemas import Evidence, RetrievalResult
 
 
 class _FakeConnection:
+    def __init__(self, *, worker_ready: bool = True) -> None:
+        self.worker_ready = worker_ready
+        self.statements: list[str] = []
+
     async def __aenter__(self) -> _FakeConnection:
         return self
 
@@ -24,13 +28,17 @@ class _FakeConnection:
     ) -> None:
         return None
 
-    async def execute(self, *_args: object, **_kwargs: object) -> _FakeResult:
-        return _FakeResult()
+    async def execute(self, statement: object, *_args: object, **_kwargs: object) -> _FakeResult:
+        self.statements.append(str(statement))
+        return _FakeResult(self.worker_ready)
 
 
 class _FakeResult:
+    def __init__(self, value: bool) -> None:
+        self.value = value
+
     def scalar(self) -> bool:
-        return True
+        return self.value
 
 
 class _FakeGatewayClient:
@@ -80,6 +88,21 @@ async def test_api_ready_reports_model_gateway_failed_when_gateway_ready_is_degr
     assert payload["components"]["model_gateway"] == "failed"
     assert payload["components"]["opensearch"] == "ok"
     assert payload["components"]["minio"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_api_ready_requires_fresh_research_and_background_lanes(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _FakeConnection(worker_ready=False)
+    monkeypatch.setattr(api_app, "get_settings", lambda: Settings(model_gateway_url="http://gateway.test"))
+    monkeypatch.setattr(api_app, "connect", lambda: connection)
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeGatewayClient)
+
+    payload: dict[str, Any] = await api_app.ready()
+
+    assert payload["components"]["worker"] == "stale"
+    heartbeat_query = next(statement for statement in connection.statements if "worker_instances" in statement)
+    assert "lane = 'deep_research'" in heartbeat_query
+    assert "document_upload" in heartbeat_query
 
 
 def test_safe_failure_payload_preserves_stage_trace_and_chunk_ids() -> None:

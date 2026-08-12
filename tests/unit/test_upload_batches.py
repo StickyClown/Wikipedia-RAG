@@ -11,7 +11,7 @@ from starlette.requests import Request
 import wikipediarag.api.handlers as api_app
 from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole, TenantRole
 from wikipediarag.config import Settings
-from wikipediarag.repository import create_document_upload_records
+from wikipediarag.repository import DocumentVersionLifecycleError, create_document_upload_records
 from wikipediarag.schemas import UploadBatchCreate, UploadBatchItemCreate
 
 
@@ -23,15 +23,29 @@ class _FakeConnectionContext:
         return None
 
 
+class _FakeResult:
+    def __init__(self, first: dict[str, Any] | None = None) -> None:
+        self._first = first
+
+    def mappings(self) -> _FakeResult:
+        return self
+
+    def first(self) -> dict[str, Any] | None:
+        return self._first
+
+
 class _CaptureConnection:
-    def __init__(self) -> None:
+    def __init__(self, existing_version: dict[str, Any] | None = None) -> None:
         self.statements: list[str] = []
         self.params: list[dict[str, Any] | None] = []
+        self.existing_version = existing_version
 
     async def execute(self, statement: object, params: dict[str, Any] | None = None) -> object:
         self.statements.append(str(statement))
         self.params.append(params)
-        return object()
+        if "FROM document_versions" in str(statement):
+            return _FakeResult(self.existing_version)
+        return _FakeResult()
 
 
 def _request(*, method: str = "POST", path: str = "/api/v1/uploads/batches") -> Request:
@@ -132,7 +146,7 @@ async def test_document_upload_completion_reuses_existing_batch_id() -> None:
     conn = _CaptureConnection()
     batch_id = "44444444-4444-4444-8444-444444444444"
 
-    await create_document_upload_records(
+    _job_id, status = await create_document_upload_records(
         cast(AsyncConnection, conn),
         tenant_id="11111111-1111-4111-8111-111111111111",
         knowledge_base_id="33333333-3333-4333-8333-333333333333",
@@ -160,3 +174,79 @@ async def test_document_upload_completion_reuses_existing_batch_id() -> None:
     assert upload_session_updates
     assert upload_session_updates[0] is not None
     assert upload_session_updates[0]["batch_id"] == batch_id
+    assert status == "received"
+
+
+async def test_published_document_upload_is_completed_without_version_reset() -> None:
+    conn = _CaptureConnection(
+        existing_version={
+            "status": "published",
+            "content_hash": "a" * 64,
+            "tenant_id": "11111111-1111-4111-8111-111111111111",
+            "knowledge_base_id": "33333333-3333-4333-8333-333333333333",
+        }
+    )
+
+    _job_id, status = await create_document_upload_records(
+        cast(AsyncConnection, conn),
+        tenant_id="11111111-1111-4111-8111-111111111111",
+        knowledge_base_id="33333333-3333-4333-8333-333333333333",
+        upload_session={
+            "id": "55555555-5555-4555-8555-555555555555",
+            "batch_id": "44444444-4444-4444-8444-444444444444",
+            "filename": "a.txt",
+            "object_key": "uploads/server-owned/key",
+            "parser_profile": "standard",
+            "content_type": "text/plain",
+            "size_bytes": 3,
+        },
+        document_id="doc:abc",
+        document_version_id="docv:abc",
+        content_hash="a" * 64,
+        metadata={},
+    )
+
+    assert status == "completed"
+    assert not any("SET status = 'received'" in statement for statement in conn.statements)
+    assert any("'deduplicated'" in statement for statement in conn.statements)
+
+
+@pytest.mark.parametrize(
+    ("version_status", "expected_code"),
+    [("parsing", "DOCUMENT_VERSION_IN_PROGRESS"), ("failed", "DOCUMENT_VERSION_REPROCESS_REQUIRED")],
+)
+async def test_existing_non_published_document_upload_requires_explicit_reprocess(
+    version_status: str,
+    expected_code: str,
+) -> None:
+    conn = _CaptureConnection(
+        existing_version={
+            "status": version_status,
+            "content_hash": "a" * 64,
+            "tenant_id": "11111111-1111-4111-8111-111111111111",
+            "knowledge_base_id": "33333333-3333-4333-8333-333333333333",
+        }
+    )
+
+    with pytest.raises(DocumentVersionLifecycleError) as error:
+        await create_document_upload_records(
+            cast(AsyncConnection, conn),
+            tenant_id="11111111-1111-4111-8111-111111111111",
+            knowledge_base_id="33333333-3333-4333-8333-333333333333",
+            upload_session={
+                "id": "55555555-5555-4555-8555-555555555555",
+                "batch_id": "44444444-4444-4444-8444-444444444444",
+                "filename": "a.txt",
+                "object_key": "uploads/server-owned/key",
+                "parser_profile": "standard",
+                "content_type": "text/plain",
+                "size_bytes": 3,
+            },
+            document_id="doc:abc",
+            document_version_id="docv:abc",
+            content_hash="a" * 64,
+            metadata={},
+        )
+
+    assert error.value.code == expected_code
+    assert len(conn.statements) == 1

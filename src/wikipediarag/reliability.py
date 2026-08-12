@@ -107,6 +107,7 @@ class DependencyCircuit:
         self._now = now
         self._consecutive_failures = 0
         self._opened_at: float | None = None
+        self._last_failure_at: float | None = None
         self._half_open_probe = False
 
     def before_call(self) -> None:
@@ -122,10 +123,12 @@ class DependencyCircuit:
     def record_success(self) -> None:
         self._consecutive_failures = 0
         self._opened_at = None
+        self._last_failure_at = None
         self._half_open_probe = False
 
     def record_failure(self) -> None:
         self._consecutive_failures += 1
+        self._last_failure_at = self._now()
         self._half_open_probe = False
         if self._consecutive_failures >= self.failure_threshold:
             self._opened_at = self._now()
@@ -133,6 +136,12 @@ class DependencyCircuit:
     @property
     def is_open(self) -> bool:
         return self._opened_at is not None and self._now() - self._opened_at < self.cooldown_seconds
+
+    @property
+    def is_degraded(self) -> bool:
+        """Expose a recent runtime failure until recovery or the cooldown expires."""
+
+        return self._last_failure_at is not None and self._now() - self._last_failure_at < self.cooldown_seconds
 
 
 def is_retryable_exception(exc: BaseException) -> bool:

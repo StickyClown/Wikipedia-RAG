@@ -11,15 +11,33 @@ models:
     operation: chat
     context_window_tokens: 80000
     tokenizer: qwen3
+    request_adapter:
+      parameter_map:
+        max_output_tokens: max_tokens
+      thinking:
+        effort: reasoning.effort
+        budget_tokens: reasoning.budget_tokens
+        return_reasoning: {path: reasoning.exclude, transform: inverse}
+    startup_canary:
+      max_tokens: 4096
     provider_preferences:
       require_parameters: true
 
   generator_main:
     provider: openrouter
-    model: qwen/qwen3.6-35b-a3b
+    model: qwen/qwen3.6-27b
     operation: chat
     context_window_tokens: 80000
     tokenizer: qwen3
+    request_adapter:
+      parameter_map:
+        max_output_tokens: max_tokens
+      thinking:
+        effort: reasoning.effort
+        budget_tokens: reasoning.budget_tokens
+        return_reasoning: {path: reasoning.exclude, transform: inverse}
+    startup_canary:
+      max_tokens: 4096
     provider_preferences:
       require_parameters: true
 
@@ -29,6 +47,42 @@ models:
     operation: chat
     context_window_tokens: 80000
     tokenizer: qwen3
+    request_adapter:
+      parameter_map:
+        max_output_tokens: max_tokens
+      thinking:
+        effort: reasoning.effort
+        budget_tokens: reasoning.budget_tokens
+        return_reasoning: {path: reasoning.exclude, transform: inverse}
+
+    startup_canary:
+      max_tokens: 4096
+
+  qwen36_quality_tier:
+    provider: openai_compatible
+    model: Qwen/Qwen3.6-27B
+    operation: chat
+    context_window_tokens: 80000
+    tokenizer: qwen3
+
+  qwen30b_thinking_vllm:
+    provider: vllm
+    model: Qwen/Qwen3-30B-A3B-Thinking-2507
+    operation: chat
+    context_window_tokens: 20000
+    tokenizer: qwen3
+    request_adapter:
+      parameter_map:
+        max_output_tokens: max_tokens
+      thinking:
+        enabled: chat_template_kwargs.enable_thinking
+        effort: reasoning_effort
+
+  embed_local_qwen3_8b:
+    provider: llamacpp
+    model: Qwen3-Embedding-8B
+    operation: embedding
+    dimensions: 1024
     provider_preferences:
       require_parameters: true
 

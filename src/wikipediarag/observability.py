@@ -150,6 +150,14 @@ def model_call_metadata(
         "retries": max(0, attempts - 1),
         "usage": usage,
     }
+    budget_metadata = response.get("_gateway_budget_metadata")
+    if isinstance(budget_metadata, dict):
+        metadata["output_budget"] = {
+            str(key): int(value)
+            for key, value in budget_metadata.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        metadata["output_budget"].setdefault("retry_count", max(0, attempts - 1))
     if safe_error_code:
         metadata["safe_error_code"] = safe_error_code
     reasoning_tokens = _reasoning_tokens(usage)

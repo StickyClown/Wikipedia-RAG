@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from wikipediarag.config import Settings, get_settings
@@ -15,6 +16,8 @@ def _client(settings: Settings, *, endpoint_url: str | None = None) -> Any:
         aws_access_key_id=settings.minio_access_key,
         aws_secret_access_key=settings.minio_secret_key,
         region_name="us-east-1",
+        # Older MinIO deployments require Content-MD5 for multi-object delete.
+        config=Config(request_checksum_calculation="when_required"),
     )
 
 
@@ -101,10 +104,22 @@ def delete_objects(keys: list[str], settings: Settings | None = None) -> int:
     deleted = 0
     for index in range(0, len(unique_keys), 1000):
         batch = unique_keys[index : index + 1000]
-        response = client.delete_objects(
-            Bucket=resolved.minio_bucket,
-            Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
-        )
+        try:
+            response = client.delete_objects(
+                Bucket=resolved.minio_bucket,
+                Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+            )
+        except ClientError as exc:
+            # Some older MinIO versions require Content-MD5 for the XML body of
+            # DeleteObjects, while boto3 does not add it for this operation.
+            # A single-object delete has no XML body and is portable across the
+            # supported S3-compatible stores.
+            if str(exc.response.get("Error", {}).get("Code") or "") != "MissingContentMD5":
+                raise
+            for key in batch:
+                client.delete_object(Bucket=resolved.minio_bucket, Key=key)
+            deleted += len(batch)
+            continue
         errors = response.get("Errors", [])
         blocking_errors = [error for error in errors if error.get("Code") not in {"NoSuchKey", "NotFound"}]
         if blocking_errors:

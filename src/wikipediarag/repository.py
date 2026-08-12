@@ -21,6 +21,14 @@ class StaleWorkerLeaseError(RuntimeError):
     """Raised when a worker no longer owns the durable job lease."""
 
 
+class DocumentVersionLifecycleError(RuntimeError):
+    """Raised when an upload would move an existing version backwards."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 _worker_lease_context: ContextVar[str | None] = ContextVar("worker_lease_id", default=None)
 
 
@@ -517,7 +525,10 @@ async def get_upload_batch_status(
                    i.progress,
                    i.error_code,
                    i.error_message,
-                   j.status AS job_status
+                   i.updated_at AS item_updated_at,
+                   j.status AS job_status,
+                   j.started_at AS job_started_at,
+                   j.worker_last_heartbeat_at AS job_last_heartbeat_at
             FROM upload_sessions s
             LEFT JOIN ingestion_job_items i
               ON i.upload_session_id = s.id
@@ -558,6 +569,9 @@ async def get_upload_batch_status(
                 "document_version_id": item.get("document_version_id"),
                 "job_id": str(item["job_id"]) if item.get("job_id") is not None else None,
                 "job_status": item.get("job_status"),
+                "job_started_at": item.get("job_started_at"),
+                "job_last_heartbeat_at": item.get("job_last_heartbeat_at"),
+                "item_updated_at": item.get("item_updated_at"),
                 "progress": item.get("progress") or {},
                 "error_code": item.get("error_code"),
                 "error_message": item.get("error_message"),
@@ -600,7 +614,7 @@ async def create_document_upload_records(
     document_version_id: str,
     content_hash: str,
     metadata: dict[str, Any],
-) -> uuid.UUID:
+) -> tuple[uuid.UUID, str]:
     job_id = new_uuid()
     existing_batch_id = upload_session.get("batch_id")
     batch_id = uuid.UUID(str(existing_batch_id)) if existing_batch_id is not None else new_uuid()
@@ -611,6 +625,34 @@ async def create_document_upload_records(
     now_payload = json_dumps(
         {"stage": "received", "documents_total": 1, "documents_completed": 0, "documents_failed": 0}
     )
+    existing_result = await conn.execute(
+        text(
+            """
+            SELECT status, content_hash, tenant_id, knowledge_base_id
+            FROM document_versions
+            WHERE id = :id
+            FOR UPDATE
+            """
+        ),
+        {"id": document_version_id, "tenant_id": tenant_id, "kb_id": knowledge_base_id},
+    )
+    existing_row = existing_result.mappings().first()
+    existing_version = dict(existing_row) if existing_row is not None else None
+    if existing_version is not None and (
+        str(existing_version.get("tenant_id")) != tenant_id
+        or str(existing_version.get("knowledge_base_id")) != knowledge_base_id
+    ):
+        raise DocumentVersionLifecycleError("DOCUMENT_VERSION_CONFLICT")
+    if existing_version is not None and str(existing_version.get("content_hash")) != content_hash:
+        raise DocumentVersionLifecycleError("DOCUMENT_VERSION_CONFLICT")
+    existing_status = str(existing_version.get("status")) if existing_version is not None else None
+    if existing_status not in {None, "published"}:
+        code = (
+            "DOCUMENT_VERSION_IN_PROGRESS"
+            if existing_status in {"received", "validating", "parsing", "normalized", "indexing"}
+            else "DOCUMENT_VERSION_REPROCESS_REQUIRED"
+        )
+        raise DocumentVersionLifecycleError(code)
     await conn.execute(
         text(
             """
@@ -657,6 +699,67 @@ async def create_document_upload_records(
         ),
         {"batch_id": str(batch_id), "session_id": upload_session["id"], "tenant_id": tenant_id},
     )
+    if existing_status == "published":
+        completed_progress = json_dumps(
+            {
+                "stage": "deduplicated",
+                "documents_total": 1,
+                "documents_completed": 1,
+                "documents_failed": 0,
+            }
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO ingestion_jobs(
+                  id, tenant_id, knowledge_base_id, kind, status, config, progress,
+                  started_at, completed_at, worker_last_heartbeat_at
+                )
+                VALUES (
+                  :id, :tenant_id, :kb_id, 'document_upload', 'completed',
+                  CAST(:config AS jsonb), CAST(:progress AS jsonb), now(), now(), now()
+                )
+                """
+            ),
+            {
+                "id": str(job_id),
+                "tenant_id": tenant_id,
+                "kb_id": knowledge_base_id,
+                "config": json_dumps(
+                    {
+                        "batch_id": str(batch_id),
+                        "upload_session_id": str(upload_session["id"]),
+                        "deduplicated": True,
+                    }
+                ),
+                "progress": completed_progress,
+            },
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO ingestion_job_items(
+                  id, job_id, tenant_id, knowledge_base_id, document_id, document_version_id,
+                  upload_session_id, status, stage, progress, claimed_at, completed_at
+                )
+                VALUES (
+                  :id, :job_id, :tenant_id, :kb_id, :document_id, :document_version_id,
+                  :upload_session_id, 'completed', 'deduplicated', CAST(:progress AS jsonb), now(), now()
+                )
+                """
+            ),
+            {
+                "id": str(item_id),
+                "job_id": str(job_id),
+                "tenant_id": tenant_id,
+                "kb_id": knowledge_base_id,
+                "document_id": document_id,
+                "document_version_id": document_version_id,
+                "upload_session_id": str(upload_session["id"]),
+                "progress": json_dumps({"stage": "deduplicated"}),
+            },
+        )
+        return job_id, "completed"
     await conn.execute(
         text(
             """
@@ -791,7 +894,7 @@ async def create_document_upload_records(
             "progress": json_dumps({"stage": "received"}),
         },
     )
-    return job_id
+    return job_id, "received"
 
 
 async def create_knowledge_source(
@@ -3622,6 +3725,29 @@ async def cancel_query_run(conn: AsyncConnection, *, query_run_id: str, error_co
         ),
         {"id": query_run_id, "error_code": error_code},
     )
+
+
+async def recover_stale_chat_query_runs(conn: AsyncConnection, *, max_age_seconds: int) -> int:
+    """Terminalize interrupted streaming chat runs after an API restart.
+
+    Deep Research owns its own durable lease recovery and is intentionally
+    excluded.  The conditional status predicate keeps repeated startup calls
+    idempotent and never alters completed runs.
+    """
+
+    result = await conn.execute(
+        text(
+            """
+            UPDATE query_runs
+            SET status = 'failed', error_code = 'STALE_QUERY_RUN_RECOVERED', completed_at = now()
+            WHERE status IN ('received', 'running')
+              AND mode IN ('normal', 'extended')
+              AND COALESCE(started_at, created_at) < now() - make_interval(secs => :max_age_seconds)
+            """
+        ),
+        {"max_age_seconds": max(1, int(max_age_seconds))},
+    )
+    return max(0, int(getattr(result, "rowcount", 0) or 0))
 
 
 async def create_research_plan(

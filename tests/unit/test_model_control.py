@@ -9,10 +9,12 @@ from wikipediarag.model_control import (
     ModelOperation,
     ThinkingMode,
     ThinkingPolicy,
+    compile_provider_payload,
     compile_token_envelope,
     map_thinking_parameters,
     merge_parameters,
     redact_connection,
+    resolve_output_budget,
     schema_canary_reserve,
     validate_stage_binding,
     validate_tokenizer_calibration,
@@ -30,17 +32,23 @@ def test_parameter_hierarchy_only_allows_workload_to_reduce_limit() -> None:
     assert resolved == {"temperature": 0.2, "max_output_tokens": 120}
 
 
-def test_unknown_parameter_is_blocked() -> None:
-    with pytest.raises(ModelControlError, match="unknown model parameter"):
-        merge_parameters({}, {"provider_magic": True}, {})
+def test_vendor_parameter_is_passed_through() -> None:
+    assert merge_parameters({}, {"provider_magic": True}, {})["provider_magic"] is True
 
 
-def test_thinking_mapping_is_explicit_per_driver() -> None:
+def test_thinking_mapping_is_declared_by_adapter() -> None:
     off = ThinkingPolicy(mode=ThinkingMode.off, effort="none")
-    assert map_thinking_parameters(ModelDriver.openrouter, off)["reasoning"]["effort"] == "none"
-    assert map_thinking_parameters(ModelDriver.vllm, off)["chat_template_kwargs"]["enable_thinking"] is False
-    with pytest.raises(ModelControlError):
-        map_thinking_parameters(ModelDriver.openai_compatible, ThinkingPolicy(mode=ThinkingMode.on, effort="low"))
+    assert map_thinking_parameters(ModelDriver.openrouter, off)["thinking"]["mode"] == "off"
+    compiled = compile_provider_payload(
+        {"model": "x", "messages": [], "max_output_tokens": 10},
+        request_adapter={
+            "parameter_map": {"max_output_tokens": "max_tokens"},
+            "thinking": {"enabled": "chat_template_kwargs.enable_thinking"},
+        },
+        thinking=off,
+    )
+    assert compiled["max_tokens"] == 10
+    assert compiled["chat_template_kwargs"]["enable_thinking"] is False
 
 
 def test_token_envelope_and_schema_reserve() -> None:
@@ -59,6 +67,25 @@ def test_token_envelope_and_schema_reserve() -> None:
             final_output_reserve=100,
             thinking=ThinkingPolicy(mode=ThinkingMode.off, effort="none"),
         )
+
+
+def test_output_budget_is_clamped_to_context_and_reports_safe_metadata() -> None:
+    budget = resolve_output_budget(
+        4096,
+        input_tokens=700,
+        context_window=1024,
+        stage_cap=8192,
+        safety_reserve=64,
+    )
+
+    assert budget.effective_tokens == 260
+    assert budget.as_metadata()["requested_output_tokens"] == 4096
+    assert budget.as_metadata()["stage_output_cap"] == 8192
+
+
+def test_output_budget_rejects_impossible_minimum() -> None:
+    with pytest.raises(ModelControlError, match="MODEL_TOKEN_BUDGET_EXCEEDED"):
+        resolve_output_budget(128, input_tokens=900, context_window=1024, safety_reserve=64)
 
 
 def test_embedding_contract_and_catalog_only_vision() -> None:
@@ -80,6 +107,25 @@ def test_embedding_contract_and_catalog_only_vision() -> None:
     )
     with pytest.raises(ModelControlError, match="MODEL_VISION_CATALOG_ONLY"):
         validate_stage_binding("chat.answer", vision, ThinkingPolicy())
+
+
+def test_chat_answer_requires_structured_output_capability() -> None:
+    plain_chat = ModelContract(
+        alias="plain-chat",
+        provider_model="plain-chat-model",
+        operation=ModelOperation.chat,
+        capabilities=frozenset({"chat"}),
+    )
+    structured_chat = ModelContract(
+        alias="structured-chat",
+        provider_model="structured-chat-model",
+        operation=ModelOperation.chat,
+        capabilities=frozenset({"chat", "structured_output"}),
+    )
+
+    with pytest.raises(ModelControlError, match="MODEL_CAPABILITY_UNSUPPORTED"):
+        validate_stage_binding("chat.answer", plain_chat, ThinkingPolicy())
+    assert validate_stage_binding("chat.answer", structured_chat, ThinkingPolicy())
 
 
 def test_tokenizer_calibration_has_safe_tolerance() -> None:

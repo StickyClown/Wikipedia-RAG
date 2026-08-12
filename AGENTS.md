@@ -5,7 +5,6 @@ current status and architecture details live elsewhere:
 
 - [README.md](README.md) - product introduction, quick start and documentation map.
 - [docs/STATUS.md](docs/STATUS.md) - active goal, validation, blockers and next task.
-- [docs/architecture.md](docs/architecture.md) - architecture overview, invariants and detailed architecture index.
 
 Before implementation, briefly state which of these files were read and the active
 goal from [docs/STATUS.md](docs/STATUS.md).

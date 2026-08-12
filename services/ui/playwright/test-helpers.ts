@@ -3,6 +3,9 @@ import { expect, type APIRequestContext, type Page } from "@playwright/test";
 export const API_BASE_URL =
   process.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
+export const UI_BASE_URL =
+  process.env.WIKIPEDIARAG_UI_TEST_BASE_URL ?? "http://localhost:5173";
+
 export function configuredCredential(name: "username" | "password") {
   const adminName =
     name === "username"
@@ -16,7 +19,16 @@ export function configuredCredential(name: "username" | "password") {
     name === "username"
       ? process.env.EVAL_AUTH_USERNAME
       : process.env.EVAL_AUTH_PASSWORD;
-  return adminName ?? genericName ?? evalName ?? "";
+  const configured = adminName ?? genericName ?? evalName;
+  if (configured) return configured;
+  if (
+    process.env.WIKIPEDIARAG_E2E_ALLOW_DEV_DEFAULTS === "1" &&
+    isLocalhost(UI_BASE_URL) &&
+    isLocalhost(API_BASE_URL)
+  ) {
+    return "admin";
+  }
+  return "";
 }
 
 export async function apiIsReachable(request: APIRequestContext) {
@@ -61,4 +73,12 @@ export async function loginWithCredentials(
 export function assertNoProviderLeakage(text: string) {
   expect(text).not.toMatch(/JSONDecodeError|provider payload/i);
   expect(text).not.toMatch(/(?:sk-|api[_-]?key|authorization)\s*[:=]/i);
+}
+
+function isLocalhost(url: string) {
+  try {
+    return ["localhost", "127.0.0.1", "::1"].includes(new URL(url).hostname);
+  } catch {
+    return false;
+  }
 }

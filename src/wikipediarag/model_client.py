@@ -32,6 +32,39 @@ def _http_client() -> httpx.AsyncClient:
     return _HTTP_CLIENT
 
 
+def _gateway_error_details(response: httpx.Response) -> tuple[str, bool]:
+    """Read only the Model Gateway's safe error metadata."""
+
+    fallback_retryable = response.status_code in TRANSIENT_PROVIDER_STATUS_CODES
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return "DEPENDENCY_UNAVAILABLE", fallback_retryable
+    detail = payload.get("detail", payload) if isinstance(payload, dict) else None
+    error = detail.get("error", detail) if isinstance(detail, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    retryable = error.get("retryable") if isinstance(error, dict) else None
+    return (
+        str(code) if isinstance(code, str) and code else "DEPENDENCY_UNAVAILABLE",
+        bool(retryable) if isinstance(retryable, bool) else fallback_retryable,
+    )
+
+
+def _request_budget_metadata(
+    payload: dict[str, Any], retry_max_output_tokens: int | None, *, requested_tokens: int | None = None
+) -> dict[str, int]:
+    requested = requested_tokens if isinstance(requested_tokens, int) else payload.get("max_tokens")
+    if not isinstance(requested, int):
+        return {}
+    cap = max(int(requested), int(retry_max_output_tokens or requested))
+    return {
+        "requested_output_tokens": int(requested),
+        "effective_output_tokens": int(requested),
+        "stage_output_cap": cap,
+        "retry_count": 0,
+    }
+
+
 async def close_http_client() -> None:
     global _HTTP_CLIENT, _HTTP_CLIENT_FACTORY
     if _HTTP_CLIENT is not None:
@@ -51,6 +84,9 @@ async def chat_completion(
     config_revision_id: str | None = None,
     response_format: dict[str, Any] | None = None,
     max_output_tokens: int | None = None,
+    retry_max_output_tokens: int | None = None,
+    stage_output_cap: int | None = None,
+    stage_safety_reserve_tokens: int | None = None,
     max_provider_attempts: int | None = None,
     deadline: OperationDeadline | None = None,
     correlation_id: str = "",
@@ -67,6 +103,10 @@ async def chat_completion(
         payload["response_format"] = response_format
     if max_output_tokens is not None:
         payload["max_tokens"] = int(max_output_tokens)
+    if stage_output_cap is not None:
+        payload["_stage_output_cap"] = int(stage_output_cap)
+    if stage_safety_reserve_tokens is not None:
+        payload["_stage_safety_reserve"] = int(stage_safety_reserve_tokens)
     request_options: dict[str, Any] = {
         "timeout_seconds": resolved.model_client_chat_timeout_seconds,
         "max_attempts": (
@@ -76,6 +116,7 @@ async def chat_completion(
         ),
         "operation": "chat",
         "alias": stage or alias,
+        "retry_max_output_tokens": retry_max_output_tokens,
     }
     if deadline is not None:
         request_options["deadline"] = deadline
@@ -227,12 +268,14 @@ async def _post_json(
     max_attempts: int = MAX_PROVIDER_ATTEMPTS,
     operation: str,
     alias: str,
+    retry_max_output_tokens: int | None = None,
     deadline: OperationDeadline | None = None,
     correlation_id: str = "",
 ) -> dict[str, Any]:
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
     started = now_ms()
+    initial_output_tokens = payload.get("max_tokens") if isinstance(payload.get("max_tokens"), int) else None
     for attempt in range(max_attempts):
         try:
             effective_timeout = (
@@ -254,34 +297,52 @@ async def _post_json(
             return result
         except (httpx.NetworkError, httpx.TimeoutException) as exc:
             if attempt + 1 == max_attempts:
+                metadata = model_call_metadata(
+                    operation=operation,
+                    alias=alias,
+                    payload=None,
+                    latency_ms=elapsed_ms(started),
+                    attempts=attempt + 1,
+                    safe_error_code=safe_error_code(exc),
+                )
+                budget_metadata = _request_budget_metadata(
+                    payload, retry_max_output_tokens, requested_tokens=initial_output_tokens
+                )
+                if budget_metadata:
+                    metadata["output_budget"] = budget_metadata
                 raise ModelGatewayError(
                     "model gateway request failed",
-                    metadata=model_call_metadata(
-                        operation=operation,
-                        alias=alias,
-                        payload=None,
-                        latency_ms=elapsed_ms(started),
-                        attempts=attempt + 1,
-                        safe_error_code=safe_error_code(exc),
-                    ),
+                    metadata=metadata,
                     cause=exc,
                 ) from exc
         except httpx.HTTPStatusError as exc:
-            response_code = safe_error_code(exc)
-            if exc.response.status_code not in TRANSIENT_PROVIDER_STATUS_CODES or attempt + 1 == max_attempts:
+            response_code, retryable = _gateway_error_details(exc.response)
+            if not retryable or attempt + 1 == max_attempts:
+                metadata = model_call_metadata(
+                    operation=operation,
+                    alias=alias,
+                    payload=None,
+                    latency_ms=elapsed_ms(started),
+                    attempts=attempt + 1,
+                    safe_error_code=response_code,
+                )
+                budget_metadata = _request_budget_metadata(
+                    payload, retry_max_output_tokens, requested_tokens=initial_output_tokens
+                )
+                if budget_metadata:
+                    metadata["output_budget"] = budget_metadata
                 raise ModelGatewayError(
                     "model gateway request failed",
-                    metadata=model_call_metadata(
-                        operation=operation,
-                        alias=alias,
-                        payload=None,
-                        latency_ms=elapsed_ms(started),
-                        attempts=attempt + 1,
-                        safe_error_code=response_code,
-                    ),
+                    metadata=metadata,
                     cause=exc,
                 ) from exc
             retry_after = _retry_after_seconds(exc.response)
+            if response_code == "MODEL_OUTPUT_TRUNCATED" and isinstance(payload.get("max_tokens"), int):
+                retry_limit = retry_max_output_tokens or int(payload["max_tokens"])
+                payload["max_tokens"] = min(
+                    max(int(payload["max_tokens"]) + 1, int(payload["max_tokens"]) * 2),
+                    max(int(payload["max_tokens"]), int(retry_limit)),
+                )
             if retry_after is not None:
                 await _bounded_retry_sleep(
                     retry_after, timeout_seconds=timeout_seconds, deadline=deadline, operation=operation

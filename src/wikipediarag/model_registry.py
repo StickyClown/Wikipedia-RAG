@@ -20,6 +20,10 @@ class ModelAlias(BaseModel):
     context_window_tokens: int | None = Field(default=None, ge=256)
     tokenizer: str | None = Field(default=None, min_length=1, max_length=120)
     provider_preferences: dict[str, Any] = Field(default_factory=dict)
+    model_defaults: dict[str, Any] = Field(default_factory=dict)
+    request_adapter: dict[str, Any] = Field(default_factory=dict)
+    request_defaults: dict[str, Any] = Field(default_factory=dict)
+    startup_canary: dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelRegistry(BaseModel):

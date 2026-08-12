@@ -367,6 +367,7 @@ async def run_task(
     report_id: str = "",
     run_started_at: str = "",
     root_run_contract_id: str = "",
+    request_namespace: str = "",
     max_attempts: int = ANSWER_EVAL_MAX_ATTEMPTS,
     retry_slot_acquire: Callable[[dict[str, Any]], Awaitable[bool]] | None = None,
 ) -> EvalTaskResult:
@@ -383,6 +384,8 @@ async def run_task(
         }
         if task.knowledge_base_ids:
             chat_kwargs["knowledge_base_ids"] = task.knowledge_base_ids
+        if request_namespace:
+            chat_kwargs["request_namespace"] = request_namespace
         try:
             async_run_chat = getattr(client, "run_chat_async", None)
             if callable(async_run_chat):

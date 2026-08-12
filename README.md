@@ -48,10 +48,10 @@ from evidence still visible to the current actor.
 
 The current default Deep Research stage profiles are:
 
-- planner/reflection: `generator_fast`, `80k` declared context, `45/55/70`
+- planner/reflection: `generator_main`, `80k` declared context, `16k` output, `45/55/70`
   productive/soft/hard ratios;
-- claim verification: `generator_main`, `24k` input and `2k` output;
-- final synthesis: `generator_main`, `80k` declared context, same `45/55/70`
+- claim verification: `verifier`, `24k` input and `4096` output;
+- final synthesis: `generator_main`, `80k` declared context and `16k` output, same `45/55/70`
   ratios;
 - ordinary Search / Extended Search outside Deep Research: unchanged `30k`
   normal search context budget.
@@ -72,6 +72,29 @@ What has actually been demonstrated:
 The target remains fully local/private model usage. OpenRouter-backed Qwen is a
 temporary development/proxy validation path behind Model Gateway aliases; no
 business component calls a provider directly.
+
+### Model Gateway topology
+
+All model traffic uses the universal Model Gateway contract: chat generation
+through `/v1/chat/completions`, embeddings through `/v1/embeddings`, and rerank
+through the configured `/rerank` path. Connections declare a `request_adapter`
+and `request_defaults`; the compiler recursively merges connection defaults,
+model defaults, stage overrides and workload parameters, then clamps the output
+token envelope. Vendor parameters are JSON-serializable and are passed through
+without a hard-coded sampler allow-list. Transport fields (`model`, `messages`,
+`stream`, `response_format`) remain gateway-owned.
+
+The active development aliases `generator_fast`, `generator_main` and
+`verifier` all target the economical Qwen 3.5 9B proxy with an `80k` context;
+they remain separate aliases for observability and future routing. Structured
+stages and readiness canaries send thinking-off through the adapter. The future
+quality tier is Qwen 3.6 27B (`80k`, inactive), while Qwen3-30B-A3B-Thinking-2507
+is a reserved vLLM tier (`20k` context, server batch budget `4096`). The operator
+runtime note `16k` is retained as deployment guidance, not as an HTTP parameter.
+Qwen3 Embedding 8B remains `1024` dimensions and is reserved for a future
+llama.cpp `/v1/embeddings` connection. Moving from OpenRouter to local
+text-generation-webui/vLLM/llama.cpp changes only connections, adapters and
+bindings; business code and stage aliases stay unchanged.
 
 ## Requirements
 
@@ -141,6 +164,13 @@ Keep them in the ignored `RRNCB/` directory or another local path, then use an
 explicit `--output-suite`, `--suite` and fresh `--run-id` for a new benchmark.
 Do not reuse or overwrite the historical `rrncb-public-v1` artifacts.
 
+Run a new immutable baseline sequentially: prepare and ingest a fresh suite,
+then run `eval-document-run --split dev --run-id <id>` for 40 tasks. Only after
+that command succeeds, run `eval-document-run --split test --resume-run-id <id>`
+for the remaining 160 tasks. RRNCB baseline runs require `--batch-size 1` so a
+missing terminal SSE event, model-output contract failure or other task failure
+stops the run before the next task.
+
 UI checks:
 
 ```bash
@@ -148,7 +178,26 @@ cd services/ui
 pnpm lint
 pnpm typecheck
 pnpm build
+pnpm test:e2e
 ```
+
+Authenticated Playwright E2E tests use `WIKIPEDIARAG_UI_TEST_ADMIN_USERNAME`
+and `WIKIPEDIARAG_UI_TEST_ADMIN_PASSWORD` against the local stack. They create
+and delete their own UUID-named knowledge bases and skip with a `BLOCKED`
+reason when the API or credentials are unavailable.
+
+Live-runtime local-auth checks do not start Compose and require an already
+running UI/API stack:
+
+```bash
+cd services/ui
+$env:WIKIPEDIARAG_E2E_ALLOW_DEV_DEFAULTS = "1"
+pnpm test:e2e:live
+```
+
+The development-only `admin`/`admin` fallback is accepted only for localhost
+when `WIKIPEDIARAG_E2E_ALLOW_DEV_DEFAULTS=1`; CI must supply explicit test
+credentials and set `WIKIPEDIARAG_REQUIRE_LIVE_E2E=1` so `BLOCKED` is fatal.
 
 Docs-only changes do not require the full unit/integration/e2e suite unless
 the active task or CI policy says otherwise.

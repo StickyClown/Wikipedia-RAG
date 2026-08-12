@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
+from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, cast
 
@@ -80,6 +81,7 @@ from wikipediarag.reliability import (
     safe_failure_from_exception,
 )
 from wikipediarag.repository import (
+    DocumentVersionLifecycleError,
     approve_research_plan,
     cancel_query_run,
     claim_idempotency_record,
@@ -124,6 +126,7 @@ from wikipediarag.repository import (
     load_research_detail_records,
     load_research_run_scopes,
     load_retrieval_events,
+    recover_stale_chat_query_runs,
     request_cancel,
     request_research_cancel,
     request_research_pause,
@@ -144,6 +147,7 @@ from wikipediarag.retrieval_contract import (
     validate_active_retrieval_contract,
 )
 from wikipediarag.retrieval_profile import get_profile_catalog, get_retrieval_profile
+from wikipediarag.retrieval_profile_resolver import normalize_retrieval_profile_request
 from wikipediarag.retrieval_profile_resolver import resolve_retrieval_profile as _resolve_retrieval_profile
 from wikipediarag.schemas import (
     AccessGroupResponse,
@@ -219,7 +223,7 @@ from wikipediarag.schemas import (
 from wikipediarag.search_index import READ_ALIAS, delete_document_chunks, update_document_access
 from wikipediarag.search_service import run_public_search
 from wikipediarag.source_connectors import ConnectorError, connector_for_kind
-from wikipediarag.storage import create_presigned_put_url, head_object, put_bytes
+from wikipediarag.storage import create_presigned_put_url, delete_objects, head_object, put_bytes
 
 
 async def resolve_retrieval_profile(conn: Any, **kwargs: Any) -> Any:
@@ -294,6 +298,13 @@ async def startup() -> None:
     settings = get_settings()
     async with connect() as conn:
         await ensure_bootstrap_admin(conn, settings)
+        await recover_stale_chat_query_runs(
+            conn,
+            max_age_seconds=max(
+                1,
+                int(settings.chat_run_deadline_seconds + settings.operation_heartbeat_seconds * 2),
+            ),
+        )
 
 
 async def health() -> dict[str, str]:
@@ -313,7 +324,12 @@ async def ready() -> dict[str, Any]:
                     """
                     SELECT EXISTS(
                       SELECT 1 FROM worker_instances
-                      WHERE last_heartbeat_at >= now() - make_interval(secs => :max_age_seconds)
+                      WHERE lane = 'deep_research'
+                        AND last_heartbeat_at >= now() - make_interval(secs => :max_age_seconds)
+                    ) AND EXISTS(
+                      SELECT 1 FROM worker_instances
+                      WHERE lane LIKE '%document_upload%'
+                        AND last_heartbeat_at >= now() - make_interval(secs => :max_age_seconds)
                     )
                     """
                 ),
@@ -931,13 +947,16 @@ async def retrieval_profiles(
                 options.append(RetrievalProfileOption(name=name, compatible=False, reason_code="KB_NOT_READY"))
             else:
                 options.append(RetrievalProfileOption(name=name, compatible=True))
-        resolved = await resolve_retrieval_profile(
-            conn,
-            tenant_id=tenant_id,
-            knowledge_base_ids=kb_ids,
-            requested=None,
-            settings=settings,
-        )
+        try:
+            resolved = await resolve_retrieval_profile(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_ids=kb_ids,
+                requested=None,
+                settings=settings,
+            )
+        except RetrievalProfileIncompatible:
+            resolved = None
     scope_hash = stable_hash(
         [
             *kb_ids,
@@ -946,9 +965,10 @@ async def retrieval_profiles(
         64,
     )
     return RetrievalProfileCatalogResponse(
-        resolved_default=resolved.name,
+        resolved_default=resolved.name if resolved is not None else None,
         scope_contract_hash=f"sha256:{scope_hash}",
         profiles=options,
+        scope_error_code=("RETRIEVAL_PROFILE_INCOMPATIBLE" if resolved is None else None),
     )
 
 
@@ -1039,11 +1059,93 @@ async def patch_knowledge_base(kb_id: str, payload: KnowledgeBasePatch, request:
 
 
 async def delete_knowledge_base(kb_id: str, request: Request) -> dict[str, str]:
-    """Delete a knowledge base after owner-role enforcement."""
+    """Delete a bounded upload-only KB after owner-role enforcement."""
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
+    settings = get_settings()
+    document_ids: list[str] = []
+    artifact_keys: list[str] = []
+    read_alias = READ_ALIAS
     async with connect() as conn:
         await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.owner)
+        kb = await get_knowledge_base(conn, tenant_id, kb_id)
+        if kb is None:
+            raise HTTPException(status_code=404, detail="knowledge base not found")
+        read_alias = str(kb.get("active_index") or READ_ALIAS)
+        document_result = await conn.execute(
+            text(
+                "SELECT id FROM documents WHERE tenant_id = :tenant_id AND knowledge_base_id = :id ORDER BY id LIMIT 26"
+            ),
+            {"id": kb_id, "tenant_id": tenant_id},
+        )
+        document_ids = [str(row["id"]) for row in document_result.mappings()]
+        if len(document_ids) > 25:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "code": "KB_DELETE_ASYNC_REQUIRED",
+                        "message": "knowledge base is too large to delete synchronously",
+                    }
+                },
+            )
+        history_result = await conn.execute(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM knowledge_sources "
+                "WHERE tenant_id = :tenant_id AND knowledge_base_id = :id AND kind <> 'direct_upload') "
+                "OR EXISTS(SELECT 1 FROM query_runs "
+                "WHERE tenant_id = :tenant_id AND knowledge_base_id = :id "
+                "AND mode NOT IN ('normal', 'extended')) "
+                "OR EXISTS(SELECT 1 FROM research_episodes episode "
+                "JOIN query_runs query_run ON query_run.id = episode.query_run_id "
+                "WHERE query_run.tenant_id = :tenant_id AND query_run.knowledge_base_id = :id) "
+                "OR EXISTS(SELECT 1 FROM research_tool_calls tool_call "
+                "JOIN query_runs query_run ON query_run.id = tool_call.query_run_id "
+                "WHERE query_run.tenant_id = :tenant_id AND query_run.knowledge_base_id = :id) "
+                "OR EXISTS(SELECT 1 FROM research_runs "
+                "WHERE tenant_id = :tenant_id AND knowledge_base_id = :id)"
+            ),
+            {"id": kb_id, "tenant_id": tenant_id},
+        )
+        if bool(history_result.scalar()):
+            raise HTTPException(
+                status_code=409,
+                detail={"error": {"code": "KB_DELETE_ASYNC_REQUIRED", "message": "knowledge base has durable history"}},
+            )
+        artifact_result = await conn.execute(
+            text("SELECT object_key FROM document_artifacts WHERE tenant_id = :tenant_id AND knowledge_base_id = :id"),
+            {"id": kb_id, "tenant_id": tenant_id},
+        )
+        artifact_keys = [str(row["object_key"]) for row in artifact_result.mappings()]
+        cleanup_statements = (
+            "DELETE FROM retrieval_events WHERE tenant_id = :tenant_id AND query_run_id IN "
+            "(SELECT id FROM query_runs WHERE tenant_id = :tenant_id AND knowledge_base_id = :id)",
+            "DELETE FROM idempotency_records WHERE tenant_id = :tenant_id AND resource_id IN "
+            "(SELECT id::text FROM query_runs WHERE tenant_id = :tenant_id AND knowledge_base_id = :id)",
+            "DELETE FROM agent_runs WHERE tenant_id = :tenant_id AND query_run_id IN "
+            "(SELECT id FROM query_runs WHERE tenant_id = :tenant_id AND knowledge_base_id = :id)",
+            "DELETE FROM query_runs WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM document_sections WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM document_artifacts WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM ingestion_job_items WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM source_document_states WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM source_sync_runs WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM chunks WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM document_versions WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM documents WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM upload_sessions WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM upload_batches WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM ingestion_jobs WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM index_versions WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM legacy_id_mappings WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM knowledge_sources WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            "DELETE FROM knowledge_base_grants WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+        )
+        for statement in cleanup_statements:
+            await conn.execute(
+                text(statement),
+                {"id": kb_id, "tenant_id": tenant_id},
+            )
         await conn.execute(
             text("DELETE FROM knowledge_bases WHERE id = :id AND tenant_id = :tenant_id"),
             {"id": kb_id, "tenant_id": tenant_id},
@@ -1057,6 +1159,17 @@ async def delete_knowledge_base(kb_id: str, request: Request) -> dict[str, str]:
             target_id=kb_id,
             outcome="success",
         )
+    for document_id in document_ids:
+        await asyncio.to_thread(
+            delete_document_chunks,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            document_id=document_id,
+            settings=settings,
+            read_alias=read_alias,
+        )
+    if artifact_keys:
+        await asyncio.to_thread(delete_objects, artifact_keys, settings)
     return {"status": "deleted"}
 
 
@@ -1888,16 +2001,22 @@ async def upload_document_multipart(
             [document_id, checksum, parser_profile, "normalized_document_v1"],
             32,
         )
-        job_id = await create_document_upload_records(
-            conn,
-            tenant_id=tenant_id,
-            knowledge_base_id=kb_id,
-            upload_session=upload_session,
-            document_id=document_id,
-            document_version_id=document_version_id,
-            content_hash=checksum,
-            metadata={**metadata, "api_multipart_upload": True},
-        )
+        try:
+            job_id, job_status = await create_document_upload_records(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                upload_session=upload_session,
+                document_id=document_id,
+                document_version_id=document_version_id,
+                content_hash=checksum,
+                metadata={**metadata, "api_multipart_upload": True},
+            )
+        except DocumentVersionLifecycleError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": {"code": exc.code, "message": "document version requires explicit reprocess"}},
+            ) from None
         await _audit(
             conn,
             request=request,
@@ -1911,7 +2030,7 @@ async def upload_document_multipart(
         document_id=document_id,
         document_version_id=document_version_id,
         job_id=str(job_id),
-        status="received",
+        status=job_status,
     )
     if idempotency_record is not None:
         async with connect() as conn:
@@ -2229,21 +2348,27 @@ async def complete_upload_session_endpoint(
     if payload is not None:
         session_metadata.update(payload.metadata)
     async with connect() as conn:
-        job_id = await create_document_upload_records(
-            conn,
-            tenant_id=tenant_id,
-            knowledge_base_id=str(session["knowledge_base_id"]),
-            upload_session={**session, "metadata": session_metadata},
-            document_id=document_id,
-            document_version_id=document_version_id,
-            content_hash=str(session["checksum_sha256"]),
-            metadata=session_metadata,
-        )
+        try:
+            job_id, job_status = await create_document_upload_records(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=str(session["knowledge_base_id"]),
+                upload_session={**session, "metadata": session_metadata},
+                document_id=document_id,
+                document_version_id=document_version_id,
+                content_hash=str(session["checksum_sha256"]),
+                metadata=session_metadata,
+            )
+        except DocumentVersionLifecycleError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": {"code": exc.code, "message": "document version requires explicit reprocess"}},
+            ) from None
     response = UploadCompleteResponse(
         document_id=document_id,
         document_version_id=document_version_id,
         job_id=str(job_id),
-        status="received",
+        status=job_status,
     )
     if idempotency_record is not None:
         async with connect() as conn:
@@ -2611,23 +2736,65 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
     request_id = str(uuid.uuid4())
-    trace_id = stable_hash([request_id, payload.message], 32)
+    effective_message = payload.message
+    conversation_id = payload.conversation_id or str(uuid.uuid4())
+    chat_overrides = deepcopy(payload.retrieval_overrides)
+    chat_overrides.setdefault("answer", {})["ambiguity_mode"] = payload.ambiguity_mode
+    if payload.conversation_id:
+        async with connect() as conn:
+            previous_run = await _load_conversation_run(
+                conn,
+                tenant_id=tenant_id,
+                user_id=actor.user_id,
+                conversation_id=payload.conversation_id,
+            )
+        if previous_run is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        assert previous_run is not None
+        previous_usage = dict(previous_run.get("usage") or {})
+        previous_interpretations = list(previous_usage.get("interpretations") or [])
+        selected_label = ""
+        if payload.selected_interpretation_id:
+            for item in previous_interpretations:
+                if str(item.get("interpretation_id") or "") == payload.selected_interpretation_id:
+                    selected_label = str(item.get("label") or "")
+                    break
+            if not selected_label:
+                raise HTTPException(status_code=400, detail="interpretation not found in conversation")
+        original_question = str(previous_run.get("input_text") or "")
+        effective_message = f"{original_question}\nУточнение пользователя: {payload.message}"
+        if selected_label:
+            effective_message += f"\nВыбранное значение: {selected_label}"
+    trace_id = stable_hash([request_id, effective_message], 32)
     deadline = OperationDeadline.after(settings.chat_run_deadline_seconds)
-    active_profile = get_retrieval_profile(
-        payload.retrieval_profile or settings.retrieval_profile,
-        settings,
-        payload.retrieval_overrides,
-    )
+    requested_profile = normalize_retrieval_profile_request(payload.retrieval_profile)
+    try:
+        active_profile = get_retrieval_profile(
+            requested_profile or settings.retrieval_profile,
+            settings,
+            chat_overrides,
+        )
+    except (KeyError, ValueError) as exc:
+        raise _unknown_retrieval_profile_http(exc, request_id) from exc
     kb_ids = _kb_scope_ids(payload.knowledge_base_ids, settings.default_kb_id)
+    if payload.conversation_id:
+        assert previous_run is not None
+        previous_scope = {
+            str(item)
+            for item in list(dict(previous_run.get("usage") or {}).get("knowledge_base_ids") or [])
+            if str(item)
+        }
+        if previous_scope and not previous_scope.issubset(set(kb_ids)):
+            raise HTTPException(status_code=404, detail="conversation is outside the requested knowledge-base scope")
     primary_kb_id = kb_ids[0]
-    classifier_suggested_extended = should_start_extended(payload.message)
+    classifier_suggested_extended = should_start_extended(effective_message)
     route_decision = initial_route_decision(
         mode=payload.mode.value,
         extended_policy=active_profile.postprocess.extended_search,
         classifier_suggested_extended=classifier_suggested_extended,
     )
     search_plan = build_search_plan(
-        query=payload.message,
+        query=effective_message,
         mode=payload.mode.value,
         route=route_decision["route"],
         route_reason=route_decision["reason"],
@@ -2644,13 +2811,13 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                 tenant_id=tenant_id,
                 kb_ids=kb_ids,
             )
-            if payload.retrieval_profile is None:
+            if requested_profile is None:
                 active_profile = await resolve_retrieval_profile(
                     conn,
                     tenant_id=tenant_id,
                     knowledge_base_ids=kb_ids,
                     requested=None,
-                    overrides=payload.retrieval_overrides,
+                    overrides=chat_overrides,
                     settings=settings,
                 )
                 route_decision = initial_route_decision(
@@ -2659,7 +2826,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     classifier_suggested_extended=classifier_suggested_extended,
                 )
                 search_plan = build_search_plan(
-                    query=payload.message,
+                    query=effective_message,
                     mode=payload.mode.value,
                     route=route_decision["route"],
                     route_reason=route_decision["reason"],
@@ -2668,13 +2835,13 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     trace_id=trace_id,
                     profile=active_profile,
                 )
-            if payload.retrieval_profile is not None:
+            if requested_profile is not None:
                 active_profile = await resolve_retrieval_profile(
                     conn,
                     tenant_id=tenant_id,
                     knowledge_base_ids=kb_ids,
-                    requested=payload.retrieval_profile,
-                    overrides=payload.retrieval_overrides,
+                    requested=requested_profile,
+                    overrides=chat_overrides,
                     settings=settings,
                 )
             access_scopes = await _document_access_scopes(
@@ -2686,16 +2853,22 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
             )
     except KnowledgeBaseNotReady as exc:
         raise _kb_not_ready_http(exc, request_id) from exc
+    except RetrievalProfileIncompatible as exc:
+        raise _retrieval_profile_incompatible_http(exc, request_id) from exc
+    except (KeyError, ValueError) as exc:
+        raise _unknown_retrieval_profile_http(exc, request_id) from exc
     search_filters = {"document_access_scopes": access_scopes}
     async with connect() as conn:
         initial_usage = _initial_query_run_usage(
             mode=payload.mode.value,
             profile=active_profile,
-            retrieval_overrides=payload.retrieval_overrides,
+            retrieval_overrides=chat_overrides,
             knowledge_base_ids=kb_ids,
             route_decision=route_decision,
             trace_id=trace_id,
             settings=settings,
+            conversation_id=conversation_id,
+            ambiguity_mode=payload.ambiguity_mode,
         )
     idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
         request=request,
@@ -2729,7 +2902,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
             request_id=request_id,
             client_request_id=payload.client_request_id,
             mode=payload.mode.value,
-            input_text=payload.message,
+            input_text=effective_message,
             trace_id=trace_id,
             usage=initial_usage,
         )
@@ -2742,6 +2915,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
         last_successful_stage = "question_received"
         retrieval: Any | None = None
         actual_search_plan = search_plan
+        active_stage_task: asyncio.Task[Any] | None = None
         yield _event(
             SseEvent(
                 event="run.started",
@@ -2811,7 +2985,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                         knowledge_base_ids=kb_ids,
                         profile=active_profile,
                         search_plan=actual_search_plan,
-                        retrieval_overrides=payload.retrieval_overrides,
+                        retrieval_overrides=chat_overrides,
                     ),
                 )
                 use_harness_first = route_decision["route"] == "extended_first"
@@ -2826,19 +3000,20 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     retrieval_task = asyncio.create_task(
                         run_extended_search(
                             conn,
-                            payload.message,
+                            effective_message,
                             tenant_id=tenant_id,
                             knowledge_base_id=primary_kb_id,
                             query_run_id=str(query_run_id),
                             trace_id=trace_id,
                             settings=settings,
                             profile=active_profile,
-                            profile_overrides=payload.retrieval_overrides,
+                            profile_overrides=chat_overrides,
                             search_filters=search_filters,
                             knowledge_base_ids=kb_ids,
                             deadline=deadline,
                         )
                     )
+                    active_stage_task = retrieval_task
                     async for heartbeat in wait_for_stage_task(
                         retrieval_task,
                         stage=current_stage,
@@ -2846,6 +3021,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     ):
                         yield heartbeat
                     retrieval = await retrieval_task
+                    active_stage_task = None
                     sequence += 1
                     yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
                     last_successful_stage = "extended_search"
@@ -2860,14 +3036,14 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                         retrieval_task = asyncio.create_task(
                             retrieve_multi(
                                 conn,
-                                payload.message,
+                                effective_message,
                                 tenant_id=tenant_id,
                                 knowledge_base_ids=kb_ids,
                                 query_run_id=str(query_run_id),
                                 trace_id=trace_id,
                                 settings=settings,
                                 profile=active_profile,
-                                profile_overrides=payload.retrieval_overrides,
+                                profile_overrides=chat_overrides,
                                 search_filters=search_filters,
                                 deadline=deadline,
                             )
@@ -2876,7 +3052,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                         retrieval_task = asyncio.create_task(
                             retrieve(
                                 conn,
-                                payload.message,
+                                effective_message,
                                 tenant_id=tenant_id,
                                 knowledge_base_id=primary_kb_id,
                                 query_run_id=str(query_run_id),
@@ -2887,6 +3063,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                                 deadline=deadline,
                             )
                         )
+                    active_stage_task = retrieval_task
                     async for heartbeat in wait_for_stage_task(
                         retrieval_task,
                         stage=current_stage,
@@ -2894,6 +3071,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     ):
                         yield heartbeat
                     retrieval = await retrieval_task
+                    active_stage_task = None
                     last_successful_stage = "retrieval"
                     sequence += 1
                     yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
@@ -2908,7 +3086,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     ):
                         repair_decision = repair_route_decision(retrieval.answerability)
                         actual_search_plan = build_search_plan(
-                            query=payload.message,
+                            query=effective_message,
                             mode=payload.mode.value,
                             route=repair_decision["route"],
                             route_reason=repair_decision["reason"],
@@ -2939,26 +3117,27 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                                 knowledge_base_ids=kb_ids,
                                 profile=active_profile,
                                 search_plan=actual_search_plan,
-                                retrieval_overrides=payload.retrieval_overrides,
+                                retrieval_overrides=chat_overrides,
                             ),
                         )
                         retrieval_task = asyncio.create_task(
                             run_extended_search(
                                 conn,
-                                payload.message,
+                                effective_message,
                                 tenant_id=tenant_id,
                                 knowledge_base_id=primary_kb_id,
                                 query_run_id=str(query_run_id),
                                 trace_id=trace_id,
                                 settings=settings,
                                 profile=active_profile,
-                                profile_overrides=payload.retrieval_overrides,
+                                profile_overrides=chat_overrides,
                                 search_filters=search_filters,
                                 knowledge_base_ids=kb_ids,
                                 seed_result=retrieval,
                                 deadline=deadline,
                             )
                         )
+                        active_stage_task = retrieval_task
                         async for heartbeat in wait_for_stage_task(
                             retrieval_task,
                             stage=current_stage,
@@ -2966,6 +3145,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                         ):
                             yield heartbeat
                         retrieval = await retrieval_task
+                        active_stage_task = None
                         sequence += 1
                         yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
                         last_successful_stage = "extended_search"
@@ -2977,7 +3157,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                 raise asyncio.CancelledError
             generation_task = asyncio.create_task(
                 generate_answer(
-                    payload.message,
+                    effective_message,
                     retrieval,
                     settings,
                     active_profile,
@@ -2985,6 +3165,7 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     correlation_id=str(query_run_id),
                 )
             )
+            active_stage_task = generation_task
             while True:
                 try:
                     answer, validation = await asyncio.wait_for(
@@ -3009,7 +3190,9 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                 except OperationDeadlineExceeded:
                     generation_task.cancel()
                     await asyncio.gather(generation_task, return_exceptions=True)
+                    active_stage_task = None
                     raise
+            active_stage_task = None
             sequence += 1
             yield stage_notice("stage.completed", current_stage, _elapsed_ms(stage_started))
             last_successful_stage = "answer_generation"
@@ -3033,6 +3216,14 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     data={
                         "text": answer,
                         "evidence": [item.model_dump() for item in retrieval.evidence],
+                        "conversation_id": conversation_id,
+                        "ambiguity_mode": payload.ambiguity_mode,
+                        "answer_mode": validation.get("answer_mode", "single"),
+                        "interpretations": validation.get("interpretations", []),
+                        "clarification_question": validation.get("clarification_question"),
+                        "status": validation.get("status"),
+                        "model_output_contract_abstained": bool(validation.get("model_output_contract_abstained")),
+                        "model_output_contract_reason": validation.get("model_output_contract_reason"),
                     },
                 )
             )
@@ -3050,6 +3241,8 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                         "search_plan": actual_search_plan,
                         "root_cause": answer_artifact["root_cause"],
                         "answer_artifact": answer_artifact,
+                        "conversation_id": conversation_id,
+                        "ambiguity_mode": payload.ambiguity_mode,
                     },
                 )
             )
@@ -3083,6 +3276,14 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                         "knowledge_base_ids": kb_ids,
                         "search_plan": actual_search_plan,
                         "root_cause": answer_artifact["root_cause"],
+                        "conversation_id": conversation_id,
+                        "ambiguity_mode": payload.ambiguity_mode,
+                        "answer_mode": validation.get("answer_mode", "single"),
+                        "interpretations": validation.get("interpretations", []),
+                        "clarification_question": validation.get("clarification_question"),
+                        "status": validation.get("status"),
+                        "model_output_contract_abstained": bool(validation.get("model_output_contract_abstained")),
+                        "model_output_contract_reason": validation.get("model_output_contract_reason"),
                         "answer_artifact": answer_artifact,
                     },
                     model_alias=str(validation.get("model_alias") or ""),
@@ -3115,16 +3316,63 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                 )
             )
         except asyncio.CancelledError:
-            async with connect() as conn:
-                await cancel_query_run(conn, query_run_id=str(query_run_id), error_code="CLIENT_DISCONNECTED")
-                if idempotency_record is not None:
-                    await complete_idempotency_record(
-                        conn,
-                        record_id=str(idempotency_record["id"]),
-                        resource_id=str(query_run_id),
-                        response_status=499,
-                        safe_response={"query_run_id": str(query_run_id), "terminal_status": "cancelled"},
-                    )
+            task_failure: Exception | None = None
+            if active_stage_task is not None:
+                if active_stage_task.done() and not active_stage_task.cancelled():
+                    try:
+                        active_stage_task.result()
+                    except Exception as exc:  # noqa: BLE001 - persist the already-terminal safe failure.
+                        task_failure = exc
+                elif not active_stage_task.done():
+                    active_stage_task.cancel()
+
+            async def persist_terminal_state() -> None:
+                async with connect() as conn:
+                    if task_failure is not None:
+                        await insert_retrieval_event(
+                            conn,
+                            tenant_id=tenant_id,
+                            query_run_id=str(query_run_id),
+                            trace_id=trace_id,
+                            event_type="answer_stage" if current_stage == "answer_generation" else "query_stage",
+                            stage=current_stage,
+                            payload=_failure_stage_event(
+                                task_failure,
+                                stage=current_stage,
+                                last_successful_stage=last_successful_stage,
+                                retrieval=retrieval,
+                            ),
+                        )
+                        await fail_query_run(
+                            conn,
+                            query_run_id=str(query_run_id),
+                            error_code=safe_error_code(task_failure),
+                        )
+                    else:
+                        await cancel_query_run(
+                            conn,
+                            query_run_id=str(query_run_id),
+                            error_code="CLIENT_DISCONNECTED",
+                        )
+                    if idempotency_record is not None:
+                        await complete_idempotency_record(
+                            conn,
+                            record_id=str(idempotency_record["id"]),
+                            resource_id=str(query_run_id),
+                            response_status=500 if task_failure is not None else 499,
+                            safe_response={
+                                "query_run_id": str(query_run_id),
+                                "terminal_status": "failed" if task_failure is not None else "cancelled",
+                                **({"error_code": safe_error_code(task_failure)} if task_failure is not None else {}),
+                            },
+                        )
+
+            try:
+                await asyncio.shield(persist_terminal_state())
+            except asyncio.CancelledError:
+                # The shielded persistence task continues after ASGI has
+                # cancelled the stream; re-raise the original disconnect.
+                pass
             raise
         except Exception as exc:
             async with connect() as conn:
@@ -3177,6 +3425,11 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     data=failure,
                 )
             )
+        finally:
+            if active_stage_task is not None:
+                if not active_stage_task.done():
+                    active_stage_task.cancel()
+                await asyncio.gather(active_stage_task, return_exceptions=True)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -3186,6 +3439,7 @@ def _replay_query_run_stream(*, request_id: str, query_run: dict[str, Any]) -> S
     query_run_id = str(query_run["id"])
     trace_id = str(query_run.get("trace_id") or "")
     terminal_status = str(query_run.get("status") or "failed")
+    stored_usage = dict(query_run.get("usage") or {})
 
     async def event_stream() -> AsyncIterator[str]:
         sequence = 1
@@ -3207,7 +3461,17 @@ def _replay_query_run_stream(*, request_id: str, query_run: dict[str, Any]) -> S
                     request_id=request_id,
                     query_run_id=query_run_id,
                     sequence=sequence,
-                    data={"text": answer, "stage": "answer_generation", "elapsed_ms": 0, "replayed": True},
+                    data={
+                        "text": answer,
+                        "stage": "answer_generation",
+                        "elapsed_ms": 0,
+                        "replayed": True,
+                        "conversation_id": stored_usage.get("conversation_id"),
+                        "ambiguity_mode": stored_usage.get("ambiguity_mode", "auto"),
+                        "answer_mode": stored_usage.get("answer_mode", "single"),
+                        "interpretations": stored_usage.get("interpretations", []),
+                        "clarification_question": stored_usage.get("clarification_question"),
+                    },
                 )
             )
             sequence += 1
@@ -3217,7 +3481,17 @@ def _replay_query_run_stream(*, request_id: str, query_run: dict[str, Any]) -> S
                     request_id=request_id,
                     query_run_id=query_run_id,
                     sequence=sequence,
-                    data={"answer": answer, "stage": "completed", "elapsed_ms": 0, "replayed": True},
+                    data={
+                        "answer": answer,
+                        "stage": "completed",
+                        "elapsed_ms": 0,
+                        "replayed": True,
+                        "conversation_id": stored_usage.get("conversation_id"),
+                        "ambiguity_mode": stored_usage.get("ambiguity_mode", "auto"),
+                        "answer_mode": stored_usage.get("answer_mode", "single"),
+                        "interpretations": stored_usage.get("interpretations", []),
+                        "clarification_question": stored_usage.get("clarification_question"),
+                    },
                 )
             )
             return
@@ -3397,13 +3671,8 @@ async def create_research_plan_endpoint(
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
     settings = get_settings()
-    kb_ids = _kb_scope_ids(payload.knowledge_base_ids, payload.knowledge_base_id or settings.default_kb_id)
-    kb_id = kb_ids[0]
-    profile = get_retrieval_profile(
-        payload.retrieval_profile or settings.retrieval_profile,
-        settings,
-        payload.retrieval_overrides,
-    )
+    kb_id = payload.knowledge_base_id or settings.default_kb_id
+    kb_ids = _research_plan_scope_ids(payload.knowledge_base_ids, kb_id)
     try:
         async with connect() as conn:
             for scoped_kb_id in kb_ids:
@@ -3414,14 +3683,14 @@ async def create_research_plan_endpoint(
                     kb_id=scoped_kb_id,
                     role=KnowledgeBaseRole.viewer,
                 )
-                await validate_active_retrieval_contract(
-                    conn,
-                    tenant_id=tenant_id,
-                    knowledge_base_id=scoped_kb_id,
-                    profile=profile,
-                    retrieval_overrides=payload.retrieval_overrides,
-                    settings=settings,
-                )
+            profile = await resolve_retrieval_profile(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_ids=kb_ids,
+                requested=normalize_retrieval_profile_request(payload.retrieval_profile),
+                overrides=payload.retrieval_overrides,
+                settings=settings,
+            )
             plan_id = await create_research_plan(
                 conn,
                 tenant_id=tenant_id,
@@ -3438,6 +3707,10 @@ async def create_research_plan_endpoint(
             )
     except KnowledgeBaseNotReady as exc:
         raise _kb_not_ready_http(exc, actor.request_id) from exc
+    except RetrievalProfileIncompatible as exc:
+        raise _retrieval_profile_incompatible_http(exc, actor.request_id) from exc
+    except (KeyError, ValueError) as exc:
+        raise _unknown_retrieval_profile_http(exc, actor.request_id) from exc
     return ResearchPlanActionResponse(plan_id=str(plan_id), status=ResearchPlanStatus.draft)
 
 
@@ -3643,7 +3916,10 @@ async def create_research_run_endpoint(payload: ResearchRunCreate, request: Requ
             kb_ids = (
                 _research_plan_scope_ids(plan.get("knowledge_base_ids"), str(plan["knowledge_base_id"]))
                 if plan is not None
-                else _kb_scope_ids(payload.knowledge_base_ids, payload.knowledge_base_id or settings.default_kb_id)
+                else _research_plan_scope_ids(
+                    payload.knowledge_base_ids,
+                    payload.knowledge_base_id or settings.default_kb_id,
+                )
             )
             kb_id = kb_ids[0]
             retrieval_overrides = (
@@ -3652,6 +3928,7 @@ async def create_research_run_endpoint(payload: ResearchRunCreate, request: Requ
             requested_profile = (
                 str(plan.get("retrieval_profile") or "") if plan is not None else payload.retrieval_profile
             ) or None
+            requested_profile = normalize_retrieval_profile_request(requested_profile)
             profile = await resolve_retrieval_profile(
                 conn,
                 tenant_id=tenant_id,
@@ -3749,6 +4026,10 @@ async def create_research_run_endpoint(payload: ResearchRunCreate, request: Requ
                 )
     except KnowledgeBaseNotReady as exc:
         raise _kb_not_ready_http(exc, request_id) from exc
+    except RetrievalProfileIncompatible as exc:
+        raise _retrieval_profile_incompatible_http(exc, request_id) from exc
+    except (KeyError, ValueError) as exc:
+        raise _unknown_retrieval_profile_http(exc, request_id) from exc
     return response
 
 
@@ -4215,6 +4496,20 @@ async def _load_query_run_for_actor(conn: Any, *, tenant_id: str, query_run_id: 
     result = await conn.execute(
         text("SELECT * FROM query_runs WHERE id = :id AND tenant_id = :tenant_id"),
         {"id": query_run_id, "tenant_id": tenant_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def _load_conversation_run(
+    conn: Any, *, tenant_id: str, user_id: str, conversation_id: str
+) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text(
+            "SELECT * FROM query_runs WHERE tenant_id = :tenant_id AND user_id = :user_id "
+            "AND usage->>'conversation_id' = :conversation_id ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"tenant_id": tenant_id, "user_id": user_id, "conversation_id": conversation_id},
     )
     row = result.mappings().first()
     return dict(row) if row is not None else None
@@ -4748,10 +5043,14 @@ def _initial_query_run_usage(
     route_decision: dict[str, str],
     trace_id: str,
     settings: Any,
+    conversation_id: str | None = None,
+    ambiguity_mode: str = "auto",
 ) -> dict[str, Any]:
     """Build the safe initial query-run usage envelope used by chat and debug search."""
     return {
         "trace_id": trace_id,
+        "conversation_id": conversation_id,
+        "ambiguity_mode": ambiguity_mode,
         "mode": mode,
         "retrieval_profile": {
             "name": profile.name,
@@ -4838,6 +5137,9 @@ async def _insert_answer_events(
             "stable_stage": "answer_generation",
             "answer": answer,
             "model_call": validation.get("model_gateway", {}),
+            "status": validation.get("status"),
+            "model_output_contract_abstained": bool(validation.get("model_output_contract_abstained")),
+            "model_output_contract_reason": validation.get("model_output_contract_reason"),
             "context_source_summary": context_source_summary,
             "latency_ms": timings_ms.get("generation_total", 0),
         },
@@ -5108,6 +5410,34 @@ def _kb_not_ready_http(exc: KnowledgeBaseNotReady, request_id: str) -> HTTPExcep
                 "message": str(exc),
                 "request_id": request_id,
                 "details": exc.details,
+            }
+        },
+    )
+
+
+def _retrieval_profile_incompatible_http(exc: RetrievalProfileIncompatible, request_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": {
+                "code": "RETRIEVAL_PROFILE_INCOMPATIBLE",
+                "message": "the selected knowledge bases do not share a compatible retrieval profile",
+                "request_id": request_id,
+                "details": exc.details,
+            }
+        },
+    )
+
+
+def _unknown_retrieval_profile_http(exc: Exception, request_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": {
+                "code": "RETRIEVAL_PROFILE_UNKNOWN",
+                "message": "the requested retrieval profile is not configured",
+                "request_id": request_id,
+                "details": {},
             }
         },
     )

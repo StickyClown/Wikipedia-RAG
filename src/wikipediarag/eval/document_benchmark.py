@@ -10,12 +10,14 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal
 
 import httpx
 
+from wikipediarag.answering import ANSWER_JSON_SCHEMA
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.eval.api_client import HttpEvalApiClient
 from wikipediarag.eval.artifacts import (
@@ -36,7 +38,7 @@ from wikipediarag.reliability import safe_failure_from_exception
 from wikipediarag.retrieval_profile import get_retrieval_profile
 
 RRNCB_DATASET = "rrncb-public"
-RRNCB_SUITE = "rrncb-public-v1"
+RRNCB_SUITE = "rrncb-public-v3"
 RRNCB_REVISION = "a88b57f29165650f47d21e551fb683063acac166"
 RRNCB_CSV_URL = (
     f"https://huggingface.co/datasets/FractalGPT/RRNCBPublic/resolve/{RRNCB_REVISION}/rrncb_public_dataset.csv"
@@ -46,7 +48,16 @@ NO_ANSWER_RE = re.compile(r"не\s+содержится\s+информац|ин�
 
 
 class RRNcBError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, safe_code: str = "RRNCB_ERROR") -> None:
+        super().__init__(message)
+        self.safe_code = safe_code
+        self.retryable = False
+
+
+class RRNcBIngestionError(RRNcBError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code, safe_code=code)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -99,6 +110,19 @@ def _rrncb_run_paths(paths: RRNcBPaths, run_id: str) -> RRNcBPaths:
         results_csv=base / "results.csv",
         status=base / "latest-status.json",
         run_contract=base / "run-contract.json",
+    )
+
+
+def _rrncb_ingestion_paths(paths: RRNcBPaths, ingestion_run_id: str) -> RRNcBPaths:
+    """Keep immutable ingestion state separate from prepared and benchmark artifacts."""
+
+    base = paths.base / "ingestions" / ingestion_run_id
+    return replace(
+        paths,
+        base=base,
+        mapping=base / "document-mapping.json",
+        ingestion_state=base / "ingestion-status.json",
+        ingestion_events=base / "ingestion-events.jsonl",
     )
 
 
@@ -327,10 +351,8 @@ def _load_tasks(paths: RRNcBPaths) -> tuple[EvalDatasetManifest, list[EvalTask]]
     return manifest, read_jsonl(paths.tasks, EvalTask)
 
 
-def _remap_tasks(
-    paths: RRNcBPaths, manifest: EvalDatasetManifest, tasks: list[EvalTask], kb_id: str, mapping: dict[str, str]
-) -> EvalDatasetManifest:
-    remapped = [
+def _mapped_tasks(tasks: list[EvalTask], kb_id: str, mapping: dict[str, str]) -> list[EvalTask]:
+    return [
         task.model_copy(
             update={
                 "gold_page_ids": [mapping[task.source_document_name]],
@@ -340,24 +362,19 @@ def _remap_tasks(
         )
         for task in tasks
     ]
-    updated = manifest.model_copy(
-        update={
-            "metadata": {
-                **manifest.metadata,
-                "prepared_dataset_hash": manifest.metadata.get("prepared_dataset_hash", manifest.dataset_hash),
-                "knowledge_base_id": kb_id,
-            },
-        }
-    )
-    write_jsonl(paths.tasks, remapped)
-    write_json(paths.manifest, updated.model_dump(mode="json"))
-    return updated
 
 
-def _create_or_resume_kb(api: _BenchmarkApi, suite: str, dataset_hash_value: str, state: dict[str, Any]) -> str:
+def _create_or_resume_kb(
+    api: _BenchmarkApi,
+    suite: str,
+    dataset_hash_value: str,
+    ingestion_run_id: str,
+    state: dict[str, Any],
+) -> str:
     if state.get("knowledge_base_id"):
         return str(state["knowledge_base_id"])
-    name = f"bench-{RRNCB_DATASET}-{dataset_hash_value[:12]}"
+    ingestion_suffix = stable_json_hash(ingestion_run_id)[:10]
+    name = f"bench-{suite}-{dataset_hash_value[:12]}-{ingestion_suffix}"
     visible = api.request("GET", "/api/v1/knowledge-bases").json()
     if isinstance(visible, list):
         existing = next((item for item in visible if isinstance(item, dict) and item.get("name") == name), None)
@@ -398,6 +415,39 @@ def _upload_one(
     raise RuntimeError("upload did not return a result")
 
 
+def _timestamp_epoch(value: object) -> float | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def _ingestion_item_failure_code(
+    item: dict[str, Any],
+    *,
+    now: float,
+    document_timeout: int,
+    heartbeat_timeout: int,
+) -> str | None:
+    if item.get("job_status") != "running":
+        return None
+    job_started = _timestamp_epoch(item.get("job_started_at"))
+    if job_started is not None and now - job_started > document_timeout:
+        return "INGESTION_DOCUMENT_TIMEOUT"
+    heartbeat = _timestamp_epoch(item.get("job_last_heartbeat_at"))
+    if heartbeat is None or now - heartbeat > heartbeat_timeout:
+        return "WORKER_HEARTBEAT_STALE"
+    return None
+
+
 def ingest_rrncb(
     *,
     suite: str = RRNCB_SUITE,
@@ -416,18 +466,24 @@ def ingest_rrncb(
 ) -> dict[str, Any]:
     if batch_size != 5 or upload_concurrency != 2:
         raise ValueError("RRNCB ingestion requires --batch-size 5 and --upload-concurrency 2")
-    paths = rrncb_paths(suite, artifacts_dir)
-    manifest, tasks = _load_tasks(paths)
-    source = read_json(paths.source_manifest)
+    if run_id and resume_run_id:
+        raise RRNcBError("RRNCB ingestion accepts either run_id or resume_run_id, not both")
+    suite_paths = rrncb_paths(suite, artifacts_dir)
+    manifest, _tasks = _load_tasks(suite_paths)
+    source = read_json(suite_paths.source_manifest)
     documents = list(source.get("documents") or [])
     if len(documents) != 65:
         raise RRNcBError("source manifest must contain exactly 65 documents")
-    state = read_json(paths.ingestion_state) if paths.ingestion_state.exists() else {}
     requested_run_id = resume_run_id or run_id
+    actual_ingestion_run_id = requested_run_id or f"{suite}-ingest-{manifest.dataset_hash[:12]}-{int(time.time())}"
+    paths = _rrncb_ingestion_paths(suite_paths, actual_ingestion_run_id)
+    state = read_json(paths.ingestion_state) if paths.ingestion_state.exists() else {}
     if resume_run_id and not state:
-        raise RRNcBError("resume run state was not found for the suite")
+        raise RRNcBError("resume ingestion run state was not found")
+    if run_id and state:
+        raise RRNcBError("ingestion run already exists; use --resume-run-id")
     if requested_run_id and state.get("run_id") and state["run_id"] != requested_run_id:
-        raise RRNcBError("run id does not match the prepared ingestion suite")
+        raise RRNcBError("ingestion run id does not match persisted state")
     if state.get("status") == "failed" and not rerun_failed:
         raise RRNcBError("ingestion has failed documents; rerun requires --rerun-failed")
     prepared_hash = str(manifest.metadata.get("prepared_dataset_hash") or manifest.dataset_hash)
@@ -437,7 +493,11 @@ def ingest_rrncb(
     client = _BenchmarkApi(api_url, resolved, timeout=180)
     started_suite = time.perf_counter()
     try:
-        kb_id = _create_or_resume_kb(client, suite, manifest.dataset_hash, state)
+        try:
+            _require_ready(api_url)
+        except Exception as exc:
+            raise RRNcBIngestionError("READINESS_FAILED") from exc
+        kb_id = _create_or_resume_kb(client, suite, manifest.dataset_hash, actual_ingestion_run_id, state)
         state.update(
             {
                 "suite": suite,
@@ -445,7 +505,8 @@ def ingest_rrncb(
                 "prepared_dataset_hash": prepared_hash,
                 "started_at": state.get("started_at", utc_now_iso()),
                 "knowledge_base_id": kb_id,
-                "run_id": state.get("run_id") or requested_run_id or suite,
+                "run_id": actual_ingestion_run_id,
+                "ingestion_run_id": actual_ingestion_run_id,
             }
         )
         state.setdefault("items", {})
@@ -461,7 +522,7 @@ def ingest_rrncb(
         retry_lock = Lock()
         for batch_index in range(0, len(documents), batch_size):
             if time.perf_counter() - started_suite > suite_timeout:
-                raise TimeoutError("RRNCB ingestion suite timeout")
+                raise RRNcBIngestionError("INGESTION_SUITE_TIMEOUT")
             batch_docs = documents[batch_index : batch_index + batch_size]
             batch_number = batch_index // batch_size + 1
             pending = [
@@ -507,6 +568,7 @@ def ingest_rrncb(
                         "metadata": {
                             "rrncb_suite": suite,
                             "rrncb_dataset_hash": manifest.dataset_hash,
+                            "rrncb_ingestion_run_id": actual_ingestion_run_id,
                             "rrncb_source_filename": doc["filename"],
                         },
                     }
@@ -517,6 +579,7 @@ def ingest_rrncb(
                     {
                         "suite": suite,
                         "dataset_hash": manifest.dataset_hash,
+                        "ingestion_run_id": actual_ingestion_run_id,
                         "batch_number": batch_number,
                         "items": [(doc["filename"], doc["sha256"]) for doc in pending],
                     }
@@ -527,7 +590,11 @@ def ingest_rrncb(
                     headers={"Idempotency-Key": batch_idempotency_key},
                     json={
                         "knowledge_base_id": kb_id,
-                        "metadata": {"rrncb_suite": suite, "rrncb_dataset_hash": manifest.dataset_hash},
+                        "metadata": {
+                            "rrncb_suite": suite,
+                            "rrncb_dataset_hash": manifest.dataset_hash,
+                            "rrncb_ingestion_run_id": actual_ingestion_run_id,
+                        },
                         "items": items,
                     },
                 ).json()
@@ -583,7 +650,14 @@ def ingest_rrncb(
                             f"/api/v1/uploads/sessions/{accepted_item['upload_session_id']}:complete",
                             headers={
                                 "Idempotency-Key": stable_json_hash(
-                                    [suite, manifest.dataset_hash, doc["filename"], doc["sha256"], "complete"]
+                                    [
+                                        suite,
+                                        manifest.dataset_hash,
+                                        actual_ingestion_run_id,
+                                        doc["filename"],
+                                        doc["sha256"],
+                                        "complete",
+                                    ]
                                 )
                             },
                             json={"metadata": {"rrncb_completed_at": utc_now_iso()}},
@@ -599,7 +673,6 @@ def ingest_rrncb(
                                 "upload_session_created_at": upload_session_created_at,
                                 "upload_transferred_at": utc_now_iso(),
                                 "upload_completed_at": utc_now_iso(),
-                                "ingestion_started_at_unix": time.time(),
                                 "complete_seconds": time.perf_counter() - complete_started,
                                 "size_bytes": doc["size_bytes"],
                                 "sha256": doc["sha256"],
@@ -607,15 +680,15 @@ def ingest_rrncb(
                             }
                         )
                         write_json(paths.ingestion_state, state)
-            item_started = {
-                doc["filename"]: float(
-                    dict(state["items"].get(doc["filename"]) or {}).get("ingestion_started_at_unix") or time.time()
-                )
-                for doc in pending
-            }
             last_progress_signature: dict[str, str] = {}
             deadline = time.perf_counter() + batch_timeout
             while time.perf_counter() < deadline:
+                if time.perf_counter() - started_suite > suite_timeout:
+                    raise RRNcBIngestionError("INGESTION_SUITE_TIMEOUT")
+                try:
+                    _require_ready(api_url)
+                except Exception as exc:
+                    raise RRNcBIngestionError("READINESS_FAILED") from exc
                 status_payload = client.request("GET", f"/api/v1/uploads/batches/{batch_id}").json()
                 for item in list(status_payload.get("items") or []):
                     if not isinstance(item, dict):
@@ -628,6 +701,9 @@ def ingest_rrncb(
                             "document_id": item.get("document_id") or row.get("document_id"),
                             "document_version_id": item.get("document_version_id") or row.get("document_version_id"),
                             "job_id": item.get("job_id") or row.get("job_id"),
+                            "job_started_at": item.get("job_started_at"),
+                            "job_last_heartbeat_at": item.get("job_last_heartbeat_at"),
+                            "item_updated_at": item.get("item_updated_at"),
                             "error_code": item.get("error_code"),
                             "parser_route": (item.get("progress") or {}).get("parser_route"),
                             "parser_queue_wait_ms": (item.get("progress") or {}).get("parser_queue_wait_ms"),
@@ -636,9 +712,9 @@ def ingest_rrncb(
                         }
                     )
                     if row.get("job_status") in {"completed", "failed", "cancelled"}:
-                        row["elapsed_seconds"] = round(
-                            time.time() - item_started.get(str(item.get("filename")), time.time()), 3
-                        )
+                        job_started = _timestamp_epoch(row.get("job_started_at"))
+                        if job_started is not None:
+                            row["elapsed_seconds"] = round(max(0.0, time.time() - job_started), 3)
                     state["items"][str(item.get("filename"))] = row
                     progress = row.get("progress") or {}
                     filename = str(item.get("filename") or "")
@@ -655,11 +731,17 @@ def ingest_rrncb(
                             },
                         )
                         last_progress_signature[filename] = signature
-                    if (
-                        row.get("job_status") not in {"completed", "failed", "cancelled"}
-                        and time.time() - item_started.get(str(item.get("filename")), time.time()) > document_timeout
-                    ):
-                        raise TimeoutError(f"RRNCB document timeout: {item.get('filename')}")
+                    if row.get("job_status") == "running":
+                        now = time.time()
+                        heartbeat_limit = max(30, int(resolved.worker_job_heartbeat_seconds) * 2)
+                        failure_code = _ingestion_item_failure_code(
+                            row,
+                            now=now,
+                            document_timeout=document_timeout,
+                            heartbeat_timeout=heartbeat_limit,
+                        )
+                        if failure_code:
+                            raise RRNcBIngestionError(failure_code)
                 completed_count = sum(
                     1
                     for item in state["items"].values()
@@ -697,7 +779,7 @@ def ingest_rrncb(
                     break
                 time.sleep(3)
             else:
-                raise TimeoutError(f"RRNCB batch {batch_index // batch_size + 1} timeout")
+                raise RRNcBIngestionError("INGESTION_BATCH_TIMEOUT")
             batch_record = {
                 "batch_index": batch_index // batch_size + 1,
                 "batch_id": batch_id,
@@ -752,12 +834,11 @@ def ingest_rrncb(
                 },
             },
         )
-        updated_manifest = _remap_tasks(paths, manifest, tasks, kb_id, mapping)
         state.update(
             {
                 "status": "completed",
                 "finished_at": utc_now_iso(),
-                "dataset_hash": updated_manifest.dataset_hash,
+                "dataset_hash": manifest.dataset_hash,
                 "prepared_dataset_hash": prepared_hash,
             }
         )
@@ -766,10 +847,26 @@ def ingest_rrncb(
             "status": "completed",
             "suite": suite,
             "knowledge_base_id": kb_id,
+            "ingestion_run_id": actual_ingestion_run_id,
             "documents": 65,
-            "dataset_hash": updated_manifest.dataset_hash,
+            "dataset_hash": manifest.dataset_hash,
             "elapsed_seconds": round(time.perf_counter() - started_suite, 3),
         }
+    except Exception as exc:
+        code = exc.code if isinstance(exc, RRNcBIngestionError) else "INGESTION_FAILED"
+        state.update(
+            {
+                "status": "failed",
+                "finished_at": utc_now_iso(),
+                "failure": {"code": code},
+                "run_id": actual_ingestion_run_id,
+                "ingestion_run_id": actual_ingestion_run_id,
+            }
+        )
+        write_json(paths.ingestion_state, state)
+        if isinstance(exc, RRNcBError):
+            raise
+        raise RRNcBIngestionError(code) from exc
     finally:
         client.close()
 
@@ -846,6 +943,16 @@ def _result_summary(tasks: list[EvalTask], results: list[EvalTaskResult]) -> dic
         ),
         "error_rate": (len(tasks) - len(completed)) / len(tasks) if tasks else 0.0,
     }
+    error_codes: dict[str, int] = {}
+    for result in results:
+        if result.status == "completed":
+            continue
+        failure = dict(result.usage.get("failure") or {})
+        fallback = result.failure_code or (result.errors[0] if result.errors else "unknown")
+        code = str(failure.get("code") or fallback)
+        error_codes[code] = error_codes.get(code, 0) + 1
+    conditional["error_taxonomy"] = dict(sorted(error_codes.items()))
+    conditional["actual_retries"] = sum(max(0, int(result.attempts) - 1) for result in results)
     conditional_metric_names = (
         "document_recall_at_1",
         "document_recall_at_5",
@@ -920,16 +1027,6 @@ def _result_summary(tasks: list[EvalTask], results: list[EvalTaskResult]) -> dic
         [float(result.latency_ms.get("model_chat", 0)) for result in steady_state], 95
     )
     conditional["empty_evidence_rate"] = aggregate(float(not result.reranked_candidates) for result in completed)
-    error_codes: dict[str, int] = {}
-    for result in results:
-        if result.status == "completed":
-            continue
-        failure = dict(result.usage.get("failure") or {})
-        fallback = result.failure_code or (result.errors[0] if result.errors else "unknown")
-        code = str(failure.get("code") or fallback)
-        error_codes[code] = error_codes.get(code, 0) + 1
-    conditional["error_taxonomy"] = dict(sorted(error_codes.items()))
-    conditional["actual_retries"] = sum(max(0, int(result.attempts) - 1) for result in results)
     return {"conditional": conditional, "end_to_end": end_to_end, **conditional}
 
 
@@ -993,6 +1090,60 @@ async def _rrncb_preflight(
             contract_ids.add(contract)
         if set(_search_document_ids(payload)[:10]) & set(task.gold_document_ids):
             hits += 1
+    generation_canary: dict[str, Any] = {"status": "failed", "code": "GENERATION_CANARY_NOT_RUN"}
+    if smoke_tasks:
+        canary = {
+            "model": get_retrieval_profile(profile_name, get_settings()).model_aliases.generator_main,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Ответь строго JSON по схеме grounded_answer. Фиксированная dev-проверка: "
+                        f"{smoke_tasks[0].question[:500]}"
+                    ),
+                }
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "rrncb_generation_canary",
+                    "strict": True,
+                    "schema": ANSWER_JSON_SCHEMA["json_schema"]["schema"],
+                },
+            },
+            "thinking": {"mode": "off", "effort": "none", "return_reasoning": False},
+            "max_output_tokens": 4096,
+            "stream": False,
+        }
+        try:
+            configured_gateway = str(get_settings().model_gateway_url).rstrip("/")
+            gateway_urls = [configured_gateway]
+            if "model-gateway" in configured_gateway and "localhost" in api_url:
+                gateway_urls.append("http://localhost:8081")
+            response = None
+            result: Any = None
+            last_error: Exception | None = None
+            for gateway_url in gateway_urls:
+                try:
+                    response = await asyncio.to_thread(
+                        httpx.post,
+                        f"{gateway_url}/v1/chat/completions",
+                        json=canary,
+                        timeout=120,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    break
+                except Exception as exc:  # noqa: BLE001 - try the host-equivalent Gateway URL.
+                    last_error = exc
+            if response is None or result is None:
+                raise last_error or RuntimeError("generation gateway is unavailable")
+            if not isinstance(result, dict) or not result.get("choices"):
+                raise ValueError("generation canary response has no choices")
+            generation_canary = {"status": "passed", "code": None}
+        except Exception as exc:  # noqa: BLE001 - persist only a stable safe code.
+            safe = safe_failure_from_exception(exc, stage="generation")
+            generation_canary = {"status": "failed", "code": safe.error_code}
     report = {
         "total": len(smoke_tasks),
         "hits_at_10": hits,
@@ -1004,8 +1155,10 @@ async def _rrncb_preflight(
         "config_hash": config_hash,
         "dataset_hash": dataset_hash_value,
         "passed": not failures and hits >= 8 and len(contract_ids) <= 1,
+        "generation_canary": generation_canary,
         "created_at": utc_now_iso(),
     }
+    report["passed"] = bool(report["passed"] and generation_canary.get("status") == "passed")
     write_json(paths.base / "preflight.json", report)
     if not report["passed"]:
         raise RRNcBError(f"RRNCB preflight failed: {report}")
@@ -1019,24 +1172,47 @@ def _rrncb_run_contract(
     ingestion_state: dict[str, Any],
     kb_id: str,
     config: EvalConfig,
+    mapping: dict[str, Any],
+    gateway_catalog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source = read_json(paths.source_manifest)
     documents = list(source.get("documents") or [])
-    document_hashes = sorted(
-        {
-            str(item.get("filename")): str(item.get("sha256"))
-            for item in documents
-            if isinstance(item, dict) and item.get("filename") and item.get("sha256")
-        }.items()
-    )
+    document_hashes = {
+        filename: checksum
+        for filename, checksum in sorted(
+            {
+                str(item.get("filename")): str(item.get("sha256"))
+                for item in documents
+                if isinstance(item, dict) and item.get("filename") and item.get("sha256")
+            }.items()
+        )
+    }
+    catalog_items = {
+        str(item.get("id")): item
+        for item in (gateway_catalog or {}).get("data", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    model_contracts = {
+        alias: {
+            "provider_model": catalog_items.get(alias, {}).get("resolved_provider_model"),
+            "connection_id": catalog_items.get(alias, {}).get("connection_id"),
+            "adapter_hash": catalog_items.get(alias, {}).get("adapter_hash"),
+        }
+        for alias in config.model_aliases.values()
+    }
+    configuration = (gateway_catalog or {}).get("configuration") or {}
     return {
         "dataset_hash": manifest.dataset_hash,
         "knowledge_base_id": kb_id,
         "ingestion_run_id": str(ingestion_state.get("run_id") or ""),
+        "mapping_hash": stable_json_hash(mapping),
         "profile": config.retrieval_profile,
         "config_hash": config.config_hash,
         "model_aliases": config.model_aliases,
         "document_hashes": document_hashes,
+        "model_contracts": model_contracts,
+        "active_model_revision_id": configuration.get("active_revision_id"),
+        "active_model_revision_hash": configuration.get("active_revision_hash"),
     }
 
 
@@ -1044,9 +1220,49 @@ def _validate_or_write_run_contract(paths: RRNcBPaths, expected: dict[str, Any])
     if paths.run_contract.exists():
         actual = read_json(paths.run_contract)
         if actual != expected:
-            raise RRNcBError("RRNCB run contract mismatch; create a new suite for a changed corpus or profile")
+            raise RRNcBError(
+                "RRNCB run contract mismatch; create a new suite for a changed corpus or profile",
+                safe_code="RUN_CONTRACT_MISMATCH",
+            )
         return
     write_json(paths.run_contract, expected)
+
+
+def _rrncb_selected_tasks(tasks: list[EvalTask], split: Literal["dev", "test"]) -> list[EvalTask]:
+    ordered = sorted(tasks, key=lambda task: (0 if task.split == "dev" else 1, task.task_id))
+    return [task for task in ordered if task.split == split]
+
+
+def _rrncb_result_failure_code(result: EvalTaskResult) -> str | None:
+    """Return the safe code that must terminate an immutable baseline run."""
+
+    if result.failure_code == "MODEL_OUTPUT_INVALID":
+        return "MODEL_OUTPUT_INVALID"
+    if not result.server_terminal_event:
+        return "TERMINAL_EVENT_MISSING"
+    if result.status != "completed":
+        return result.failure_code or "TASK_FAILED"
+    return None
+
+
+def _require_completed_dev_split(
+    *,
+    run_paths: RRNcBPaths,
+    tasks: list[EvalTask],
+    results: dict[str, EvalTaskResult],
+) -> None:
+    if not run_paths.status.exists():
+        raise RRNcBError("RRNCB test split requires a completed dev run")
+    previous_status = read_json(run_paths.status)
+    dev_tasks = _rrncb_selected_tasks(tasks, "dev")
+    dev_results = [results.get(task.task_id) for task in dev_tasks]
+    if (
+        previous_status.get("status") != "completed"
+        or previous_status.get("requested_split") != "dev"
+        or len(dev_results) != len(dev_tasks)
+        or any(result is None or _rrncb_result_failure_code(result) for result in dev_results)
+    ):
+        raise RRNcBError("RRNCB test split requires a successful completed dev run")
 
 
 async def run_rrncb(
@@ -1054,67 +1270,148 @@ async def run_rrncb(
     suite: str = RRNCB_SUITE,
     api_url: str = "http://localhost:8000",
     profile_name: str = "upload_sota_mvp",
-    batch_size: int = 2,
+    batch_size: int = 1,
     question_timeout: int = 300,
     suite_timeout: int = 28800,
     resume: bool = True,
     rerun_failed: bool = False,
     run_id: str | None = None,
     resume_run_id: str | None = None,
+    ingestion_run_id: str | None = None,
+    split: Literal["dev", "test"] = "dev",
     artifacts_dir: Path | None = None,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
+    if batch_size != 1:
+        raise RRNcBError("RRNCB baseline requires --batch-size 1 for fail-fast execution")
+    if run_id and resume_run_id:
+        raise RRNcBError("RRNCB accepts either run_id or resume_run_id, not both")
+    if split not in {"dev", "test"}:
+        raise RRNcBError(f"unsupported RRNCB split: {split}")
     paths = rrncb_paths(suite, artifacts_dir)
-    manifest, tasks = _load_tasks(paths)
-    state = read_json(paths.ingestion_state)
-    kb_id = str(state.get("knowledge_base_id") or "")
-    if not kb_id or state.get("status") != "completed":
-        raise RRNcBError("ingestion must complete before running RRNCB RAG")
+    manifest, prepared_tasks = _load_tasks(paths)
     requested_run_id = resume_run_id or run_id
     if resume_run_id and not (paths.base / "runs" / resume_run_id).exists():
         raise RRNcBError("resume run artifacts were not found for the suite")
     actual_run_id = requested_run_id or f"{suite}-{manifest.dataset_hash[:12]}-{int(time.time())}"
     run_paths = _rrncb_run_paths(paths, actual_run_id)
+    persisted_contract = read_json(run_paths.run_contract) if run_paths.run_contract.exists() else {}
+    persisted_ingestion_id = str(persisted_contract.get("ingestion_run_id") or "")
+    if ingestion_run_id and persisted_ingestion_id and ingestion_run_id != persisted_ingestion_id:
+        raise RRNcBError("RRNCB run contract mismatch; ingestion run changed")
+    selected_ingestion_id = ingestion_run_id or persisted_ingestion_id
+    if not selected_ingestion_id:
+        raise RRNcBError("RRNCB run requires --ingestion-run-id")
+    ingestion_paths = _rrncb_ingestion_paths(paths, selected_ingestion_id)
+    if not ingestion_paths.ingestion_state.exists() or not ingestion_paths.mapping.exists():
+        raise RRNcBError("completed ingestion artifacts were not found")
+    state = read_json(ingestion_paths.ingestion_state)
+    kb_id = str(state.get("knowledge_base_id") or "")
+    if not kb_id or state.get("status") != "completed":
+        raise RRNcBError("ingestion must complete before running RRNCB RAG")
+    mapping_payload = read_json(ingestion_paths.mapping)
+    mapping_records = dict(mapping_payload.get("documents") or {})
+    mapping = {
+        str(filename): str(record.get("document_id") or "")
+        for filename, record in mapping_records.items()
+        if isinstance(record, dict) and record.get("document_id")
+    }
+    if len(mapping) != 65:
+        raise RRNcBError("ingestion mapping must contain 65 documents")
+    tasks = _mapped_tasks(prepared_tasks, kb_id, mapping)
     resolved = settings or get_settings()
     config = _rrncb_config(resolved, profile_name)
-    ready_payload = _require_ready(api_url)
+    try:
+        ready_payload = _require_ready(api_url)
+    except Exception as exc:
+        write_json(
+            run_paths.status,
+            {
+                "status": "failed",
+                "run_id": actual_run_id,
+                "suite": suite,
+                "failure": {"code": "READINESS_FAILED"},
+                "updated_at": utc_now_iso(),
+            },
+        )
+        raise RRNcBError("READINESS_FAILED", safe_code="READINESS_FAILED") from exc
     # The API owns the 300-second operation deadline.  Keep the client read
     # timeout slightly above it so a terminal SSE event is not cut off by a
     # second independent timer.
     client = HttpEvalApiClient.from_settings(resolved, timeout=question_timeout + 15)
-    preflight_path = paths.base / "preflight.json"
-    preflight = read_json(preflight_path) if preflight_path.exists() else {}
-    if not (
-        bool(preflight.get("passed"))
-        and preflight.get("knowledge_base_id") == kb_id
-        and preflight.get("profile") == profile_name
-        and preflight.get("config_hash") == config.config_hash
-        and preflight.get("dataset_hash") == manifest.dataset_hash
-    ):
-        await _rrncb_preflight(
-            paths=paths,
-            tasks=tasks,
-            kb_id=kb_id,
-            profile_name=profile_name,
-            client=client,
-            api_url=api_url,
-            config_hash=config.config_hash,
-            dataset_hash_value=manifest.dataset_hash,
+    try:
+        gateway_catalog_response = await asyncio.to_thread(
+            httpx.get, f"{api_url.rstrip('/')}/v1/models", timeout=30, follow_redirects=True
         )
-        preflight = read_json(preflight_path)
+        gateway_catalog_response.raise_for_status()
+        gateway_catalog = gateway_catalog_response.json()
+        if not isinstance(gateway_catalog, dict):
+            gateway_catalog = {}
+    except Exception:
+        gateway_catalog = {}
+    preflight_path = run_paths.base / "preflight.json"
+    preflight = read_json(preflight_path) if preflight_path.exists() else {}
+    try:
+        if not (
+            bool(preflight.get("passed"))
+            and preflight.get("knowledge_base_id") == kb_id
+            and preflight.get("profile") == profile_name
+            and preflight.get("config_hash") == config.config_hash
+            and preflight.get("dataset_hash") == manifest.dataset_hash
+        ):
+            await _rrncb_preflight(
+                paths=run_paths,
+                tasks=tasks,
+                kb_id=kb_id,
+                profile_name=profile_name,
+                client=client,
+                api_url=api_url,
+                config_hash=config.config_hash,
+                dataset_hash_value=manifest.dataset_hash,
+            )
+            preflight = read_json(preflight_path)
+    except Exception as exc:
+        write_json(
+            run_paths.status,
+            {
+                "status": "failed",
+                "run_id": actual_run_id,
+                "suite": suite,
+                "failure": {"code": "READINESS_FAILED"},
+                "updated_at": utc_now_iso(),
+            },
+        )
+        client.close()
+        raise RRNcBError("READINESS_FAILED", safe_code="READINESS_FAILED") from exc
     run_contract = _rrncb_run_contract(
         paths=run_paths,
         manifest=manifest,
         ingestion_state=state,
         kb_id=kb_id,
         config=config,
+        mapping=mapping_payload,
+        gateway_catalog=gateway_catalog,
     )
     run_contract["run_id"] = actual_run_id
     run_contract["index_contract_ids"] = list(preflight.get("index_contract_ids") or [])
     run_contract["retrieval_profile_hash"] = stable_json_hash(
         get_retrieval_profile(profile_name, resolved).model_dump(mode="json")
     )
-    _validate_or_write_run_contract(run_paths, run_contract)
+    try:
+        _validate_or_write_run_contract(run_paths, run_contract)
+    except RRNcBError:
+        write_json(
+            run_paths.status,
+            {
+                "status": "failed",
+                "run_id": actual_run_id,
+                "suite": suite,
+                "failure": {"code": "RUN_CONTRACT_MISMATCH"},
+                "updated_at": utc_now_iso(),
+            },
+        )
+        client.close()
+        raise
     old_results = read_jsonl(run_paths.results, EvalTaskResult) if resume and run_paths.results.exists() else []
     incompatible = [
         result
@@ -1123,21 +1420,36 @@ async def run_rrncb(
         and (result.dataset_hash != manifest.dataset_hash or result.config_hash != config.config_hash)
     ]
     if incompatible:
+        client.close()
         raise RRNcBError("existing RRNCB results have a different dataset or profile contract")
     existing = {result.task_id: result for result in old_results if result.status == "completed" or not rerun_failed}
-    ordered = sorted(tasks, key=lambda task: (0 if task.split == "dev" else 1, task.task_id))
-    cold_start_ids = {task.task_id for task in [item for item in ordered if item.split == "dev"][:5]}
+    selected_tasks = _rrncb_selected_tasks(tasks, split)
+    if split == "test":
+        if not resume_run_id:
+            client.close()
+            raise RRNcBError("RRNCB test split requires --resume-run-id from the dev run")
+        try:
+            _require_completed_dev_split(run_paths=run_paths, tasks=tasks, results=existing)
+        except Exception:
+            client.close()
+            raise
+    cold_start_ids = {task.task_id for task in _rrncb_selected_tasks(tasks, "dev")[:5]}
     started = time.perf_counter()
-    completed_count = len(existing)
+    selected_ids = {task.task_id for task in selected_tasks}
+    existing_selected = {task_id: result for task_id, result in existing.items() if task_id in selected_ids}
+    completed_count = sum(result.status == "completed" for result in existing_selected.values())
     status: dict[str, Any] = {
         "status": "running",
         "run_id": actual_run_id,
         "suite": suite,
         "dataset_hash": manifest.dataset_hash,
         "knowledge_base_id": kb_id,
-        "total": len(tasks),
+        "ingestion_run_id": selected_ingestion_id,
+        "total": len(selected_tasks),
         "completed": completed_count,
-        "failed": sum(1 for result in existing.values() if result.status != "completed"),
+        "failed": sum(1 for result in existing_selected.values() if result.status != "completed"),
+        "requested_split": split,
+        "selected_task_count": len(selected_tasks),
         "started_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
         "retry_budget": 20,
@@ -1164,6 +1476,8 @@ async def run_rrncb(
                 manifest=manifest,
                 client=client,
                 settings=resolved,
+                eval_run_id=actual_run_id,
+                request_namespace=actual_run_id,
                 max_attempts=2,
                 retry_slot_acquire=acquire_retry_slot,
             )
@@ -1207,37 +1521,46 @@ async def run_rrncb(
 
     retry_budget_used = {"count": 0}
     retry_budget_lock = asyncio.Lock()
-    pending_tasks = [task for task in ordered if task.task_id not in existing]
+    pending_tasks = [task for task in selected_tasks if task.task_id not in existing]
+    failure: dict[str, str] | None = None
+    for result in existing_selected.values():
+        if code := _rrncb_result_failure_code(result):
+            failure = {"code": code, "task_id": result.task_id, "stage": "existing_result"}
+            break
     heartbeat_task = asyncio.create_task(heartbeat())
     try:
-        for offset in range(0, len(pending_tasks), batch_size):
+        for offset, task in enumerate(pending_tasks, start=1):
+            if failure:
+                break
             if time.perf_counter() - started > suite_timeout:
-                raise TimeoutError("RRNCB RAG suite timeout")
-            batch = pending_tasks[offset : offset + batch_size]
-            results = await asyncio.gather(*(run_one(task) for task in batch))
-            for result in results:
-                append_jsonl(run_paths.results, result)
-                existing[result.task_id] = result
-                if result.status == "completed":
-                    completed_count += 1
-                else:
-                    status["failed"] += 1
+                failure = {"code": "SUITE_TIMEOUT", "task_id": task.task_id, "stage": "suite"}
+                break
+            result = await run_one(task)
+            append_jsonl(run_paths.results, result)
+            existing[result.task_id] = result
+            if result.status == "completed":
+                completed_count += 1
+            else:
+                status["failed"] += 1
             status["completed"] = completed_count
             status["updated_at"] = utc_now_iso()
-            status["last_batch"] = offset // batch_size + 1
+            status["last_batch"] = offset
             write_json(run_paths.status, status)
             print(
                 json.dumps(
                     {
                         "elapsed_seconds": round(time.perf_counter() - started, 3),
                         "processed": completed_count + int(status["failed"]),
-                        "total": len(tasks),
+                        "total": len(selected_tasks),
                         "failed": status["failed"],
                     },
                     ensure_ascii=False,
                 ),
                 flush=True,
             )
+            if code := _rrncb_result_failure_code(result):
+                failure = {"code": code, "task_id": result.task_id, "stage": "task"}
+                break
         final_results = [existing[task.task_id] for task in tasks if task.task_id in existing]
         task_by_id = {task.task_id: task for task in tasks}
         dev_tasks = [task for task in tasks if task.split == "dev"]
@@ -1250,6 +1573,19 @@ async def run_rrncb(
             "knowledge_base_id": kb_id,
             "config": config.model_dump(mode="json"),
             "ready": ready_payload,
+            "execution": {
+                "requested_split": split,
+                "selected_task_count": len(selected_tasks),
+                "completed_selected": sum(
+                    result.status == "completed" for task_id, result in existing.items() if task_id in selected_ids
+                ),
+                "failed_selected": sum(
+                    result.status != "completed" for task_id, result in existing.items() if task_id in selected_ids
+                ),
+                "status": "failed" if failure else "completed",
+                "failure": failure,
+                "fail_fast": True,
+            },
             "all": _result_summary(tasks, final_results),
             "dev": _result_summary(dev_tasks, dev_results),
             "test": _result_summary(test_tasks, test_results),
@@ -1348,18 +1684,25 @@ async def run_rrncb(
                 )
         status.update(
             {
-                "status": "completed" if len(final_results) == len(tasks) and not status["failed"] else "failed",
+                "status": report["execution"]["status"],
                 "finished_at": utc_now_iso(),
                 "report": str(run_paths.report),
                 "report_markdown": str(run_paths.report_markdown),
                 "results_csv": str(run_paths.results_csv),
+                "failure": failure,
             }
         )
         write_json(run_paths.status, status)
+        if failure:
+            raise RRNcBError(
+                f"RRNCB baseline stopped: {failure['code']}",
+                safe_code=failure["code"],
+            )
         return report
     finally:
         heartbeat_task.cancel()
         await asyncio.gather(heartbeat_task, return_exceptions=True)
+        client.close()
 
 
 def rrncb_status(*, suite: str = RRNCB_SUITE, artifacts_dir: Path | None = None) -> dict[str, Any]:

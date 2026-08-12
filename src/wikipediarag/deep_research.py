@@ -889,7 +889,12 @@ async def synthesize_research_report(
             alias=profile.deep_research.synthesis.model_alias,
             response_format=SYNTHESIS_JSON_SCHEMA,
             max_output_tokens=profile.deep_research.synthesis.max_output_tokens,
-            max_provider_attempts=1,
+            retry_max_output_tokens=profile.deep_research.synthesis.max_output_tokens * 2,
+            stage_output_cap=profile.deep_research.synthesis.max_output_tokens,
+            stage_safety_reserve_tokens=int(
+                profile.deep_research.synthesis.max_context_tokens * profile.deep_research.synthesis.safety_reserve
+            ),
+            max_provider_attempts=2,
         )
         content = json.loads(str(response["choices"][0]["message"]["content"]))
         markdown = str(content.get("markdown") or "").strip()

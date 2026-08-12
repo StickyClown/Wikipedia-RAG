@@ -61,6 +61,8 @@ async def create_connection(
     driver: str,
     base_url: str,
     endpoint_paths: Mapping[str, Any] | None,
+    request_adapter: Mapping[str, Any] | None,
+    request_defaults: Mapping[str, Any] | None,
     safe_headers: Mapping[str, Any] | None,
     tls_verify: bool,
     enabled: bool,
@@ -70,9 +72,9 @@ async def create_connection(
         text(
             """
             INSERT INTO model_provider_connections
-              (id,name,driver,base_url,endpoint_paths,safe_headers,tls_verify,enabled)
-            VALUES (:id,:name,:driver,:base_url,CAST(:endpoint_paths AS jsonb),
-                    CAST(:safe_headers AS jsonb),:tls_verify,:enabled)
+              (id,name,driver,base_url,endpoint_paths,request_adapter,request_defaults,safe_headers,tls_verify,enabled)
+            VALUES (:id,:name,:driver,:base_url,CAST(:endpoint_paths AS jsonb),CAST(:request_adapter AS jsonb),
+                    CAST(:request_defaults AS jsonb),CAST(:safe_headers AS jsonb),:tls_verify,:enabled)
             """
         ),
         {
@@ -81,6 +83,8 @@ async def create_connection(
             "driver": driver,
             "base_url": base_url.rstrip("/"),
             "endpoint_paths": _json(endpoint_paths),
+            "request_adapter": _json(request_adapter),
+            "request_defaults": _json(request_defaults),
             "safe_headers": _json(safe_headers),
             "tls_verify": tls_verify,
             "enabled": enabled,
@@ -99,7 +103,10 @@ async def patch_connection(
     row_version: int,
     changes: Mapping[str, Any],
 ) -> dict[str, Any]:
-    allowed = {"name", "base_url", "endpoint_paths", "safe_headers", "tls_verify", "enabled"}
+    allowed = {
+        "name", "base_url", "endpoint_paths", "request_adapter", "request_defaults",
+        "safe_headers", "tls_verify", "enabled",
+    }
     changes = {key: value for key, value in changes.items() if key in allowed}
     if changes.get("enabled") is False:
         referenced = await conn.execute(
@@ -116,7 +123,7 @@ async def patch_connection(
     assignments: list[str] = []
     params: dict[str, Any] = {"id": connection_id, "row_version": row_version}
     for key, value in changes.items():
-        if key in {"endpoint_paths", "safe_headers"}:
+        if key in {"endpoint_paths", "request_adapter", "request_defaults", "safe_headers"}:
             assignments.append(f"{key} = CAST(:{key} AS jsonb)")
             params[key] = _json(value)
         elif key == "base_url":
@@ -197,7 +204,7 @@ async def list_models(conn: AsyncConnection) -> list[dict[str, Any]]:
     result = await conn.execute(
         text(
             """
-            SELECT m.*, c.name AS connection_name, c.driver, c.base_url
+            SELECT m.*, c.name AS connection_name, c.driver, c.base_url, c.request_adapter, c.request_defaults
             FROM model_aliases m LEFT JOIN model_provider_connections c ON c.id = m.connection_id
             ORDER BY m.alias
             """
@@ -210,7 +217,7 @@ async def get_model(conn: AsyncConnection, model_id: str) -> dict[str, Any] | No
     result = await conn.execute(
         text(
             """
-            SELECT m.*, c.name AS connection_name, c.driver, c.base_url
+            SELECT m.*, c.name AS connection_name, c.driver, c.base_url, c.request_adapter, c.request_defaults
             FROM model_aliases m LEFT JOIN model_provider_connections c ON c.id = m.connection_id
             WHERE m.id = :id
             """
@@ -245,18 +252,19 @@ async def create_model(conn: AsyncConnection, payload: Mapping[str, Any]) -> dic
         "tokenizer_contract": _json(payload.get("tokenizer_contract", {})),
         "model_defaults": _json(payload.get("model_defaults", {})),
         "thinking_capabilities": _json(payload.get("thinking_capabilities", {})),
+        "startup_canary": _json(payload.get("startup_canary", {})),
     }
     await conn.execute(
         text(
             """
             INSERT INTO model_aliases
               (id,alias,provider,provider_model,operation,connection_id,input_modalities,capabilities,
-               context_window_tokens,max_output_tokens,dimensions,tokenizer_contract,model_defaults,thinking_capabilities)
+               context_window_tokens,max_output_tokens,dimensions,tokenizer_contract,model_defaults,thinking_capabilities,startup_canary)
             VALUES (:id,:alias,:provider,:provider_model,:operation,:connection_id,
                     CAST(:input_modalities AS jsonb),CAST(:capabilities AS jsonb),
                     :context_window_tokens,:max_output_tokens,:dimensions,
                     CAST(:tokenizer_contract AS jsonb),CAST(:model_defaults AS jsonb),
-                    CAST(:thinking_capabilities AS jsonb))
+                    CAST(:thinking_capabilities AS jsonb),CAST(:startup_canary AS jsonb))
             """
         ),
         fields,
@@ -280,6 +288,7 @@ async def patch_model(
         "tokenizer_contract",
         "model_defaults",
         "thinking_capabilities",
+        "startup_canary",
         "is_enabled",
     }
     changes = {key: value for key, value in changes.items() if key in allowed}
@@ -300,7 +309,10 @@ async def patch_model(
         return model
     assignments: list[str] = []
     params: dict[str, Any] = {"id": model_id, "row_version": row_version}
-    json_fields = {"input_modalities", "capabilities", "tokenizer_contract", "model_defaults", "thinking_capabilities"}
+    json_fields = {
+        "input_modalities", "capabilities", "tokenizer_contract", "model_defaults",
+        "thinking_capabilities", "startup_canary",
+    }
     for key, value in changes.items():
         if key in json_fields:
             assignments.append(f"{key}=CAST(:{key} AS jsonb)")

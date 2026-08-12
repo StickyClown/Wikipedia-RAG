@@ -465,7 +465,12 @@ async def run_extended_search(
     if state.stop_reason is None:
         state.stop_reason = "budget_reached"
     final_evidence = _renumber_evidence(
-        _select_final_evidence(combined, step_evidence_ids_by_step, profile.postprocess.final_evidence_max)
+        _select_final_evidence(
+            combined,
+            step_evidence_ids_by_step,
+            min(profile.postprocess.final_evidence_max, 12),
+            ambiguity_mode=profile.answer.ambiguity_mode,
+        )
     )
     answerability = decide_answerability(query, final_evidence, profile)
     if answerability.status == AnswerabilityStatus.conflicting and state.stop_reason in {
@@ -948,9 +953,9 @@ def _select_final_evidence(
     combined: dict[str, Evidence],
     step_evidence_ids_by_step: list[list[str]],
     limit: int,
+    *,
+    ambiguity_mode: str = "off",
 ) -> list[Evidence]:
-    if not step_evidence_ids_by_step:
-        return list(combined.values())[:limit]
     selected_ids: list[str] = []
     seen: set[str] = set()
     priority: dict[str, int] = {}
@@ -974,12 +979,32 @@ def _select_final_evidence(
             chunk_id,
         ),
     )
+    first_pass: list[str] = []
+    remaining: list[str] = []
+    seen_documents: set[str] = set()
+    if ambiguity_mode in {"auto", "always"}:
+        for chunk_id in ordered:
+            item = combined[chunk_id]
+            document_key = str(item.document_id or item.source_url or item.title or "")
+            if document_key not in seen_documents and len(first_pass) < min(8, limit):
+                first_pass.append(chunk_id)
+                seen_documents.add(document_key)
+            else:
+                remaining.append(chunk_id)
+        ordered = [*first_pass, *remaining]
+    document_counts: dict[str, int] = {}
     for chunk_id in ordered:
         unit = combined[chunk_id].content_unit_id or str(combined[chunk_id].metadata.get("content_unit_id") or chunk_id)
         if unit in seen:
             continue
+        document_key = str(
+            combined[chunk_id].document_id or combined[chunk_id].source_url or combined[chunk_id].title or ""
+        )
+        if ambiguity_mode in {"auto", "always"} and document_counts.get(document_key, 0) >= 2:
+            continue
         selected_ids.append(chunk_id)
         seen.add(unit)
+        document_counts[document_key] = document_counts.get(document_key, 0) + 1
         if len(selected_ids) >= limit:
             break
     return [combined[item] for item in selected_ids]

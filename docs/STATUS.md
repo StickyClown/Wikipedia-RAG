@@ -1,8 +1,111 @@
 # Project Status
 
-Last updated: 2026-08-10
+Last updated: 2026-08-12
+
+## Universal Model Gateway / RRNCB v3 status
+
+The active implementation now compiles every model request through the
+OpenAI-compatible Gateway contract (`/v1/chat/completions`, `/v1/embeddings`,
+configurable `/rerank`). Connection adapters declare endpoint paths, standard
+field mappings and thinking paths; arbitrary JSON vendor parameters are merged
+recursively, while transport fields and the bounded token envelope remain
+Gateway-owned. The additive database migration is `006_model_gateway_request_adapter`.
+
+`generator_fast` and `verifier` resolve to Qwen 3.5 9B; `generator_main` is
+currently switched to OpenRouter Qwen 3.6-27B. All active chat aliases declare
+an 80k context and a 4096-token startup canary. Deep Research planner and
+synthesis use `generator_main` (80k/16k), verifier uses `verifier` (24k/4096),
+and ordinary Answer remains 4096. Thinking-off is declared by adapter rather
+than selected by provider-specific Python branches. Qwen3-30B-A3B-Thinking-2507
+and local llama.cpp embedding remain inactive future connections.
+
+RRNCB v3 ingestion remains complete and immutable:
+`rrncb-public-v3-ingest-20260811` (65 documents, 13 batches); retrieval
+preflight is 10/10. Existing failed runs remain unchanged. A generation
+structured canary is now part of RRNCB preflight, so baseline cannot start on
+retrieval evidence alone; the run contract records active revision/hash,
+resolved provider models, connection IDs and adapter hashes. A new dev run must
+be created only after Gateway/API readiness and model smoke are green.
+
+Live validation on 2026-08-12: additive migration `006_model_gateway_request_adapter`
+is applied; Gateway `/ready` and API `/ready` are `ok`; and
+`smoke-models --provider openrouter` passed embedding `1024`, structured JSON
+and rerank ordering. A new RRNCB dev attempt was started under the separate
+`rrncb-public-v3-gateway-20260812` name but was stopped during the long
+preflight before a run artifact or terminal result was written. Therefore no
+40/40 or 160/160 quality claim is made yet; the next operator action is to run
+that immutable dev split and resume its successful run for test.
+
+Execution attempt after that validation: old baseline directories were retired
+from the active `runs/` directory. New immutable dev runs
+`rrncb-public-v3-20260812-dev2` and `rrncb-public-v3-20260812-dev3` both passed
+retrieval preflight and the structured generation canary, then stopped on the
+first task (`rrncb-0010`) with terminal `MODEL_OUTPUT_INVALID`. The live API
+diagnostic is the safe citation-contract reason `structured model output claim
+evidence is not cited in the answer`; this is a model-quality contract failure,
+not a readiness or transport failure. No test split was started.
+
+After switching `generator_main` to Qwen 3.6-27B, Gateway `/ready` remained
+`ok`. Two single-question dev checks also reached terminal responses but both
+failed strict answer validation: `rrncb-0010`
+(`query_run_id=1ac693bd-0739-36d2-930f-57fe60d133b0`) failed because claim
+evidence was not cited in the answer; `rrncb-0001`
+(`query_run_id=097c5fd1-9c24-0f37-ee39-573c1bae6600`) failed because a single
+answer contained interpretations. No successful dev question or 40/40 run has
+been recorded, and the 160-task test split remains blocked by the terminal
+dev-contract requirement.
+
+An ad-hoc API/RAG check on 2026-08-12 reran the `rrncb-0010` question against
+the RRNCB v3 knowledge base and completed as query run
+`3d448bc7-b6f7-c8a0-6cbf-36f6201a1224` with three citations and no
+model-contract abstention. This is not an RRNCB evaluator dev result and does
+not change the 40/40 or test-split gate.
+
+The current source now treats a parsed semantic answer-contract conflict
+(claims/citations, answer mode or interpretations) as a completed, safe
+abstention with a stable reason rather than exposing a terminal
+`MODEL_OUTPUT_INVALID`. The abstention has no citations, claims or
+interpretations and is recorded separately from retrieval answerability. This
+does not establish model quality or alter RRNCB state. Malformed, schema-invalid
+and truncated model output remain terminal `MODEL_OUTPUT_INVALID` or
+`MODEL_OUTPUT_TRUNCATED`; no repair call or retry is introduced.
+
+Focused local validation for this correction passed: the answering, Gateway,
+model-control, diagnostics and API contract tests report 85 passed; focused
+Ruff and mypy report no issues. RRNCB and paid provider calls were not run.
 
 ## Current milestone
+
+**Fast source-agnostic ambiguity answering**
+
+The active chat milestone keeps the final context at no more than 12 evidence,
+uses one generator call, and sends no more than 24 candidates to the reranker by
+default. `ambiguity_mode` is `off`, `auto` (default), or `always`; the same
+generator determines whether the supplied evidence supports one meaning or
+several. In `auto`/`always`, context packing gives the first eight slots to
+different documents and fills the remaining four by relevance, with at most two
+evidence items per document. No source-type rules, ingestion changes, ZIM work,
+semantic clustering, extra embeddings, or second rerank are part of this
+milestone.
+
+Completion means the model lists every meaning actually supported by the 12
+evidence items and the user can focus the next chat retrieval on a selected
+meaning or deterministic free-text clarification. RRNCB baseline work starts
+only after this milestone.
+
+`always` now uses a strict structured contract only when the existing
+answerability signal reports `ambiguous_entity=true`: the generator must return
+`answer_mode=multiple`, at least two cited interpretations and a clarification
+question. A prose-only list without the structured interpretations produces a
+safe contract-abstention rather than a grounded answer; no second generator call
+is used. When the signal is false, the normal single-answer contract remains
+available.
+
+The final provider-backed three-mode Browser smoke remains pending because
+structured answer quality still fails the citation contract on Qwen 3.6-27B.
+Gateway/API readiness and deterministic ambiguity-contract, retrieval and UI
+build checks remain green; semantic contract failures are not presented as
+grounded answers and do not trigger a fallback or retry.
 
 Deep Research has moved from the initial V1 single-KB slice to a local-first
 stage-profile runtime: durable episodes, typed evidence/claim/decision memory,
@@ -19,14 +122,62 @@ Ordinary Search and the chat Extended Search harness keep their existing
 smaller normal-search context profile. The runtime default productive target
 remains `45%` until a fresh real-model/local-model matrix safely beats it.
 
+## Live UI runtime correction (2026-08-10)
+
+The observed live regressions are corrected in source and covered by focused
+unit/UI checks. `auto` is now a public UI sentinel only: server-owned profile
+resolution converts it to default selection across the full KB scope, while
+new research plans and runs persist the resolved concrete profile. Research
+scope always contains its primary KB. Unknown explicit profiles return safe
+`422 RETRIEVAL_PROFILE_UNKNOWN`; incompatible scopes return safe
+`409 RETRIEVAL_PROFILE_INCOMPATIBLE`; the profile catalog stays `200` with
+all profiles marked incompatible and a `scope_error_code` rather than leaking
+a `KeyError` as a 500.
+
+Interrupted normal/extended chat query runs are recovered at API startup as
+`failed/STALE_QUERY_RUN_RECOVERED`. Streaming chat now owns and joins active
+retrieval/generation tasks on cancellation, records the already-completed
+provider failure if it wins the disconnect race, otherwise records
+`CLIENT_DISCONNECTED`. Gateway provider errors expose only safe `code` and
+`retryable` metadata; client retries are limited to retryable failures. Recent
+Gateway alias failures temporarily degrade `/ready` until success or cooldown.
+
+The UI omits `retrieval_profile` for auto, blocks Ask/Search/Research when the
+selected scope lacks a shared profile, shows its safe reason, keeps terminal
+Ask errors visible, renders model connection test state and time, and scrolls
+and focuses the Document Viewer heading after structure arrives. Viewer
+loading/errors are also visible before structure. Playwright helpers now select
+exactly one isolated upload KB and set research scope separately; blank model
+forms remain disabled with required-field guidance.
+
+Focused validation completed: `uv run pytest tests/unit/test_research_plan_endpoint.py
+tests/unit/test_retrieval_profile.py tests/unit/test_query_run_recovery.py
+tests/unit/test_api_readiness.py tests/unit/test_gateway_app.py
+tests/unit/test_model_client_observability.py -q` (39 passed); `pnpm test --
+App.protocol.test.ts` (3 passed); UI lint, typecheck and production build
+passed. Full provider-backed browser smoke is not claimed here: it still
+requires healthy configured credentials and the documented ZIM deployment
+prerequisite.
+
+Runtime rebuild verification: `docker compose up -d --build api worker
+model-gateway ui` completed without deleting volumes and API `/ready` returned
+`ok`. The first isolated Playwright attempt found stale helper assertions
+against hidden `<option>` elements; the second reached successful TXT
+publication but found an ambiguous `published` locator and cross-origin
+teardown fetch. Both helpers have been corrected in source. The complete mock
+E2E acceptance remains pending a final clean run; provider-backed acceptance
+is also pending real-provider canary health and is not represented as passed.
+
 ## Reliability & UX Correction V2 (2026-08-10)
 
 The approved post-RRNCB correction is implemented in the current source tree.
 Structured model output now uses typed `AnswerDraft`/`ClaimDraft` validation;
 BOM/fenced JSON is normalized locally, while malformed or truncated output ends
 with `MODEL_OUTPUT_INVALID`/`MODEL_OUTPUT_TRUNCATED` and never triggers an
-automatic repair call. The Gateway performs the generator schema/max-token
-startup canary, keeps alias readiness/circuit state, and the mock provider has
+automatic repair call. Parsed semantic contract conflicts now terminalize as
+safe abstentions with redacted reason metadata, never as grounded answers. The
+Gateway performs a positive synthetic grounded-claim schema/max-token startup
+canary, keeps alias readiness/circuit state, and the mock provider has
 deterministic malformed/truncated/delayed/schema-mismatch modes.
 
 Chat, replay and eval share canonical safe failures, one monotonic deadline,
@@ -97,6 +248,18 @@ passed 388 tests; focused Ruff lint/format passed; UI lint, typecheck, Vitest
 
 ## Implemented now
 
+- Playwright E2E contract coverage now includes local authentication, isolated
+  knowledge-base creation/selection, in-memory TXT upload through visible
+  ingestion progress, exact search/viewer verification, chat citations,
+  retrieval debugger, Deep Research lifecycle entry, and safe disabled/error
+  states. Authenticated checks remain opt-in and report `BLOCKED` skips when
+  local API credentials or runtime dependencies are unavailable.
+- A dedicated sequential `test:e2e:live` gate now validates the existing dev
+  runtime without starting Compose: readiness, local login/session restore,
+  HttpOnly/SameSite cookie attributes, logout, safe invalid-login response and
+  CSRF-protected UI mutation. It accepts the documented localhost-only
+  development credential fallback, while CI can make any `BLOCKED` preflight
+  condition fatal with `WIKIPEDIARAG_REQUIRE_LIVE_E2E=1`.
 - Local production-shaped RAG MVP with FastAPI API, worker, Model Gateway, React/Vite UI and Docker Compose dependencies.
 - Web UI UX pass: desktop app shell with Chat/Search/Research/Knowledge Base tabs, compact KB context controls, structured Deep Research findings with clickable evidence refs, multi-KB scope selection (up to three), cancellable polling and Markdown/Word/CSV exports.
 - UI read-only browser coverage now includes public smoke, RU/EN switching, offline login errors, mobile overflow checks, keyboard tab navigation and platform-admin model-control rendering. API/network failures are converted to localized safe messages without uncaught `Failed to fetch` console errors; generated Playwright results remain ignored by lint/format tooling. Authenticated suites are opt-in through local environment credentials and skip safely when the API is not running. Current UI validation: Playwright 6 passed/4 skipped (API unavailable), Vitest 3 passed, lint/typecheck/format/build passed.
@@ -1049,6 +1212,20 @@ passed 388 tests; focused Ruff lint/format passed; UI lint, typecheck, Vitest
 
 ## Active blockers and risks
 
+- 2026-08-10 live correction follow-up: isolated `upload_mock` Playwright Ask / source / Debug acceptance passed (`1 passed`, 13.8s). The helper now uses one selected KB, collapses the long scope list before Chat interaction, and tears down bounded test-owned upload KBs including normal Chat child records. Older MinIO `MissingContentMD5` batch delete falls back to single-object deletion. Research mock acceptance and the full three-spec E2E set remain unrun after this cleanup change.
+- Provider-backed smoke is passing for a bounded Russian-Wikipedia Ask and a short Deep Research run. The Ask canary now uses `RETRIEVAL_PROFILE=sota_mvp`, structured reasoning defaults are disabled, nested FastAPI Gateway errors are unwrapped, and the production answer budget is 4096 tokens. A live Ask for `Что такое Россия?` completed with terminal `run.completed`, answer text and citations on 2026-08-11. A short provider-backed Research run also reached `completed` with 15 evidence rows, 14 claims and a final report. The final Ask repeat after tightening the insufficient-evidence prompt also reached `run.completed`. The full Research/upload E2E matrix remains outstanding.
+
+- **Russian-Wikipedia retrieval relevance blocker (2026-08-11):** live Browser
+  Ask and Deep Research runs terminalize correctly, but the current Russian
+  Wikipedia index returns unrelated asteroid, domain-name and short-article
+  fragments for broad questions such as `Что такое Россия?`. Ask therefore
+  produces a technically valid answer with citations that are semantically
+  unreliable, while Deep Research reaches `completed · quality_gate` with
+  `partial` coverage and no confirmed findings. Do not treat these runs as a
+  semantic-quality pass. Resolution requires rechecking the Russian ZIM/index
+  contents, document-to-chunk normalization and retrieval relevance/rerank
+  filters; `ZIM_NOT_FOUND` remains a separate deployment prerequisite.
+
 - Multi-KB direct retrieval is implemented; Multi-KB Extended Search remains future work.
 - Offline Deep Research matrix results are not yet a provider/runtime policy
   benchmark. The current 45% productive-target default should not be changed
@@ -1064,6 +1241,44 @@ passed 388 tests; focused Ruff lint/format passed; UI lint, typecheck, Vitest
 - OpenRouter-backed gates still depend on provider quota, credits, latency and model behavior.
 
 ## Next approved task
+
+### Model Gateway structured canary correction (2026-08-11)
+
+The startup canary retains the full production `grounded_answer` schema and
+`reasoning={"effort":"none"}`, but its isolated structured-output budget is
+now 256 tokens (the production answer budget is unchanged). Its safe readiness
+reason distinguishes `structured_output_truncated`,
+`structured_schema_invalid`, and `structured_output_limit_exceeded` without
+recording provider response bodies, prompts, credentials, or document content.
+The affected alias remains `MODEL_ALIAS_UNREADY`. Gateway unit tests, Ruff,
+format, and Mypy pass. The Gateway/API Compose rebuild preserved volumes;
+both `/ready` endpoints returned `ok`, and the real `smoke-models --provider
+openrouter` passed embeddings (1024 dimensions), structured chat and rerank.
+
+A new `rrncb-public-v2` suite was then prepared with the pinned 200-task
+dataset hash and all 65 PDFs. Its fresh ingestion run
+`rrncb-public-v2-20260811t224700z` stopped at the existing 900-second document
+timeout in batch 1 while the API reported its worker stale. No `dev` task and
+no `test` task were submitted, no timeout/retry policy was weakened, and the
+historic `rrncb-public-v1` artifacts were not modified. A completed ingestion
+and healthy API readiness remain mandatory before the live `dev` baseline can
+resume.
+
+### RRNCB baseline runner preparation (2026-08-11)
+
+The immutable baseline runner now defaults to a new `rrncb-public-v2` suite and
+supports `eval-document-run --split dev|test`. A baseline is strict
+fail-fast with sequential task execution: it writes a safe partial report and
+stops on any failed task, missing terminal SSE event, `MODEL_OUTPUT_INVALID`,
+readiness, preflight or run-contract failure. `test` requires
+`--resume-run-id` for a successful completed 40-task `dev` run; the stable run
+contract pins dataset/PDF hashes, KB, retrieval profile, model aliases and
+index contract IDs. The report now records the requested split and selected
+task outcome, while the final test phase retains dev/test/all metrics.
+
+Deterministic validation passed: RRNCB unit tests (7), focused Ruff and Mypy.
+The local `RRNCB/` directory contains 65 PDFs, but the current API `/ready` is
+`degraded` because Model Gateway is failed, so no live `dev` run was started.
 
 After the Model Gateway provider canary is healthy, run the new immutable RRNCB
 baseline: fresh run ID, 40 dev tasks first, then 160 test tasks, with the same
@@ -1081,3 +1296,31 @@ follow-up and must not change this regression configuration.
 - Historical status archive: [history/STATUS-archive.md](history/STATUS-archive.md).
 - Latest reviewed gate report:
   `artifacts/eval/release-gates/reviewed-wikipedia-smoke-v1/20260730T195822Z-reviewed-wikipedia-smoke-v1-release-gate-5b04e45f/report.json`.
+
+### Provider-backed Ask follow-up (2026-08-11)
+
+The full Research/upload E2E matrix remains unrun. A provider-backed Russian-Wikipedia Ask was repeated after the Gateway/API rebuild: retrieval and extended search completed, answer generation initially exposed the true `MODEL_OUTPUT_TRUNCATED` contract failure (the 768-token answer cap), then completed after the production budget was raised. The terminal SSE event was `run.completed` and included answer text with citations. Safe diagnostics now retain only error code/reason text; provider body, prompt and document content are not logged. A bounded provider-backed Deep Research smoke subsequently reached `completed` with evidence and a final report.
+
+### Generation budget hardening follow-up (2026-08-11)
+
+Production budgets are now explicit and envelope-checked: Ask `4096`, verifier
+`4096`, planner/synthesis `16000`. The requested `16384` planner/synthesis cap
+would exceed the mathematically compatible `0.70 + 0.20 + 0.10` reserves in an
+`80000` context window, so `16000` is the highest safe value. Structured
+Gateway requests keep reasoning disabled by default, retry `MODEL_OUTPUT_TRUNCATED`
+at most once up to the stage cap, and do not retry `MODEL_OUTPUT_INVALID` or
+non-retryable provider rejections. Runtime metadata exposes only safe budget,
+attempt and finish information. Full unit tests remain green after this change.
+
+### In-app Browser Ask/Research confirmation (2026-08-11)
+
+After rebuilding the UI container, a fresh authenticated Browser tab with only
+Russian Wikipedia selected completed both live paths. Ask sent a real SSE
+chat request, rendered an answer with `[S1]`–`[S12]`, and exposed a working
+Debug timeline ending in `query_complete` (query id suffix
+`5e698f31-09c0-0346-b23f-8a943b6646ea`). Deep Research run `826e7e8a` visibly
+progressed through retrieval/evaluation/synthesis to `completed · quality_gate`
+with 15 evidence-memory items and 9 episodes. The run completed technically,
+but its coverage stayed `partial` because the current Russian-Wikipedia index
+returned unrelated asteroid/domain fragments; semantic retrieval quality is
+still an open blocker even though transport and terminalization now work.

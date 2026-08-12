@@ -87,8 +87,74 @@ class _RetryAfterThenOkAsyncClient:
         )
 
 
+class _RejectedByGatewayAsyncClient:
+    calls = 0
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def post(self, *_args: object, **_kwargs: object) -> httpx.Response:
+        type(self).calls += 1
+        request = httpx.Request("POST", "http://gateway.test/v1/chat/completions")
+        return httpx.Response(
+            502,
+            request=request,
+            json={
+                "error": {
+                    "code": "MODEL_PROVIDER_REJECTED",
+                    "message": "safe message only",
+                    "retryable": False,
+                }
+            },
+        )
+
+
+class _TruncatedThenOkAsyncClient:
+    calls = 0
+    max_tokens: list[int] = []
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def __aenter__(self) -> _TruncatedThenOkAsyncClient:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def post(self, _url: str, *, json: dict[str, object], **_kwargs: object) -> httpx.Response:
+        type(self).calls += 1
+        type(self).max_tokens.append(int(json["max_tokens"]) if isinstance(json["max_tokens"], int) else 0)
+        request = httpx.Request("POST", "http://gateway.test/v1/chat/completions")
+        if type(self).calls == 1:
+            return httpx.Response(
+                502,
+                request=request,
+                json={"error": {"code": "MODEL_OUTPUT_TRUNCATED", "retryable": True}},
+            )
+        return httpx.Response(200, request=request, json={"choices": [{"message": {"content": "{}"}}]})
+
+
 async def _no_sleep(_seconds: float) -> None:
     return None
+
+
+def test_gateway_error_details_unwraps_fastapi_safe_error_contract() -> None:
+    response = httpx.Response(
+        502,
+        request=httpx.Request("POST", "http://gateway.test/v1/chat/completions"),
+        json={
+            "detail": {
+                "error": {
+                    "code": "MODEL_OUTPUT_TRUNCATED",
+                    "message": "safe message only",
+                    "retryable": True,
+                }
+            }
+        },
+    )
+
+    assert model_client._gateway_error_details(response) == ("MODEL_OUTPUT_TRUNCATED", True)
 
 
 @pytest.mark.asyncio
@@ -164,6 +230,50 @@ async def test_model_gateway_honors_retry_after_header(monkeypatch: pytest.Monke
 
     assert payload["_gateway_metadata"]["attempts"] == 2
     assert recorded_sleeps == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_does_not_retry_explicit_non_retryable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _RejectedByGatewayAsyncClient.calls = 0
+    monkeypatch.setattr("wikipediarag.model_client.httpx.AsyncClient", _RejectedByGatewayAsyncClient)
+    monkeypatch.setattr("wikipediarag.model_client.asyncio.sleep", _no_sleep)
+
+    with pytest.raises(ModelGatewayError) as exc_info:
+        await model_client._post_json(
+            "http://gateway.test/v1/chat/completions",
+            {"model": "alias", "messages": []},
+            timeout_seconds=1,
+            max_attempts=2,
+            operation="chat",
+            alias="alias",
+        )
+
+    assert _RejectedByGatewayAsyncClient.calls == 1
+    assert exc_info.value.metadata["safe_error_code"] == "MODEL_PROVIDER_REJECTED"
+    assert exc_info.value.metadata["retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_retries_truncation_once_with_larger_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    _TruncatedThenOkAsyncClient.calls = 0
+    _TruncatedThenOkAsyncClient.max_tokens = []
+    monkeypatch.setattr("wikipediarag.model_client.httpx.AsyncClient", _TruncatedThenOkAsyncClient)
+    monkeypatch.setattr("wikipediarag.model_client.asyncio.sleep", _no_sleep)
+
+    await model_client._post_json(
+        "http://gateway.test/v1/chat/completions",
+        {"model": "alias", "messages": [], "max_tokens": 256},
+        timeout_seconds=1,
+        max_attempts=2,
+        operation="chat",
+        alias="alias",
+        retry_max_output_tokens=512,
+    )
+
+    assert _TruncatedThenOkAsyncClient.calls == 2
+    assert _TruncatedThenOkAsyncClient.max_tokens == [256, 512]
 
 
 @pytest.mark.asyncio

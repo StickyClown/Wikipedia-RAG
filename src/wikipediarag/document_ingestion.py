@@ -346,11 +346,39 @@ def chunks_for_normalized_document(
     words = document.text.split()
     if not words:
         return []
+    normalized_hash = normalized_document_hash(document)
+    block_contexts: list[tuple[int, int, dict[str, Any], list[str]]] = []
+    consumed_words = 0
+    fallback_section_path = [document.title]
+    for block in document.blocks:
+        metadata = dict(block.metadata or {})
+        section_path = metadata.get("section_path")
+        if isinstance(section_path, list) and section_path:
+            fallback_section_path = [str(item) for item in section_path if str(item)]
+        block_word_count = len(block.text.split())
+        block_contexts.append(
+            (
+                consumed_words,
+                consumed_words + max(block_word_count, 1),
+                dict(block.locator),
+                list(fallback_section_path),
+            )
+        )
+        consumed_words += block_word_count
     chunks: list[Chunk] = []
+    context_index = 0
     for ordinal, start in enumerate(range(0, len(words), 220), start=1):
         body = " ".join(words[start : start + 220])
-        locator = _locator_for_offset(document.blocks, start)
-        section_path = _section_path_for_offset(document.blocks, start, document.title)
+        while context_index < len(block_contexts):
+            block_start, block_end, _locator, _section_path = block_contexts[context_index]
+            if block_start <= start < block_end:
+                break
+            context_index += 1
+        if context_index < len(block_contexts):
+            _block_start, _block_end, locator, section_path = block_contexts[context_index]
+        else:
+            locator = {"page": 1}
+            section_path = list(fallback_section_path)
         section_id = _section_id(document_version_id, section_path)
         content_hash = stable_hash([body], 64)
         chunk_id = "doc:" + stable_hash(
@@ -363,7 +391,7 @@ def chunks_for_normalized_document(
             "chunk_ordinal": ordinal,
             "locator": locator,
             "content_hash": content_hash,
-            "normalized_hash": normalized_document_hash(document),
+            "normalized_hash": normalized_hash,
             "parser_route": document.parser_route,
             "parser_name": document.parser_name,
             "parser_version": document.parser_version,
@@ -547,7 +575,7 @@ async def _call_xberg(
                     files={"files": (validation.filename, data, validation.detected_mime)},
                 )
                 response.raise_for_status()
-                payload = response.json()
+            payload = await asyncio.to_thread(response.json)
             parser_latency_ms = _elapsed_ms(parser_started)
     except httpx.HTTPStatusError as exc:
         raise ParserServiceError("docling", _parser_failure_code(exc), "docling parser request failed") from exc
@@ -591,7 +619,7 @@ async def _call_docling(
                     files={"files": (validation.filename, data, validation.detected_mime)},
                 )
                 response.raise_for_status()
-                payload = response.json()
+            payload = await asyncio.to_thread(response.json)
             parser_latency_ms = _elapsed_ms(parser_started)
     except Exception as exc:
         raise ParserServiceError("docling", _parser_failure_code(exc), "docling parser request failed") from exc
@@ -623,13 +651,17 @@ async def _document_from_parser_payload(
     settings: Settings,
     parser_runtime: dict[str, int] | None = None,
 ) -> NormalizedDocument:
-    text = _extract_text_payload(payload)
+    text = await asyncio.to_thread(_extract_text_payload, payload)
     metadata = await extract_metadata(text, filename=validation.filename, settings=settings)
-    warnings = _extract_warnings(payload)
-    tables = _extract_tables(payload)
-    document = _document_from_text(
+    title, warnings, tables = await asyncio.gather(
+        asyncio.to_thread(_extract_title, payload),
+        asyncio.to_thread(_extract_warnings, payload),
+        asyncio.to_thread(_extract_tables, payload),
+    )
+    document = await asyncio.to_thread(
+        _document_from_text,
         text,
-        title=_extract_title(payload) or _title_from_filename(validation.filename),
+        title=title or _title_from_filename(validation.filename),
         metadata=metadata,
         parser_name=parser_name,
         parser_version=parser_version,

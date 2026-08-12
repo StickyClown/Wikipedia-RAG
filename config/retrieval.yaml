@@ -25,6 +25,7 @@ profiles:
       dense_top_k: 100
       fusion_top_k: 60
       rerank: true
+      rerank_input_k: 24
       rerank_top_k: 50
       query_rewrite: conditional
       query_decomposition: conditional
@@ -54,33 +55,34 @@ profiles:
         max_rewrites: 2
         max_depth: 3
       planner:
-        model_alias: generator_fast
+        model_alias: generator_main
         max_context_tokens: 80000
         productive_target: 0.45
         soft_limit: 0.55
         hard_input_limit: 0.70
-        output_reserve: 0.15
-        safety_reserve: 0.15
-        max_output_tokens: 12000
+        output_reserve: 0.20
+        safety_reserve: 0.10
+        max_output_tokens: 16000
       verifier:
-        model_alias: generator_main
+        model_alias: verifier
         max_context_tokens: 24000
         productive_target: 0.45
         soft_limit: 0.55
         hard_input_limit: 0.70
-        output_reserve: 0.10
-        safety_reserve: 0.20
-        max_output_tokens: 2000
+        output_reserve: 0.20
+        safety_reserve: 0.10
+        max_output_tokens: 4096
       synthesis:
         model_alias: generator_main
         max_context_tokens: 80000
         productive_target: 0.45
         soft_limit: 0.55
         hard_input_limit: 0.70
-        output_reserve: 0.15
-        safety_reserve: 0.15
-        max_output_tokens: 12000
+        output_reserve: 0.20
+        safety_reserve: 0.10
+        max_output_tokens: 16000
     answer:
+      max_output_tokens: 4096
       citations_required: true
       deterministic_citation_validation: true
       verification:
@@ -121,6 +123,7 @@ profiles:
       dense_top_k: 60
       fusion_top_k: 40
       rerank: true
+      rerank_input_k: 24
       rerank_top_k: 20
       query_rewrite: "off"
       query_decomposition: "off"
@@ -170,6 +173,7 @@ profiles:
         safety_reserve: 0.15
         max_output_tokens: 12000
     answer:
+      max_output_tokens: 768
       citations_required: true
       deterministic_citation_validation: true
       verification:

@@ -995,10 +995,12 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
             )
 
         stage = "chunking"
+        await _update_item_stage(item_id, stage, {"stage": stage})
         target = await _resolve_upload_index_target(tenant_id, kb_id, settings)
         source_url = f"{settings.api_public_base_url.rstrip('/')}/api/v1/documents/{quote(document_id, safe='')}"
         document_access = _document_access_for_ingestion(document_id=document_id, source_metadata=source_metadata)
-        chunks = chunks_for_normalized_document(
+        chunks = await asyncio.to_thread(
+            chunks_for_normalized_document,
             normalized,
             document_id=document_id,
             document_version_id=document_version_id,

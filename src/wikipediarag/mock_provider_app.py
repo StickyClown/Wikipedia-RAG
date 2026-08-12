@@ -87,6 +87,9 @@ async def chat_completions(payload: dict[str, Any]) -> dict[str, Any]:
             answer = json.dumps(
                 {
                     "answer_markdown": f"{sentence} [{first_id}]",
+                    "answer_mode": "single",
+                    "interpretations": [],
+                    "clarification_question": None,
                     "claims": [
                         {
                             "claim_id": "mock-claim-1",
@@ -103,6 +106,9 @@ async def chat_completions(payload: dict[str, Any]) -> dict[str, Any]:
             answer = json.dumps(
                 {
                     "answer_markdown": "Недостаточно доказательств в локальной базе.",
+                    "answer_mode": "single",
+                    "interpretations": [],
+                    "clarification_question": None,
                     "claims": [],
                     "insufficient_evidence": True,
                     "insufficient_evidence_reason": "insufficient_context",

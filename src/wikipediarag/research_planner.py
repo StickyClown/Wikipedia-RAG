@@ -181,6 +181,11 @@ async def plan_research_step(
                     alias=profile.deep_research.planner.model_alias,
                     response_format=planner_json_schema(allowed_tool_names),
                     max_output_tokens=profile.deep_research.planner.max_output_tokens,
+                    retry_max_output_tokens=profile.deep_research.planner.max_output_tokens * 2,
+                    stage_output_cap=profile.deep_research.planner.max_output_tokens,
+                    stage_safety_reserve_tokens=int(
+                        profile.deep_research.planner.max_context_tokens * profile.deep_research.planner.safety_reserve
+                    ),
                     max_provider_attempts=PLANNER_PROVIDER_ATTEMPTS,
                 ),
                 timeout=PLANNER_TIMEOUT_SECONDS,

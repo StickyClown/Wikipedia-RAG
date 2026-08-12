@@ -243,6 +243,11 @@ async def _verify_claims_llm(
         alias=profile.model_aliases.verifier,
         response_format=VERIFIER_JSON_SCHEMA,
         max_output_tokens=profile.deep_research.verifier.max_output_tokens,
+        retry_max_output_tokens=profile.deep_research.verifier.max_output_tokens * 2,
+        stage_output_cap=profile.deep_research.verifier.max_output_tokens,
+        stage_safety_reserve_tokens=int(
+            profile.deep_research.verifier.max_context_tokens * profile.deep_research.verifier.safety_reserve
+        ),
         deadline=deadline,
         correlation_id=correlation_id,
     )

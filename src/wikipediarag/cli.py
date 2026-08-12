@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from xml.sax.saxutils import escape
 
 import httpx
@@ -336,12 +336,12 @@ def build_parser() -> argparse.ArgumentParser:
     eval_document_prepare_parser.add_argument("--dataset", choices=["rrncb-public"], default="rrncb-public")
     eval_document_prepare_parser.add_argument("--documents-dir", required=True)
     eval_document_prepare_parser.add_argument("--csv", dest="csv_path", default=None)
-    eval_document_prepare_parser.add_argument("--output-suite", default="rrncb-public-v1")
+    eval_document_prepare_parser.add_argument("--output-suite", default="rrncb-public-v3")
     eval_document_prepare_parser.add_argument("--artifacts-dir", default="artifacts/eval")
     eval_document_prepare_parser.add_argument("--json", action="store_true")
 
     eval_document_ingest_parser = subparsers.add_parser("eval-document-ingest")
-    eval_document_ingest_parser.add_argument("--suite", default="rrncb-public-v1")
+    eval_document_ingest_parser.add_argument("--suite", default="rrncb-public-v3")
     eval_document_ingest_parser.add_argument("--api", default="http://localhost:8000")
     eval_document_ingest_parser.add_argument("--batch-size", type=int, default=5)
     eval_document_ingest_parser.add_argument("--upload-concurrency", type=int, default=2)
@@ -355,20 +355,22 @@ def build_parser() -> argparse.ArgumentParser:
     eval_document_ingest_parser.add_argument("--json", action="store_true")
 
     eval_document_run_parser = subparsers.add_parser("eval-document-run")
-    eval_document_run_parser.add_argument("--suite", default="rrncb-public-v1")
+    eval_document_run_parser.add_argument("--suite", default="rrncb-public-v3")
     eval_document_run_parser.add_argument("--api", default="http://localhost:8000")
     eval_document_run_parser.add_argument("--retrieval-profile", default="upload_sota_mvp")
-    eval_document_run_parser.add_argument("--batch-size", type=int, default=2)
+    eval_document_run_parser.add_argument("--batch-size", type=int, default=1)
     eval_document_run_parser.add_argument("--question-timeout", type=int, default=300)
     eval_document_run_parser.add_argument("--suite-timeout", type=int, default=28800)
     eval_document_run_parser.add_argument("--run-id", default=None)
     eval_document_run_parser.add_argument("--resume-run-id", default=None)
+    eval_document_run_parser.add_argument("--ingestion-run-id", required=True)
+    eval_document_run_parser.add_argument("--split", choices=("dev", "test"), default="dev")
     eval_document_run_parser.add_argument("--rerun-failed", action="store_true")
     eval_document_run_parser.add_argument("--artifacts-dir", default="artifacts/eval")
     eval_document_run_parser.add_argument("--json", action="store_true")
 
     eval_document_status_parser = subparsers.add_parser("eval-document-status")
-    eval_document_status_parser.add_argument("--suite", default="rrncb-public-v1")
+    eval_document_status_parser.add_argument("--suite", default="rrncb-public-v3")
     eval_document_status_parser.add_argument("--latest", action="store_true")
     eval_document_status_parser.add_argument("--json", action="store_true")
     eval_document_status_parser.add_argument("--artifacts-dir", default="artifacts/eval")
@@ -1069,21 +1071,27 @@ def run_eval_document_ingest(args: argparse.Namespace) -> None:
 def run_eval_document_run(args: argparse.Namespace) -> None:
     from wikipediarag.eval.document_benchmark import run_rrncb
 
-    report = asyncio.run(
-        run_rrncb(
-            suite=str(args.suite),
-            api_url=str(args.api),
-            profile_name=str(args.retrieval_profile),
-            batch_size=int(args.batch_size),
-            question_timeout=int(args.question_timeout),
-            suite_timeout=int(args.suite_timeout),
-            resume=True,
-            rerun_failed=bool(args.rerun_failed),
-            run_id=str(args.run_id) if args.run_id else None,
-            resume_run_id=str(args.resume_run_id) if args.resume_run_id else None,
-            artifacts_dir=Path(args.artifacts_dir),
+    try:
+        report = asyncio.run(
+            run_rrncb(
+                suite=str(args.suite),
+                api_url=str(args.api),
+                profile_name=str(args.retrieval_profile),
+                batch_size=int(args.batch_size),
+                question_timeout=int(args.question_timeout),
+                suite_timeout=int(args.suite_timeout),
+                resume=True,
+                rerun_failed=bool(args.rerun_failed),
+                run_id=str(args.run_id) if args.run_id else None,
+                resume_run_id=str(args.resume_run_id) if args.resume_run_id else None,
+                ingestion_run_id=str(args.ingestion_run_id),
+                split=cast(Literal["dev", "test"], str(args.split)),
+                artifacts_dir=Path(args.artifacts_dir),
+            )
         )
-    )
+    except Exception as exc:
+        print(json.dumps({"status": "failed", "failure": _safe_cli_failure(exc, stage="eval_document_run")}))
+        raise SystemExit(1) from None
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
@@ -1177,6 +1185,8 @@ def smoke_models(gateway: str, provider: str) -> None:
                 "model": aliases["generator_fast"],
                 "messages": [{"role": "user", "content": 'Верни JSON {"ok": true}'}],
                 "response_format": {"type": "json_object"},
+                "thinking": {"mode": "off", "effort": "none", "return_reasoning": False},
+                "max_output_tokens": 4096,
                 "stream": False,
             },
         )
@@ -4068,8 +4078,8 @@ if __name__ == "__main__":
     except httpx.HTTPError as exc:
         failure = _safe_cli_failure(exc, stage="cli_http")
         print(f"HTTP error: {failure['code']}", file=sys.stderr)
-        raise SystemExit(1) from exc
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise SystemExit(1) from None
+    except Exception as exc:
         failure = _safe_cli_failure(exc, stage="cli")
         print(failure["code"], file=sys.stderr)
-        raise SystemExit(1) from exc
+        raise SystemExit(1) from None

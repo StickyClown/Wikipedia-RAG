@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profile
+from wikipediarag.retrieval_profile_resolver import normalize_retrieval_profile_request
 
 
 def test_sota_mvp_profile_matches_required_defaults() -> None:
@@ -20,6 +21,13 @@ def test_sota_mvp_profile_matches_required_defaults() -> None:
     assert profile.model_aliases.generator_main == "generator_main"
     assert profile.answer.verification.citation_validation == "strict"
     assert profile.answer.verification.claim_verification == "off"
+
+
+def test_auto_profile_sentinel_resolves_as_server_default_request() -> None:
+    assert normalize_retrieval_profile_request("auto") is None
+    assert normalize_retrieval_profile_request(" AUTO ") is None
+    assert normalize_retrieval_profile_request("") is None
+    assert normalize_retrieval_profile_request("upload_mock") == "upload_mock"
 
 
 def test_verified_profile_enables_claim_verifier_without_changing_base() -> None:
@@ -102,10 +110,12 @@ def test_deep_research_profile_separates_stage_context_from_normal_search() -> N
     assert profile.deep_research.max_episodes == 12
     assert profile.deep_research.max_tool_calls == 12
     assert profile.deep_research.tool_timeout_seconds == 120
-    assert planner.model_alias == "generator_fast"
+    assert planner.model_alias == "generator_main"
     assert planner.max_context_tokens == 80_000
-    assert verifier.model_alias == "generator_main"
+    assert verifier.model_alias == "verifier"
     assert verifier.max_context_tokens == 24_000
-    assert verifier.max_output_tokens == 2_000
+    assert planner.max_output_tokens == 16_000
+    assert verifier.max_output_tokens == 4_096
+    assert synthesis.max_output_tokens == 16_000
     assert synthesis.model_alias == "generator_main"
     assert synthesis.max_context_tokens == 80_000

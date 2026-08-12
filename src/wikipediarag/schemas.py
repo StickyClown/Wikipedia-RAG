@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
@@ -14,6 +14,8 @@ class ModelConnectionCreate(BaseModel):
     driver: str = Field(pattern=r"^(openrouter|vllm|llamacpp|textgen_webui|openai_compatible|mock)$")
     base_url: str = Field(min_length=1, max_length=2048)
     endpoint_paths: dict[str, str] = Field(default_factory=dict)
+    request_adapter: dict[str, Any] = Field(default_factory=dict)
+    request_defaults: dict[str, Any] = Field(default_factory=dict)
     safe_headers: dict[str, str] = Field(default_factory=dict)
     tls_verify: bool = True
     enabled: bool = True
@@ -24,6 +26,8 @@ class ModelConnectionPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_.:-]+$")
     base_url: str | None = Field(default=None, min_length=1, max_length=2048)
     endpoint_paths: dict[str, str] | None = None
+    request_adapter: dict[str, Any] | None = None
+    request_defaults: dict[str, Any] | None = None
     safe_headers: dict[str, str] | None = None
     tls_verify: bool | None = None
     enabled: bool | None = None
@@ -43,6 +47,7 @@ class ModelCreate(BaseModel):
     tokenizer_contract: dict[str, Any] = Field(default_factory=dict)
     model_defaults: dict[str, Any] = Field(default_factory=dict)
     thinking_capabilities: dict[str, Any] = Field(default_factory=dict)
+    startup_canary: dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelPatch(BaseModel):
@@ -56,6 +61,7 @@ class ModelPatch(BaseModel):
     tokenizer_contract: dict[str, Any] | None = None
     model_defaults: dict[str, Any] | None = None
     thinking_capabilities: dict[str, Any] | None = None
+    startup_canary: dict[str, Any] | None = None
     is_enabled: bool | None = None
 
 
@@ -82,6 +88,8 @@ class ChatMode(StrEnum):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=32000)
     conversation_id: str | None = None
+    ambiguity_mode: Literal["off", "auto", "always"] = "auto"
+    selected_interpretation_id: str | None = Field(default=None, max_length=128)
     knowledge_base_ids: list[str] = Field(default_factory=list, max_length=50)
     mode: ChatMode = ChatMode.normal
     stream: bool = True
@@ -106,9 +114,10 @@ class RetrievalProfileOption(BaseModel):
 
 
 class RetrievalProfileCatalogResponse(BaseModel):
-    resolved_default: str
+    resolved_default: str | None = None
     scope_contract_hash: str
     profiles: list[RetrievalProfileOption]
+    scope_error_code: str | None = None
 
 
 class SearchFilters(BaseModel):
@@ -987,6 +996,9 @@ class UploadBatchItemStatus(BaseModel):
     document_version_id: str | None = None
     job_id: str | None = None
     job_status: str | None = None
+    job_started_at: datetime | None = None
+    job_last_heartbeat_at: datetime | None = None
+    item_updated_at: datetime | None = None
     progress: dict[str, Any] = Field(default_factory=dict)
     error_code: str | None = None
     error_message: str | None = None

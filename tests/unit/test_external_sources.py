@@ -372,9 +372,9 @@ async def test_multipart_upload_reuses_upload_records(monkeypatch: pytest.Monkey
             "checksum_sha256": "checksum",
         }
 
-    async def create_records(_conn: object, **kwargs: Any) -> uuid.UUID:
+    async def create_records(_conn: object, **kwargs: Any) -> tuple[uuid.UUID, str]:
         events.append(("records", kwargs))
-        return uuid.UUID("66666666-6666-4666-8666-666666666666")
+        return uuid.UUID("66666666-6666-4666-8666-666666666666"), "received"
 
     async def audit(*_args: object, **_kwargs: object) -> None:
         return None

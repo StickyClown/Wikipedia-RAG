@@ -44,6 +44,7 @@ class EvalApiClient(Protocol):
         retrieval_profile: str,
         retrieval_overrides: dict[str, Any],
         mode: str,
+        request_namespace: str = "",
     ) -> dict[str, Any]: ...
 
     def url_ok(self, url: str) -> bool: ...
@@ -112,6 +113,7 @@ class HttpEvalApiClient:
         retrieval_overrides: dict[str, Any],
         mode: str,
         knowledge_base_ids: list[str] | None = None,
+        request_namespace: str = "",
     ) -> dict[str, Any]:
         payload = {
             "message": question,
@@ -125,6 +127,7 @@ class HttpEvalApiClient:
                 retrieval_overrides=retrieval_overrides,
                 mode=mode,
                 knowledge_base_ids=knowledge_base_ids,
+                request_namespace=request_namespace,
             ),
         }
         if knowledge_base_ids:
@@ -192,6 +195,7 @@ class HttpEvalApiClient:
         retrieval_overrides: dict[str, Any],
         mode: str,
         knowledge_base_ids: list[str] | None = None,
+        request_namespace: str = "",
     ) -> dict[str, Any]:
         """Consume chat SSE without a worker thread so cancellation closes the socket."""
         payload: dict[str, Any] = {
@@ -206,6 +210,7 @@ class HttpEvalApiClient:
                 retrieval_overrides=retrieval_overrides,
                 mode=mode,
                 knowledge_base_ids=knowledge_base_ids,
+                request_namespace=request_namespace,
             ),
         }
         if knowledge_base_ids:
@@ -318,6 +323,17 @@ class HttpEvalApiClient:
                 if self._authenticated_api != normalized_api:
                     self._login_local(client, normalized_api)
         return client
+
+    def close(self) -> None:
+        """Close the lazily-created shared HTTP client."""
+
+        with self._auth_lock:
+            client = self._client
+            self._client = None
+            self._authenticated_api = ""
+            self._csrf_token = ""
+        if client is not None:
+            client.close()
 
     def _login_local(self, client: httpx.Client, api: str) -> None:
         login = client.post(
@@ -486,8 +502,9 @@ def _client_request_id(
     retrieval_overrides: dict[str, Any],
     mode: str,
     knowledge_base_ids: list[str] | None,
+    request_namespace: str = "",
 ) -> str:
-    """Stable opaque identity lets eval resume an interrupted chat without another model call."""
+    """Stable opaque identity lets one eval run resume without cross-run replay."""
     encoded = json.dumps(
         {
             "question": question,
@@ -495,6 +512,7 @@ def _client_request_id(
             "retrieval_overrides": retrieval_overrides,
             "mode": mode,
             "knowledge_base_ids": knowledge_base_ids or [],
+            "request_namespace": request_namespace,
         },
         ensure_ascii=False,
         sort_keys=True,

@@ -7,8 +7,10 @@ the gateway when resolving an immutable configuration revision.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -36,21 +38,14 @@ class ThinkingMode(StrEnum):
     auto = "auto"
 
 
+# Kept as documentation for callers that want to expose common controls.  The
+# gateway intentionally does not reject additional JSON parameters: vendor
+# extensions are configured declaratively by the connection adapter.
 SUPPORTED_PARAMETERS: frozenset[str] = frozenset(
     {
-        "temperature",
-        "top_p",
-        "top_k",
-        "min_p",
-        "frequency_penalty",
-        "presence_penalty",
-        "repetition_penalty",
-        "seed",
-        "stop",
-        "max_output_tokens",
-        "embedding_batch_size",
-        "dimensions",
-        "timeout",
+        "temperature", "top_p", "top_k", "min_p", "frequency_penalty",
+        "presence_penalty", "repetition_penalty", "seed", "stop",
+        "max_output_tokens", "embedding_batch_size", "dimensions", "timeout",
         "thinking",
     }
 )
@@ -110,7 +105,7 @@ STAGE_CATALOG: tuple[StageSpec, ...] = (
         embedding_fingerprint_required=True,
     ),
     StageSpec("retrieval.rerank", ModelOperation.rerank, frozenset({"rerank"})),
-    StageSpec("chat.answer", ModelOperation.chat, frozenset({"chat"})),
+    StageSpec("chat.answer", ModelOperation.chat, frozenset({"chat", "structured_output"})),
     StageSpec("chat.claim_verification", ModelOperation.chat, frozenset({"chat", "structured_output"})),
     StageSpec("deep_research.planner", ModelOperation.chat, frozenset({"chat", "structured_output"})),
     StageSpec("deep_research.verifier", ModelOperation.chat, frozenset({"chat", "structured_output"})),
@@ -169,13 +164,213 @@ class TokenEnvelope:
         return self.total <= self.context_window
 
 
+@dataclass(frozen=True, slots=True)
+class OutputBudget:
+    requested_tokens: int
+    effective_tokens: int
+    stage_cap: int
+    input_tokens: int
+    reasoning_reserve: int
+    safety_reserve: int
+    context_window: int
+
+    def as_metadata(self) -> dict[str, int]:
+        return {
+            "requested_output_tokens": self.requested_tokens,
+            "effective_output_tokens": self.effective_tokens,
+            "stage_output_cap": self.stage_cap,
+            "input_tokens_estimate": self.input_tokens,
+            "reasoning_reserve_tokens": self.reasoning_reserve,
+            "safety_reserve_tokens": self.safety_reserve,
+            "context_window_tokens": self.context_window,
+        }
+
+
 class ModelControlError(ValueError):
     """Safe validation error suitable for exposing as a stable error code."""
+
+
+def resolve_output_budget(
+    requested_tokens: int,
+    *,
+    input_tokens: int,
+    context_window: int,
+    stage_cap: int | None = None,
+    reasoning_reserve: int = 0,
+    safety_reserve: int = 32,
+    minimum_tokens: int = 64,
+) -> OutputBudget:
+    """Resolve a bounded completion budget without exceeding the model envelope."""
+
+    values = (requested_tokens, input_tokens, context_window, reasoning_reserve, safety_reserve, minimum_tokens)
+    if min(values) < 0 or (stage_cap is not None and stage_cap < 0):
+        raise ModelControlError("token envelope values must be non-negative")
+    cap = int(stage_cap if stage_cap is not None else requested_tokens)
+    available = int(context_window) - int(input_tokens) - int(reasoning_reserve) - int(safety_reserve)
+    effective = min(int(requested_tokens), cap, available)
+    if effective < int(minimum_tokens):
+        raise ModelControlError("MODEL_TOKEN_BUDGET_EXCEEDED")
+    return OutputBudget(
+        requested_tokens=int(requested_tokens),
+        effective_tokens=effective,
+        stage_cap=cap,
+        input_tokens=int(input_tokens),
+        reasoning_reserve=int(reasoning_reserve),
+        safety_reserve=int(safety_reserve),
+        context_window=int(context_window),
+    )
 
 
 def config_hash(value: Any) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _json_value(value: Any, *, path: str = "parameter") -> Any:
+    """Validate and copy a JSON-serializable configuration value."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ModelControlError(f"non-finite JSON value at {path}")
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item, path=f"{path}.{key}") for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item, path=f"{path}[{index}]") for index, item in enumerate(value)]
+    raise ModelControlError(f"parameter is not JSON-serializable: {path}")
+
+
+def deep_merge_json(*sources: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Recursively merge JSON objects; scalar and array values are replaced."""
+    result: dict[str, Any] = {}
+    for source in sources:
+        if source is None:
+            continue
+        checked = _json_value(source)
+        if not isinstance(checked, dict):
+            raise ModelControlError("parameter source must be a JSON object")
+        for key, value in checked.items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = deep_merge_json(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+    return result
+
+
+def _set_path(payload: dict[str, Any], path: str, value: Any) -> None:
+    current = payload
+    parts = [part for part in str(path).split(".") if part]
+    if not parts:
+        raise ModelControlError("request adapter path cannot be empty")
+    for part in parts[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    current[parts[-1]] = copy.deepcopy(value)
+
+
+def _pop_path(payload: dict[str, Any], path: str) -> Any:
+    current: Any = payload
+    parts = [part for part in str(path).split(".") if part]
+    if not parts:
+        return None
+    for part in parts[:-1]:
+        current = current.get(part)
+        if not isinstance(current, dict):
+            return None
+    return current.pop(parts[-1], None)
+
+
+def _adapter_path(spec: Any) -> tuple[str, str | None]:
+    if isinstance(spec, str):
+        return spec, None
+    if isinstance(spec, Mapping):
+        path = spec.get("path")
+        if not isinstance(path, str) or not path:
+            raise ModelControlError("request adapter path must be a non-empty string")
+        return path, str(spec.get("transform")) if spec.get("transform") is not None else None
+    raise ModelControlError("request adapter path must be a string or object")
+
+
+def compile_provider_payload(
+    payload: Mapping[str, Any],
+    *,
+    connection_defaults: Mapping[str, Any] | None = None,
+    model_defaults: Mapping[str, Any] | None = None,
+    stage_overrides: Mapping[str, Any] | None = None,
+    request_adapter: Mapping[str, Any] | None = None,
+    thinking: Mapping[str, Any] | ThinkingPolicy | None = None,
+    protected_fields: frozenset[str] = frozenset({"model", "messages", "stream", "response_format"}),
+) -> dict[str, Any]:
+    """Compile the stable gateway request into an OpenAI-compatible wire body.
+
+    The adapter is data, not a provider switch.  It may map any standard field
+    to a dotted vendor path and declares the paths for thinking controls.
+    """
+    workload = deep_merge_json(dict(payload))
+    extra_body = workload.pop("extra_body", None)
+    if extra_body is not None:
+        if not isinstance(extra_body, Mapping):
+            raise ModelControlError("extra_body must be a JSON object")
+        workload = deep_merge_json(extra_body, workload)
+    canonical = {key: copy.deepcopy(workload[key]) for key in protected_fields if key in workload}
+    result = deep_merge_json(connection_defaults, model_defaults, stage_overrides)
+    result = deep_merge_json(result, {key: value for key, value in workload.items() if key not in protected_fields})
+    # Existing callers use the internal ``max_tokens`` spelling; normalize it
+    # to the stable contract before the declarative adapter runs.
+    if "max_tokens" in result and "max_output_tokens" not in result:
+        result["max_output_tokens"] = result.pop("max_tokens")
+
+    adapter = _json_value(request_adapter or {})
+    if not isinstance(adapter, dict):
+        raise ModelControlError("request_adapter must be a JSON object")
+    parameter_map = adapter.get("parameter_map", {"max_output_tokens": "max_tokens"})
+    if parameter_map is None:
+        parameter_map = {}
+    if not isinstance(parameter_map, Mapping):
+        raise ModelControlError("request_adapter.parameter_map must be an object")
+    for source, spec in parameter_map.items():
+        if source not in result:
+            continue
+        path, transform = _adapter_path(spec)
+        value = result.pop(source)
+        if transform == "inverse":
+            value = not bool(value)
+        elif transform not in {None, "identity"}:
+            raise ModelControlError(f"unsupported request adapter transform: {transform}")
+        _set_path(result, path, value)
+
+    if thinking is not None:
+        policy = thinking.as_dict() if isinstance(thinking, ThinkingPolicy) else dict(thinking)
+        mode = str(policy.get("mode", "off"))
+        thinking_map = adapter.get("thinking", {})
+        if thinking_map is not None and not isinstance(thinking_map, Mapping):
+            raise ModelControlError("request_adapter.thinking must be an object")
+        values = {
+            "enabled": mode != ThinkingMode.off.value,
+            "effort": "none" if mode == ThinkingMode.off.value else policy.get("effort"),
+            "budget_tokens": policy.get("budget_tokens"),
+            "return_reasoning": bool(policy.get("return_reasoning", False)),
+        }
+        for name, spec in (thinking_map or {}).items():
+            if name not in values or values[name] is None:
+                continue
+            path, transform = _adapter_path(spec)
+            value = values[name]
+            if isinstance(spec, Mapping) and name == "enabled":
+                value = spec.get("on" if value else "off", value)
+            if transform == "inverse":
+                value = not bool(value)
+            elif transform not in {None, "identity"}:
+                raise ModelControlError(f"unsupported request adapter transform: {transform}")
+            _set_path(result, path, value)
+    result.pop("thinking", None)
+    for key, value in canonical.items():
+        result[key] = value
+    return result
 
 
 def merge_parameters(
@@ -186,13 +381,8 @@ def merge_parameters(
     capabilities: Mapping[str, Any] | None = None,
     workload_max_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """Resolve defaults in the documented order and reject unknown fields."""
-    result: dict[str, Any] = {}
-    for source in (driver_defaults or {}, model_defaults or {}, stage_overrides or {}):
-        unknown = set(source) - SUPPORTED_PARAMETERS
-        if unknown:
-            raise ModelControlError(f"unknown model parameter(s): {', '.join(sorted(unknown))}")
-        result.update(source)
+    """Resolve defaults in order while allowing arbitrary JSON vendor fields."""
+    result = deep_merge_json(driver_defaults, model_defaults, stage_overrides)
     capability_map = capabilities or {}
     for name in result:
         if capability_map and capability_map.get(name) is False:
@@ -244,13 +434,13 @@ def validate_stage_binding(stage_key: str, model: ModelContract, thinking: Think
         raise ModelControlError("MODEL_STAGE_UNKNOWN")
     if not model.enabled or model.operation is not stage.operation:
         raise ModelControlError("MODEL_OPERATION_UNSUPPORTED")
-    if not stage.required_capabilities.issubset(model.capabilities):
-        raise ModelControlError("MODEL_CAPABILITY_UNSUPPORTED")
     if stage.required_modalities - set(model.input_modalities):
         raise ModelControlError("MODEL_MODALITY_UNSUPPORTED")
     if model.vision_input and stage.operation is ModelOperation.chat and "image" not in stage.required_modalities:
         # Vision is catalog-only until a dedicated stage is added to the registry.
         raise ModelControlError("MODEL_VISION_CATALOG_ONLY")
+    if not stage.required_capabilities.issubset(model.capabilities):
+        raise ModelControlError("MODEL_CAPABILITY_UNSUPPORTED")
     if thinking.mode is ThinkingMode.on and not bool(model.thinking_capabilities.get("reasoning_control", False)):
         raise ModelControlError("MODEL_THINKING_UNSUPPORTED")
     if thinking.mode is ThinkingMode.auto and not bool(model.thinking_capabilities.get("canary_auto", False)):
@@ -259,35 +449,13 @@ def validate_stage_binding(stage_key: str, model: ModelContract, thinking: Think
 
 
 def map_thinking_parameters(driver: ModelDriver, policy: ThinkingPolicy) -> dict[str, Any]:
-    """Map the stable contract to documented endpoint parameters only."""
-    effort: str | None
-    if policy.mode is ThinkingMode.off:
-        effort = "none"
-    else:
-        effort = policy.effort
-    if driver is ModelDriver.openrouter:
-        return {"reasoning": {"effort": effort, "exclude": not policy.return_reasoning}}
-    if driver is ModelDriver.vllm:
-        return {
-            "reasoning_effort": effort,
-            "chat_template_kwargs": {"enable_thinking": policy.mode is not ThinkingMode.off},
-        }
-    if driver is ModelDriver.llamacpp:
-        return {
-            "reasoning_effort": effort,
-            "chat_template_kwargs": {"enable_thinking": policy.mode is not ThinkingMode.off},
-        }
-    if driver is ModelDriver.textgen_webui:
-        return {
-            "reasoning_effort": effort,
-            "enable_thinking": policy.mode is not ThinkingMode.off,
-        }
-    if driver is ModelDriver.mock:
-        return {"thinking": policy.as_dict()}
-    # OpenAI-compatible endpoints have no safe universal translation.
-    if policy.mode is not ThinkingMode.off:
-        raise ModelControlError("MODEL_THINKING_MAPPING_UNCONFIRMED")
-    return {}
+    """Backward-compatible helper returning the stable field only.
+
+    Provider wire paths are intentionally declared in ``request_adapter``;
+    this compatibility function no longer switches on a provider enum.
+    """
+    del driver
+    return {"thinking": policy.as_dict()}
 
 
 def redact_connection(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -298,6 +466,8 @@ def redact_connection(value: Mapping[str, Any]) -> dict[str, Any]:
         "driver",
         "base_url",
         "endpoint_paths",
+        "request_adapter",
+        "request_defaults",
         "safe_headers",
         "tls_verify",
         "enabled",

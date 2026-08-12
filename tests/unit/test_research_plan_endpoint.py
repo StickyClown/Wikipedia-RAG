@@ -15,13 +15,54 @@ from wikipediarag.auth import (
     PlatformRole,
     TenantRole,
 )
-from wikipediarag.retrieval_contract import KnowledgeBaseNotReady
+from wikipediarag.retrieval_contract import KnowledgeBaseNotReady, RetrievalProfileIncompatible
 from wikipediarag.schemas import ResearchPlanCreate
 
 
 class _FakeConnectionContext:
     async def __aenter__(self) -> object:
         return object()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        return None
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    async def execute(self, statement: Any, _parameters: dict[str, Any]) -> _EmptyResult:
+        self.statements.append(str(statement))
+        return _EmptyResult()
+
+
+class _EmptyMappings:
+    def __iter__(self) -> object:
+        return iter(())
+
+    def first(self) -> None:
+        return None
+
+
+class _EmptyResult:
+    def mappings(self) -> _EmptyMappings:
+        return _EmptyMappings()
+
+    def scalar(self) -> bool:
+        return False
+
+
+class _RecordingConnectionContext:
+    def __init__(self, connection: _RecordingConnection) -> None:
+        self.connection = connection
+
+    async def __aenter__(self) -> _RecordingConnection:
+        return self.connection
 
     async def __aexit__(
         self,
@@ -60,6 +101,60 @@ def _actor() -> ActorContext:
     )
 
 
+def test_research_scope_always_contains_primary_knowledge_base() -> None:
+    assert api_app._research_plan_scope_ids(["secondary", "third"], "primary") == [
+        "primary",
+        "secondary",
+        "third",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_empty_knowledge_base_removes_its_grants_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _RecordingConnection()
+
+    async def require_actor(_request: Request) -> ActorContext:
+        return _actor()
+
+    async def require_kb_role(_conn: object, **_kwargs: Any) -> KnowledgeBaseRole:
+        return KnowledgeBaseRole.owner
+
+    async def audit(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def get_kb(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+        return {"active_index": ""}
+
+    def delete_chunks(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def delete_artifacts(*_args: Any, **_kwargs: Any) -> int:
+        return 0
+
+    monkeypatch.setattr(api_app, "connect", lambda: _RecordingConnectionContext(connection))
+    monkeypatch.setattr(api_app, "_require_actor", require_actor)
+    monkeypatch.setattr(api_app, "_require_kb_role", require_kb_role)
+    monkeypatch.setattr(api_app, "_audit", audit)
+    monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
+    monkeypatch.setattr(api_app, "delete_document_chunks", delete_chunks)
+    monkeypatch.setattr(api_app, "delete_objects", delete_artifacts)
+
+    response = await api_app.delete_knowledge_base("kb-id", _request())
+
+    assert response == {"status": "deleted"}
+    grant_delete = next(
+        index
+        for index, statement in enumerate(connection.statements)
+        if "DELETE FROM knowledge_base_grants" in statement
+    )
+    kb_delete = next(
+        index for index, statement in enumerate(connection.statements) if "DELETE FROM knowledge_bases" in statement
+    )
+    assert grant_delete < kb_delete
+
+
 async def test_create_research_plan_returns_safe_kb_not_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -69,7 +164,7 @@ async def test_create_research_plan_returns_safe_kb_not_ready(
     async def require_kb_role(_conn: object, **_kwargs: Any) -> KnowledgeBaseRole:
         return KnowledgeBaseRole.viewer
 
-    async def validate_contract(_conn: object, **_kwargs: Any) -> None:
+    async def resolve_profile(_conn: object, **_kwargs: Any) -> SimpleNamespace:
         raise KnowledgeBaseNotReady(
             "active index source is incompatible with retrieval profile",
             details={"knowledge_base_id": "33333333-3333-4333-8333-333333333333"},
@@ -78,12 +173,7 @@ async def test_create_research_plan_returns_safe_kb_not_ready(
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
     monkeypatch.setattr(api_app, "_require_kb_role", require_kb_role)
-    monkeypatch.setattr(api_app, "validate_active_retrieval_contract", validate_contract)
-    monkeypatch.setattr(
-        api_app,
-        "get_retrieval_profile",
-        lambda *_args, **_kwargs: SimpleNamespace(name="upload_sota_mvp"),
-    )
+    monkeypatch.setattr(api_app, "resolve_retrieval_profile", resolve_profile)
 
     with pytest.raises(HTTPException) as exc_info:
         await api_app.create_research_plan_endpoint(
@@ -99,3 +189,37 @@ async def test_create_research_plan_returns_safe_kb_not_ready(
     error = cast(dict[str, Any], detail["error"])
     assert error["code"] == "KB_NOT_READY"
     assert error["request_id"] == _actor().request_id
+
+
+@pytest.mark.asyncio
+async def test_retrieval_profile_catalog_returns_incompatible_scope_without_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def require_actor(_request: Request) -> ActorContext:
+        return _actor()
+
+    async def load_roles(_conn: object, **_kwargs: Any) -> dict[str, KnowledgeBaseRole]:
+        return {"first": KnowledgeBaseRole.viewer, "second": KnowledgeBaseRole.viewer}
+
+    async def get_kb(_conn: object, _tenant_id: str, kb_id: str) -> dict[str, str]:
+        return {"id": kb_id, "active_index": "read_alias"}
+
+    async def load_index(_conn: object, **_kwargs: Any) -> dict[str, str]:
+        return {"id": "index-id", "read_alias": "read_alias", "embedding_alias": "embed_default"}
+
+    async def resolve_profile(_conn: object, **_kwargs: Any) -> SimpleNamespace:
+        raise RetrievalProfileIncompatible("no common profile")
+
+    monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
+    monkeypatch.setattr(api_app, "_require_actor", require_actor)
+    monkeypatch.setattr(api_app, "_load_kb_scope_roles", load_roles)
+    monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
+    monkeypatch.setattr(api_app, "load_index_version_by_read_alias", load_index)
+    monkeypatch.setattr(api_app, "resolve_retrieval_profile", resolve_profile)
+
+    catalog = await api_app.retrieval_profiles(_request(), ["first", "second"])
+
+    assert catalog.resolved_default is None
+    assert catalog.scope_error_code == "RETRIEVAL_PROFILE_INCOMPATIBLE"
+    assert catalog.profiles
+    assert all(not profile.compatible for profile in catalog.profiles)

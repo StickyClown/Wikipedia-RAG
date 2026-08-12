@@ -5,15 +5,24 @@ from typing import Any
 
 import pytest
 
-from wikipediarag.answering import generate_answer, validate_citations, validate_citations_with_policy
+from wikipediarag.answering import (
+    ModelOutputError,
+    _answer_json_schema_for_mode,
+    _parse_answer_draft,
+    generate_answer,
+    validate_citations,
+    validate_citations_with_policy,
+)
 from wikipediarag.config import Settings
 from wikipediarag.observability import safe_telemetry_payload
 from wikipediarag.retrieval import (
+    _order_ambiguity_candidates,
     _snapshot_candidates,
     apply_page_quota,
     build_stage_events,
     page_scope_key,
     postprocess_candidates,
+    rerank,
     rrf_fuse,
 )
 from wikipediarag.retrieval_profile import get_retrieval_profile
@@ -213,6 +222,359 @@ def test_postprocess_keeps_quoted_title_without_negative_marker() -> None:
     assert not [event for event in events if event.get("reason") == "EXPLICIT_NEGATIVE_TITLE"]
 
 
+def test_ambiguity_context_exposes_distinct_documents_and_caps_each_document() -> None:
+    profile = get_retrieval_profile("test_mock")
+    candidates = [
+        {**_candidate(f"country-{index}", "Россия", page_id=index), "document_id": "country"} for index in range(1, 5)
+    ] + [
+        {**_candidate(f"asteroid-{index}", "Россия (астероид)", page_id=index), "document_id": "asteroid"}
+        for index in range(1, 5)
+    ]
+    selected, _events = postprocess_candidates(
+        _order_ambiguity_candidates(candidates, 12, "auto"),
+        profile,
+        requested_top_k=12,
+        query="Что такое Россия?",
+        ambiguity_mode="auto",
+    )
+
+    assert len(selected) <= 12
+    assert {item["document_id"] for item in selected} == {"country", "asteroid"}
+    assert max(sum(item["document_id"] == document for item in selected) for document in {"country", "asteroid"}) <= 2
+
+
+def test_sota_profile_limits_rerank_input_without_changing_legacy_top_k() -> None:
+    profile = get_retrieval_profile("sota_mvp")
+    assert profile.retrieval.rerank_input_k == 24
+    assert profile.retrieval.rerank_top_k == 50
+    assert profile.postprocess.final_evidence_max == 12
+
+
+@pytest.mark.asyncio
+async def test_rerank_gateway_input_is_capped_at_24(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: list[int] = []
+
+    async def fake_gateway(_query: str, documents: list[str], *_args: object, **_kwargs: object) -> dict[str, object]:
+        observed.append(len(documents))
+        return {"results": [{"index": index, "relevance_score": 1.0} for index in range(len(documents))]}
+
+    monkeypatch.setattr("wikipediarag.retrieval.gateway_rerank", fake_gateway)
+    candidates = [_candidate(f"c{index}", "Россия", page_id=index) for index in range(30)]
+    profile = get_retrieval_profile("test_mock")
+    await rerank("Россия", candidates, Settings(), profile, top_k=50, score_all=True)
+
+    assert observed == [24]
+
+
+def test_multiple_interpretations_validate_citations_independently() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+        Evidence(
+            evidence_id="S2",
+            chunk_id="c2",
+            title="Россия (астероид)",
+            section_path=[],
+            content="астероид",
+            source_url="u2",
+        ),
+    ]
+    draft = _parse_answer_draft(
+        json.dumps(
+            {
+                "answer_markdown": "Найдено два подтверждённых значения.",
+                "answer_mode": "multiple",
+                "clarification_question": "О каком значении речь?",
+                "interpretations": [
+                    {
+                        "interpretation_id": "country",
+                        "label": "Страна",
+                        "answer_markdown": "Россия — страна [S1]",
+                        "evidence_ids": ["S1"],
+                        "claims": [{"claim_id": "c-country", "text": "Страна", "evidence_ids": ["S1"], "type": "fact"}],
+                    },
+                    {
+                        "interpretation_id": "asteroid",
+                        "label": "Астероид",
+                        "answer_markdown": "Россия — астероид [S2]",
+                        "evidence_ids": ["S2"],
+                        "claims": [
+                            {"claim_id": "c-asteroid", "text": "Астероид", "evidence_ids": ["S2"], "type": "fact"}
+                        ],
+                    },
+                ],
+                "claims": [],
+                "insufficient_evidence": False,
+            }
+        ),
+        evidence,
+        strict=True,
+    )
+    assert draft["answer_mode"] == "multiple"
+    assert {item["interpretation_id"] for item in draft["interpretations"]} == {"country", "asteroid"}
+
+
+def test_always_ambiguous_schema_requires_multiple_interpretations() -> None:
+    schema = _answer_json_schema_for_mode(ambiguity_expected=True)["json_schema"]["schema"]
+    assert schema["properties"]["answer_mode"]["enum"] == ["multiple"]
+    assert schema["properties"]["interpretations"]["minItems"] == 2
+    assert schema["properties"]["clarification_question"]["type"] == "string"
+    assert schema["properties"]["clarification_question"]["minLength"] == 1
+
+
+def test_answer_schema_binds_claims_to_current_evidence_ids() -> None:
+    schema = _answer_json_schema_for_mode(ambiguity_expected=False, evidence_ids=["S2", "S1", "S1"])["json_schema"][
+        "schema"
+    ]
+    claim_evidence = schema["properties"]["claims"]["items"]["properties"]["evidence_ids"]
+    interpretation_evidence = schema["properties"]["interpretations"]["items"]["properties"]["evidence_ids"]
+
+    assert schema["properties"]["answer_markdown"]["minLength"] == 1
+    assert claim_evidence["minItems"] == 1
+    assert claim_evidence["items"]["enum"] == ["S1", "S2"]
+    assert interpretation_evidence["items"]["enum"] == ["S1", "S2"]
+
+
+def test_answer_draft_reports_safe_contract_reason() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1")
+    ]
+    payload: dict[str, object] = {
+        "answer_markdown": "Россия — страна [S2]",
+        "answer_mode": "single",
+        "interpretations": [],
+        "clarification_question": None,
+        "claims": [{"claim_id": "country", "text": "Страна", "evidence_ids": ["S2"], "type": "fact"}],
+        "insufficient_evidence": False,
+    }
+
+    with pytest.raises(ModelOutputError) as error:
+        _parse_answer_draft(json.dumps(payload), evidence, strict=True)
+
+    assert error.value.reason == "unknown_evidence"
+
+
+def test_insufficient_evidence_draft_discards_provider_citations_before_grounded_answer_validation() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+        Evidence(evidence_id="S2", chunk_id="c2", title="Москва", section_path=[], content="город", source_url="u2"),
+    ]
+    payload: dict[str, object] = {
+        "answer_markdown": "Недостаточно данных [S1] [S2]",
+        "answer_mode": "single",
+        "interpretations": [],
+        "clarification_question": None,
+        "claims": [],
+        "insufficient_evidence": True,
+        "insufficient_evidence_reason": "insufficient_context",
+    }
+
+    parsed = _parse_answer_draft(json.dumps(payload), evidence, strict=True)
+
+    assert parsed["insufficient_evidence"] is True
+    assert parsed["model_output_normalizations"] == ["insufficient_evidence_abstention"]
+
+
+def test_answer_draft_derives_claims_only_from_existing_cited_sentences() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+        Evidence(evidence_id="S2", chunk_id="c2", title="Москва", section_path=[], content="город", source_url="u2"),
+    ]
+    payload: dict[str, object] = {
+        "answer_markdown": "Россия — страна [S1]. Москва — город [S2].",
+        "answer_mode": "single",
+        "interpretations": [],
+        "clarification_question": None,
+        "claims": [],
+        "insufficient_evidence": False,
+    }
+
+    parsed = _parse_answer_draft(json.dumps(payload), evidence, strict=True)
+
+    assert [claim["evidence_ids"] for claim in parsed["claims"]] == [["S1"], ["S2"]]
+    assert parsed["model_output_normalizations"] == ["claims_derived_from_citations"]
+
+
+def test_answer_draft_canonicalizes_duplicate_provider_claim_ids() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+        Evidence(evidence_id="S2", chunk_id="c2", title="Столица", section_path=[], content="Москва", source_url="u2"),
+    ]
+    payload = {
+        "answer_markdown": "Россия — страна [S1]. Её столица — Москва [S2]",
+        "answer_mode": "single",
+        "interpretations": [],
+        "clarification_question": None,
+        "claims": [
+            {"claim_id": "claim", "text": "Россия — страна", "evidence_ids": ["S1"], "type": "fact"},
+            {"claim_id": "claim", "text": "Столица — Москва", "evidence_ids": ["S2"], "type": "fact"},
+        ],
+        "insufficient_evidence": False,
+    }
+
+    parsed = _parse_answer_draft(json.dumps(payload), evidence, strict=True)
+
+    assert [claim["claim_id"] for claim in parsed["claims"]] == ["claim", "claim-1"]
+    assert parsed["model_output_normalizations"] == ["duplicate_claim_id"]
+
+
+def test_answer_draft_canonicalizes_incomplete_multiple_mode_without_ambiguity_requirement() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+    ]
+    payload = {
+        "answer_markdown": "Россия — страна [S1]",
+        "answer_mode": "multiple",
+        "interpretations": [],
+        "clarification_question": "О каком значении речь?",
+        "claims": [{"claim_id": "country", "text": "Россия — страна", "evidence_ids": ["S1"], "type": "fact"}],
+        "insufficient_evidence": False,
+    }
+
+    parsed = _parse_answer_draft(json.dumps(payload), evidence, strict=True)
+
+    assert parsed["answer_mode"] == "single"
+    assert parsed["interpretations"] == []
+    assert parsed["clarification_question"] is None
+    assert parsed["model_output_normalizations"] == ["multiple_without_two_interpretations"]
+
+
+def test_answer_draft_canonicalizes_duplicate_provider_interpretation_ids() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+        Evidence(
+            evidence_id="S2",
+            chunk_id="c2",
+            title="Россия (астероид)",
+            section_path=[],
+            content="астероид",
+            source_url="u2",
+        ),
+    ]
+    payload = {
+        "answer_markdown": "Есть два значения: страна [S1] и астероид [S2]",
+        "answer_mode": "multiple",
+        "clarification_question": "О каком значении речь?",
+        "interpretations": [
+            {
+                "interpretation_id": "meaning",
+                "label": "Страна",
+                "answer_markdown": "Россия — страна [S1]",
+                "evidence_ids": ["S1"],
+                "claims": [{"claim_id": "country", "text": "страна", "evidence_ids": ["S1"], "type": "fact"}],
+            },
+            {
+                "interpretation_id": "meaning",
+                "label": "Астероид",
+                "answer_markdown": "Россия — астероид [S2]",
+                "evidence_ids": ["S2"],
+                "claims": [{"claim_id": "asteroid", "text": "астероид", "evidence_ids": ["S2"], "type": "fact"}],
+            },
+        ],
+        "claims": [],
+        "insufficient_evidence": False,
+    }
+
+    parsed = _parse_answer_draft(json.dumps(payload), evidence, strict=True)
+
+    assert [item["interpretation_id"] for item in parsed["interpretations"]] == ["meaning", "interpretation-1"]
+    assert parsed["model_output_normalizations"] == ["duplicate_interpretation_id"]
+
+
+def test_answer_draft_rejects_incomplete_multiple_mode_when_ambiguity_is_required() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+    ]
+    payload = {
+        "answer_markdown": "Россия — страна [S1]",
+        "answer_mode": "multiple",
+        "interpretations": [],
+        "clarification_question": "О каком значении речь?",
+        "claims": [{"claim_id": "country", "text": "Россия — страна", "evidence_ids": ["S1"], "type": "fact"}],
+        "insufficient_evidence": False,
+    }
+
+    with pytest.raises(ModelOutputError, match="at least two interpretations"):
+        _parse_answer_draft(json.dumps(payload), evidence, strict=True, ambiguity_expected=True)
+
+
+def test_always_ambiguous_rejects_single_structured_answer() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+    ]
+    payload = {
+        "answer_markdown": "Россия — страна [S1]",
+        "answer_mode": "single",
+        "interpretations": [],
+        "clarification_question": None,
+        "claims": [{"claim_id": "country", "text": "Страна", "evidence_ids": ["S1"], "type": "fact"}],
+        "insufficient_evidence": False,
+    }
+    with pytest.raises(ModelOutputError, match="answer_mode=multiple"):
+        _parse_answer_draft(json.dumps(payload), evidence, strict=True, ambiguity_expected=True)
+
+
+def test_always_ambiguous_rejects_empty_structured_interpretations_or_question() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+        Evidence(
+            evidence_id="S2",
+            chunk_id="c2",
+            title="Россия (астероид)",
+            section_path=[],
+            content="астероид",
+            source_url="u2",
+        ),
+    ]
+    payload = {
+        "answer_markdown": "Есть два значения [S1] [S2]",
+        "answer_mode": "multiple",
+        "interpretations": [],
+        "clarification_question": "",
+        "claims": [
+            {"claim_id": "country", "text": "Страна", "evidence_ids": ["S1"], "type": "fact"},
+            {"claim_id": "asteroid", "text": "Астероид", "evidence_ids": ["S2"], "type": "fact"},
+        ],
+        "insufficient_evidence": False,
+    }
+    with pytest.raises(ModelOutputError, match="at least two interpretations"):
+        _parse_answer_draft(json.dumps(payload), evidence, strict=True, ambiguity_expected=True)
+
+    payload["interpretations"] = [
+        {
+            "interpretation_id": "country",
+            "label": "Страна",
+            "answer_markdown": "Страна [S1]",
+            "evidence_ids": ["S1"],
+            "claims": [{"claim_id": "country-i", "text": "Страна", "evidence_ids": ["S1"], "type": "fact"}],
+        },
+        {
+            "interpretation_id": "asteroid",
+            "label": "Астероид",
+            "answer_markdown": "Астероид [S2]",
+            "evidence_ids": ["S2"],
+            "claims": [{"claim_id": "asteroid-i", "text": "Астероид", "evidence_ids": ["S2"], "type": "fact"}],
+        },
+    ]
+    with pytest.raises(ModelOutputError, match="clarification_question"):
+        _parse_answer_draft(json.dumps(payload), evidence, strict=True, ambiguity_expected=True)
+
+
+def test_always_without_ambiguity_keeps_single_answer_contract() -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+    ]
+    payload = {
+        "answer_markdown": "Россия — страна [S1]",
+        "answer_mode": "single",
+        "interpretations": [],
+        "clarification_question": None,
+        "claims": [{"claim_id": "country", "text": "Страна", "evidence_ids": ["S1"], "type": "fact"}],
+        "insufficient_evidence": False,
+    }
+    parsed = _parse_answer_draft(json.dumps(payload), evidence, strict=True, ambiguity_expected=False)
+    assert parsed["answer_mode"] == "single"
+
+
 def test_page_quota_is_scoped_by_knowledge_base_and_document() -> None:
     candidates = [
         {**_candidate("a", "A", page_id=1), "knowledge_base_id": "kb-1", "document_id": "doc-1"},
@@ -336,6 +698,274 @@ async def test_generate_answer_returns_generation_timings(monkeypatch: pytest.Mo
     timings = validation["timings_ms"]
     assert isinstance(timings, dict)
     assert set(timings) >= {"generation_total", "model_chat", "answer_parse", "citation_validation"}
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_abstains_for_undeclared_citation_without_claim_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Первый", section_path=[], content="факт", source_url="u1"),
+        Evidence(evidence_id="S2", chunk_id="c2", title="Второй", section_path=[], content="факт", source_url="u2"),
+    ]
+    retrieval = RetrievalResult(
+        query="q",
+        trace_id="trace",
+        evidence=evidence,
+        events=[],
+        answerability=AnswerabilityDecision(
+            status=AnswerabilityStatus.partial,
+            confidence=0.8,
+            reason="partial",
+        ),
+    )
+    profile = get_retrieval_profile("test_mock", Settings())
+    verified = False
+
+    async def fake_chat_completion(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "answer_markdown": "Проверочный факт [S1]",
+                                "answer_mode": "single",
+                                "interpretations": [],
+                                "clarification_question": None,
+                                "claims": [
+                                    {
+                                        "claim_id": "wrong-link",
+                                        "text": "Проверочный факт",
+                                        "evidence_ids": ["S2"],
+                                        "type": "fact",
+                                    }
+                                ],
+                                "insufficient_evidence": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ],
+            "usage": {"total_tokens": 5},
+            "provider": "SiliconFlow",
+            "id": "provider-request",
+            "_gateway_metadata": {"provider": "SiliconFlow", "attempts": 1},
+        }
+
+    async def fail_claim_verification(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal verified
+        verified = True
+        raise AssertionError("claim verification must not run after a contract abstention")
+
+    monkeypatch.setattr("wikipediarag.answering.chat_completion", fake_chat_completion)
+    monkeypatch.setattr("wikipediarag.answering.verify_claims", fail_claim_verification)
+
+    answer, validation = await generate_answer("q", retrieval, Settings(), profile)
+
+    assert "проверяемый ответ" in answer
+    assert validation["status"] == "abstained"
+    assert validation["model_output_contract_abstained"] is True
+    assert validation["model_output_contract_reason"] == "undeclared_citation"
+    assert validation["citations"] == []
+    assert validation["claims"] == []
+    assert validation["interpretations"] == []
+    assert validation["provider"] == "SiliconFlow"
+    assert validation["provider_request_id"] == "provider-request"
+    assert validation["usage"] == {"total_tokens": 5}
+    assert validation["answerability_status"] == AnswerabilityStatus.partial.value
+    timings = validation["timings_ms"]
+    assert isinstance(timings, dict)
+    assert set(timings) >= {"model_chat", "answer_parse", "claim_verification", "generation_total"}
+    assert timings["claim_verification"] == 0
+    assert verified is False
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_abstains_for_single_answer_with_interpretations(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+    ]
+    retrieval = RetrievalResult(query="q", trace_id="trace", evidence=evidence, events=[])
+    profile = get_retrieval_profile("test_mock", Settings())
+
+    async def fake_chat_completion(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "answer_markdown": "Россия — страна [S1]",
+                                "answer_mode": "single",
+                                "interpretations": [
+                                    {
+                                        "interpretation_id": "country",
+                                        "label": "Страна",
+                                        "answer_markdown": "Россия — страна [S1]",
+                                        "evidence_ids": ["S1"],
+                                        "claims": [
+                                            {
+                                                "claim_id": "country",
+                                                "text": "Россия — страна",
+                                                "evidence_ids": ["S1"],
+                                                "type": "fact",
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "clarification_question": None,
+                                "claims": [],
+                                "insufficient_evidence": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ],
+            "usage": {"total_tokens": 5},
+            "provider": "Venice",
+        }
+
+    monkeypatch.setattr("wikipediarag.answering.chat_completion", fake_chat_completion)
+
+    _answer, validation = await generate_answer("q", retrieval, Settings(), profile)
+
+    assert validation["status"] == "abstained"
+    assert validation["model_output_contract_reason"] == "answer_mode_contract"
+    assert validation["answer_mode"] == "single"
+    assert validation["interpretations"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "finish_reason", "error_code"),
+    [
+        ("not json", None, "MODEL_OUTPUT_INVALID"),
+        (json.dumps({"answer_markdown": "Неполная схема"}), None, "MODEL_OUTPUT_INVALID"),
+        ("{", "length", "MODEL_OUTPUT_TRUNCATED"),
+    ],
+)
+async def test_generate_answer_keeps_malformed_and_truncated_output_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    finish_reason: str | None,
+    error_code: str,
+) -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+    ]
+    retrieval = RetrievalResult(query="q", trace_id="trace", evidence=evidence, events=[])
+    profile = get_retrieval_profile("test_mock", Settings())
+
+    async def fake_chat_completion(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"choices": [{"finish_reason": finish_reason, "message": {"content": content}}]}
+
+    monkeypatch.setattr("wikipediarag.answering.chat_completion", fake_chat_completion)
+
+    with pytest.raises(ModelOutputError) as error:
+        await generate_answer("q", retrieval, Settings(), profile)
+
+    assert error.value.safe_code == error_code
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_always_ambiguous_uses_one_generator_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence = [
+        Evidence(evidence_id="S1", chunk_id="c1", title="Россия", section_path=[], content="страна", source_url="u1"),
+        Evidence(
+            evidence_id="S2",
+            chunk_id="c2",
+            title="Россия (астероид)",
+            section_path=[],
+            content="астероид",
+            source_url="u2",
+        ),
+    ]
+    answerability = AnswerabilityDecision(
+        status=AnswerabilityStatus.partial,
+        confidence=0.8,
+        reason="ambiguous_entity",
+        signals={"ambiguous_entity": True},
+    )
+    retrieval = RetrievalResult(
+        query="Что такое Россия?",
+        trace_id="trace",
+        evidence=evidence,
+        events=[],
+        answerability=answerability,
+    )
+    profile = get_retrieval_profile("test_mock", Settings(), overrides={"answer": {"ambiguity_mode": "always"}})
+    calls = 0
+
+    async def fake_chat_completion(*_args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        response_format = kwargs["response_format"]
+        assert isinstance(response_format, dict)
+        json_schema = response_format["json_schema"]
+        assert isinstance(json_schema, dict)
+        schema = json_schema["schema"]
+        assert isinstance(schema, dict)
+        assert schema["properties"]["interpretations"]["minItems"] == 2
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "answer_markdown": "Есть два значения: страна [S1] и астероид [S2]",
+                                "answer_mode": "multiple",
+                                "clarification_question": "О каком значении речь?",
+                                "interpretations": [
+                                    {
+                                        "interpretation_id": "country",
+                                        "label": "Страна",
+                                        "answer_markdown": "Россия — страна [S1]",
+                                        "evidence_ids": ["S1"],
+                                        "claims": [
+                                            {
+                                                "claim_id": "country-claim",
+                                                "text": "Страна",
+                                                "evidence_ids": ["S1"],
+                                                "type": "fact",
+                                            }
+                                        ],
+                                    },
+                                    {
+                                        "interpretation_id": "asteroid",
+                                        "label": "Астероид",
+                                        "answer_markdown": "Россия — астероид [S2]",
+                                        "evidence_ids": ["S2"],
+                                        "claims": [
+                                            {
+                                                "claim_id": "asteroid-claim",
+                                                "text": "Астероид",
+                                                "evidence_ids": ["S2"],
+                                                "type": "fact",
+                                            }
+                                        ],
+                                    },
+                                ],
+                                "claims": [],
+                                "insufficient_evidence": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ],
+            "usage": {"total_tokens": 5},
+            "provider": "mock",
+        }
+
+    monkeypatch.setattr("wikipediarag.answering.chat_completion", fake_chat_completion)
+    _answer, validation = await generate_answer("Что такое Россия?", retrieval, Settings(), profile)
+
+    assert calls == 1
+    assert validation["answer_mode"] == "multiple"
+    assert validation["ambiguity_contract_status"] == "satisfied"
 
 
 @pytest.mark.asyncio

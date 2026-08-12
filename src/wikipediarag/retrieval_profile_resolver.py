@@ -18,6 +18,19 @@ from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profi
 _AUTO_PROFILE_ORDER = ("upload_sota_mvp", "upload_mock", "sota_mvp", "test_mock")
 
 
+def normalize_retrieval_profile_request(requested: str | None) -> str | None:
+    """Translate the public UI's automatic-profile sentinel to server defaulting.
+
+    ``auto`` is deliberately not a configured retrieval profile.  Keeping the
+    normalization at the resolver boundary preserves backward compatibility
+    for older clients while ensuring persisted research plans always contain a
+    concrete profile name.
+    """
+
+    normalized = str(requested or "").strip()
+    return None if not normalized or normalized.casefold() == "auto" else normalized
+
+
 async def resolve_retrieval_profile(
     conn: AsyncConnection,
     *,
@@ -36,6 +49,7 @@ async def resolve_retrieval_profile(
     """
 
     resolved = settings or get_settings()
+    requested = normalize_retrieval_profile_request(requested)
     if not knowledge_base_ids:
         return get_retrieval_profile(requested, resolved, overrides)
 

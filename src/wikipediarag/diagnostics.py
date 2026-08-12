@@ -208,6 +208,14 @@ def build_failure_artifact(
 
 
 def _root_cause(retrieval: RetrievalResult, validation: dict[str, Any]) -> dict[str, Any]:
+    if validation.get("model_output_contract_abstained"):
+        return _cause(
+            code="model_output_contract_abstained",
+            category="generation",
+            severity="warning",
+            message="model output could not satisfy the grounded answer contract",
+            signals={"reason": validation.get("model_output_contract_reason")},
+        )
     claim = _claim_verification_summary(validation)
     if claim.get("blocked"):
         return _cause(

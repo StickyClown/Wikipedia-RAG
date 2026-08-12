@@ -144,6 +144,8 @@ async def admin_create_model_connection(request: Request, payload: ModelConnecti
             driver=payload.driver,
             base_url=base_url,
             endpoint_paths=payload.endpoint_paths,
+            request_adapter=payload.request_adapter,
+            request_defaults=payload.request_defaults,
             safe_headers=payload.safe_headers,
             tls_verify=payload.tls_verify,
             enabled=payload.enabled,
@@ -389,7 +391,10 @@ async def admin_test_model(request: Request, model_id: str) -> dict[str, Any]:
                             paths=connection.get("endpoint_paths") or {},
                             headers=connection.get("_probe_headers") or {},
                             tls_verify=bool(connection.get("tls_verify", True)),
-                        )
+                            request_adapter=connection.get("request_adapter") or {},
+                            request_defaults=connection.get("request_defaults") or {},
+                        ),
+                        max_output_tokens=int((model.get("startup_canary") or {}).get("max_tokens") or 4096),
                     )
                 else:
                     result = await _connection_probe(connection)
@@ -459,6 +464,10 @@ async def admin_export_model_configuration(request: Request) -> Response:
             "tokenizer_contract": row.get("tokenizer_contract") or {},
             "model_defaults": row.get("model_defaults") or {},
             "thinking_capabilities": row.get("thinking_capabilities") or {},
+            "startup_canary": row.get("startup_canary") or {},
+            "connection_id": str(row.get("connection_id")) if row.get("connection_id") else None,
+            "request_adapter": row.get("request_adapter") or {},
+            "request_defaults": row.get("request_defaults") or {},
         }
         for row in models
     ]
@@ -486,9 +495,27 @@ async def admin_save_model_configuration(
     unknown = set(payload.stages) - set(STAGE_BY_KEY)
     if unknown:
         raise HTTPException(status_code=422, detail={"code": "MODEL_STAGE_UNKNOWN", "message": "unknown stage key"})
-    snapshot = {"stages": payload.stages}
     try:
         async with connect() as conn:
+            models = await list_models(conn)
+            connections = await list_connections(conn)
+            snapshot = {
+                "stages": payload.stages,
+                "models": [
+                    {
+                        "alias": row["alias"],
+                        "provider_model": row["provider_model"],
+                        "operation": row["operation"],
+                        "connection_id": str(row["connection_id"]) if row.get("connection_id") else None,
+                        "model_defaults": row.get("model_defaults") or {},
+                        "startup_canary": row.get("startup_canary") or {},
+                        "request_adapter": row.get("request_adapter") or {},
+                        "request_defaults": row.get("request_defaults") or {},
+                    }
+                    for row in models
+                ],
+                "connections": [redact_connection(row) for row in connections],
+            }
             revision = await save_draft(
                 conn,
                 snapshot=snapshot,

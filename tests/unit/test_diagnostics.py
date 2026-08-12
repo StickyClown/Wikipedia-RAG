@@ -119,6 +119,49 @@ def test_answer_artifact_marks_claim_verification_block_as_root_cause() -> None:
     assert artifact["validation"]["claim_verification"]["unsupported_claim_count"] == 1
 
 
+def test_answer_artifact_marks_model_contract_abstention_without_provider_content() -> None:
+    profile = get_retrieval_profile("test_mock", Settings())
+    retrieval = RetrievalResult(
+        query="q",
+        trace_id="trace",
+        evidence=[
+            Evidence(
+                evidence_id="S1",
+                chunk_id="c1",
+                title="Россия",
+                section_path=[],
+                content="секрет",
+                source_url="u1",
+            )
+        ],
+        events=[],
+        answerability=AnswerabilityDecision(status=AnswerabilityStatus.partial, confidence=0.8, reason="partial"),
+    )
+
+    artifact = build_answer_artifact(
+        query_run_id="run",
+        knowledge_base_id="kb",
+        search_plan=_plan(profile),
+        retrieval=retrieval,
+        validation={
+            "valid": True,
+            "model_output_contract_abstained": True,
+            "model_output_contract_reason": "undeclared_citation",
+        },
+        timings_ms={},
+        answer_present=True,
+    )
+
+    assert artifact["root_cause"] == {
+        "version": artifact["root_cause"]["version"],
+        "code": "model_output_contract_abstained",
+        "category": "generation",
+        "severity": "warning",
+        "message": "model output could not satisfy the grounded answer contract",
+        "signals": {"reason": "undeclared_citation"},
+    }
+
+
 def _plan(profile: RetrievalProfile) -> dict[str, Any]:
     return build_search_plan(
         query="q",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import wikipediarag.document_ingestion as document_ingestion
 from wikipediarag.config import Settings
 from wikipediarag.document_ingestion import (
     DocumentMetadata,
@@ -241,6 +242,30 @@ def test_normalized_hash_and_chunk_ids_are_deterministic() -> None:
     assert first_chunks[0].next_chunk_id == first_chunks[1].id
     assert first_chunks[1].prev_chunk_id == first_chunks[0].id
     assert first_chunks[0].metadata["locator"] == {"page": 1, "block_index": 1}
+
+
+def test_chunker_computes_normalized_hash_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    document = _document(" ".join(f"слово{index}" for index in range(2000)))
+    original = document_ingestion.normalized_document_hash
+    calls = 0
+
+    def counted_hash(value: NormalizedDocument) -> str:
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(document_ingestion, "normalized_document_hash", counted_hash)
+
+    chunks = chunks_for_normalized_document(
+        document,
+        document_id="doc:linear",
+        document_version_id="docv:linear",
+        source_url="http://localhost/doc",
+        dimensions=4,
+    )
+
+    assert len(chunks) >= 10
+    assert calls == 1
 
 
 def test_chunker_preserves_uploaded_document_headings_as_sections() -> None:
