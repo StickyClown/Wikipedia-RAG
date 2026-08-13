@@ -19,7 +19,11 @@ from wikipediarag.model_registry import get_model_registry
 from wikipediarag.observability import retrieval_span, safe_error_code, safe_telemetry_payload
 from wikipediarag.query_transforms import bounded_decomposition, bounded_rewrite, normalize_query
 from wikipediarag.reliability import OperationDeadline
-from wikipediarag.repository import fetch_chunks_for_dense_scan, insert_retrieval_event
+from wikipediarag.repository import (
+    fetch_chunks_for_dense_scan,
+    fetch_current_retrieval_chunks,
+    insert_retrieval_event,
+)
 from wikipediarag.retrieval_contract import validate_active_retrieval_contract
 from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profile
 from wikipediarag.schemas import Evidence, RetrievalResult
@@ -198,6 +202,13 @@ async def retrieve(
     ]
     results = await asyncio.gather(*tasks)
     result_sets = {label: candidates for label, candidates, _timing, _model_events in results}
+    result_sets = await _confirm_current_candidates(
+        conn,
+        result_sets,
+        tenant_id=tenant_id,
+        knowledge_base_by_label={label: knowledge_base_id for label in result_sets},
+        search_filters=search_filters,
+    )
     _tag_candidate_sets(result_sets.values(), active_query_context)
     result_sets_snapshot = {label: _snapshot_candidates(candidates) for label, candidates in result_sets.items()}
     model_events = ([shared_embedding_event] if shared_embedding_event else []) + [
@@ -510,6 +521,13 @@ async def retrieve_multi(
             timings_ms[base_key] = max(timings_ms.get(base_key, 0), timing_value)
             if kb_id:
                 timings_ms[f"{timing_key}:{kb_id}"] = timing_value
+    result_sets = await _confirm_current_candidates(
+        conn,
+        result_sets,
+        tenant_id=tenant_id,
+        knowledge_base_by_label={label: label.partition(":")[2] for label in result_sets},
+        search_filters=search_filters,
+    )
     _tag_candidate_sets(result_sets.values(), active_query_context)
     result_sets_snapshot = {label: _snapshot_candidates(candidates) for label, candidates in result_sets.items()}
 
@@ -978,6 +996,51 @@ def _document_access_scope_from_filters(filters: dict[str, Any] | None) -> Docum
         return None
     scope = filters.get("document_access_scope")
     return scope if isinstance(scope, DocumentAccessScope) else None
+
+
+async def _confirm_current_candidates(
+    conn: AsyncConnection,
+    result_sets: dict[str, list[dict[str, Any]]],
+    *,
+    tenant_id: str,
+    knowledge_base_by_label: dict[str, str],
+    search_filters: dict[str, Any] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Keep only candidates that PostgreSQL currently permits us to expose.
+
+    The search index is deliberately useful for recall but cannot make a chunk
+    public.  This confirmation happens before fusion/reranking, so a stale
+    candidate never affects score, provenance, or cache output.
+    """
+    confirmed: dict[str, list[dict[str, Any]]] = {}
+    for label, candidates in result_sets.items():
+        knowledge_base_id = knowledge_base_by_label.get(label, "")
+        rows = await fetch_current_retrieval_chunks(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            chunk_ids=[str(item.get("chunk_id") or "") for item in candidates],
+        )
+        access_scope = _document_access_scope_from_filters(_filters_for_kb(search_filters, knowledge_base_id))
+        safe_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            current = rows.get(str(candidate.get("chunk_id") or ""))
+            if current is None:
+                continue
+            metadata = {**dict(candidate.get("metadata") or {}), **dict(current.get("metadata") or {})}
+            if not is_document_visible(metadata, access_scope):
+                continue
+            safe_candidates.append(
+                {
+                    **candidate,
+                    "knowledge_base_id": knowledge_base_id,
+                    "document_id": str(current.get("document_id") or candidate.get("document_id") or ""),
+                    "document_version_id": current.get("document_version_id") or candidate.get("document_version_id"),
+                    "metadata": metadata,
+                }
+            )
+        confirmed[label] = safe_candidates
+    return confirmed
 
 
 def rrf_fuse(result_sets: dict[str, list[dict[str, Any]]], top_k: int, k: int = 60) -> list[dict[str, Any]]:

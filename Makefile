@@ -4,7 +4,7 @@ TEST ?=
 PROVIDER ?= mock
 EVAL_COUNT ?= 150
 
-.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e smoke eval eval-smoke eval-generate eval-full eval-document-prepare eval-document-ingest eval-document-run eval-document-status check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload reliability-smoke verify-document-corpus verify-cross-tenant-hardening deep-research-smoke deep-research-hard-smoke deep-research-hard-gate deep-research-matrix deep-research-tool-matrix
+.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e test-functional-retrieval test-functional-ui test-functional-reliability test-functional-model-runtime test-architecture functional-up smoke eval eval-smoke eval-generate eval-full eval-document-prepare eval-document-ingest eval-document-run eval-document-status check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload reliability-smoke verify-document-corpus verify-cross-tenant-hardening deep-research-smoke deep-research-hard-smoke deep-research-hard-gate deep-research-matrix deep-research-tool-matrix
 
 bootstrap:
 	uv sync --all-groups
@@ -41,6 +41,25 @@ test-integration:
 
 test-e2e:
 	uv run pytest tests/e2e $(if $(TEST),-k $(TEST),)
+
+# Local preparation only: it never stops containers or removes user volumes.
+functional-up:
+	MODEL_PROVIDER=mock RETRIEVAL_PROFILE=upload_mock DOCUMENT_PARSER_SERVICES_REQUIRED=true docker compose up -d --build postgres redis minio opensearch mock-provider model-gateway metadata-service xberg docling api worker
+
+test-functional-retrieval: functional-up
+	WIKIPEDIARAG_REQUIRE_FUNCTIONAL=1 MODEL_PROVIDER=mock RETRIEVAL_PROFILE=upload_mock uv run pytest tests/functional/test_retrieval_business_path.py -q
+
+test-functional-ui: functional-up
+	cd services/ui && WIKIPEDIARAG_REQUIRE_LIVE_E2E=1 WIKIPEDIARAG_E2E_ALLOW_DEV_DEFAULTS=1 pnpm playwright test --workers=1 playwright/ui-upload-search.spec.ts playwright/ui-chat-debug.spec.ts
+
+test-functional-reliability: functional-up
+	WIKIPEDIARAG_REQUIRE_FUNCTIONAL=1 MODEL_PROVIDER=mock RETRIEVAL_PROFILE=upload_mock uv run pytest tests/functional -q
+
+test-functional-model-runtime: functional-up
+	WIKIPEDIARAG_REQUIRE_FUNCTIONAL=1 MODEL_PROVIDER=mock RETRIEVAL_PROFILE=upload_mock uv run pytest tests/functional/test_model_runtime_config_path.py -q
+
+test-architecture:
+	uv run pytest tests/unit/test_architecture_boundaries.py -q
 
 smoke:
 	uv run python -m wikipediarag.cli smoke

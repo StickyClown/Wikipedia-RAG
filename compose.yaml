@@ -165,6 +165,7 @@ services:
     command: python -m wikipediarag.gateway_app
     environment:
       MODEL_PROVIDER: ${MODEL_PROVIDER:-mock}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://rag:change-me-local-only@postgres:5432/rag}
       MODEL_GATEWAY_STARTUP_SMOKE: ${MODEL_GATEWAY_STARTUP_SMOKE:-warn}
       RETRIEVAL_PROFILE: ${RETRIEVAL_PROFILE:-test_mock}
       MODELS_CONFIG_PATH: ${MODELS_CONFIG_PATH:-/app/config/models.yaml}
@@ -178,7 +179,10 @@ services:
     ports:
       - "8081:8080"
     depends_on:
-      - mock-provider
+      postgres:
+        condition: service_healthy
+      mock-provider:
+        condition: service_started
 
   api:
     build:

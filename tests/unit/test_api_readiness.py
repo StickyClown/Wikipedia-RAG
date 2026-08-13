@@ -72,12 +72,25 @@ class _FakeGatewayClient:
         )
 
 
+async def _projection_health(_conn: object) -> dict[str, object]:
+    return {
+        "pending": 0,
+        "oldest_age_seconds": 0,
+        "last_error_code": None,
+        "reconciliation_pending": 0,
+        "reconciliation_degraded": 0,
+        "reconciliation_oldest_age_seconds": 0,
+        "reconciliation_error_code": None,
+    }
+
+
 @pytest.mark.asyncio
 async def test_api_ready_reports_model_gateway_failed_when_gateway_ready_is_degraded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(api_app, "get_settings", lambda: Settings(model_gateway_url="http://gateway.test"))
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnection())
+    monkeypatch.setattr(api_app, "search_projection_health", _projection_health)
     monkeypatch.setattr(httpx, "AsyncClient", _FakeGatewayClient)
 
     payload: dict[str, Any] = await api_app.ready()
@@ -95,6 +108,7 @@ async def test_api_ready_requires_fresh_research_and_background_lanes(monkeypatc
     connection = _FakeConnection(worker_ready=False)
     monkeypatch.setattr(api_app, "get_settings", lambda: Settings(model_gateway_url="http://gateway.test"))
     monkeypatch.setattr(api_app, "connect", lambda: connection)
+    monkeypatch.setattr(api_app, "search_projection_health", _projection_health)
     monkeypatch.setattr(httpx, "AsyncClient", _FakeGatewayClient)
 
     payload: dict[str, Any] = await api_app.ready()

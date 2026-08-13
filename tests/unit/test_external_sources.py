@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from fastapi import UploadFile
+from opensearchpy import NotFoundError
 from starlette.requests import Request
 
 import wikipediarag.api.handlers as api_app
@@ -152,6 +153,25 @@ def test_opensearch_delete_by_document_version_is_tenant_and_kb_scoped(monkeypat
     assert {"term": {"document_version_id": "docv:old"}} in filters
 
 
+def test_opensearch_delete_by_document_version_accepts_missing_derived_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Client:
+        def delete_by_query(self, **_kwargs: Any) -> dict[str, int]:
+            raise NotFoundError(404, "missing index", {})
+
+    monkeypatch.setattr("wikipediarag.search_index.get_client", lambda _settings: Client())
+
+    assert (
+        delete_document_version_chunks(
+            tenant_id="tenant",
+            knowledge_base_id="kb",
+            document_version_id="docv:first",
+        )
+        == 0
+    )
+
+
 @pytest.mark.asyncio
 async def test_local_folder_connector_reports_changes_and_full_sync_tombstones(tmp_path: Any) -> None:
     root = tmp_path / "docs"
@@ -267,15 +287,11 @@ async def test_patch_source_access_applies_default_to_existing_documents(monkeyp
     async def update_db(*_args: object, **kwargs: Any) -> None:
         calls.append(("document_access", kwargs))
 
-    async def get_kb(*_args: object) -> dict[str, str]:
-        return {"active_index": "read-kb"}
+    async def enqueue(*_args: object, **kwargs: Any) -> None:
+        calls.append(("projection", kwargs))
 
     async def audit(*_args: object, **kwargs: Any) -> None:
         calls.append(("audit", kwargs))
-
-    def update_os(**kwargs: Any) -> int:
-        calls.append(("opensearch", kwargs))
-        return 1
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
@@ -284,9 +300,8 @@ async def test_patch_source_access_applies_default_to_existing_documents(monkeyp
     monkeypatch.setattr(api_app, "update_knowledge_source_document_access_default", update_default)
     monkeypatch.setattr(api_app, "list_source_active_document_refs", list_refs)
     monkeypatch.setattr(api_app, "update_document_access_metadata", update_db)
-    monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
+    monkeypatch.setattr(api_app, "enqueue_document_access_projection", enqueue)
     monkeypatch.setattr(api_app, "_audit", audit)
-    monkeypatch.setattr(api_app, "update_document_access", update_os)
 
     response = await api_app.patch_source_access(
         "33333333-3333-4333-8333-333333333333",
@@ -298,7 +313,7 @@ async def test_patch_source_access_applies_default_to_existing_documents(monkeyp
     assert response.updated_documents == 2
     assert response.document_access_default == {"policy": "tenant", "user_ids": [], "group_ids": []}
     assert [name for name, _payload in calls].count("document_access") == 2
-    assert [name for name, _payload in calls].count("opensearch") == 2
+    assert [name for name, _payload in calls].count("projection") == 2
     assert all(payload.get("origin") == "source_default" for name, payload in calls if name == "document_access")
 
 

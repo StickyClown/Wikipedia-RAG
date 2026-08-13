@@ -33,10 +33,24 @@ goal from [docs/STATUS.md](docs/STATUS.md).
 5. Review the diff for security, tenancy, errors, migrations, observability and accidental scope growth.
 6. Update [docs/STATUS.md](docs/STATUS.md) when the task changes project state.
 7. Do not claim a command passed unless it was run and exited successfully.
+8. For architecture and refactoring work, trace each critical decision as
+   `code → contract → owner → boundary → executable invariant`.
+   Cite executable code and its verification; label unproven ownership or
+   enforcement as `UNCLEAR` or `NOT ENFORCED`. Documentation never substitutes
+   for code evidence.
 
 Use stable Make targets when available. If `make` is unavailable, run the
 equivalent `uv`, `pnpm` or `docker compose` commands and record the exact
 commands and exit codes.
+
+## Выбор проверки по изменённому договору
+
+- Поиск: проверка текущего поведения, HTTP-путь и экран, если функция видна пользователю.
+- Загрузка: загрузка → работник → публикация → поиск.
+- Доступ: разрешённый и запрещённый путь через открытую границу.
+- Шлюз или настройки модели: предметная операция → настоящий шлюз → имитационный поставщик → наблюдаемая фактическая конфигурация.
+- Только отображение: проверка типов, сборка и выбранный путь Playwright.
+- Не запускать несвязанные длительные проверки без анализа зависимостей.
 
 ## Safety Rules
 

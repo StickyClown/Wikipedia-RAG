@@ -283,6 +283,11 @@ async def test_gateway_warn_mode_starts_degraded_when_openrouter_smoke_fails(
     monkeypatch.setattr(gateway_app, "get_settings", lambda: _settings(startup_smoke="warn"))
     monkeypatch.setattr(gateway_app, "_openrouter_startup_smoke", fail_smoke)
 
+    async def legacy_control_plane(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(gateway_app, "_active_control_plane_readiness", legacy_control_plane)
+
     await gateway_app.startup_smoke()
 
     assert await gateway_app.health() == {"status": "ok"}
@@ -372,6 +377,48 @@ async def test_gateway_ready_exposes_recent_runtime_alias_failure_until_recovery
 
 
 @pytest.mark.asyncio
+async def test_gateway_ready_marks_an_active_incomplete_revision_unready(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def incomplete_control_plane(*_args: object) -> bool:
+        return False
+
+    monkeypatch.setattr(gateway_app, "_active_control_plane_readiness", incomplete_control_plane)
+
+    ready = await gateway_app.ready()
+
+    assert ready["status"] == "degraded"
+    assert {
+        "component": "model_control_plane",
+        "status": "failed",
+        "reason": "MODEL_REVISION_SNAPSHOT_INCOMPLETE",
+    } in ready["checks"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_alias_does_not_fall_back_to_yaml_for_incomplete_active_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Connection:
+        async def __aenter__(self) -> _Connection:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    async def active(*_args: object) -> dict[str, object]:
+        return {"id": "revision", "config_hash": "hash", "resolved_snapshot": {"aliases": {}}}
+
+    monkeypatch.setattr(gateway_app, "connect", lambda *_args: _Connection())
+    monkeypatch.setattr(gateway_app, "active_revision", active)
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: Settings())
+
+    with pytest.raises(HTTPException) as exc_info:
+        await gateway_app._resolve_alias_payload({"model": "generator_fast"}, "chat")
+
+    assert exc_info.value.status_code == 503
+    assert cast(dict[str, str], exc_info.value.detail)["code"] == "MODEL_REVISION_SNAPSHOT_INCOMPLETE"
+
+
+@pytest.mark.asyncio
 async def test_gateway_required_mode_preserves_fatal_startup_smoke(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -441,6 +488,12 @@ async def test_gateway_proxy_forwards_alias_provider_preferences(monkeypatch: py
 
     assert payload["model_alias"] == "generator_fast"
     assert payload["provider"] == "openrouter"
+    runtime = payload["_gateway_runtime_config"]
+    assert runtime["resolution_source"] == "yaml_registry"
+    assert runtime["alias"] == "generator_fast"
+    assert runtime["operation"] == "chat"
+    assert runtime["provider_model"] == "qwen/qwen3.5-9b"
+    assert runtime["adapter_hash"]
     assert _RecordingProxyAsyncClient.captured_timeout == Settings().model_provider_timeout_seconds
     assert _RecordingProxyAsyncClient.captured_url == "https://openrouter.ai/api/v1/chat/completions"
     assert cast(dict[str, object], _RecordingProxyAsyncClient.captured_json) == {

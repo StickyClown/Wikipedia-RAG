@@ -161,6 +161,8 @@ type Job = {
 
 type Evidence = {
   evidence_id: string;
+  chunk_id: string;
+  document_id: string;
   title: string;
   section_path: string[];
   content: string;
@@ -219,7 +221,12 @@ type Interpretation = {
   interpretation_id: string;
   label: string;
   answer_markdown: string;
-  claims: Array<{ claim_id: string; text: string; evidence_ids: string[]; type: string }>;
+  claims: Array<{
+    claim_id: string;
+    text: string;
+    evidence_ids: string[];
+    type: string;
+  }>;
   evidence_ids: string[];
 };
 
@@ -1697,7 +1704,9 @@ export function App() {
     }
   }
 
-  const [ambiguityMode, setAmbiguityMode] = useState<"off" | "auto" | "always">("auto");
+  const [ambiguityMode, setAmbiguityMode] = useState<"off" | "auto" | "always">(
+    "auto",
+  );
   const [conversationId, setConversationId] = useState("");
   const [, setSelectedInterpretationId] = useState("");
   const [interpretations, setInterpretations] = useState<Interpretation[]>([]);
@@ -2343,7 +2352,10 @@ export function App() {
     URL.revokeObjectURL(url);
   }
 
-  async function openDocumentViewer(item: SearchResult) {
+  async function openDocumentViewer(
+    item: Pick<SearchResult, "document_id" | "chunk_id">,
+  ) {
+    setActiveTab("search");
     setViewerBusy(true);
     setViewerError("");
     setViewerSearchResults([]);
@@ -4459,16 +4471,26 @@ export function App() {
                   <label className="compact-field">
                     {locale === "ru" ? "Неоднозначность" : "Ambiguity"}
                     <select
-                      aria-label={locale === "ru" ? "Неоднозначность" : "Ambiguity"}
+                      aria-label={
+                        locale === "ru" ? "Неоднозначность" : "Ambiguity"
+                      }
                       value={ambiguityMode}
                       onChange={(event) =>
-                        setAmbiguityMode(event.target.value as "off" | "auto" | "always")
+                        setAmbiguityMode(
+                          event.target.value as "off" | "auto" | "always",
+                        )
                       }
                     >
-                      <option value="off">{locale === "ru" ? "Обычный" : "Normal"}</option>
-                      <option value="auto">{locale === "ru" ? "Авто" : "Auto"}</option>
+                      <option value="off">
+                        {locale === "ru" ? "Обычный" : "Normal"}
+                      </option>
+                      <option value="auto">
+                        {locale === "ru" ? "Авто" : "Auto"}
+                      </option>
                       <option value="always">
-                        {locale === "ru" ? "Показать разные значения" : "Show different meanings"}
+                        {locale === "ru"
+                          ? "Показать разные значения"
+                          : "Show different meanings"}
                       </option>
                     </select>
                   </label>
@@ -4532,27 +4554,46 @@ export function App() {
                   </div>
                   {answerMode === "multiple" && interpretations.length > 0 && (
                     <div className="interpretations">
-                      <h3>{locale === "ru" ? "Возможные значения" : "Possible meanings"}</h3>
+                      <h3>
+                        {locale === "ru"
+                          ? "Возможные значения"
+                          : "Possible meanings"}
+                      </h3>
                       {interpretations.map((interpretation) => (
-                        <article key={interpretation.interpretation_id} className="interpretation-card">
+                        <article
+                          key={interpretation.interpretation_id}
+                          className="interpretation-card"
+                        >
                           <h4>{interpretation.label}</h4>
                           <div className="answer-markdown">
-                            {renderSafeAnswer(interpretation.answer_markdown, evidence)}
+                            {renderSafeAnswer(
+                              interpretation.answer_markdown,
+                              evidence,
+                            )}
                           </div>
                           <button
                             type="button"
                             onClick={() => {
-                              setSelectedInterpretationId(interpretation.interpretation_id);
+                              setSelectedInterpretationId(
+                                interpretation.interpretation_id,
+                              );
                               void submitChat(
-                                { preventDefault: () => undefined } as FormEvent,
                                 {
-                                  question: clarificationQuestion || interpretation.label,
-                                  selectedInterpretationId: interpretation.interpretation_id,
+                                  preventDefault: () => undefined,
+                                } as FormEvent,
+                                {
+                                  question:
+                                    clarificationQuestion ||
+                                    interpretation.label,
+                                  selectedInterpretationId:
+                                    interpretation.interpretation_id,
                                 },
                               );
                             }}
                           >
-                            {locale === "ru" ? "Уточнить это значение" : "Clarify this meaning"}
+                            {locale === "ru"
+                              ? "Уточнить это значение"
+                              : "Clarify this meaning"}
                           </button>
                         </article>
                       ))}
@@ -4575,6 +4616,14 @@ export function App() {
                         </a>
                         <span>{item.section_path.join(" / ")}</span>
                         <p>{item.content}</p>
+                        {item.document_id && item.chunk_id && (
+                          <button
+                            type="button"
+                            onClick={() => void openDocumentViewer(item)}
+                          >
+                            Open document
+                          </button>
+                        )}
                       </article>
                     ))}
                   </div>
@@ -4744,7 +4793,9 @@ function sseFailureMessage(payload: SsePayload, translate: Translate): string {
   };
   if (typeof code === "string" && messages[code]) {
     const retryNote =
-      code === "MODEL_OUTPUT_TRUNCATED" && typeof attempts === "number" && attempts > 1
+      code === "MODEL_OUTPUT_TRUNCATED" &&
+      typeof attempts === "number" &&
+      attempts > 1
         ? `; выполнен ограниченный повтор (${attempts} попытки)`
         : "";
     return `${messages[code]}${retryNote} (${translate("error_code")}: ${code})`;

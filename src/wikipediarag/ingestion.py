@@ -6,7 +6,6 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -26,6 +25,7 @@ from wikipediarag.document_ingestion import (
     validate_upload_bytes,
 )
 from wikipediarag.ids import scoped_id, stable_hash
+from wikipediarag.import_paths import configured_or_requested_filename, resolve_import_filename
 from wikipediarag.model_client import embeddings
 from wikipediarag.model_registry import get_model_registry
 from wikipediarag.reliability import is_retryable_exception, safe_failure_from_exception
@@ -33,6 +33,8 @@ from wikipediarag.repository import (
     claim_next_ingestion_job_item,
     create_document_deletion_job,
     create_source_document_ingestion_item,
+    enqueue_document_access_projection,
+    enqueue_document_publication_projection,
     finish_knowledge_source_sync,
     get_document_public,
     get_job,
@@ -74,7 +76,6 @@ from wikipediarag.search_index import (
     delete_document_chunks,
     delete_document_version_chunks,
     ensure_index,
-    update_document_access,
 )
 from wikipediarag.source_connectors import ConnectorError, SourceDocument, connector_for_kind
 from wikipediarag.storage import delete_objects, get_bytes, put_bytes, put_text
@@ -104,8 +105,18 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
     config = dict(job["config"])
     tenant_id = str(job["tenant_id"])
     kb_id = str(job["knowledge_base_id"])
-    xml_path = Path(str(config.get("xml_path") or resolved.wiki_xml_path))
-    index_path = Path(str(config.get("index_path") or resolved.wiki_index_path))
+    # Import jobs persist only logical filenames.  Do not revive a legacy raw
+    # path from the job payload: the configured directory is the authority.
+    xml_filename = configured_or_requested_filename(
+        str(config["xml_filename"]) if config.get("xml_filename") else None,
+        resolved.wiki_xml_path,
+    )
+    index_filename = configured_or_requested_filename(
+        str(config["index_filename"]) if config.get("index_filename") else None,
+        resolved.wiki_index_path,
+    )
+    xml_path = resolve_import_filename(resolved.wiki_xml_path.parent, xml_filename)
+    index_path = resolve_import_filename(resolved.wiki_index_path.parent, index_filename)
     snapshot_id = str(config.get("snapshot_id") or resolved.wiki_snapshot_id)
     limit = config.get("limit")
     page_limit = int(limit) if limit is not None else None
@@ -308,10 +319,11 @@ async def process_zim_import(job: dict[str, Any], settings: Settings | None = No
         embed_alias = profile.model_aliases.embed
         embed_model = model_registry.require(embed_alias, "embedding")
         dimensions = int(embed_model.dimensions or profile.embedding_dimensions(resolved.embedding_dimensions))
-        zim_path = resolve_zim_path(
-            Path(str(config.get("zim_dir") or resolved.zim_dir)),
-            str(config.get("zim_filename") or resolved.zim_filename),
-            str(config["zim_path"]) if config.get("zim_path") else None,
+        configured_filename = str(config.get("zim_filename") or resolved.zim_filename)
+        zim_path = (
+            resolve_import_filename(resolved.zim_dir, configured_filename)
+            if configured_filename
+            else resolve_zim_path(resolved.zim_dir)
         )
         limit = config.get("limit")
         page_limit = int(limit) if limit is not None else 10000
@@ -1024,22 +1036,8 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
         async with connect() as conn:
             for chunk in staged_chunks:
                 await upsert_chunk(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, chunk=chunk)
-        published_chunks = _with_publication_status(embedded_chunks, "published")
-        indexed = await asyncio.to_thread(
-            bulk_index_chunks,
-            published_chunks,
-            tenant_id=tenant_id,
-            knowledge_base_id=kb_id,
-            settings=settings,
-            write_alias=str(target["write_alias"]),
-            physical_index=str(target["physical_index"]),
-            read_alias=str(target["read_alias"]),
-            dimensions=int(target["embedding_dimensions"]),
-        )
-        if indexed != len(embedded_chunks):
-            raise RuntimeError("indexed chunk count did not match staged chunk count")
-
         stage = "published"
+        published_chunks = _with_publication_status(embedded_chunks, "published")
         async with connect() as conn:
             for chunk in published_chunks:
                 await upsert_chunk(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, chunk=chunk)
@@ -1052,6 +1050,14 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
                 chunks=published_chunks,
             )
             await update_document_version(conn, document_version_id, status="published")
+            await enqueue_document_publication_projection(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=document_id,
+                document_version_id=document_version_id,
+                chunks=published_chunks,
+            )
             await update_ingestion_job_item(
                 conn,
                 item_id,
@@ -1062,7 +1068,7 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
                     "parser_route": normalized.parser_route,
                     **parser_runtime_progress,
                     "chunks_staged": len(embedded_chunks),
-                    "chunks_published": indexed,
+                    "chunks_published": len(published_chunks),
                 },
             )
         await _save_document_upload_job_progress(job_id, stage)
@@ -1654,18 +1660,14 @@ async def _ingest_source_document(
                 document_access=document_access,
                 origin=document_access_origin,
             )
-            kb = await get_knowledge_base(conn, tenant_id, kb_id)
-            read_alias = str((kb or {}).get("active_index") or READ_ALIAS)
-        await asyncio.to_thread(
-            update_document_access,
-            tenant_id=tenant_id,
-            knowledge_base_id=kb_id,
-            document_id=str(existing["document_id"]),
-            document_access=document_access,
-            origin=document_access_origin,
-            settings=settings,
-            read_alias=read_alias,
-        )
+            await enqueue_document_access_projection(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=str(existing["document_id"]),
+                document_access=document_access,
+                origin=document_access_origin,
+            )
         return "documents_skipped"
 
     object_key = (

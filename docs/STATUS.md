@@ -1,6 +1,153 @@
 # Project Status
 
-Last updated: 2026-08-12
+Last updated: 2026-08-13
+
+## MODEL-002/003, AUTH-004, DR-003 security closure (2026-08-13)
+
+`MODEL-002` remains closed for the current provider-driver set: runtime imports
+are guarded by `tests/unit/test_architecture_boundaries.py`; a new provider SDK
+must extend that allowlist in the same change. `MODEL-003` now has direct
+regression evidence that an incomplete active revision degrades Gateway
+readiness and rejects alias calls with `MODEL_REVISION_SNAPSHOT_INCOMPLETE`,
+without falling back to YAML. The local mock functional path still confirms the
+active revision/hash for chat, embeddings and rerank.
+
+AUTH-004 now has a fail-closed route inventory for every public API handler.
+Search authorizes client `source_id`, `document_id` and `knowledge_base_id`
+filters before retrieval and rejects group/object-prefix authority filters with
+`AUTHORITY_FILTER_FORBIDDEN`. XML, index and ZIM import fields retain their
+public names but accept only existing basenames below operator-owned roots;
+invalid names return `IMPORT_FILE_NAME_INVALID`, and worker import resolution
+repeats that containment check.
+
+DR-003 continues to rebuild both research context and public detail from
+currently retrievable, ACL-visible evidence; claims with a revoked linked
+evidence item are omitted. The current focused verification is deterministic
+unit plus PostgreSQL persistence coverage.
+
+**Closure state:** MODEL-002 and MODEL-003 are closed within their documented
+boundaries. AUTH-004 and DR-003 are only partially closed: the remaining
+approved proof work is a full authorised/cross-tenant API route matrix and a
+provider-backed ACL-revocation E2E respectively. They are listed explicitly in
+the architecture refactoring queue and are not represented as completed.
+
+Executed evidence for this change:
+
+- focused Ruff — passed;
+- focused Mypy — passed;
+- focused unit suite — 101 passed;
+- `WIKIPEDIARAG_INTEGRATION_DATABASE_URL=... uv run pytest tests/integration/test_deep_research_persistence.py -q` — 1 passed;
+- `WIKIPEDIARAG_FUNCTIONAL_DATABASE_URL=... uv run pytest tests/functional/test_model_runtime_config_path.py -q` — 1 passed.
+
+## AUTH-003 / ING-003 Definition-of-Done evidence closure (2026-08-13)
+
+Добавлен `tests/integration/test_search_projection_reconciliation.py`. Каждый
+тест поднимает отдельную временную PostgreSQL database, применяет миграции
+001–009 и использует уникальный physical index/read/write alias в реальном
+OpenSearch 2.17. Все девять ранее отсутствовавших доказательств выполнены
+детерминированно; production-код и схема после миграции 009 не менялись.
+
+Executed evidence:
+
+- `uv run pytest tests/unit` — 498 passed.
+- `uv run pytest tests/integration` — 19 passed.
+- `uv run pytest tests/integration/test_search_projection_reconciliation.py -q` — 4 passed.
+- `WIKIPEDIARAG_REQUIRE_FUNCTIONAL=1 MODEL_PROVIDER=mock RETRIEVAL_PROFILE=upload_mock uv run pytest tests/functional/test_retrieval_business_path.py -q` — 1 passed.
+- `pnpm playwright test --workers=1 playwright/ui-upload-search.spec.ts` — 3 passed.
+- `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy src tests` — passed.
+
+Functional proof matrix:
+
+| Proof | Before | After | Executed evidence |
+| --- | --- | --- | --- |
+| Missing OpenSearch projection restored | FAIL — deterministic real-service proof absent | PASS | real reconciliation integration test |
+| Extra OpenSearch projection removed | FAIL — deterministic real-service proof absent | PASS | real reconciliation integration test |
+| Second reconciliation has zero projection delta | FAIL — deterministic real-service proof absent | PASS | counted real OpenSearch mutation calls = 0 |
+| No new `document_publication` event | FAIL — deterministic real-service proof absent | PASS | PostgreSQL event count unchanged |
+| Historical scheduling bounded by configured batch | FAIL — deterministic real-service proof absent | PASS | real PostgreSQL batch size assertion |
+| Repeated scheduling converges to zero work | FAIL — deterministic real-service proof absent | PASS | repeated scheduler calls return 0 |
+| Concurrent schedulers cannot duplicate document/generation work | FAIL — deterministic real-service proof absent | PASS | concurrent PostgreSQL connections + unique-row assertion |
+| Lease-loss reclaim converges after a possibly successful mutation | FAIL — deterministic real-service proof absent | PASS | real OpenSearch mutation, expired lease, second worker reclaim |
+| Retention is bounded and preserves non-eligible work/canonical state | FAIL — deterministic real-service proof absent | PASS | bounded PostgreSQL cleanup and canonical snapshot |
+| SAFETY HTTP/API/debug corrupted staged projection | PASS | PASS | functional retrieval gate |
+| SAFETY Search UI corrupted staged projection | PASS | PASS | Playwright Search gate |
+
+## Дополнение от 2026-08-13: точная сверка поисковой проекции
+
+Добавлена миграция `008_search_projection_reconciliation` и ограниченная
+сверка проекции документа. Работник читает допустимые фрагменты только из
+PostgreSQL: документ должен быть активен, фрагмент — опубликован, а его версия
+— текущей, опубликованной и активной. Затем он ограниченно сверяет точный набор
+производных записей OpenSearch, удаляет только явно найденные лишние записи,
+записывает канонические и повторно сравнивает отпечаток. Отпечаток канонизирует
+порядок полей правила доступа, поэтому одинаковые правила не дают ложной ошибки.
+
+Подтверждено на локальном стеке с `MODEL_PROVIDER=mock` и
+`RETRIEVAL_PROFILE=upload_mock`: HTTP-путь загрузки и поиска, сквозная проверка
+снимка фактической настройки модели, а также экранные пути поиска и вопроса с
+открытием источника. После перезапуска контейнеры были явно пересозданы с этими
+переменными: передача переменных только команде браузерной проверки не меняет
+окружение уже работающих служб.
+
+Закрыта историческая часть **AUTH-003 / ING-003**: миграция `009` хранит
+поколение и durable cursor ограниченного discovery, уникальная строка на
+`document_id` не допускает дублирование logical work, а long repair продлевает
+lease условно по owner/state. Потерявший lease worker не делает следующий
+OpenSearch mutation и не завершает строку. Reconciler применяет bounded delta,
+проверяет bulk items и не создаёт новый `document_publication`; завершённые
+projection events удаляются ограниченными пакетами по retention. Backlog
+остаётся наблюдаемым в `/ready`, но не делает service unavailable: PostgreSQL
+confirmation уже сохраняет safety.
+
+Функциональный тест с `MODEL_PROVIDER=mock` вручную оставляет в OpenSearch
+реалистичную запись `published`, одновременно переводя канонический chunk в
+`staged`. Она намеренно попадает в BM25 и dense candidates, но отсутствует в
+public Search, retrieval debug и browser Search. Полная матрица route IDs
+(AUTH-004) и отдельный provider-backed отзыв видимости Deep Research (DR-003)
+остаются незавершёнными сквозными доказательствами; базовые guards уже
+реализованы и отражены в текущем security closure выше.
+
+## Защитные и сквозные проверки перед упрощением договоров
+
+Добавлен набор наблюдаемых проверок D-01—D-09 для подтверждённых повторов без
+объединения их рабочего кода. Для поиска OpenSearch теперь отбирает только
+кандидатов с признаком публикации, а PostgreSQL пакетно подтверждает публикацию,
+активность документа и актуальные правила доступа до объединения результатов и
+перед выдачей из Redis. Изменение документа участвует в отпечатке окна поиска.
+
+Добавлены целевые команды и документ выбора сквозной проверки. Обычный путь
+поиска использует только местный имитационный поставщик. Настройки
+`Settings`, `.env.example`, Compose и YAML-профили намеренно не объединялись.
+
+Следующее исправление AUTH-003 добавило миграцию `007_search_projection_events`.
+PostgreSQL сохраняет изменение доступа и событие обновления OpenSearch в одной
+транзакции; отдельный рабочий путь повторяет это обновление с ограничением
+попыток. `/ready` показывает состояние этой очереди как `search_projection`.
+Чтение всё ещё повторно подтверждает доступ в PostgreSQL, поэтому задержка или
+ошибка OpenSearch может скрыть результат, но не раскрыть документ. Gateway
+получил безопасную метку фактической конфигурации в служебных данных ответа;
+активная конфигурация БД используется для запросов по псевдониму, когда она
+существует, а YAML остаётся начальным каталогом.
+
+Выполнен сквозной сценарий отдельного пользователя с ролью `EDITOR` только в
+первой базе: реальный вход через HTTP не даёт переданному клиентом идентификатору
+второй базы расширить доступ. После прямого ужесточения правила в PostgreSQL
+устаревшие Redis и OpenSearch повторно проверяются и не раскрывают документ.
+
+Публикация теперь сохраняет канонические опубликованные строки и долговечное
+событие `document_publication` в одной транзакции. Работник загружает только эти
+строки, сверяет точный набор и отпечаток фрагментов, идемпотентно заменяет
+проекцию версии и ограниченно повторяет ошибку. Отсутствующая прежняя проекция
+OpenSearch является безопасным пустым состоянием. Историческая сверка теперь
+покрыта реальными PostgreSQL/OpenSearch integration tests с bounded discovery,
+идемпотентным повтором, lease reclaim и retention; отдельный staged-фрагмент
+по-прежнему проверяется существующим functional/UI safety gate.
+
+Для MODEL-003 активная ревизия PostgreSQL хранит неизменяемый снимок псевдонимов;
+Gateway не переходит к YAML при неполном активном снимке. Сквозная проверка
+временно активирует локальную ревизию и подтверждает чат, векторизацию и
+перестановку через `ModelClient → Gateway → mock`, включая идентификатор и хэш
+фактической ревизии. Внешние поставщики и RRNCB не запускались.
 
 ## Universal Model Gateway / RRNCB v3 status
 

@@ -1038,9 +1038,96 @@ ADDITIVE_MIGRATIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "006_model_gateway_request_adapter",
         (
-            "ALTER TABLE model_provider_connections ADD COLUMN IF NOT EXISTS request_adapter jsonb NOT NULL DEFAULT '{}'",
-            "ALTER TABLE model_provider_connections ADD COLUMN IF NOT EXISTS request_defaults jsonb NOT NULL DEFAULT '{}'",
+            "ALTER TABLE model_provider_connections ADD COLUMN IF NOT EXISTS request_adapter "
+            "jsonb NOT NULL DEFAULT '{}'",
+            "ALTER TABLE model_provider_connections ADD COLUMN IF NOT EXISTS request_defaults "
+            "jsonb NOT NULL DEFAULT '{}'",
             "ALTER TABLE model_aliases ADD COLUMN IF NOT EXISTS startup_canary jsonb NOT NULL DEFAULT '{}'",
+        ),
+    ),
+    (
+        "007_search_projection_events",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS search_projection_events (
+              id uuid PRIMARY KEY,
+              tenant_id uuid NOT NULL REFERENCES tenants(id),
+              knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+              document_id text NOT NULL REFERENCES documents(id),
+              event_kind text NOT NULL CHECK (event_kind IN ('document_access','document_publication')),
+              dedupe_key text NOT NULL UNIQUE,
+              payload jsonb NOT NULL DEFAULT '{}',
+              status text NOT NULL DEFAULT 'received' CHECK (status IN ('received','running','completed','failed')),
+              attempts int NOT NULL DEFAULT 0,
+              next_attempt_at timestamptz NOT NULL DEFAULT now(),
+              worker_lease_id text NULL,
+              worker_lease_expires_at timestamptz NULL,
+              error_code text NULL,
+              error_message text NULL,
+              completed_at timestamptz NULL,
+              created_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_search_projection_events_claim "
+            "ON search_projection_events(status, next_attempt_at, worker_lease_expires_at, created_at)",
+            "CREATE INDEX IF NOT EXISTS ix_search_projection_events_tenant "
+            "ON search_projection_events(tenant_id, knowledge_base_id, created_at DESC)",
+        ),
+    ),
+    (
+        "008_search_projection_reconciliation",
+        (
+            "ALTER TABLE search_projection_events DROP CONSTRAINT IF EXISTS search_projection_events_document_id_fkey",
+            "ALTER TABLE search_projection_events ADD CONSTRAINT search_projection_events_document_id_fkey "
+            "FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE",
+            """
+            CREATE TABLE IF NOT EXISTS search_projection_reconciliation (
+              document_id text PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+              tenant_id uuid NOT NULL REFERENCES tenants(id),
+              knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),
+              status text NOT NULL DEFAULT 'due' CHECK (status IN ('due','running','ok','degraded')),
+              attempts int NOT NULL DEFAULT 0,
+              next_check_at timestamptz NOT NULL DEFAULT now(),
+              last_checked_at timestamptz NULL,
+              last_success_at timestamptz NULL,
+              worker_lease_id text NULL,
+              worker_lease_expires_at timestamptz NULL,
+              expected_document_version_id text NULL,
+              expected_projection_hash text NULL,
+              observed_projection_hash text NULL,
+              last_error_code text NULL,
+              created_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS ix_search_projection_reconciliation_claim "
+            "ON search_projection_reconciliation(status, next_check_at, worker_lease_expires_at, updated_at)",
+            "CREATE INDEX IF NOT EXISTS ix_search_projection_reconciliation_scope "
+            "ON search_projection_reconciliation(tenant_id, knowledge_base_id, updated_at DESC)",
+        ),
+    ),
+    (
+        "009_search_projection_historical_reconciliation",
+        (
+            "ALTER TABLE search_projection_reconciliation "
+            "ADD COLUMN IF NOT EXISTS reconciliation_generation integer NOT NULL DEFAULT 1",
+            "ALTER TABLE search_projection_reconciliation "
+            "ADD CONSTRAINT search_projection_reconciliation_generation_check "
+            "CHECK (reconciliation_generation >= 1)",
+            """
+            CREATE TABLE IF NOT EXISTS search_projection_reconciliation_scan_state (
+              generation integer PRIMARY KEY CHECK (generation >= 1),
+              cursor_document_id text NULL,
+              completed_at timestamptz NULL,
+              updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            """
+            INSERT INTO search_projection_reconciliation_scan_state(generation)
+            VALUES (1)
+            ON CONFLICT (generation) DO NOTHING
+            """,
         ),
     ),
 )

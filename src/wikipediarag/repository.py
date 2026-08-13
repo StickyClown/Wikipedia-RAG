@@ -2594,6 +2594,547 @@ async def update_document_access_metadata(
     )
 
 
+async def enqueue_document_access_projection(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_access: dict[str, Any],
+    origin: str | None,
+) -> None:
+    """Durably schedule the derived index update in the same DB transaction.
+
+    PostgreSQL remains the access authority.  The event is intentionally
+    separate from ingestion jobs: it is small, retryable projection work and
+    must not be lost when an HTTP request finishes before OpenSearch responds.
+    """
+    access = normalize_document_access(document_access)
+    payload = {"document_access": access, "origin": origin or ""}
+    dedupe_key = stable_hash(["document_access", tenant_id, knowledge_base_id, document_id, json_dumps(payload)], 64)
+    await conn.execute(
+        text(
+            """
+            INSERT INTO search_projection_events(
+              id, tenant_id, knowledge_base_id, document_id, event_kind, dedupe_key, payload
+            )
+            VALUES (
+              :id, :tenant_id, :knowledge_base_id, :document_id, 'document_access', :dedupe_key,
+              CAST(:payload AS jsonb)
+            )
+            ON CONFLICT (dedupe_key) DO NOTHING
+            """
+        ),
+        {
+            "id": str(new_uuid()),
+            "tenant_id": tenant_id,
+            "knowledge_base_id": knowledge_base_id,
+            "document_id": document_id,
+            "dedupe_key": dedupe_key,
+            "payload": json_dumps(payload),
+        },
+    )
+
+
+async def enqueue_document_publication_projection(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_version_id: str,
+    chunks: list[Chunk],
+) -> None:
+    """Durably request indexing of an already-published DB document version."""
+    chunk_ids = sorted(str(chunk.id) for chunk in chunks)
+    payload = {
+        "document_version_id": document_version_id,
+        "chunk_ids": chunk_ids,
+        "chunk_count": len(chunk_ids),
+        "chunk_set_hash": stable_hash(chunk_ids, 64),
+    }
+    dedupe_key = stable_hash(
+        [
+            "document_publication",
+            tenant_id,
+            knowledge_base_id,
+            document_id,
+            document_version_id,
+            payload["chunk_set_hash"],
+        ],
+        64,
+    )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO search_projection_events(
+              id, tenant_id, knowledge_base_id, document_id, event_kind, dedupe_key, payload
+            )
+            VALUES (
+              :id, :tenant_id, :knowledge_base_id, :document_id, 'document_publication', :dedupe_key,
+              CAST(:payload AS jsonb)
+            )
+            ON CONFLICT (dedupe_key) DO NOTHING
+            """
+        ),
+        {
+            "id": str(new_uuid()),
+            "tenant_id": tenant_id,
+            "knowledge_base_id": knowledge_base_id,
+            "document_id": document_id,
+            "dedupe_key": dedupe_key,
+            "payload": json_dumps(payload),
+        },
+    )
+    await mark_search_projection_reconciliation_due(
+        conn,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        document_id=document_id,
+    )
+    await mark_search_projection_reconciliation_due(
+        conn,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        document_id=document_id,
+        expected_document_version_id=document_version_id,
+        expected_projection_hash=str(payload["chunk_set_hash"]),
+    )
+
+
+async def load_published_document_version_chunks(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    document_version_id: str,
+) -> list[Chunk]:
+    """Load the canonical published projection input; never trust event content."""
+    result = await conn.execute(
+        text(
+            """
+            SELECT id, document_id, page_id, revision_id, title, section_path, content,
+                   parent_chunk_id, prev_chunk_id, next_chunk_id, source_uri, source_url,
+                   content_hash, embedding, metadata
+            FROM chunks
+            WHERE tenant_id = :tenant_id AND knowledge_base_id = :knowledge_base_id
+              AND document_id = :document_id AND document_version_id = :document_version_id
+              AND publication_status = 'published'
+            ORDER BY chunk_ordinal, id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "knowledge_base_id": knowledge_base_id,
+            "document_id": document_id,
+            "document_version_id": document_version_id,
+        },
+    )
+    return [
+        Chunk(
+            id=str(row["id"]),
+            document_id=str(row["document_id"]),
+            page_id=int(row["page_id"] or 0),
+            revision_id=int(row["revision_id"] or 0),
+            title=str(row["title"]),
+            section_path=tuple(row["section_path"] or []),
+            content=str(row["content"]),
+            parent_chunk_id=str(row["parent_chunk_id"]) if row["parent_chunk_id"] else None,
+            prev_chunk_id=str(row["prev_chunk_id"]) if row["prev_chunk_id"] else None,
+            next_chunk_id=str(row["next_chunk_id"]) if row["next_chunk_id"] else None,
+            source_uri=str(row["source_uri"]),
+            source_url=str(row["source_url"]),
+            content_hash=str(row["content_hash"]),
+            embedding=list(row["embedding"] or []),
+            metadata=dict(row["metadata"] or {}),
+        )
+        for row in result.mappings()
+    ]
+
+
+async def load_current_document_projection(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+) -> tuple[str | None, list[Chunk]]:
+    """Load the only projection a reader may eventually observe.
+
+    The current document version and its ACL are read from PostgreSQL at repair
+    time.  A stale OpenSearch document can therefore only be removed or
+    replaced, never treated as an authority.
+    """
+    result = await conn.execute(
+        text(
+            """
+            SELECT d.metadata AS document_metadata, d.lifecycle_state,
+                   c.id, c.document_id, c.page_id, c.revision_id, c.title,
+                   c.section_path, c.content, c.parent_chunk_id, c.prev_chunk_id,
+                   c.next_chunk_id, c.source_uri, c.source_url, c.content_hash,
+                   c.embedding, c.metadata
+            FROM documents AS d
+            LEFT JOIN document_versions AS dv
+              ON dv.id = d.metadata->>'current_version_id'
+             AND dv.document_id = d.id
+             AND dv.tenant_id = d.tenant_id
+             AND dv.knowledge_base_id = d.knowledge_base_id
+             AND dv.status = 'published'
+             AND dv.lifecycle_state = 'active'
+            LEFT JOIN chunks AS c
+              ON c.document_id = d.id
+             AND c.tenant_id = d.tenant_id
+             AND c.knowledge_base_id = d.knowledge_base_id
+             AND c.document_version_id = dv.id
+             AND c.publication_status = 'published'
+            WHERE d.id = :document_id AND d.tenant_id = :tenant_id
+              AND d.knowledge_base_id = :knowledge_base_id
+            ORDER BY c.chunk_ordinal, c.id
+            """
+        ),
+        {"tenant_id": tenant_id, "knowledge_base_id": knowledge_base_id, "document_id": document_id},
+    )
+    rows = [dict(row) for row in result.mappings()]
+    if not rows or str(rows[0].get("lifecycle_state") or "") != "active":
+        return None, []
+    document_metadata = dict(rows[0].get("document_metadata") or {})
+    version_id = str(document_metadata.get("current_version_id") or "") or None
+    chunks: list[Chunk] = []
+    for row in rows:
+        if row.get("id") is None:
+            continue
+        metadata = dict(row.get("metadata") or {})
+        metadata["publication_status"] = "published"
+        if "document_access" in document_metadata:
+            metadata["document_access"] = document_metadata["document_access"]
+        chunks.append(
+            Chunk(
+                id=str(row["id"]),
+                document_id=str(row["document_id"]),
+                page_id=int(row["page_id"] or 0),
+                revision_id=int(row["revision_id"] or 0),
+                title=str(row["title"]),
+                section_path=tuple(row["section_path"] or []),
+                content=str(row["content"]),
+                parent_chunk_id=str(row["parent_chunk_id"]) if row["parent_chunk_id"] else None,
+                prev_chunk_id=str(row["prev_chunk_id"]) if row["prev_chunk_id"] else None,
+                next_chunk_id=str(row["next_chunk_id"]) if row["next_chunk_id"] else None,
+                source_uri=str(row["source_uri"]),
+                source_url=str(row["source_url"]),
+                content_hash=str(row["content_hash"]),
+                embedding=list(row["embedding"] or []),
+                metadata=metadata,
+            )
+        )
+    return version_id, chunks
+
+
+async def claim_next_search_projection_event(
+    conn: AsyncConnection,
+    *,
+    lease_id: str,
+    lease_seconds: int,
+) -> dict[str, Any] | None:
+    result = await conn.execute(
+        text(
+            """
+            WITH candidate AS (
+              SELECT id
+              FROM search_projection_events
+              WHERE (status = 'received' OR (status = 'running' AND worker_lease_expires_at < now()))
+                AND next_attempt_at <= now()
+              ORDER BY created_at
+              LIMIT 1
+              FOR UPDATE SKIP LOCKED
+            )
+            UPDATE search_projection_events AS event
+            SET status = 'running',
+                attempts = event.attempts + 1,
+                worker_lease_id = :lease_id,
+                worker_lease_expires_at = now() + make_interval(secs => :lease_seconds),
+                updated_at = now()
+            FROM candidate
+            WHERE event.id = candidate.id
+            RETURNING event.*
+            """
+        ),
+        {"lease_id": lease_id, "lease_seconds": max(1, int(lease_seconds))},
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
+async def complete_search_projection_event(conn: AsyncConnection, *, event_id: str, lease_id: str) -> None:
+    result = await conn.execute(
+        text(
+            """
+            UPDATE search_projection_events
+            SET status = 'completed', completed_at = now(), worker_lease_id = NULL,
+                worker_lease_expires_at = NULL, error_code = NULL, error_message = NULL, updated_at = now()
+            WHERE id = :id AND status = 'running' AND worker_lease_id = :lease_id
+            """
+        ),
+        {"id": event_id, "lease_id": lease_id},
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("SEARCH_PROJECTION_LEASE_LOST")
+
+
+async def retry_search_projection_event(
+    conn: AsyncConnection,
+    *,
+    event_id: str,
+    lease_id: str,
+    error_code: str,
+    max_attempts: int = 5,
+) -> None:
+    result = await conn.execute(
+        text(
+            """
+            UPDATE search_projection_events
+            SET status = CASE WHEN attempts >= :max_attempts THEN 'failed' ELSE 'received' END,
+                next_attempt_at = now() + make_interval(secs => LEAST(300, 2 ^ LEAST(attempts, 8))),
+                worker_lease_id = NULL, worker_lease_expires_at = NULL,
+                error_code = :error_code, error_message = 'search projection update failed', updated_at = now()
+            WHERE id = :id AND status = 'running' AND worker_lease_id = :lease_id
+            """
+        ),
+        {"id": event_id, "lease_id": lease_id, "error_code": error_code[:96], "max_attempts": max_attempts},
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("SEARCH_PROJECTION_LEASE_LOST")
+
+
+async def claim_due_search_projection_reconciliations(
+    conn: AsyncConnection, *, lease_id: str, lease_seconds: int, batch_size: int
+) -> list[dict[str, Any]]:
+    result = await conn.execute(
+        text(
+            """
+            WITH candidate AS (
+              SELECT document_id FROM search_projection_reconciliation
+              WHERE (status IN ('due','degraded') OR (status='running' AND worker_lease_expires_at < now()))
+                AND next_check_at <= now()
+              ORDER BY next_check_at, updated_at LIMIT :batch_size FOR UPDATE SKIP LOCKED
+            )
+            UPDATE search_projection_reconciliation AS item
+            SET status='running', attempts=item.attempts+1, worker_lease_id=:lease_id,
+                worker_lease_expires_at=now()+make_interval(secs => :lease_seconds),
+                last_checked_at=now(), updated_at=now()
+            FROM candidate WHERE item.document_id=candidate.document_id
+            RETURNING item.*
+            """
+        ),
+        {"lease_id": lease_id, "lease_seconds": max(1, int(lease_seconds)), "batch_size": max(1, int(batch_size))},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def schedule_historical_search_projection_reconciliations(
+    conn: AsyncConnection, *, batch_size: int, generation: int = 1
+) -> int:
+    """Schedule one durable, resumable page of pre-reconciliation documents.
+
+    The scan-state row is a short-lived scheduler claim, not a global worker
+    lock.  The reconciliation table's document primary key is the durable
+    idempotency identity and prevents duplicate logical work.
+    """
+    result = await conn.execute(
+        text(
+            """
+            WITH state AS (
+              SELECT cursor_document_id, completed_at
+              FROM search_projection_reconciliation_scan_state
+              WHERE generation = :generation
+              FOR UPDATE SKIP LOCKED
+            ), candidate AS (
+              SELECT d.id, d.tenant_id, d.knowledge_base_id
+              FROM documents AS d CROSS JOIN state
+              WHERE state.completed_at IS NULL
+                AND (state.cursor_document_id IS NULL OR d.id > state.cursor_document_id)
+                AND NOT EXISTS (
+                  SELECT 1 FROM search_projection_reconciliation AS r
+                  WHERE r.document_id = d.id AND r.reconciliation_generation >= :generation
+                )
+              ORDER BY d.id
+              LIMIT :batch_size
+              FOR UPDATE OF d SKIP LOCKED
+            ), scheduled AS (
+              INSERT INTO search_projection_reconciliation(
+                document_id, tenant_id, knowledge_base_id, status, next_check_at, reconciliation_generation
+              )
+              SELECT id, tenant_id, knowledge_base_id, 'due', now(), :generation FROM candidate
+              ON CONFLICT (document_id) DO UPDATE
+              SET status = CASE WHEN search_projection_reconciliation.reconciliation_generation < :generation
+                                  THEN 'due' ELSE search_projection_reconciliation.status END,
+                  next_check_at = CASE WHEN search_projection_reconciliation.reconciliation_generation < :generation
+                                       THEN now() ELSE search_projection_reconciliation.next_check_at END,
+                  reconciliation_generation = GREATEST(search_projection_reconciliation.reconciliation_generation,
+                                                      :generation),
+                  updated_at = now()
+              RETURNING document_id
+            ), advanced AS (
+              UPDATE search_projection_reconciliation_scan_state AS scan
+              SET cursor_document_id = COALESCE((SELECT max(id) FROM candidate), scan.cursor_document_id),
+                  completed_at = CASE
+                    WHEN scan.completed_at IS NOT NULL THEN scan.completed_at
+                    WHEN NOT EXISTS (SELECT 1 FROM candidate) THEN now()
+                    ELSE NULL END,
+                  updated_at = now()
+              WHERE scan.generation = :generation
+                AND EXISTS (SELECT 1 FROM state)
+              RETURNING scan.generation
+            )
+            SELECT count(*) AS scheduled FROM scheduled
+            """
+        ),
+        {"generation": generation, "batch_size": max(1, int(batch_size))},
+    )
+    return int(result.scalar_one() or 0)
+
+
+async def renew_search_projection_reconciliation_lease(
+    conn: AsyncConnection, *, document_id: str, lease_id: str, lease_seconds: int
+) -> bool:
+    """Extend only the current owner's lease; false is an external fence."""
+    result = await conn.execute(
+        text(
+            """
+            UPDATE search_projection_reconciliation
+            SET worker_lease_expires_at = now() + make_interval(secs => :lease_seconds), updated_at = now()
+            WHERE document_id = :document_id AND status = 'running'
+              AND worker_lease_id = :lease_id AND worker_lease_expires_at >= now()
+            RETURNING document_id
+            """
+        ),
+        {"document_id": document_id, "lease_id": lease_id, "lease_seconds": max(1, int(lease_seconds))},
+    )
+    return result.mappings().first() is not None
+
+
+async def cleanup_completed_search_projection_events(
+    conn: AsyncConnection, *, retention_days: int, batch_size: int
+) -> int:
+    """Bounded, restart-safe retention for obsolete completed projection events."""
+    result = await conn.execute(
+        text(
+            """
+            WITH candidate AS (
+              SELECT id FROM search_projection_events
+              WHERE status = 'completed'
+                AND completed_at < now() - make_interval(days => :retention_days)
+              ORDER BY completed_at, id
+              LIMIT :batch_size
+              FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM search_projection_events AS event
+            USING candidate
+            WHERE event.id = candidate.id
+            RETURNING event.id
+            """
+        ),
+        {"retention_days": max(0, int(retention_days)), "batch_size": max(1, int(batch_size))},
+    )
+    return len(list(result.mappings()))
+
+
+async def finish_search_projection_reconciliation(
+    conn: AsyncConnection,
+    *,
+    document_id: str,
+    lease_id: str,
+    expected_document_version_id: str | None,
+    expected_projection_hash: str,
+    observed_projection_hash: str,
+    interval_seconds: int,
+) -> None:
+    result = await conn.execute(
+        text(
+            """
+            UPDATE search_projection_reconciliation
+            SET status='ok', next_check_at=now()+make_interval(secs => :interval_seconds), last_success_at=now(),
+                worker_lease_id=NULL, worker_lease_expires_at=NULL,
+                expected_document_version_id=:version_id, expected_projection_hash=:expected_hash,
+                observed_projection_hash=:observed_hash, last_error_code=NULL, updated_at=now()
+            WHERE document_id=:document_id AND status='running' AND worker_lease_id=:lease_id
+            """
+        ),
+        {
+            "document_id": document_id,
+            "lease_id": lease_id,
+            "version_id": expected_document_version_id,
+            "expected_hash": expected_projection_hash,
+            "observed_hash": observed_projection_hash,
+            "interval_seconds": max(1, int(interval_seconds)),
+        },
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("SEARCH_PROJECTION_LEASE_LOST")
+
+
+async def fail_search_projection_reconciliation(
+    conn: AsyncConnection, *, document_id: str, lease_id: str, error_code: str, max_attempts: int = 5
+) -> None:
+    result = await conn.execute(
+        text(
+            """
+            UPDATE search_projection_reconciliation
+            SET status=CASE WHEN attempts >= :max_attempts THEN 'degraded' ELSE 'due' END,
+                next_check_at=now()+make_interval(secs => CASE WHEN attempts >= :max_attempts THEN 3600
+                    ELSE LEAST(300, 2 ^ LEAST(attempts, 8)) END), worker_lease_id=NULL,
+                worker_lease_expires_at=NULL, last_error_code=:error_code, updated_at=now()
+            WHERE document_id=:document_id AND status='running' AND worker_lease_id=:lease_id
+            """
+        ),
+        {"document_id": document_id, "lease_id": lease_id, "error_code": error_code[:96], "max_attempts": max_attempts},
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("SEARCH_PROJECTION_LEASE_LOST")
+
+
+async def search_projection_health(conn: AsyncConnection) -> dict[str, Any]:
+    result = await conn.execute(
+        text(
+            """
+            SELECT count(*) FILTER (WHERE status IN ('received','running')) AS pending,
+                   EXTRACT(EPOCH FROM (
+                     now() - min(created_at) FILTER (WHERE status IN ('received','running'))
+                   )) AS oldest_age_seconds,
+                   (array_agg(error_code ORDER BY updated_at DESC)
+                     FILTER (WHERE status = 'failed'))[1] AS last_error_code
+            FROM search_projection_events
+            """
+        )
+    )
+    row = dict(result.mappings().one())
+    reconciliation = await conn.execute(
+        text(
+            """
+            SELECT count(*) FILTER (WHERE status IN ('due','running')) AS pending,
+                   count(*) FILTER (WHERE status='degraded') AS degraded,
+                   EXTRACT(EPOCH FROM (now() - min(next_check_at) FILTER (WHERE status IN ('due','degraded'))))
+                     AS oldest_age_seconds,
+                   (array_agg(last_error_code ORDER BY updated_at DESC)
+                     FILTER (WHERE status='degraded' AND last_error_code IS NOT NULL))[1] AS last_error_code
+            FROM search_projection_reconciliation
+            """
+        )
+    )
+    reconciliation_row = dict(reconciliation.mappings().one())
+    return {
+        "pending": int(row.get("pending") or 0),
+        "oldest_age_seconds": int(float(row.get("oldest_age_seconds") or 0)),
+        "last_error_code": str(row["last_error_code"]) if row.get("last_error_code") else None,
+        "reconciliation_pending": int(reconciliation_row.get("pending") or 0),
+        "reconciliation_degraded": int(reconciliation_row.get("degraded") or 0),
+        "reconciliation_oldest_age_seconds": int(float(reconciliation_row.get("oldest_age_seconds") or 0)),
+        "reconciliation_error_code": (
+            str(reconciliation_row["last_error_code"]) if reconciliation_row.get("last_error_code") else None
+        ),
+    }
+
+
 async def fetch_chunk_by_id(
     conn: AsyncConnection,
     *,
@@ -2628,6 +3169,136 @@ async def fetch_chunk_by_id(
     )
     row = result.mappings().first()
     return dict(row) if row is not None else None
+
+
+async def fetch_current_retrieval_chunks(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    chunk_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Return the currently publishable candidates for a search result set.
+
+    OpenSearch and Redis are candidate/cache layers, not authorization owners.
+    A single PostgreSQL read therefore confirms publication, document lifecycle,
+    and the current document access metadata before a candidate is exposed.
+    """
+    requested = sorted({str(chunk_id) for chunk_id in chunk_ids if str(chunk_id)})
+    if not requested:
+        return {}
+    result = await conn.execute(
+        text(
+            """
+            SELECT c.id AS chunk_id,
+                   c.document_id,
+                   c.document_version_id,
+                   c.metadata AS chunk_metadata,
+                   d.metadata AS document_metadata
+            FROM chunks AS c
+            JOIN documents AS d
+              ON d.id = c.document_id
+             AND d.tenant_id = c.tenant_id
+             AND d.knowledge_base_id = c.knowledge_base_id
+            JOIN document_versions AS dv
+              ON dv.id = c.document_version_id
+             AND dv.document_id = d.id
+             AND dv.tenant_id = d.tenant_id
+             AND dv.knowledge_base_id = d.knowledge_base_id
+            WHERE c.tenant_id = :tenant_id
+              AND c.knowledge_base_id = :knowledge_base_id
+              AND c.id = ANY(CAST(:chunk_ids AS text[]))
+              AND c.publication_status = 'published'
+              AND d.lifecycle_state = 'active'
+              AND c.document_version_id = (d.metadata->>'current_version_id')
+              AND dv.status = 'published'
+              AND dv.lifecycle_state = 'active'
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "knowledge_base_id": knowledge_base_id,
+            "chunk_ids": requested,
+        },
+    )
+    rows: dict[str, dict[str, Any]] = {}
+    for row in result.mappings():
+        item = dict(row)
+        metadata = dict(item.pop("chunk_metadata") or {})
+        # Document ACL is the current authority.  It intentionally overwrites
+        # stale copied metadata from an indexed chunk.
+        document_metadata = dict(item.pop("document_metadata") or {})
+        if "document_access" in document_metadata:
+            metadata["document_access"] = document_metadata["document_access"]
+        rows[str(item["chunk_id"])] = {**item, "metadata": metadata}
+    return rows
+
+
+async def mark_search_projection_reconciliation_due(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    expected_document_version_id: str | None = None,
+    expected_projection_hash: str | None = None,
+) -> None:
+    """Make a derived document projection eligible for bounded repair.
+
+    This runs in the same PostgreSQL transaction as the canonical change.  It
+    never grants access itself; it merely schedules a repair of OpenSearch.
+    """
+    await conn.execute(
+        text(
+            """
+            INSERT INTO search_projection_reconciliation(
+              document_id, tenant_id, knowledge_base_id, status, next_check_at,
+              expected_document_version_id, expected_projection_hash
+            )
+            VALUES (:document_id, :tenant_id, :knowledge_base_id, 'due', now(),
+                    :expected_document_version_id, :expected_projection_hash)
+            ON CONFLICT (document_id) DO UPDATE
+            SET status='due', next_check_at=now(), worker_lease_id=NULL,
+                worker_lease_expires_at=NULL,
+                expected_document_version_id=COALESCE(EXCLUDED.expected_document_version_id,
+                                                       search_projection_reconciliation.expected_document_version_id),
+                expected_projection_hash=COALESCE(EXCLUDED.expected_projection_hash,
+                                                    search_projection_reconciliation.expected_projection_hash),
+                updated_at=now()
+            """
+        ),
+        {
+            "document_id": document_id,
+            "tenant_id": tenant_id,
+            "knowledge_base_id": knowledge_base_id,
+            "expected_document_version_id": expected_document_version_id,
+            "expected_projection_hash": expected_projection_hash,
+        },
+    )
+
+
+async def retrieval_document_scope_marker(
+    conn: AsyncConnection,
+    *,
+    tenant_id: str,
+    knowledge_base_ids: list[str],
+) -> str:
+    """A small cache-version marker that changes when document access changes."""
+    scoped_ids = sorted({str(value) for value in knowledge_base_ids if str(value)})
+    if not scoped_ids:
+        return "none"
+    result = await conn.execute(
+        text(
+            """
+            SELECT COALESCE(MAX(updated_at)::text, 'none') AS marker
+            FROM documents
+            WHERE tenant_id = :tenant_id
+              AND knowledge_base_id = ANY(CAST(:knowledge_base_ids AS uuid[]))
+            """
+        ),
+        {"tenant_id": tenant_id, "knowledge_base_ids": scoped_ids},
+    )
+    return str(result.scalar_one() or "none")
 
 
 async def upsert_document(
@@ -5593,12 +6264,26 @@ async def load_research_detail_records(
             ORDER BY created_at, id
         """,
         "evidence": """
-            SELECT id, question_id, chunk_id, document_id, document_version_id, knowledge_base_id,
-                   evidence_ref, title, source_url, section_path, content_abstract, support_status,
-                   score, evidence_fingerprint, metadata
-            FROM research_evidence_records
-            WHERE tenant_id = :tenant_id AND research_run_id = :run_id
-            ORDER BY created_at, evidence_ref
+            SELECT e.id, e.question_id, e.chunk_id, e.document_id, e.document_version_id, e.knowledge_base_id,
+                   e.evidence_ref, e.title, e.source_url, e.section_path, e.content_abstract, e.support_status,
+                   e.score, e.evidence_fingerprint, e.metadata,
+                   d.metadata AS current_document_metadata,
+                   CASE WHEN d.id IS NOT NULL
+                              AND d.lifecycle_state='active'
+                              AND e.document_version_id=(d.metadata->>'current_version_id')
+                              AND dv.status='published' AND dv.lifecycle_state='active'
+                              AND c.publication_status='published'
+                        THEN true ELSE false END AS current_retrievable
+            FROM research_evidence_records AS e
+            LEFT JOIN documents AS d ON d.id=e.document_id AND d.tenant_id=e.tenant_id
+              AND d.knowledge_base_id=e.knowledge_base_id
+            LEFT JOIN document_versions AS dv ON dv.id=e.document_version_id AND dv.document_id=d.id
+              AND dv.tenant_id=d.tenant_id AND dv.knowledge_base_id=d.knowledge_base_id
+            LEFT JOIN chunks AS c ON c.id=e.chunk_id AND c.document_id=d.id
+              AND c.document_version_id=e.document_version_id AND c.tenant_id=d.tenant_id
+              AND c.knowledge_base_id=d.knowledge_base_id
+            WHERE e.tenant_id = :tenant_id AND e.research_run_id = :run_id
+            ORDER BY e.created_at, e.evidence_ref
         """,
         "claims": """
             SELECT id, question_id, claim_text, support_status, evidence_ids, metadata
@@ -5636,6 +6321,11 @@ async def load_research_detail_records(
     for key, sql in queries.items():
         result = await conn.execute(text(sql), {"tenant_id": tenant_id, "run_id": research_run_id})
         records[key] = [dict(row) for row in result.mappings()]
+    for evidence in records["evidence"]:
+        metadata = dict(evidence.get("metadata") or {})
+        metadata["document_metadata"] = dict(evidence.pop("current_document_metadata") or {})
+        evidence["metadata"] = metadata
+        evidence["current_retrievable"] = bool(evidence.get("current_retrievable"))
     return records
 
 

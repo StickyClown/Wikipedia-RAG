@@ -43,9 +43,19 @@ class ThinkingMode(StrEnum):
 # extensions are configured declaratively by the connection adapter.
 SUPPORTED_PARAMETERS: frozenset[str] = frozenset(
     {
-        "temperature", "top_p", "top_k", "min_p", "frequency_penalty",
-        "presence_penalty", "repetition_penalty", "seed", "stop",
-        "max_output_tokens", "embedding_batch_size", "dimensions", "timeout",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "repetition_penalty",
+        "seed",
+        "stop",
+        "max_output_tokens",
+        "embedding_batch_size",
+        "dimensions",
+        "timeout",
         "thinking",
     }
 )

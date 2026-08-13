@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     worker_background_concurrency: int = 1
     worker_job_lease_seconds: int = 180
     worker_job_heartbeat_seconds: int = 30
+    search_projection_reconcile_interval_seconds: int = 300
+    search_projection_reconcile_batch_size: int = 25
+    search_projection_reconcile_mutation_batch_size: int = 100
+    # OpenSearch defaults to a 10,000-result window.  The repair reads one
+    # extra record to prove a complete exact set, so 9,999 is the largest safe
+    # bounded value without switching to a scroll cursor.
+    search_projection_reconcile_max_chunks_per_document: int = 9_999
+    search_projection_event_retention_days: int = 30
+    search_projection_event_retention_batch_size: int = 100
+    search_projection_ready_max_age_seconds: int = 600
     models_config_path: Path = Path("config/models.yaml")
     retrieval_config_path: Path = Path("config/retrieval.yaml")
     retrieval_profile: str = "test_mock"

@@ -100,6 +100,11 @@ text fields, embedding, source URL and metadata.
 OpenSearch is not authoritative. Worker publication writes chunks to
 PostgreSQL, bulk indexes published chunks into OpenSearch, validates count, then
 updates DB chunks/version to published. Deletion removes derived OpenSearch
+
+Before a result is returned, PostgreSQL batch-confirms each OpenSearch or Redis
+candidate as published, attached to an active document, and visible under the
+current document access policy. A stale derived record can therefore cause a
+false absence but must not reveal a document.
 chunks by `tenant_id + knowledge_base_id + document_id`.
 
 Retrieval applies server-owned tenant and KB filters for BM25 and dense search.

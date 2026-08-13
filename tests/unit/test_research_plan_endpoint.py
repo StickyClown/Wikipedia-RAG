@@ -149,9 +149,18 @@ async def test_delete_empty_knowledge_base_removes_its_grants_first(
         for index, statement in enumerate(connection.statements)
         if "DELETE FROM knowledge_base_grants" in statement
     )
+    projection_delete = next(
+        index
+        for index, statement in enumerate(connection.statements)
+        if "DELETE FROM search_projection_events" in statement
+    )
+    document_delete = next(
+        index for index, statement in enumerate(connection.statements) if "DELETE FROM documents" in statement
+    )
     kb_delete = next(
         index for index, statement in enumerate(connection.statements) if "DELETE FROM knowledge_bases" in statement
     )
+    assert projection_delete < document_delete
     assert grant_delete < kb_delete
 
 

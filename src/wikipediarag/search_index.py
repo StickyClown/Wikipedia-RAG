@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import Any, cast
 
-from opensearchpy import OpenSearch
+from opensearchpy import NotFoundError, OpenSearch
 from opensearchpy.helpers import bulk
 
 from wikipediarag.config import Settings, get_settings
@@ -124,6 +125,7 @@ def bulk_index_chunks(
     dimensions: int | None = None,
     physical_index: str = PHYSICAL_INDEX,
     read_alias: str = READ_ALIAS,
+    refresh: bool | str = False,
 ) -> int:
     resolved = settings or get_settings()
     ensure_index(
@@ -173,8 +175,7 @@ def bulk_index_chunks(
     ]
     if not actions:
         return 0
-    indexed, _ = bulk(client, actions, refresh=True)
-    return int(indexed)
+    return _apply_projection_bulk(client, actions, refresh=refresh)
 
 
 def bm25_search(
@@ -192,6 +193,10 @@ def bm25_search(
     filter_clauses = [
         {"term": {"tenant_id": tenant_id}},
         {"term": {"knowledge_base_id": knowledge_base_id}},
+        # OpenSearch is a derived candidate index.  Publication in PostgreSQL is
+        # authoritative, but this cheap predicate keeps staged rows out of the
+        # normal first-stage result set as well.
+        {"term": {"metadata.publication_status.keyword": "published"}},
         *_public_filter_clauses(filters or {}),
     ]
     response = client.search(
@@ -232,6 +237,7 @@ def dense_search(
     filter_clauses = [
         {"term": {"tenant_id": tenant_id}},
         {"term": {"knowledge_base_id": knowledge_base_id}},
+        {"term": {"metadata.publication_status.keyword": "published"}},
         *_public_filter_clauses(filters or {}),
     ]
     response = client.search(
@@ -260,22 +266,25 @@ def delete_document_chunks(
 ) -> int:
     resolved = settings or get_settings()
     client = get_client(resolved)
-    response = client.delete_by_query(
-        index=read_alias,
-        body={
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"tenant_id": tenant_id}},
-                        {"term": {"knowledge_base_id": knowledge_base_id}},
-                        {"term": {"document_id": document_id}},
-                    ]
+    try:
+        response = client.delete_by_query(
+            index=read_alias,
+            body={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"tenant_id": tenant_id}},
+                            {"term": {"knowledge_base_id": knowledge_base_id}},
+                            {"term": {"document_id": document_id}},
+                        ]
+                    }
                 }
-            }
-        },
-        conflicts="proceed",
-        refresh=True,
-    )
+            },
+            conflicts="proceed",
+            refresh=True,
+        )
+    except NotFoundError:
+        return 0
     return int(response.get("deleted") or 0)
 
 
@@ -289,23 +298,137 @@ def delete_document_version_chunks(
 ) -> int:
     resolved = settings or get_settings()
     client = get_client(resolved)
-    response = client.delete_by_query(
-        index=read_alias,
-        body={
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"tenant_id": tenant_id}},
-                        {"term": {"knowledge_base_id": knowledge_base_id}},
-                        {"term": {"document_version_id": document_version_id}},
-                    ]
+    try:
+        response = client.delete_by_query(
+            index=read_alias,
+            body={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"tenant_id": tenant_id}},
+                            {"term": {"knowledge_base_id": knowledge_base_id}},
+                            {"term": {"document_version_id": document_version_id}},
+                        ]
+                    }
                 }
-            }
-        },
-        conflicts="proceed",
-        refresh=True,
-    )
+            },
+            conflicts="proceed",
+            refresh=True,
+        )
+    except NotFoundError:
+        # A first projection has no previous per-version document to remove.
+        # Treat the missing derived index as an idempotent empty projection.
+        return 0
     return int(response.get("deleted") or 0)
+
+
+def read_document_projection(
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    document_id: str,
+    limit: int,
+    settings: Settings | None = None,
+    read_alias: str = READ_ALIAS,
+) -> list[dict[str, Any]]:
+    """Read a bounded, exact derived projection for one document.
+
+    The caller supplies the document identity from PostgreSQL.  This helper is
+    intentionally not a general discovery API and returns no more than the
+    configured safety bound.
+    """
+    try:
+        response = get_client(settings or get_settings()).search(
+            index=read_alias,
+            body={
+                "size": max(1, int(limit)),
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"tenant_id": tenant_id}},
+                            {"term": {"knowledge_base_id": knowledge_base_id}},
+                            {"term": {"document_id": document_id}},
+                        ]
+                    }
+                },
+                "_source": [
+                    "chunk_id",
+                    "document_version_id",
+                    "content_hash",
+                    "metadata.document_access",
+                    "metadata.publication_status",
+                ],
+            },
+        )
+    except NotFoundError:
+        return []
+    return [dict(hit) for hit in response.get("hits", {}).get("hits", [])]
+
+
+def delete_exact_projection_documents(
+    *,
+    document_ids: Iterable[str],
+    settings: Settings | None = None,
+    read_alias: str = READ_ALIAS,
+    refresh: bool | str = False,
+) -> int:
+    """Delete only explicitly observed OpenSearch document identifiers."""
+    identifiers = sorted({str(value) for value in document_ids if str(value)})
+    if not identifiers:
+        return 0
+    client = get_client(settings or get_settings())
+    actions = [{"_op_type": "delete", "_index": read_alias, "_id": identifier} for identifier in identifiers]
+    return _apply_projection_bulk(client, actions, refresh=refresh)
+
+
+def _apply_projection_bulk(client: OpenSearch, actions: list[dict[str, Any]], *, refresh: bool | str) -> int:
+    """Apply a bounded projection mutation and inspect every bulk outcome.
+
+    ``helpers.bulk`` returns HTTP-successful item failures separately.  Treating
+    those as success would make a reconciliation complete while the derived
+    projection remains divergent, so failures are surfaced to the durable,
+    bounded event retry policy.
+    """
+    succeeded, errors = bulk(
+        client,
+        actions,
+        refresh=refresh,
+        raise_on_error=False,
+        raise_on_exception=False,
+        stats_only=False,
+    )
+    if errors:
+        statuses: list[str] = []
+        for error in errors:
+            operation: dict[str, Any] = next(iter(error.values()), {}) if isinstance(error, dict) else {}
+            statuses.append(str(operation.get("status") or "unknown"))
+        raise RuntimeError(f"SEARCH_PROJECTION_BULK_ITEM_FAILED:{','.join(sorted(set(statuses))[:4])}")
+    if int(succeeded) != len(actions):
+        raise RuntimeError("SEARCH_PROJECTION_BULK_COUNT_MISMATCH")
+    return int(succeeded)
+
+
+def projection_fingerprint(records: Iterable[dict[str, Any]]) -> str:
+    """Return a safe stable fingerprint without retaining document content."""
+    normalized = []
+    for record in records:
+        source = record.get("_source", record)
+        metadata = source.get("metadata") or {}
+        normalized.append(
+            [
+                str(source.get("chunk_id") or ""),
+                str(source.get("document_version_id") or ""),
+                str(source.get("content_hash") or metadata.get("content_hash") or ""),
+                str(metadata.get("publication_status") or ""),
+                json.dumps(
+                    metadata.get("document_access") or {},
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            ]
+        )
+    return stable_hash(sorted(normalized), 64)
 
 
 def update_document_access(

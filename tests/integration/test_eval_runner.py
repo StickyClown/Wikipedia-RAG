@@ -33,6 +33,7 @@ class FakeEvalClient:
         retrieval_profile: str,
         retrieval_overrides: dict[str, Any],
         mode: str,
+        request_namespace: str = "",
     ) -> dict[str, Any]:
         self.calls += 1
         return {
@@ -109,8 +110,9 @@ class EvidenceOnlyEvalClient(FakeEvalClient):
         retrieval_profile: str,
         retrieval_overrides: dict[str, Any],
         mode: str,
+        request_namespace: str = "",
     ) -> dict[str, Any]:
-        del question, api, retrieval_profile, retrieval_overrides, mode
+        del question, api, retrieval_profile, retrieval_overrides, mode, request_namespace
         self.calls += 1
         return {
             "failed": False,
@@ -156,6 +158,7 @@ class MixedPathEvalClient(FakeEvalClient):
         retrieval_profile: str,
         retrieval_overrides: dict[str, Any],
         mode: str,
+        request_namespace: str = "",
     ) -> dict[str, Any]:
         payload = super().run_chat(
             question,
@@ -163,6 +166,7 @@ class MixedPathEvalClient(FakeEvalClient):
             retrieval_profile=retrieval_profile,
             retrieval_overrides=retrieval_overrides,
             mode=mode,
+            request_namespace=request_namespace,
         )
         retrieval = payload["usage"]["data"]["retrieval"]
         if "harness" in question:
@@ -190,6 +194,7 @@ class FlakyEvalClient(FakeEvalClient):
         retrieval_profile: str,
         retrieval_overrides: dict[str, Any],
         mode: str,
+        request_namespace: str = "",
     ) -> dict[str, Any]:
         if self.calls == 0:
             self.calls += 1
@@ -212,6 +217,7 @@ class FailingWithRetrievalEvalClient(FakeEvalClient):
         retrieval_profile: str,
         retrieval_overrides: dict[str, Any],
         mode: str,
+        request_namespace: str = "",
     ) -> dict[str, Any]:
         del question, api, retrieval_profile, retrieval_overrides, mode
         self.calls += 1
@@ -474,6 +480,7 @@ class BackfillEvalClient(FakeEvalClient):
         retrieval_profile: str,
         retrieval_overrides: dict[str, Any],
         mode: str,
+        request_namespace: str = "",
     ) -> dict[str, Any]:
         del api, retrieval_profile, retrieval_overrides, mode
         with self._lock:

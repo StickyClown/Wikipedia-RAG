@@ -26,6 +26,18 @@ test("[e2e][chat] renders an answer, cited source, and retrieval debugger", asyn
   await expect(
     chatPanel.locator(".sources").getByText(uploadedFixture.marker).first(),
   ).toBeVisible();
+  const source = chatPanel.locator(".sources article").first();
+  const sourceTitle = (await source.locator("a").innerText()).replace(
+    /^\[S\d+\]\s*/,
+    "",
+  );
+  await source
+    .getByRole("button", { name: "Open document", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name: sourceTitle })).toBeVisible();
+  await expect(page.getByText(uploadedFixture.marker).first()).toBeVisible();
+  await page.getByTestId("tab-chat").click();
+  await expect(chatPanel).toBeVisible();
 
   const debugButton = chatPanel.getByRole("button", {
     name: "Debug",

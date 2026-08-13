@@ -537,7 +537,12 @@ async def admin_save_model_configuration(
 
 
 async def _validate_snapshot(conn: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
-    models = {str(row["alias"]): row for row in await list_models(conn)}
+    frozen_aliases = snapshot.get("aliases") or {}
+    models = {
+        str(alias): dict(row)
+        for alias, row in frozen_aliases.items()
+        if isinstance(row, dict) and str(row.get("alias") or alias) == str(alias)
+    }
     failures: list[dict[str, str]] = []
     stages = snapshot.get("stages", {})
     for stage in STAGE_CATALOG:
@@ -548,7 +553,11 @@ async def _validate_snapshot(conn: Any, snapshot: dict[str, Any]) -> dict[str, A
         alias = binding.get("model_alias") or binding.get("alias")
         model = models.get(str(alias))
         if model is None:
-            failures.append({"stage": stage.key, "code": "MODEL_ALIAS_NOT_FOUND"})
+            failures.append({"stage": stage.key, "code": "MODEL_REVISION_SNAPSHOT_INCOMPLETE"})
+            continue
+        required = {"provider", "provider_model", "operation", "connection_id", "request_adapter", "request_defaults"}
+        if not required.issubset(model):
+            failures.append({"stage": stage.key, "code": "MODEL_REVISION_SNAPSHOT_INCOMPLETE"})
             continue
         canary_status = model.get("canary_status") or {}
         if isinstance(canary_status, dict) and canary_status.get("status") == "failed":

@@ -158,6 +158,13 @@ def model_call_metadata(
             if isinstance(value, int) and not isinstance(value, bool)
         }
         metadata["output_budget"].setdefault("retry_count", max(0, attempts - 1))
+    runtime_config = response.get("_gateway_runtime_config")
+    if isinstance(runtime_config, dict):
+        metadata["runtime_config"] = {
+            str(key): value
+            for key, value in runtime_config.items()
+            if isinstance(value, str | int | float | bool) or value is None
+        }
     if safe_error_code:
         metadata["safe_error_code"] = safe_error_code
     reasoning_tokens = _reasoning_tokens(usage)

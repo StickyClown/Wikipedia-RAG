@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import csv
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -150,7 +151,7 @@ def test_eval_api_client_scopes_chat_and_debug_to_knowledge_base(monkeypatch: py
 
 
 def test_eval_chat_idempotency_is_stable_within_a_run_and_isolated_across_runs() -> None:
-    shared = {
+    shared: dict[str, Any] = {
         "question": "Что такое Россия?",
         "retrieval_profile": "upload_sota_mvp",
         "retrieval_overrides": {},
@@ -343,7 +344,7 @@ def test_rrncb_cli_run_emits_safe_terminal_failure_without_traceback(
         raise RRNcBError("provider details must not be printed", safe_code="MODEL_OUTPUT_INVALID")
 
     monkeypatch.setattr(benchmark, "run_rrncb", fail_rrncb)
-    args = SimpleNamespace(
+    args = argparse.Namespace(
         suite="rrncb-unit",
         api="http://api",
         retrieval_profile="upload_sota_mvp",

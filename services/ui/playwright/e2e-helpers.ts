@@ -4,6 +4,7 @@ import {
   type Page,
   type TestInfo,
 } from "@playwright/test";
+import { execFileSync } from "node:child_process";
 import {
   API_BASE_URL,
   apiIsReachable,
@@ -126,16 +127,33 @@ export async function requireAuthenticatedStack(
   request: Parameters<typeof apiIsReachable>[0],
   testInfo: TestInfo,
 ) {
-  testInfo.skip(
-    !(await apiIsReachable(request)),
-    "BLOCKED: API is unavailable; start the local API, worker, storage, search, and model services.",
-  );
-  testInfo.skip(
-    !configuredCredential("username") || !configuredCredential("password"),
-    "BLOCKED: configure WIKIPEDIARAG_UI_TEST_ADMIN_USERNAME and WIKIPEDIARAG_UI_TEST_ADMIN_PASSWORD.",
-  );
+  const requireLive = process.env.WIKIPEDIARAG_REQUIRE_LIVE_E2E === "1";
+  const block = (reason: string) => {
+    if (requireLive) throw new Error(`BLOCKED: ${reason}`);
+    testInfo.skip(true, `BLOCKED: ${reason}`);
+  };
+  if (!(await apiIsReachable(request))) {
+    block(
+      "API is unavailable; start the local API, worker, storage, search, and model services.",
+    );
+  }
+  if (!configuredCredential("username") || !configuredCredential("password")) {
+    block(
+      "configure WIKIPEDIARAG_UI_TEST_ADMIN_USERNAME and WIKIPEDIARAG_UI_TEST_ADMIN_PASSWORD.",
+    );
+  }
   await page.goto("/");
+  const knowledgeBasesLoaded = page.waitForResponse(
+    (response) =>
+      response.request().method() === "GET" &&
+      response.status() === 200 &&
+      response.url().includes("/api/v1/knowledge-bases"),
+  );
   await loginAsConfiguredAdmin(page);
+  // Login starts the asynchronous session refresh.  Do not click a workspace
+  // tab until its KB refresh has settled, otherwise that refresh can select
+  // the default chat tab after the test selected the Knowledge tab.
+  await knowledgeBasesLoaded;
 }
 
 export async function createKnowledgeBase(page: Page, name: string) {
@@ -241,6 +259,83 @@ export async function deleteKnowledgeBase(page: Page, knowledgeBaseId: string) {
   ).toMatchObject({
     ok: true,
   });
+}
+
+export async function corruptUploadedFixturePublication(
+  page: Page,
+  fixture: UploadedFixture,
+) {
+  // Test-only fault injection: PostgreSQL says staged while the already-real
+  // OpenSearch projection keeps its published marker.  No product endpoint is
+  // added for this; the browser must still receive no result.
+  const session = await page
+    .context()
+    .request.get(`${API_BASE_URL}/api/v1/auth/session`);
+  expect(session.ok(), "load browser CSRF token").toBeTruthy();
+  const csrf = ((await session.json()) as { csrf_token?: string }).csrf_token;
+  const search = await page
+    .context()
+    .request.post(`${API_BASE_URL}/api/v1/search`, {
+      data: {
+        query: fixture.marker,
+        knowledge_base_ids: [fixture.id],
+        limit: 10,
+      },
+      headers: csrf ? { "X-CSRF-Token": csrf } : {},
+    });
+  expect(search.ok(), "find test-owned uploaded document").toBeTruthy();
+  const payload = (await search.json()) as {
+    results?: Array<{ document_id?: string }>;
+  };
+  const documentId = payload.results?.[0]?.document_id;
+  expect(documentId, "test-owned uploaded document id").toBeTruthy();
+  execFileSync(
+    "docker",
+    [
+      "compose",
+      "exec",
+      "-T",
+      "postgres",
+      "psql",
+      "-U",
+      "rag",
+      "-d",
+      "rag",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-c",
+      `UPDATE chunks SET publication_status = 'staged' WHERE knowledge_base_id = '${fixture.id}' AND document_id = '${documentId}';`,
+    ],
+    { cwd: "../..", stdio: "pipe" },
+  );
+  const aliases = execFileSync(
+    "docker",
+    [
+      "compose",
+      "exec",
+      "-T",
+      "postgres",
+      "psql",
+      "-U",
+      "rag",
+      "-d",
+      "rag",
+      "-At",
+      "-c",
+      `SELECT active_index FROM knowledge_bases WHERE id = '${fixture.id}';`,
+    ],
+    { cwd: "../..", encoding: "utf8" },
+  ).trim();
+  const refreshed = await fetch(
+    `http://localhost:9200/${encodeURIComponent(aliases)}/_refresh`,
+    {
+      method: "POST",
+    },
+  );
+  expect(
+    refreshed.ok,
+    "refresh deliberately stale OpenSearch fixture",
+  ).toBeTruthy();
 }
 
 function uniqueName(prefix: string) {

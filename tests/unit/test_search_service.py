@@ -11,6 +11,20 @@ from wikipediarag.schemas import Evidence, FilterExpression, SearchFilters, Sear
 from wikipediarag.search_service import _opensearch_filter_payload, run_public_search
 
 
+@pytest.fixture(autouse=True)
+def _search_storage_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep retrieval-shape tests independent of the new authoritative DB read."""
+
+    async def marker(*_args: Any, **_kwargs: Any) -> str:
+        return "test-marker"
+
+    async def confirm(_conn: object, results: list[Any], **_kwargs: Any) -> list[Any]:
+        return results
+
+    monkeypatch.setattr("wikipediarag.search_service.retrieval_document_scope_marker", marker)
+    monkeypatch.setattr("wikipediarag.search_service._confirm_current_search_results", confirm)
+
+
 def _evidence(
     chunk_id: str,
     *,

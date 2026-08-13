@@ -239,7 +239,7 @@ async def test_document_structure_allows_tenant_public_document_without_kb_grant
     assert response.document_access["policy"] == "tenant"
 
 
-async def test_patch_document_access_requires_manager_and_updates_search_metadata(
+async def test_patch_document_access_requires_manager_and_durably_queues_search_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
@@ -257,24 +257,24 @@ async def test_patch_document_access_requires_manager_and_updates_search_metadat
     async def update_db(*_args: object, **kwargs: Any) -> None:
         calls.append(("db", kwargs))
 
-    async def get_kb(*_args: object) -> dict[str, str]:
-        return {"active_index": "read-kb"}
+    async def enqueue(*_args: object, **kwargs: Any) -> None:
+        calls.append(("projection", kwargs))
 
     async def audit(*_args: object, **kwargs: Any) -> None:
         calls.append(("audit", kwargs))
-
-    def update_os(**kwargs: Any) -> int:
-        calls.append(("opensearch", kwargs))
-        return 3
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
     monkeypatch.setattr(api_app, "get_document_public", get_document)
     monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+
+    async def validate_principals(*_args: object, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(api_app, "_validate_document_access_principals", validate_principals)
     monkeypatch.setattr(api_app, "update_document_access_metadata", update_db)
-    monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
+    monkeypatch.setattr(api_app, "enqueue_document_access_projection", enqueue)
     monkeypatch.setattr(api_app, "_audit", audit)
-    monkeypatch.setattr(api_app, "update_document_access", update_os)
 
     response = await api_app.patch_document_access(
         "doc:1",
@@ -285,8 +285,9 @@ async def test_patch_document_access_requires_manager_and_updates_search_metadat
     assert response.document_access == {"policy": "restricted", "user_ids": ["user:1"], "group_ids": ["group:1"]}
     assert calls[0][0] == "role"
     assert calls[1][1]["origin"] == "manual"
-    assert calls[-1][0] == "opensearch"
-    assert calls[-1][1]["read_alias"] == "read-kb"
+    assert calls[-1][0] == "audit"
+    assert calls[-2][0] == "projection"
+    assert calls[-2][1]["origin"] == "manual"
 
 
 async def test_document_context_resolves_section_id_server_side(monkeypatch: pytest.MonkeyPatch) -> None:

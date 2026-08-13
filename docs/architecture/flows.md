@@ -139,6 +139,9 @@ sequenceDiagram
 ```
 
 Publication point: chunks are queryable only after OpenSearch bulk index
+and PostgreSQL publication confirmation. OpenSearch and Redis are candidate
+layers; each returned candidate is batch-confirmed against current PostgreSQL
+publication, lifecycle and document-access state.
 succeeds and DB chunks/version are updated to published. Document sections are
 written from the same published chunk set; failed or cancelled ingestion does
 not publish document navigation state.

@@ -681,6 +681,8 @@ def visible_research_evidence(
 ) -> list[dict[str, Any]]:
     visible: list[dict[str, Any]] = []
     for row in evidence_records:
+        if not bool(row.get("current_retrievable", True)):
+            continue
         metadata = dict(row.get("metadata") or {})
         document_metadata = dict(metadata.get("document_metadata") or {})
         scoped_access: DocumentAccessScope | None = (

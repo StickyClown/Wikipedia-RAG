@@ -14,7 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.ids import stable_hash
-from wikipediarag.repository import get_knowledge_base, load_index_version_by_read_alias
+from wikipediarag.repository import (
+    fetch_current_retrieval_chunks,
+    get_knowledge_base,
+    load_index_version_by_read_alias,
+    retrieval_document_scope_marker,
+)
 from wikipediarag.retrieval import retrieve, retrieve_multi
 from wikipediarag.schemas import (
     Evidence,
@@ -57,11 +62,17 @@ async def run_public_search(
     document_access_scopes: dict[str, DocumentAccessScope] | None = None,
 ) -> SearchResponse:
     resolved = settings or get_settings()
+    document_scope_marker = await retrieval_document_scope_marker(
+        conn,
+        tenant_id=tenant_id,
+        knowledge_base_ids=knowledge_base_ids,
+    )
     fingerprint = _search_fingerprint(
         payload,
         tenant_id=tenant_id,
         knowledge_base_ids=knowledge_base_ids,
         document_access_scopes=document_access_scopes,
+        document_scope_marker=document_scope_marker,
     )
     offset, cursor_fingerprint = _decode_cursor(payload.cursor) if payload.cursor else (payload.offset, None)
     if cursor_fingerprint is not None and cursor_fingerprint != fingerprint:
@@ -83,6 +94,12 @@ async def run_public_search(
     cached_payload = await _redis_get(cache_key, resolved)
     if cached_payload is not None and len(cached_payload.get("results", [])) >= window:
         cached_results = [SearchResult.model_validate(item) for item in cached_payload["results"]]
+        cached_results = await _confirm_current_search_results(
+            conn,
+            cached_results,
+            tenant_id=tenant_id,
+            document_access_scopes=document_access_scopes,
+        )
         page = cached_results[offset : offset + payload.limit + 1]
         has_more = len(page) > payload.limit
         return SearchResponse(
@@ -139,6 +156,12 @@ async def run_public_search(
     search_results = [
         _search_result(item, query=payload.query, include_highlights=payload.include_highlights) for item in filtered
     ]
+    search_results = await _confirm_current_search_results(
+        conn,
+        search_results,
+        tenant_id=tenant_id,
+        document_access_scopes=document_access_scopes,
+    )
     facets = _facets(filtered) if payload.include_facets else []
     await _redis_set(
         cache_key,
@@ -286,6 +309,33 @@ def _matches_document_access(evidence: Evidence, scopes: dict[str, DocumentAcces
     if not scopes:
         return True
     return is_document_visible(dict(evidence.metadata or {}), scopes.get(evidence.knowledge_base_id))
+
+
+async def _confirm_current_search_results(
+    conn: AsyncConnection,
+    results: list[SearchResult],
+    *,
+    tenant_id: str,
+    document_access_scopes: dict[str, DocumentAccessScope] | None,
+) -> list[SearchResult]:
+    """Recheck cache and retrieval output against current publication and ACL state."""
+    by_kb: dict[str, list[SearchResult]] = defaultdict(list)
+    for item in results:
+        by_kb[item.knowledge_base_id].append(item)
+    allowed: list[SearchResult] = []
+    for knowledge_base_id, scoped_results in by_kb.items():
+        rows = await fetch_current_retrieval_chunks(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            chunk_ids=[item.chunk_id for item in scoped_results],
+        )
+        scope = (document_access_scopes or {}).get(knowledge_base_id)
+        for item in scoped_results:
+            row = rows.get(item.chunk_id)
+            if row is not None and is_document_visible(dict(row.get("metadata") or {}), scope):
+                allowed.append(item)
+    return allowed
 
 
 def _matches_expression(evidence: Evidence, expression: FilterExpression) -> bool:
@@ -506,6 +556,7 @@ def _search_fingerprint(
     tenant_id: str,
     knowledge_base_ids: list[str],
     document_access_scopes: dict[str, DocumentAccessScope] | None,
+    document_scope_marker: str = "none",
 ) -> str:
     scope_payload = {
         str(kb_id): {
@@ -520,7 +571,7 @@ def _search_fingerprint(
     scope_hash = stable_hash([json.dumps(scope_payload, sort_keys=True)], 32)
     return stable_hash(
         [
-            "search_cursor_v2",
+            "search_cursor_v3",
             tenant_id,
             *sorted(knowledge_base_ids),
             " ".join(payload.query.split()).casefold(),
@@ -528,6 +579,7 @@ def _search_fingerprint(
             json.dumps([item.model_dump(mode="json") for item in payload.filter_expressions], sort_keys=True),
             payload.ranking_profile or "",
             scope_hash,
+            document_scope_marker,
         ],
         32,
     )

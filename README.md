@@ -149,6 +149,8 @@ make test-integration
 make smoke
 make smoke-models PROVIDER=mock
 make verify-document-upload
+make test-functional-retrieval
+make test-functional-ui
 make verify-document-corpus
 make verify-cross-tenant-hardening
 make deep-research-smoke
@@ -186,6 +188,11 @@ and `WIKIPEDIARAG_UI_TEST_ADMIN_PASSWORD` against the local stack. They create
 and delete their own UUID-named knowledge bases and skip with a `BLOCKED`
 reason when the API or credentials are unavailable.
 
+Focused functional checks prepare only the local services they need and force
+`MODEL_PROVIDER=mock` with `RETRIEVAL_PROFILE=upload_mock`. See
+[docs/functional-verification.md](docs/functional-verification.md) for the
+change-driven selection rule and the business paths each command covers.
+
 Live-runtime local-auth checks do not start Compose and require an already
 running UI/API stack:
 
@@ -213,6 +220,7 @@ the active task or CI policy says otherwise.
 - [docs/architecture/security-and-tenancy.md](docs/architecture/security-and-tenancy.md) - auth, roles, tenancy and access controls.
 - [docs/architecture/search-and-deep-research.md](docs/architecture/search-and-deep-research.md) - backend search, chat retrieval, Extended Search and Deep Research contract.
 - [docs/architecture/deployment-and-operations.md](docs/architecture/deployment-and-operations.md) - local Compose and external deployment requirements.
+- [docs/functional-verification.md](docs/functional-verification.md) - compact matrix of functional checks selected by changed contract.
 - [AGENTS.md](AGENTS.md) - long-lived instructions for coding agents.
 - [docs/exec-plans/35-development-roadmap.md](docs/exec-plans/35-development-roadmap.md) and [docs/exec-plans/36-deep-research-tool-loop.md](docs/exec-plans/36-deep-research-tool-loop.md) - current/recent implementation plans and their measured status.
 - [docs/exec-plans/](docs/exec-plans/) - older implementation plans retained as historical records.

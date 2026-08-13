@@ -18,6 +18,39 @@ def _json(value: Any) -> str:
     return json_dumps(value if value is not None else {})
 
 
+async def _freeze_aliases(conn: AsyncConnection, snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy the executable alias contract into a revision before it is hashed."""
+    frozen = dict(snapshot)
+    aliases: dict[str, dict[str, Any]] = {}
+    result = await conn.execute(
+        text(
+            """
+            SELECT m.alias, m.provider, m.provider_model, m.operation, m.connection_id,
+                   m.input_modalities, m.capabilities, m.context_window_tokens,
+                   m.max_output_tokens, m.dimensions, m.tokenizer_contract,
+                   m.model_defaults, m.thinking_capabilities, m.startup_canary,
+                   c.driver AS connection_driver, c.base_url, c.endpoint_paths,
+                   c.safe_headers, c.tls_verify, c.request_adapter AS connection_request_adapter,
+                   c.request_defaults AS connection_request_defaults
+            FROM model_aliases AS m
+            LEFT JOIN model_provider_connections AS c ON c.id=m.connection_id
+            WHERE m.is_enabled=true AND (m.connection_id IS NULL OR c.enabled=true)
+            ORDER BY m.alias
+            """
+        )
+    )
+    for row in result.mappings():
+        item = dict(row)
+        # The adapter belongs to the connection.  Keep the historical aliases
+        # as well so old consumers can read a revision, but never read a
+        # mutable model_aliases adapter column (it does not exist).
+        item["request_adapter"] = item.get("connection_request_adapter") or {}
+        item["request_defaults"] = item.get("connection_request_defaults") or {}
+        aliases[str(item["alias"])] = item
+    frozen["aliases"] = aliases
+    return frozen
+
+
 async def list_connections(conn: AsyncConnection) -> list[dict[str, Any]]:
     result = await conn.execute(
         text(
@@ -104,8 +137,14 @@ async def patch_connection(
     changes: Mapping[str, Any],
 ) -> dict[str, Any]:
     allowed = {
-        "name", "base_url", "endpoint_paths", "request_adapter", "request_defaults",
-        "safe_headers", "tls_verify", "enabled",
+        "name",
+        "base_url",
+        "endpoint_paths",
+        "request_adapter",
+        "request_defaults",
+        "safe_headers",
+        "tls_verify",
+        "enabled",
     }
     changes = {key: value for key, value in changes.items() if key in allowed}
     if changes.get("enabled") is False:
@@ -310,8 +349,12 @@ async def patch_model(
     assignments: list[str] = []
     params: dict[str, Any] = {"id": model_id, "row_version": row_version}
     json_fields = {
-        "input_modalities", "capabilities", "tokenizer_contract", "model_defaults",
-        "thinking_capabilities", "startup_canary",
+        "input_modalities",
+        "capabilities",
+        "tokenizer_contract",
+        "model_defaults",
+        "thinking_capabilities",
+        "startup_canary",
     }
     for key, value in changes.items():
         if key in json_fields:
@@ -367,7 +410,7 @@ async def save_draft(
     expected_row_version: int | None,
     actor_user_id: str | None,
 ) -> dict[str, Any]:
-    snapshot_dict = dict(snapshot)
+    snapshot_dict = await _freeze_aliases(conn, snapshot)
     digest = config_hash(snapshot_dict)
     if revision_id:
         params = {
@@ -476,6 +519,19 @@ async def activate_revision(conn: AsyncConnection, *, revision_id: str, config_h
     revision = result.mappings().first()
     if revision is None:
         raise RuntimeError("MODEL_VALIDATION_STALE")
+    snapshot = dict(revision.get("resolved_snapshot") or {})
+    aliases = snapshot.get("aliases")
+    stages = snapshot.get("stages") or {}
+    if not isinstance(aliases, dict) or not isinstance(stages, dict):
+        raise RuntimeError("MODEL_REVISION_SNAPSHOT_INCOMPLETE")
+    required = {"provider", "provider_model", "operation", "connection_id", "request_adapter", "request_defaults"}
+    for binding in stages.values():
+        if not isinstance(binding, Mapping):
+            raise RuntimeError("MODEL_REVISION_SNAPSHOT_INCOMPLETE")
+        alias = str(binding.get("model_alias") or binding.get("alias") or "")
+        contract = aliases.get(alias)
+        if not alias or not isinstance(contract, Mapping) or not required.issubset(contract):
+            raise RuntimeError("MODEL_REVISION_SNAPSHOT_INCOMPLETE")
     await conn.execute(
         text("UPDATE model_configuration_revisions SET status='archived', updated_at=now() WHERE status='active'")
     )

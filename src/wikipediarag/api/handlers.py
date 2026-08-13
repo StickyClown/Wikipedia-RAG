@@ -72,6 +72,7 @@ from wikipediarag.document_access import (
 from wikipediarag.document_ingestion import UploadValidationError, safe_upload_filename, sha256_hex
 from wikipediarag.extended import run_extended_search, should_start_extended
 from wikipediarag.ids import stable_hash
+from wikipediarag.import_paths import ImportFileNameError, configured_or_requested_filename, resolve_import_filename
 from wikipediarag.observability import content_policy, safe_error_code, safe_telemetry_payload
 from wikipediarag.oidc_service import complete_oidc_callback, encrypt_server_tokens, oidc_login_enabled, start_oidc_flow
 from wikipediarag.reliability import (
@@ -99,6 +100,7 @@ from wikipediarag.repository import (
     create_source_sync_job,
     create_upload_batch,
     create_upload_session,
+    enqueue_document_access_projection,
     fail_query_run,
     fetch_document_context_chunks,
     get_document_lifecycle,
@@ -132,6 +134,7 @@ from wikipediarag.repository import (
     request_research_pause,
     request_resume,
     search_document_chunks,
+    search_projection_health,
     soft_delete_document,
     update_document_access_metadata,
     update_knowledge_source,
@@ -220,7 +223,7 @@ from wikipediarag.schemas import (
     UserPatch,
     ZimImportRequest,
 )
-from wikipediarag.search_index import READ_ALIAS, delete_document_chunks, update_document_access
+from wikipediarag.search_index import READ_ALIAS, delete_document_chunks
 from wikipediarag.search_service import run_public_search
 from wikipediarag.source_connectors import ConnectorError, connector_for_kind
 from wikipediarag.storage import create_presigned_put_url, delete_objects, head_object, put_bytes
@@ -316,6 +319,15 @@ async def ready() -> dict[str, Any]:
     """Report dependency readiness without exposing dependency internals."""
     settings = get_settings()
     components: dict[str, str] = {}
+    projection_details: dict[str, Any] = {
+        "pending": 0,
+        "oldest_age_seconds": 0,
+        "last_error_code": None,
+        "reconciliation_pending": 0,
+        "reconciliation_degraded": 0,
+        "reconciliation_oldest_age_seconds": 0,
+        "reconciliation_error_code": None,
+    }
     try:
         async with connect() as conn:
             await conn.execute(text("SELECT 1"))
@@ -335,11 +347,30 @@ async def ready() -> dict[str, Any]:
                 ),
                 {"max_age_seconds": max(30, settings.worker_job_heartbeat_seconds * 2)},
             )
+            projection = await search_projection_health(conn)
+            projection_details = {
+                "pending": int(projection.get("pending") or 0),
+                "oldest_age_seconds": int(projection.get("oldest_age_seconds") or 0),
+                "last_error_code": projection.get("last_error_code"),
+                "reconciliation_pending": int(projection.get("reconciliation_pending") or 0),
+                "reconciliation_degraded": int(projection.get("reconciliation_degraded") or 0),
+                "reconciliation_oldest_age_seconds": int(projection.get("reconciliation_oldest_age_seconds") or 0),
+                "reconciliation_error_code": projection.get("reconciliation_error_code"),
+            }
         components["postgres"] = "ok"
         components["worker"] = "ok" if bool(worker.scalar()) else "stale"
+        components["search_projection"] = (
+            "degraded"
+            if (
+                projection.get("last_error_code")
+                or int(projection.get("oldest_age_seconds") or 0) > settings.search_projection_ready_max_age_seconds
+            )
+            else "ok"
+        )
     except Exception:
         components["postgres"] = "failed"
         components["worker"] = "failed"
+        components["search_projection"] = "failed"
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             response = await client.get(f"{settings.model_gateway_url.rstrip('/')}/ready")
@@ -367,7 +398,7 @@ async def ready() -> dict[str, Any]:
     for component, value in await asyncio.gather(*(check_http(name, url) for name, url in checks.items())):
         components[component] = value
     status = "ok" if all(value == "ok" for value in components.values()) else "degraded"
-    return {"status": status, "components": components}
+    return {"status": status, "components": components, "search_projection": projection_details}
 
 
 async def local_login(
@@ -814,7 +845,9 @@ async def create_group(payload: GroupCreate, request: Request) -> dict[str, str]
             },
         )
         if group_type == GroupType.local:
-            await _replace_local_group_members(conn, group_id=group_id, member_user_ids=payload.member_user_ids)
+            await _replace_local_group_members(
+                conn, group_id=group_id, member_user_ids=payload.member_user_ids, tenant_id=tenant_id
+            )
         await _audit(
             conn,
             request=request,
@@ -844,7 +877,9 @@ async def patch_group(group_id: str, payload: GroupPatch, request: Request) -> d
         if payload.member_user_ids is not None:
             if GroupType(group["group_type"]) != GroupType.local:
                 raise HTTPException(status_code=409, detail="OIDC group membership is externally managed")
-            await _replace_local_group_members(conn, group_id=group_id, member_user_ids=payload.member_user_ids)
+            await _replace_local_group_members(
+                conn, group_id=group_id, member_user_ids=payload.member_user_ids, tenant_id=tenant_id
+            )
         await _audit(
             conn,
             request=request,
@@ -1125,6 +1160,9 @@ async def delete_knowledge_base(kb_id: str, request: Request) -> dict[str, str]:
             "DELETE FROM agent_runs WHERE tenant_id = :tenant_id AND query_run_id IN "
             "(SELECT id FROM query_runs WHERE tenant_id = :tenant_id AND knowledge_base_id = :id)",
             "DELETE FROM query_runs WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
+            # Projection events reference both the KB and its documents.  They are
+            # derived state and must be removed before the canonical rows below.
+            "DELETE FROM search_projection_events WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
             "DELETE FROM document_sections WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
             "DELETE FROM document_artifacts WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
             "DELETE FROM ingestion_job_items WHERE knowledge_base_id = :id AND tenant_id = :tenant_id",
@@ -1406,7 +1444,6 @@ async def patch_source_access(
     request: Request,
 ) -> SourceAccessResponse:
     """Update default document access for a source and optionally existing source documents."""
-    settings = get_settings()
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
     document_access = normalize_document_access(payload.model_dump(mode="json"))
@@ -1416,6 +1453,7 @@ async def patch_source_access(
         source = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
         if source is None:
             raise HTTPException(status_code=404, detail="source not found")
+        await _validate_document_access_principals(conn, tenant_id=tenant_id, document_access=document_access)
         await update_knowledge_source_document_access_default(
             conn,
             tenant_id=tenant_id,
@@ -1443,9 +1481,15 @@ async def patch_source_access(
                 document_access=document_access,
                 origin="source_default",
             )
+            await enqueue_document_access_projection(
+                conn,
+                tenant_id=tenant_id,
+                knowledge_base_id=kb_id,
+                document_id=str(target["document_id"]),
+                document_access=document_access,
+                origin="source_default",
+            )
         updated_documents = len(targets)
-        kb = await get_knowledge_base(conn, tenant_id, kb_id)
-        read_alias = str((kb or {}).get("active_index") or READ_ALIAS)
         await _audit(
             conn,
             request=request,
@@ -1454,17 +1498,6 @@ async def patch_source_access(
             target_type="knowledge_source",
             target_id=source_id,
             outcome="success",
-        )
-    for target in targets:
-        await asyncio.to_thread(
-            update_document_access,
-            tenant_id=tenant_id,
-            knowledge_base_id=kb_id,
-            document_id=str(target["document_id"]),
-            document_access=document_access,
-            origin="source_default",
-            settings=settings,
-            read_alias=read_alias,
         )
     return SourceAccessResponse(
         source_id=source_id,
@@ -1630,10 +1663,15 @@ async def create_wikipedia_import(payload: ImportRequest, request: Request) -> d
     settings = get_settings()
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
+    try:
+        xml_filename = configured_or_requested_filename(payload.xml_path, settings.wiki_xml_path)
+        index_filename = configured_or_requested_filename(payload.index_path, settings.wiki_index_path)
+    except ImportFileNameError as exc:
+        raise _import_file_name_error() from exc
     config = {
         "limit": payload.limit,
-        "xml_path": payload.xml_path or str(settings.wiki_xml_path),
-        "index_path": payload.index_path or str(settings.wiki_index_path),
+        "xml_filename": xml_filename,
+        "index_filename": index_filename,
         "snapshot_id": payload.snapshot_id or settings.wiki_snapshot_id,
         "retrieval_profile": settings.retrieval_profile,
     }
@@ -1684,11 +1722,22 @@ async def create_zim_import(payload: ZimImportRequest, request: Request) -> dict
     settings = get_settings()
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
+    if payload.zim_path and payload.zim_filename and payload.zim_path != payload.zim_filename:
+        raise _import_file_name_error()
+    requested_filename = payload.zim_filename or payload.zim_path
+    try:
+        zim_filename = (
+            resolve_import_filename(settings.zim_dir, requested_filename).name
+            if requested_filename
+            else (
+                resolve_import_filename(settings.zim_dir, settings.zim_filename).name if settings.zim_filename else None
+            )
+        )
+    except ImportFileNameError as exc:
+        raise _import_file_name_error() from exc
     config = {
         "limit": payload.limit or 10000,
-        "zim_path": payload.zim_path,
-        "zim_dir": str(settings.zim_dir),
-        "zim_filename": payload.zim_filename or settings.zim_filename,
+        "zim_filename": zim_filename,
         "snapshot_id": payload.snapshot_id,
         "kiwix_public_base_url": settings.kiwix_public_base_url,
         "kiwix_book_name": settings.kiwix_book_name,
@@ -2407,7 +2456,6 @@ async def patch_document_access(
     request: Request,
 ) -> DocumentAccessResponse:
     """Update document access metadata for a manager-scoped document."""
-    settings = get_settings()
     actor = await _require_actor(request)
     tenant_id = require_active_tenant(actor)
     document_access = normalize_document_access(payload.model_dump(mode="json"))
@@ -2417,6 +2465,7 @@ async def patch_document_access(
             raise HTTPException(status_code=404, detail="document not found")
         kb_id = str(document["knowledge_base_id"])
         await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
+        await _validate_document_access_principals(conn, tenant_id=tenant_id, document_access=document_access)
         version_id = str(document["current_version_id"]) if document.get("current_version_id") else None
         await update_document_access_metadata(
             conn,
@@ -2427,8 +2476,14 @@ async def patch_document_access(
             document_access=document_access,
             origin="manual",
         )
-        kb = await get_knowledge_base(conn, tenant_id, kb_id)
-        read_alias = str((kb or {}).get("active_index") or READ_ALIAS)
+        await enqueue_document_access_projection(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            document_id=document_id,
+            document_access=document_access,
+            origin="manual",
+        )
         await _audit(
             conn,
             request=request,
@@ -2438,16 +2493,6 @@ async def patch_document_access(
             target_id=document_id,
             outcome="success",
         )
-    await asyncio.to_thread(
-        update_document_access,
-        tenant_id=tenant_id,
-        knowledge_base_id=kb_id,
-        document_id=document_id,
-        document_access=document_access,
-        origin="manual",
-        settings=settings,
-        read_alias=read_alias,
-    )
     return DocumentAccessResponse(
         document_id=document_id,
         knowledge_base_id=kb_id,
@@ -2716,6 +2761,13 @@ async def search(payload: SearchRequest, request: Request) -> SearchResponse:
                 tenant_id=tenant_id,
                 kb_ids=kb_ids,
                 kb_roles=kb_roles,
+            )
+            await _authorize_search_identity_filters(
+                conn,
+                tenant_id=tenant_id,
+                kb_ids=kb_ids,
+                access_scopes=access_scopes,
+                payload=payload,
             )
             return await run_public_search(
                 conn,
@@ -4456,7 +4508,32 @@ async def _kb_grant_acl_metadata(
     }
 
 
-async def _replace_local_group_members(conn: Any, *, group_id: str, member_user_ids: list[str]) -> None:
+async def _validate_document_access_principals(conn: Any, *, tenant_id: str, document_access: dict[str, Any]) -> None:
+    """Reject foreign users and groups before an ACL is persisted.
+
+    Client identifiers carry no authority.  The check intentionally returns a
+    generic safe validation error instead of confirming a foreign principal.
+    """
+    user_ids = sorted({str(value) for value in document_access.get("user_ids") or [] if str(value)})
+    group_ids = sorted({str(value) for value in document_access.get("group_ids") or [] if str(value)})
+    for table, ids in (("users", user_ids), ("groups", group_ids)):
+        if not ids:
+            continue
+        result = await conn.execute(
+            text(f"SELECT count(*) FROM {table} WHERE tenant_id=:tenant_id AND id = ANY(CAST(:ids AS uuid[]))"),  # noqa: S608
+            {"tenant_id": tenant_id, "ids": ids},
+        )
+        if int(result.scalar_one() or 0) != len(ids):
+            raise HTTPException(status_code=422, detail={"code": "ACCESS_PRINCIPAL_OUT_OF_SCOPE"})
+
+
+async def _replace_local_group_members(
+    conn: Any, *, group_id: str, member_user_ids: list[str], tenant_id: str | None = None
+) -> None:
+    if tenant_id is not None:
+        await _validate_document_access_principals(
+            conn, tenant_id=tenant_id, document_access={"user_ids": member_user_ids, "group_ids": []}
+        )
     await conn.execute(
         text("DELETE FROM group_memberships WHERE group_id = :group_id AND membership_type = 'LOCAL'"),
         {"group_id": group_id},
@@ -4522,6 +4599,83 @@ def _kb_scope_ids(knowledge_base_ids: list[str], default_kb_id: str) -> list[str
         if normalized and normalized not in scope:
             scope.append(normalized)
     return scope or [default_kb_id]
+
+
+def _import_file_name_error() -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": {
+                "code": "IMPORT_FILE_NAME_INVALID",
+                "message": "import file must be an available filename in the configured directory",
+            }
+        },
+    )
+
+
+def _authority_filter_forbidden() -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": {
+                "code": "AUTHORITY_FILTER_FORBIDDEN",
+                "message": "authority fields cannot be used in a search filter",
+            }
+        },
+    )
+
+
+def _filter_identity_values(payload: SearchRequest, field_name: str) -> list[str]:
+    values: list[str] = []
+    if field_name == "source_id" and payload.filters.source_id:
+        values.append(payload.filters.source_id)
+    for expression in payload.filter_expressions:
+        if expression.field.casefold() != field_name:
+            continue
+        raw_values = expression.value if isinstance(expression.value, list) else [expression.value]
+        values.extend(str(value) for value in raw_values if str(value))
+    return list(dict.fromkeys(values))
+
+
+async def _authorize_search_identity_filters(
+    conn: Any,
+    *,
+    tenant_id: str,
+    kb_ids: list[str],
+    access_scopes: Mapping[str, DocumentAccessScope],
+    payload: SearchRequest,
+) -> None:
+    """Authorize resource identifiers carried by public search filters before retrieval."""
+    forbidden_fields = {"group_id", "group_ids", "object_key", "object_prefix", "prefix", "storage_prefix"}
+    if any(expression.field.casefold() in forbidden_fields for expression in payload.filter_expressions):
+        raise _authority_filter_forbidden()
+
+    requested_kb_ids = _filter_identity_values(payload, "knowledge_base_id")
+    if any(kb_id not in kb_ids for kb_id in requested_kb_ids):
+        raise HTTPException(status_code=404, detail="search filter resource not found")
+
+    for source_id in _filter_identity_values(payload, "source_id"):
+        try:
+            uuid.UUID(source_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="search filter resource not found") from None
+        result = await conn.execute(
+            text("SELECT knowledge_base_id FROM knowledge_sources WHERE id = :id AND tenant_id = :tenant_id"),
+            {"id": source_id, "tenant_id": tenant_id},
+        )
+        source = result.mappings().first()
+        if source is None or str(source["knowledge_base_id"]) not in kb_ids:
+            raise HTTPException(status_code=404, detail="search filter resource not found")
+
+    for document_id in _filter_identity_values(payload, "document_id"):
+        document = await get_document_public(conn, tenant_id, document_id)
+        if document is None:
+            raise HTTPException(status_code=404, detail="search filter resource not found")
+        kb_id = str(document["knowledge_base_id"])
+        if kb_id not in kb_ids or not is_document_visible(
+            dict(document.get("metadata") or {}), access_scopes.get(kb_id)
+        ):
+            raise HTTPException(status_code=404, detail="search filter resource not found")
 
 
 async def _require_search_scope_ready(conn: Any, *, tenant_id: str, kb_ids: list[str]) -> None:
@@ -4901,7 +5055,7 @@ def _research_detail(
     claims = []
     for row in records["claims"]:
         evidence_ids = [str(item) for item in row.get("evidence_ids") or []]
-        if not evidence_ids or any(item in visible_evidence_ids for item in evidence_ids):
+        if evidence_ids and all(item in visible_evidence_ids for item in evidence_ids):
             claims.append(row)
     visible_claim_ids = {str(row.get("id")) for row in claims}
     relations = [

@@ -254,6 +254,23 @@ async def ready() -> dict[str, Any]:
         for alias, circuit in sorted(_dependency_circuits.items())
         if circuit.is_degraded
     )
+    control_plane = await _active_control_plane_readiness(get_settings())
+    if control_plane is False:
+        dynamic_checks.append(
+            ReadinessCheck(
+                component="model_control_plane",
+                status="failed",
+                reason="MODEL_REVISION_SNAPSHOT_INCOMPLETE",
+            )
+        )
+    elif control_plane == "unavailable":
+        dynamic_checks.append(
+            ReadinessCheck(
+                component="model_control_plane",
+                status="failed",
+                reason="MODEL_CONTROL_PLANE_UNAVAILABLE",
+            )
+        )
     checks = [*_readiness_state.checks, *dynamic_checks]
     return {
         "status": "degraded" if checks else _readiness_state.status,
@@ -268,18 +285,20 @@ async def ready() -> dict[str, Any]:
     }
 
 
-async def _active_control_plane_readiness(settings: Settings) -> bool | None:
+async def _active_control_plane_readiness(settings: Settings) -> bool | str | None:
     """Return DB readiness when an active revision exists, or None for legacy YAML mode."""
     try:
         async with asyncio.timeout(1.0):
             async with connect(settings) as conn:
                 revision = await active_revision(conn)
-    except Exception:  # noqa: BLE001 - startup retains legacy behavior if DB is unavailable.
-        return None
+    except Exception:  # noqa: BLE001 - never silently report YAML bootstrap while DB is unavailable.
+        return "unavailable"
     if revision is None:
         return None
     report = revision.get("validation_report") or {}
-    return revision.get("status") == "active" and report.get("status") == "passed"
+    snapshot = revision.get("resolved_snapshot") or {}
+    aliases = snapshot.get("aliases") if isinstance(snapshot, dict) else None
+    return bool(revision.get("status") == "active" and report.get("status") == "passed" and isinstance(aliases, dict))
 
 
 @app.get("/v1/models")
@@ -364,7 +383,8 @@ async def create_rerank(payload: dict[str, Any], request: Request) -> dict[str, 
 async def tokenize(payload: dict[str, Any]) -> dict[str, Any]:
     """Return a safe token count using the tokenizer contract selected by the alias."""
     settings = get_settings()
-    payload = await _resolve_stage_payload(payload, "chat")
+    if payload.get("stage"):
+        payload = await _resolve_stage_payload(payload, "chat")
     alias_name = str(payload.get("model") or "")
     alias = get_model_registry(settings).require(alias_name, "chat")
     value = payload.get("text")
@@ -388,7 +408,7 @@ async def _resolve_stage_payload(payload: dict[str, Any], operation: str) -> dic
     """
     stage_key = payload.get("stage")
     if not stage_key:
-        return payload
+        return await _resolve_alias_payload(payload, operation)
     revision_id = payload.get("config_revision_id")
     if not revision_id:
         raise HTTPException(
@@ -503,6 +523,82 @@ async def _resolve_stage_payload(payload: dict[str, Any], operation: str) -> dic
                     if token:
                         headers.setdefault("Authorization", f"Bearer {token}")
                 except Exception as exc:  # noqa: BLE001 - only expose a safe stable error.
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "MODEL_CREDENTIALS_UNREADABLE", "message": "model credentials are unavailable"},
+                    ) from exc
+            result["_gateway_headers"] = headers
+        result["_model_config_revision_id"] = str(revision["id"])
+        result["_model_config_hash"] = str(revision["config_hash"])
+        return result
+
+
+async def _resolve_alias_payload(payload: dict[str, Any], operation: str) -> dict[str, Any]:
+    """Use the active database catalog for aliases once a revision is active.
+
+    YAML is deliberately only the bootstrap catalog.  A running control plane
+    must leave an identity on every alias request, not just on stage requests.
+    """
+    alias_name = str(payload.get("model") or "")
+    if not alias_name:
+        raise HTTPException(status_code=422, detail={"code": "MODEL_ALIAS_REQUIRED", "message": "model is required"})
+    settings = get_settings()
+    async with connect(settings) as conn:
+        revision = await active_revision(conn)
+        if revision is None:
+            return payload
+        snapshot = dict(revision.get("resolved_snapshot") or {})
+        aliases = snapshot.get("aliases")
+        model = dict(aliases.get(alias_name) or {}) if isinstance(aliases, dict) else {}
+        required = {"provider", "provider_model", "operation", "connection_id", "request_adapter", "request_defaults"}
+        if not isinstance(aliases, dict) or not required.issubset(model):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "MODEL_REVISION_SNAPSHOT_INCOMPLETE",
+                    "message": "active model configuration snapshot is incomplete",
+                },
+            )
+        if str(model.get("operation") or "") != operation:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "MODEL_ALIAS_UNAVAILABLE",
+                    "message": "active model alias is unavailable in the active revision",
+                },
+            )
+        result = {**payload, "_db_model_contract": model}
+        result["_gateway_request_adapter"] = dict(
+            model.get("request_adapter") or model.get("connection_request_adapter") or {}
+        )
+        result["_gateway_request_defaults"] = dict(
+            model.get("request_defaults") or model.get("connection_request_defaults") or {}
+        )
+        result["_gateway_model_defaults"] = dict(model.get("model_defaults") or {})
+        if model.get("base_url"):
+            result["_gateway_base_url"] = str(model["base_url"])
+            result["_gateway_paths"] = model.get("endpoint_paths") or {}
+            headers = dict(model.get("safe_headers") or {})
+            credential_result = await conn.execute(
+                text(
+                    "SELECT encrypted_payload FROM model_connection_credentials "
+                    "WHERE connection_id=:connection_id AND state='active'"
+                ),
+                {"connection_id": model.get("connection_id")},
+            )
+            credential_row = credential_result.mappings().first()
+            encrypted_payload = credential_row.get("encrypted_payload") if credential_row is not None else None
+            if encrypted_payload:
+                try:
+                    credential_values = decrypt_server_tokens(settings, json.loads(str(encrypted_payload)))
+                    token = (
+                        credential_values.get("api_key")
+                        or credential_values.get("token")
+                        or credential_values.get("access_token")
+                    )
+                    if token:
+                        headers.setdefault("Authorization", f"Bearer {token}")
+                except Exception as exc:  # noqa: BLE001
                     raise HTTPException(
                         status_code=503,
                         detail={"code": "MODEL_CREDENTIALS_UNREADABLE", "message": "model credentials are unavailable"},
@@ -665,6 +761,21 @@ async def proxy(path: str, payload: dict[str, Any], *, correlation_id: str = "")
     circuit.record_success()
     result.setdefault("model_alias", model_alias)
     result.setdefault("provider", alias.provider)
+    db_revision_id = payload.get("_model_config_revision_id")
+    db_config_hash = payload.get("_model_config_hash")
+    result["_gateway_runtime_config"] = {
+        "resolution_source": "database_revision" if isinstance(db_contract, dict) else "yaml_registry",
+        "config_revision_id": str(db_revision_id) if db_revision_id else None,
+        "config_hash": str(db_config_hash) if db_config_hash else None,
+        "alias": model_alias,
+        "operation": alias.operation,
+        "provider": alias.provider,
+        "provider_model": alias.model,
+        "connection_id": str(db_contract.get("connection_id"))
+        if isinstance(db_contract, dict) and db_contract.get("connection_id")
+        else None,
+        "adapter_hash": config_hash(payload.get("_gateway_request_adapter") or alias.request_adapter),
+    }
     if budget_metadata:
         result["_gateway_budget_metadata"] = budget_metadata
     return result
