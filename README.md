@@ -153,6 +153,8 @@ make test-functional-retrieval
 make test-functional-ui
 make verify-document-corpus
 make verify-cross-tenant-hardening
+make verify-live-http-authorization-matrix LIVE_HTTP_AUTHORIZATION_MATRIX_ARGS="--operational-test-database-url <test-db-url>"
+make verify-provider-acl-revocation PROVIDER_ACL_REVOCATION_ARGS="--operational-test-database-url <test-db-url>"
 make deep-research-smoke
 make deep-research-matrix
 make deep-research-hard-gate
@@ -205,6 +207,13 @@ pnpm test:e2e:live
 The development-only `admin`/`admin` fallback is accepted only for localhost
 when `WIKIPEDIARAG_E2E_ALLOW_DEV_DEFAULTS=1`; CI must supply explicit test
 credentials and set `WIKIPEDIARAG_REQUIRE_LIVE_E2E=1` so `BLOCKED` is fatal.
+
+Operational authorization gates also use an already-running stack and require
+`WIKIPEDIARAG_OPERATIONAL_TEST_DATABASE_URL` only for test-local identity
+seeding. Their assertions use public HTTP. Provider ACL revocation additionally
+requires API readiness plus a successful OpenRouter alias canary through Model
+Gateway; `BLOCKED` is non-passing and reports never contain database URLs,
+credentials, document markers, prompts, provider payloads, or storage keys.
 
 Docs-only changes do not require the full unit/integration/e2e suite unless
 the active task or CI policy says otherwise.

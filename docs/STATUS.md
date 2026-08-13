@@ -2,6 +2,28 @@
 
 Last updated: 2026-08-13
 
+## AUTH-004 / DR-003 operational-gate foundation (2026-08-13)
+
+Public HTTP routes now carry typed authorization metadata that is exported as
+the `x-wikipediarag-authorization` OpenAPI extension. The contract is checked
+against every registered route and identifies tenant boundary, capability,
+scenario family, cross-tenant behavior, and document/retrieval/research output
+surfaces. This replaces the duplicated hand-maintained unit inventory.
+
+`verify-provider-acl-revocation` is implemented for a separately managed
+OpenRouter-ready stack: it uses a test-only DB identity seeder, performs upload
+through current ACL revoke through HTTP, and checks every tagged exposure route
+for the revoked marker and linked evidence IDs. It is not yet executed evidence.
+`verify-live-http-authorization-matrix` now seeds two generated tenants plus
+non-platform tenant-admin/KB-owner actors, creates HTTP-owned fixtures, and
+executes the authorized and cross-tenant/actor-scoped replay for every route.
+Denied resource mutations are checked against a content-free pre/post target
+hash. The 2026-08-13 local attempt reached the readiness prerequisite but was
+correctly non-passing because Model Gateway reported `structured_schema_invalid`
+and API `/ready` was `degraded`; no route-matrix pass is claimed. This is an
+operational environment blocker, not a skipped route or a completed AUTH-004
+acceptance result.
+
 ## MODEL-002/003, AUTH-004, DR-003 security closure (2026-08-13)
 
 `MODEL-002` remains closed for the current provider-driver set: runtime imports

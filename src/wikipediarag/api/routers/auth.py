@@ -1,15 +1,67 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
-
 from wikipediarag.api import handlers
+from wikipediarag.api.route_contracts import AuthorizationBoundary, ContractRouter, CrossTenantBehavior, contract
 
-router = APIRouter()
+router = ContractRouter()
 
-router.add_api_route("/api/v1/auth/local/login", handlers.local_login, methods=["POST"])
-router.add_api_route("/api/v1/auth/oidc/start", handlers.oidc_start, methods=["POST"])
-router.add_api_route("/api/v1/auth/oidc/callback", handlers.oidc_callback, methods=["GET"])
-router.add_api_route("/api/v1/auth/local/password", handlers.change_password, methods=["POST"])
-router.add_api_route("/api/v1/auth/logout", handlers.logout, methods=["POST"])
-router.add_api_route("/api/v1/auth/session", handlers.get_session, methods=["GET"])
-router.add_api_route("/api/v1/auth/session/tenant", handlers.select_session_tenant, methods=["POST"])
+router.add_contract_route(
+    "/api/v1/auth/local/login",
+    handlers.local_login,
+    methods=["POST"],
+    authorization=contract(
+        AuthorizationBoundary.public, "anonymous", "create", "local_login", CrossTenantBehavior.not_applicable
+    ),
+)
+router.add_contract_route(
+    "/api/v1/auth/oidc/start",
+    handlers.oidc_start,
+    methods=["POST"],
+    authorization=contract(
+        AuthorizationBoundary.public, "anonymous", "create", "oidc_start", CrossTenantBehavior.not_applicable
+    ),
+)
+router.add_contract_route(
+    "/api/v1/auth/oidc/callback",
+    handlers.oidc_callback,
+    methods=["GET"],
+    authorization=contract(
+        AuthorizationBoundary.public, "external_identity", "read", "oidc_callback", CrossTenantBehavior.not_applicable
+    ),
+)
+router.add_contract_route(
+    "/api/v1/auth/local/password",
+    handlers.change_password,
+    methods=["POST"],
+    authorization=contract(
+        AuthorizationBoundary.session, "authenticated", "update", "password", CrossTenantBehavior.not_applicable
+    ),
+)
+router.add_contract_route(
+    "/api/v1/auth/logout",
+    handlers.logout,
+    methods=["POST"],
+    authorization=contract(
+        AuthorizationBoundary.session, "authenticated", "delete", "logout", CrossTenantBehavior.not_applicable
+    ),
+)
+router.add_contract_route(
+    "/api/v1/auth/session",
+    handlers.get_session,
+    methods=["GET"],
+    authorization=contract(
+        AuthorizationBoundary.session, "anonymous_or_session", "read", "session", CrossTenantBehavior.not_applicable
+    ),
+)
+router.add_contract_route(
+    "/api/v1/auth/session/tenant",
+    handlers.select_session_tenant,
+    methods=["POST"],
+    authorization=contract(
+        AuthorizationBoundary.active_tenant,
+        "tenant_member",
+        "update",
+        "session_tenant",
+        CrossTenantBehavior.actor_scoped,
+    ),
+)

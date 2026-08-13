@@ -1,109 +1,51 @@
-from wikipediarag.api.app import ROUTERS
-
-# A route can have no client-controlled resource ID, but it still must be
-# classified.  Adding a new public handler without extending this map fails
-# the test and forces a review of its tenant/KB/resource boundary.
-ROUTE_AUTHORIZATION: dict[str, tuple[str, ...]] = {
-    "local_login": ("session",),
-    "oidc_start": ("session",),
-    "oidc_callback": ("session",),
-    "change_password": ("session",),
-    "logout": ("session",),
-    "get_session": ("session",),
-    "select_session_tenant": ("tenant_id",),
-    "admin_list_users": ("platform_admin",),
-    "admin_create_user": ("platform_admin",),
-    "admin_patch_user": ("platform_admin", "user_id"),
-    "admin_list_tenants": ("platform_admin",),
-    "admin_create_tenant": ("platform_admin",),
-    "admin_patch_tenant": ("platform_admin", "tenant_id"),
-    "admin_list_model_connections": ("platform_admin",),
-    "admin_create_model_connection": ("platform_admin",),
-    "admin_patch_model_connection": ("platform_admin", "connection_id"),
-    "admin_test_model_connection": ("platform_admin", "connection_id"),
-    "admin_discover_model_connection": ("platform_admin", "connection_id"),
-    "admin_list_models": ("platform_admin",),
-    "admin_create_model": ("platform_admin",),
-    "admin_patch_model": ("platform_admin", "model_id"),
-    "admin_test_model": ("platform_admin", "model_id"),
-    "admin_model_stages": ("platform_admin",),
-    "admin_model_configuration": ("platform_admin",),
-    "admin_export_model_configuration": ("platform_admin",),
-    "admin_save_model_configuration": ("platform_admin",),
-    "admin_validate_model_configuration": ("platform_admin",),
-    "admin_activate_model_configuration": ("platform_admin",),
-    "admin_restore_model_configuration": ("platform_admin", "revision_id"),
-    "list_groups": ("tenant",),
-    "create_group": ("tenant", "member_user_ids"),
-    "patch_group": ("tenant", "group_id", "member_user_ids"),
-    "delete_group": ("tenant", "group_id"),
-    "get_knowledge_bases": ("tenant",),
-    "retrieval_profiles": ("knowledge_base_ids",),
-    "create_knowledge_base": ("tenant",),
-    "list_access_groups": ("kb_id",),
-    "get_knowledge_base_endpoint": ("kb_id",),
-    "patch_knowledge_base": ("kb_id",),
-    "delete_knowledge_base": ("kb_id",),
-    "list_kb_grants": ("kb_id",),
-    "create_kb_grant": ("kb_id", "subject_id"),
-    "patch_kb_grant": ("kb_id", "grant_id"),
-    "delete_kb_grant": ("kb_id", "grant_id"),
-    "list_sources": ("kb_id",),
-    "create_source": ("kb_id",),
-    "get_source": ("kb_id", "source_id"),
-    "patch_source": ("kb_id", "source_id"),
-    "patch_source_access": ("kb_id", "source_id", "user_ids", "group_ids"),
-    "healthcheck_source": ("kb_id", "source_id"),
-    "sync_source": ("kb_id", "source_id"),
-    "get_source_sync_run": ("run_id",),
-    "create_wikipedia_import": ("configured_import_filename",),
-    "create_zim_import": ("configured_import_filename",),
-    "get_ingestion_job": ("job_id",),
-    "ingestion_job_events": ("job_id",),
-    "cancel_ingestion_job": ("job_id",),
-    "resume_ingestion_job": ("job_id",),
-    "upload_document_multipart": ("kb_id",),
-    "create_upload_session_endpoint": ("knowledge_base_id",),
-    "create_upload_batch_endpoint": ("knowledge_base_id",),
-    "get_upload_batch_endpoint": ("batch_id",),
-    "complete_upload_session_endpoint": ("upload_session_id",),
-    "get_document": ("document_id",),
-    "get_document_versions": ("document_id",),
-    "patch_document_access": ("document_id", "user_ids", "group_ids"),
-    "get_document_structure": ("document_id",),
-    "get_document_context": ("document_id", "chunk_id", "section_id"),
-    "search_document": ("document_id",),
-    "delete_document": ("document_id",),
-    "reprocess_document": ("document_id",),
-    "search": ("knowledge_base_ids", "source_id", "filter_expression_identity"),
-    "run_debug_search": ("knowledge_base_ids",),
-    "stream_chat_response": ("knowledge_base_ids", "conversation_id"),
-    "query_run_retrieval": ("query_run_id",),
-    "query_run_feedback": ("query_run_id",),
-    "query_run_evaluation": ("query_run_id",),
-    "create_research_plan_endpoint": ("knowledge_base_id", "knowledge_base_ids"),
-    "list_research_plans_endpoint": ("tenant",),
-    "get_research_plan_endpoint": ("research_plan_id",),
-    "patch_research_plan_endpoint": ("research_plan_id", "knowledge_base_id", "knowledge_base_ids"),
-    "approve_research_plan_endpoint": ("research_plan_id",),
-    "create_research_run_endpoint": ("knowledge_base_id", "knowledge_base_ids", "research_plan_id"),
-    "list_research_runs_endpoint": ("tenant",),
-    "get_research_run_endpoint": ("research_run_id",),
-    "research_run_events": ("research_run_id",),
-    "pause_research_run": ("research_run_id",),
-    "resume_research_run": ("research_run_id",),
-    "cancel_research_run": ("research_run_id",),
-}
+from wikipediarag.api.app import ROUTERS, create_app
+from wikipediarag.api.route_contracts import (
+    OPENAPI_AUTHORIZATION_EXTENSION,
+    CrossTenantBehavior,
+    ExposureSurface,
+    route_contract_from_openapi,
+)
 
 
-def test_every_public_api_route_has_an_explicit_authorization_inventory_entry() -> None:
-    actual: set[str] = set()
-    for router in ROUTERS:
-        for route in router.routes:
-            path = getattr(route, "path", "")
-            endpoint = getattr(route, "endpoint", None)
-            if path.startswith("/api/") and endpoint is not None:
-                actual.add(endpoint.__name__)
+def _public_routes() -> list[object]:
+    return [route for router in ROUTERS for route in router.routes]
 
-    assert actual == set(ROUTE_AUTHORIZATION)
-    assert all(classification for classification in ROUTE_AUTHORIZATION.values())
+
+def test_every_public_http_route_has_a_typed_authorization_contract() -> None:
+    routes = _public_routes()
+    contracts = [route_contract_from_openapi(route) for route in routes]
+
+    assert routes
+    assert all(item is not None for item in contracts)
+    assert all(item.scenario for item in contracts if item is not None)
+    assert all(item.capability for item in contracts if item is not None)
+
+
+def test_authorization_contracts_are_exported_in_openapi() -> None:
+    schema = create_app().openapi()
+    exported = [
+        operation[OPENAPI_AUTHORIZATION_EXTENSION]
+        for path, path_item in schema["paths"].items()
+        if path.startswith("/api/") or path in {"/health", "/ready"}
+        for operation in path_item.values()
+        if isinstance(operation, dict) and OPENAPI_AUTHORIZATION_EXTENSION in operation
+    ]
+
+    assert len(exported) == len(_public_routes())
+    assert {item["cross_tenant"] for item in exported} >= {
+        CrossTenantBehavior.deny.value,
+        CrossTenantBehavior.actor_scoped.value,
+        CrossTenantBehavior.not_applicable.value,
+    }
+
+
+def test_document_retrieval_and_research_exposure_routes_are_explicit() -> None:
+    exposure = {
+        item.scenario: set(item.exposure)
+        for item in (route_contract_from_openapi(route) for route in _public_routes())
+        if item is not None and item.exposure
+    }
+
+    assert ExposureSurface.document in exposure["document"]
+    assert ExposureSurface.retrieval in exposure["search"]
+    assert ExposureSurface.research in exposure["research_run"]

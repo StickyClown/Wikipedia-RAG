@@ -1,14 +1,28 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from collections.abc import Callable
+from typing import Any
 
 from wikipediarag.api import handlers
+from wikipediarag.api.route_contracts import AuthorizationBoundary as B
+from wikipediarag.api.route_contracts import ContractRouter, contract
+from wikipediarag.api.route_contracts import CrossTenantBehavior as X
 
-router = APIRouter()
+router = ContractRouter()
 
-router.add_api_route("/api/v1/admin/users", handlers.admin_list_users, methods=["GET"])
-router.add_api_route("/api/v1/admin/users", handlers.admin_create_user, methods=["POST"])
-router.add_api_route("/api/v1/admin/users/{user_id}", handlers.admin_patch_user, methods=["PATCH"])
-router.add_api_route("/api/v1/admin/tenants", handlers.admin_list_tenants, methods=["GET"])
-router.add_api_route("/api/v1/admin/tenants", handlers.admin_create_tenant, methods=["POST"])
-router.add_api_route("/api/v1/admin/tenants/{tenant_id}", handlers.admin_patch_tenant, methods=["PATCH"])
+
+def _admin(path: str, endpoint: Callable[..., Any], methods: list[str], operation: str, scenario: str) -> None:
+    router.add_contract_route(
+        path,
+        endpoint,
+        methods=methods,
+        authorization=contract(B.platform, "platform_admin", operation, scenario, X.not_applicable),
+    )
+
+
+_admin("/api/v1/admin/users", handlers.admin_list_users, ["GET"], "read", "admin_user_collection")
+_admin("/api/v1/admin/users", handlers.admin_create_user, ["POST"], "create", "admin_user_collection")
+_admin("/api/v1/admin/users/{user_id}", handlers.admin_patch_user, ["PATCH"], "update", "admin_user")
+_admin("/api/v1/admin/tenants", handlers.admin_list_tenants, ["GET"], "read", "admin_tenant_collection")
+_admin("/api/v1/admin/tenants", handlers.admin_create_tenant, ["POST"], "create", "admin_tenant_collection")
+_admin("/api/v1/admin/tenants/{tenant_id}", handlers.admin_patch_tenant, ["PATCH"], "update", "admin_tenant")

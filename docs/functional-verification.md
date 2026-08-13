@@ -27,3 +27,17 @@ bounded PostgreSQL batches; the normal functional commands remain mock-only.
 Локальные команды: `make test-functional-retrieval` и
 `make test-functional-ui`. При отсутствии готовой среды обязательный режим
 завершается ошибкой с причиной `BLOCKED`, а не успешным пропуском.
+
+## Operational authorization gates
+
+`make verify-live-http-authorization-matrix` reads the typed authorization
+metadata attached to every public route and compares it with the live OpenAPI
+contract. A route can be `executed`, `failed`, or `BLOCKED`; blocked routes are
+not treated as coverage.
+
+`make verify-provider-acl-revocation` requires an already running,
+provider-ready stack and `WIKIPEDIARAG_OPERATIONAL_TEST_DATABASE_URL`. The URL
+is used only to seed a non-bypassing local identity. Upload, ingestion,
+research, ACL revoke, and post-revoke reads traverse HTTP. Any tagged document,
+retrieval, or research response that exposes the generated marker or linked
+evidence ID fails the gate; reports retain route/status/error metadata only.

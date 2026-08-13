@@ -10,6 +10,16 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 from sqlalchemy import text
 
 from wikipediarag.api import handlers
+from wikipediarag.api.route_contracts import (
+    AuthorizationBoundary as AuthorizationBoundary,
+)
+from wikipediarag.api.route_contracts import (
+    CrossTenantBehavior as CrossTenantBehavior,
+)
+from wikipediarag.api.route_contracts import (
+    attach_route_contracts,
+    contract,
+)
 from wikipediarag.config import get_settings
 from wikipediarag.db import connect, json_dumps
 from wikipediarag.model_control import (
@@ -722,3 +732,122 @@ async def admin_restore_model_configuration(request: Request, revision_id: str) 
             metadata={"new_draft_id": str(revision["id"])},
         )
         return revision
+
+
+attach_route_contracts(
+    router,
+    {
+        "admin_list_model_connections": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "read",
+            "admin_model_connection_collection",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_create_model_connection": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "create",
+            "admin_model_connection_collection",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_patch_model_connection": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "update",
+            "admin_model_connection",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_test_model_connection": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "execute",
+            "admin_model_connection",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_discover_model_connection": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "execute",
+            "admin_model_connection",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_list_models": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "read",
+            "admin_model_collection",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_create_model": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "create",
+            "admin_model_collection",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_patch_model": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "update",
+            "admin_model",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_test_model": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "execute",
+            "admin_model",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_model_stages": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "read",
+            "admin_model_stages",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_model_configuration": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "read",
+            "admin_model_configuration",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_export_model_configuration": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "read",
+            "admin_model_configuration",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_save_model_configuration": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "update",
+            "admin_model_configuration",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_validate_model_configuration": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "execute",
+            "admin_model_configuration",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_activate_model_configuration": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "execute",
+            "admin_model_configuration",
+            CrossTenantBehavior.not_applicable,
+        ),
+        "admin_restore_model_configuration": contract(
+            AuthorizationBoundary.platform,
+            "platform_admin",
+            "update",
+            "admin_model_configuration",
+            CrossTenantBehavior.not_applicable,
+        ),
+    },
+)

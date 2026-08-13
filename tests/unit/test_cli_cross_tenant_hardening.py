@@ -153,3 +153,28 @@ def test_upload_smokes_use_active_upload_retrieval_profile() -> None:
 
     assert "upload_sota_mvp" in constants
     assert "upload_mock" not in constants
+
+
+def test_live_matrix_authorized_probe_rejects_auth_and_server_failures() -> None:
+    assert cli._live_authorized_probe(_response(422, {}), public=False)["passed"] is True
+    assert cli._live_authorized_probe(_response(401, {}), public=False)["passed"] is False
+    assert cli._live_authorized_probe(_response(500, {}), public=True)["passed"] is False
+
+
+def test_live_matrix_session_tenant_payload_replays_foreign_authority() -> None:
+    fixture_secret = "test" + "-credential"
+    fixtures = cli._LiveAuthorizationMatrixFixtures(
+        public=cast(httpx.Client, object()),
+        admin=cast(httpx.Client, object()),
+        manager_a=cast(httpx.Client, object()),
+        manager_b=cast(httpx.Client, object()),
+        identifiers={"tenant_a": "tenant-a", "tenant_b": "tenant-b", "kb_a": "kb-a"},
+        admin_username="admin",
+        admin_secret=fixture_secret,
+        manager_a_username="manager-a",
+        manager_a_password=fixture_secret,
+    )
+    route = cast(Any, type("Route", (), {"path": "/api/v1/auth/session/tenant", "method": "POST"})())
+
+    assert cli._live_matrix_payload(route, fixtures, foreign=False) == {"tenant_id": "tenant-a"}
+    assert cli._live_matrix_payload(route, fixtures, foreign=True) == {"tenant_id": "tenant-b"}

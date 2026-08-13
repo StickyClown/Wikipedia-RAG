@@ -76,6 +76,10 @@ class ReliabilitySmokeError(RuntimeError):
         self.safe_code = safe_code
 
 
+class OperationalGateBlocked(RuntimeError):
+    """A required operational environment capability is unavailable."""
+
+
 def _safe_cli_failure(exc: BaseException, *, stage: str) -> dict[str, Any]:
     """Return a content-free CLI artifact failure without exception details."""
     failure = safe_failure_from_exception(exc, stage=stage)
@@ -482,6 +486,12 @@ def build_parser() -> argparse.ArgumentParser:
     hardening_parser.add_argument("--skip-compose", action="store_true")
     hardening_parser.add_argument("--down-after", action="store_true")
 
+    authorization_matrix_parser = subparsers.add_parser("verify-live-http-authorization-matrix")
+    _add_operational_gate_arguments(authorization_matrix_parser)
+
+    acl_revocation_parser = subparsers.add_parser("verify-provider-acl-revocation")
+    _add_operational_gate_arguments(acl_revocation_parser, provider_required=True)
+
     deep_research_parser = subparsers.add_parser("deep-research-smoke")
     _add_deep_research_runtime_arguments(
         deep_research_parser,
@@ -614,6 +624,10 @@ def main() -> None:
         verify_document_corpus(args)
     elif args.command == "verify-cross-tenant-hardening":
         verify_cross_tenant_hardening(args)
+    elif args.command == "verify-live-http-authorization-matrix":
+        verify_live_http_authorization_matrix(args)
+    elif args.command == "verify-provider-acl-revocation":
+        verify_provider_acl_revocation(args)
     elif args.command == "deep-research-smoke":
         verify_deep_research_smoke(args)
     elif args.command == "deep-research-hard-gate":
@@ -636,6 +650,33 @@ def _add_eval_generate_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--resume-run-id", default=None)
+
+
+def _add_operational_gate_arguments(parser: argparse.ArgumentParser, *, provider_required: bool = False) -> None:
+    """Arguments shared by live authorization operational gates.
+
+    The database URL is deliberately required and never written to reports. It
+    is used only by the test-only identity seeder; every assertion endpoint is
+    still exercised through HTTP.
+    """
+    parser.add_argument("--api", default=os.environ.get("WIKIPEDIARAG_OPERATIONAL_API", "http://localhost:8000"))
+    parser.add_argument(
+        "--admin-username",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_USERNAME", "admin"),
+    )
+    parser.add_argument("--admin-secret-file", default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD_FILE"))
+    parser.add_argument(
+        "--admin-secret",
+        default=os.environ.get("WIKIPEDIARAG_ADMIN_PASSWORD", "admin"),  # noqa: S106
+    )
+    parser.add_argument(
+        "--operational-test-database-url",
+        default=os.environ.get("WIKIPEDIARAG_OPERATIONAL_TEST_DATABASE_URL"),
+    )
+    parser.add_argument("--timeout-seconds", type=int, default=600)
+    parser.add_argument("--keep-fixtures", action="store_true")
+    parser.add_argument("--gateway", default=os.environ.get("MODEL_GATEWAY_PUBLIC_URL", "http://localhost:8081"))
+    parser.set_defaults(provider_required=provider_required)
 
 
 def _configure_stdio() -> None:
@@ -1837,6 +1878,770 @@ def verify_cross_tenant_hardening(args: argparse.Namespace) -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if exit_code:
         raise SystemExit(exit_code)
+
+
+def verify_live_http_authorization_matrix(args: argparse.Namespace) -> None:
+    """Audit the deployed HTTP surface against its executable route contracts.
+
+    This command intentionally does not start Compose.  Operational environments
+    must provide an already-ready API and an explicit test database URL for the
+    identity seeder; an unmet prerequisite is recorded as BLOCKED and exits
+    non-zero instead of being represented as a passed check.
+    """
+    from wikipediarag.operational_authorization import (
+        public_route_contracts,
+        route_requires_cross_tenant_replay,
+        safe_contract_report,
+        tenant_denial_probe,
+    )
+
+    api = str(args.api).rstrip("/")
+    report_dir = Path("artifacts/validation/live-http-authorization-matrix") / time.strftime(
+        "%Y%m%dT%H%M%SZ", time.gmtime()
+    )
+    report_dir.mkdir(parents=True, exist_ok=True)
+    routes = public_route_contracts()
+    report: dict[str, Any] = {
+        "passed": False,
+        "api": api,
+        "report_dir": str(report_dir),
+        "routes": safe_contract_report(routes),
+        "route_count": len(routes),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "checks": [],
+    }
+    exit_code = 0
+    try:
+        if not args.operational_test_database_url:
+            raise OperationalGateBlocked("OPERATIONAL_TEST_DATABASE_URL_REQUIRED")
+        admin_secret = _resolve_hardening_admin_secret(args)
+        if not admin_secret:
+            raise OperationalGateBlocked("ADMIN_SECRET_REQUIRED")
+        with httpx.Client(timeout=max(30, int(args.timeout_seconds)), follow_redirects=True) as client:
+            try:
+                _wait_json_ready(client, f"{api}/ready", "api", require_ok=True)
+            except RuntimeError as exc:
+                raise OperationalGateBlocked("API_READINESS_REQUIRED") from exc
+            _record_check(report, "api_ready", True)
+            schema = _get_json(client, f"{api}/openapi.json")
+            _verify_live_openapi_authorization_contracts(schema, routes)
+            _record_check(report, "openapi_route_contracts", True, {"route_count": len(routes)})
+            fixtures = _build_live_authorization_matrix_fixtures(
+                client,
+                api=api,
+                admin_secret=admin_secret,
+                admin_username=str(args.admin_username),
+                database_url=str(args.operational_test_database_url),
+                timeout_seconds=int(args.timeout_seconds),
+            )
+            _record_check(report, "two_tenant_non_bypassing_identities", True)
+            states: list[dict[str, Any]] = []
+            try:
+                for route in routes:
+                    authorized_client = (
+                        fixtures.admin if route.path.startswith("/api/v1/admin/") else fixtures.manager_a
+                    )
+                    if route.path in {"/health", "/ready"} or route.path in {
+                        "/api/v1/auth/local/login",
+                        "/api/v1/auth/oidc/start",
+                        "/api/v1/auth/oidc/callback",
+                    }:
+                        authorized_client = fixtures.public
+                    authorized = _live_matrix_request(authorized_client, api, route, fixtures, foreign=False)
+                    authorized_summary = _live_authorized_probe(authorized, public=authorized_client is fixtures.public)
+                    state: dict[str, Any] = {
+                        "method": route.method,
+                        "path": route.path,
+                        "authorized": authorized_summary,
+                    }
+                    if route_requires_cross_tenant_replay(route):
+                        before = _live_matrix_target_fingerprint(fixtures.manager_a, api, route, fixtures)
+                        rejected = _live_matrix_request(fixtures.manager_b, api, route, fixtures, foreign=True)
+                        denial = tenant_denial_probe(rejected, forbidden_values=fixtures.foreign_identifiers())
+                        after = _live_matrix_target_fingerprint(fixtures.manager_a, api, route, fixtures)
+                        denial["side_effect_free"] = before == after
+                        denial["passed"] = bool(denial["passed"]) and bool(denial["side_effect_free"])
+                        state["rejection"] = denial
+                    elif route.contract.cross_tenant.value == "actor-scoped":
+                        scoped = _live_matrix_request(fixtures.manager_b, api, route, fixtures, foreign=True)
+                        leak = _response_contains_any(scoped, fixtures.foreign_identifiers())
+                        state["rejection"] = {
+                            **_safe_http_summary(scoped),
+                            "passed": scoped.status_code < 500 and not leak,
+                            "leak_detected": leak,
+                            "side_effect_free": True,
+                        }
+                    else:
+                        state["rejection"] = {"passed": True, "state": "NOT_APPLICABLE"}
+                    state["state"] = (
+                        "EXECUTED"
+                        if bool(state["authorized"]["passed"]) and bool(state["rejection"]["passed"])
+                        else "FAILED"
+                    )
+                    states.append(state)
+            finally:
+                fixtures.close()
+            report["route_states"] = states
+            failed = [item for item in states if item["state"] != "EXECUTED"]
+            if failed:
+                raise RuntimeError("AUTHORIZATION_ROUTE_MATRIX_FAILED")
+            _record_check(report, "every_public_route_executed", True, {"route_count": len(states)})
+        report["passed"] = True
+    except OperationalGateBlocked as exc:
+        exit_code = 2
+        report["blocked"] = {"code": str(exc)}
+    except Exception as exc:
+        exit_code = 1
+        report["error"] = _safe_cli_failure(exc, stage="live_http_authorization_matrix")
+    finally:
+        report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_operational_gate_report(report_dir, "live-http-authorization-matrix", report)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+@dataclass
+class _LiveAuthorizationMatrixFixtures:
+    """Test-owned HTTP fixtures; reports retain only route/status metadata."""
+
+    public: httpx.Client
+    admin: httpx.Client
+    manager_a: httpx.Client
+    manager_b: httpx.Client
+    identifiers: dict[str, str]
+    admin_username: str
+    admin_secret: str
+    manager_a_username: str
+    manager_a_password: str
+
+    def foreign_identifiers(self) -> tuple[str, ...]:
+        return tuple(value for key, value in self.identifiers.items() if key.endswith("_a"))
+
+    def close(self) -> None:
+        for client in (self.public, self.admin, self.manager_a, self.manager_b):
+            client.close()
+
+
+def _build_live_authorization_matrix_fixtures(
+    client: httpx.Client,
+    *,
+    api: str,
+    admin_secret: str,
+    admin_username: str,
+    database_url: str,
+    timeout_seconds: int,
+) -> _LiveAuthorizationMatrixFixtures:
+    """Create only generated tenants, memberships, and HTTP-owned resources."""
+    _login_for_hardening(client, api, admin_username, admin_secret)
+    suffix = f"auth-matrix-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:8]}"
+    tenant_a = _create_hardening_tenant(client, api, suffix, "a")
+    tenant_b = _create_hardening_tenant(client, api, suffix, "b")
+    manager_a_identity, manager_b_identity = asyncio.run(
+        _seed_live_matrix_identities(tenant_a=tenant_a, tenant_b=tenant_b, database_url=database_url)
+    )
+    manager_a = httpx.Client(timeout=max(30, timeout_seconds), follow_redirects=True)
+    manager_b = httpx.Client(timeout=max(30, timeout_seconds), follow_redirects=True)
+    _login_deep_research_viewer(manager_a, api, manager_a_identity["username"], manager_a_identity["password"])
+    _login_deep_research_viewer(manager_b, api, manager_b_identity["username"], manager_b_identity["password"])
+    _select_hardening_tenant(manager_a, api, tenant_a)
+    _select_hardening_tenant(manager_b, api, tenant_b)
+    kb_a = _create_verify_knowledge_base(manager_a, api)
+    kb_b = _create_verify_knowledge_base(manager_b, api)
+    kb_delete_a = _create_verify_knowledge_base(manager_a, api)
+    group = manager_a.post(
+        f"{api}/api/v1/groups", json={"name": f"matrix-group-{suffix}", "group_type": "LOCAL"}, timeout=30
+    )
+    group.raise_for_status()
+    source = manager_a.post(
+        f"{api}/api/v1/knowledge-bases/{kb_a}/sources",
+        json={"kind": "wikipedia", "name": f"matrix-source-{suffix}", "config": {}},
+        timeout=30,
+    )
+    source.raise_for_status()
+    grants = manager_a.get(f"{api}/api/v1/knowledge-bases/{kb_a}/grants", timeout=30)
+    grants.raise_for_status()
+    grant = manager_a.post(
+        f"{api}/api/v1/knowledge-bases/{kb_a}/grants",
+        json={"subject_type": "GROUP", "subject_id": str(group.json()["id"]), "role": "MANAGER"},
+        timeout=30,
+    )
+    grant.raise_for_status()
+    upload = _upload_operational_acl_fixture(manager_a, api, kb_a, f"matrix-{uuid.uuid4().hex}")
+    job = _wait_job_terminal(manager_a, api, upload["job_id"], timeout_seconds=timeout_seconds)
+    if job.get("status") != "completed":
+        raise OperationalGateBlocked("MATRIX_UPLOAD_FIXTURE_NOT_COMPLETED")
+    batch = manager_a.post(
+        f"{api}/api/v1/uploads/batches",
+        json={
+            "knowledge_base_id": kb_a,
+            "items": [
+                {
+                    "filename": "matrix-pending.txt",
+                    "content_type": "text/plain",
+                    "size_bytes": 1,
+                    "checksum_sha256": hashlib.sha256(b"x").hexdigest(),
+                }
+            ],
+        },
+        timeout=30,
+    )
+    batch.raise_for_status()
+    sync = manager_a.post(
+        f"{api}/api/v1/knowledge-bases/{kb_a}/sources/{source.json()['id']}:sync",
+        json={"mode": "incremental"},
+        timeout=30,
+    )
+    sync_payload = sync.json() if sync.is_success else {}
+    plan = manager_a.post(
+        f"{api}/api/v1/research-plans",
+        json={
+            "topic": "operational authorization matrix",
+            "knowledge_base_id": kb_a,
+            "retrieval_profile": "upload_mock",
+        },
+        timeout=30,
+    )
+    plan_payload = plan.json() if plan.is_success else {}
+    run = manager_a.post(
+        f"{api}/api/v1/research-runs",
+        json={
+            "topic": "operational authorization matrix",
+            "knowledge_base_id": kb_a,
+            "retrieval_profile": "upload_mock",
+        },
+        timeout=30,
+    )
+    run_payload = run.json() if run.is_success else {}
+    debug = manager_a.post(
+        f"{api}/api/v1/search:debug",
+        json={"message": "authorization matrix", "knowledge_base_ids": [kb_a], "retrieval_profile": "upload_mock"},
+        timeout=max(30, timeout_seconds),
+    )
+    debug_payload = debug.json() if debug.is_success else {}
+    document_delete = _upload_operational_acl_fixture(manager_a, api, kb_a, f"matrix-delete-{uuid.uuid4().hex}")
+    delete_job = _wait_job_terminal(manager_a, api, document_delete["job_id"], timeout_seconds=timeout_seconds)
+    if delete_job.get("status") != "completed":
+        raise OperationalGateBlocked("MATRIX_DELETE_DOCUMENT_FIXTURE_NOT_COMPLETED")
+    identifiers = {
+        "tenant_a": tenant_a,
+        "tenant_b": tenant_b,
+        "kb_a": kb_a,
+        "kb_b": kb_b,
+        "kb_delete_a": kb_delete_a,
+        "group_a": str(group.json()["id"]),
+        "source_a": str(source.json()["id"]),
+        "grant_a": str(grant.json()["id"]),
+        "job_a": str(upload["job_id"]),
+        "document_a": str(upload["document_id"]),
+        "document_delete_a": str(document_delete["document_id"]),
+        "upload_session_a": str(upload.get("upload_session_id") or ""),
+        "batch_a": str(batch.json()["batch_id"]),
+        "source_sync_run_a": str(sync_payload.get("run_id") or uuid.uuid4()),
+        "research_plan_a": str(plan_payload.get("plan_id") or uuid.uuid4()),
+        "research_run_a": str(run_payload.get("run_id") or uuid.uuid4()),
+        "query_run_a": str(debug_payload.get("query_run_id") or uuid.uuid4()),
+        "user_a": str(manager_a_identity["user_id"]),
+        "connection_a": str(uuid.uuid4()),
+        "model_a": str(uuid.uuid4()),
+        "revision_a": str(uuid.uuid4()),
+    }
+    return _LiveAuthorizationMatrixFixtures(
+        public=httpx.Client(timeout=max(30, timeout_seconds), follow_redirects=True),
+        admin=client,
+        manager_a=manager_a,
+        manager_b=manager_b,
+        identifiers=identifiers,
+        admin_username=admin_username,
+        admin_secret=admin_secret,
+        manager_a_username=manager_a_identity["username"],
+        manager_a_password=manager_a_identity["password"],
+    )
+
+
+async def _seed_live_matrix_identities(
+    *, tenant_a: str, tenant_b: str, database_url: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Use one event loop: SQLAlchemy's async pool is deliberately loop-bound."""
+    manager_a = await _seed_deep_research_viewer_user(tenant_id=tenant_a, database_url=database_url)
+    manager_b = await _seed_deep_research_viewer_user(tenant_id=tenant_b, database_url=database_url)
+    await _seed_operational_tenant_membership(
+        tenant_id=tenant_a, user_id=manager_a["user_id"], database_url=database_url
+    )
+    await _seed_operational_tenant_membership(
+        tenant_id=tenant_b, user_id=manager_b["user_id"], database_url=database_url
+    )
+    return manager_a, manager_b
+
+
+def _live_matrix_request(
+    client: httpx.Client, api: str, route: Any, fixtures: _LiveAuthorizationMatrixFixtures, *, foreign: bool
+) -> httpx.Response:
+    path = str(route.path)
+    values = fixtures.identifiers
+    replacements = {
+        "kb_id": values["kb_delete_a"] if route.method == "DELETE" else values["kb_a"],
+        "source_id": values["source_a"],
+        "grant_id": values["grant_a"],
+        "group_id": values["group_a"],
+        "job_id": values["job_a"],
+        "upload_session_id": values["upload_session_a"],
+        "batch_id": values["batch_a"],
+        "document_id": values["document_delete_a"] if route.method == "DELETE" else values["document_a"],
+        "query_run_id": values["query_run_a"],
+        "research_plan_id": values["research_plan_a"],
+        "research_run_id": values["research_run_a"],
+        "user_id": values["user_a"],
+        "tenant_id": values["tenant_a"],
+        "connection_id": values["connection_a"],
+        "model_id": values["model_a"],
+        "revision_id": values["revision_a"],
+    }
+    for key, value in replacements.items():
+        path = path.replace("{" + key + "}", value)
+    payload = _live_matrix_payload(route, fixtures, foreign=foreign)
+    response = client.request(route.method, f"{api}{path}", json=payload, timeout=180)
+    if path == "/api/v1/auth/logout" and client is fixtures.manager_a:
+        _login_deep_research_viewer(client, api, fixtures.manager_a_username, fixtures.manager_a_password)
+        _select_hardening_tenant(client, api, fixtures.identifiers["tenant_a"])
+    return response
+
+
+def _live_matrix_payload(
+    route: Any, fixtures: _LiveAuthorizationMatrixFixtures, *, foreign: bool
+) -> dict[str, Any] | None:
+    path = str(route.path)
+    values = fixtures.identifiers
+    foreign_kb = values["kb_a"] if foreign else values["kb_a"]
+    if path == "/api/v1/auth/local/login":
+        return {"username": fixtures.admin_username, "password": fixtures.admin_secret, "remember_me": False}
+    if path == "/api/v1/auth/oidc/callback":
+        return None
+    if path == "/api/v1/auth/local/password":
+        return {"current_password": fixtures.manager_a_password, "new_password": fixtures.manager_a_password}
+    if path == "/api/v1/auth/session/tenant":
+        return {"tenant_id": values["tenant_b"] if foreign else values["tenant_a"]}
+    if path == "/api/v1/groups" and route.method == "POST":
+        return {"name": f"matrix-extra-{uuid.uuid4().hex[:8]}", "group_type": "LOCAL", "tenant_id": values["tenant_a"]}
+    if path == "/api/v1/groups/{group_id}" and route.method == "PATCH":
+        return {"name": f"matrix-patched-{uuid.uuid4().hex[:8]}"}
+    if path == "/api/v1/knowledge-bases" and route.method == "POST":
+        return {"name": f"matrix-extra-{uuid.uuid4().hex[:8]}", "tenant_id": values["tenant_a"]}
+    if path == "/api/v1/knowledge-bases/{kb_id}" and route.method == "PATCH":
+        return {"name": f"matrix-patched-{uuid.uuid4().hex[:8]}"}
+    if path.endswith("/grants") and route.method == "POST":
+        return {"subject_type": "USER", "subject_id": values["user_a"], "role": "MANAGER"}
+    if "/grants/{grant_id}" in path and route.method == "PATCH":
+        return {"role": "OWNER"}
+    if path.endswith("/sources") and route.method == "POST":
+        return {"kind": "wikipedia", "name": f"matrix-source-{uuid.uuid4().hex[:8]}", "config": {}}
+    if "/sources/{source_id}" in path and route.method == "PATCH":
+        return {"name": f"matrix-source-patched-{uuid.uuid4().hex[:8]}"}
+    if path.endswith("/access"):
+        return {"policy": "kb", "user_ids": [], "group_ids": [], "apply_to_existing": False}
+    if path.endswith(":sync"):
+        return {"mode": "incremental"}
+    if path.endswith("/wikipedia/imports"):
+        return {"xml_path": "not-a-permitted-import.xml", "tenant_id": values["tenant_a"]}
+    if path.endswith("/zim-imports"):
+        return {"zim_filename": "not-a-permitted-import.zim", "tenant_id": values["tenant_a"]}
+    if path == "/api/v1/uploads/sessions":
+        content = b"x"
+        return {
+            "filename": "matrix-request.txt",
+            "content_type": "text/plain",
+            "size_bytes": len(content),
+            "checksum_sha256": hashlib.sha256(content).hexdigest(),
+            "knowledge_base_id": foreign_kb,
+        }
+    if path == "/api/v1/uploads/batches":
+        return {
+            "knowledge_base_id": foreign_kb,
+            "items": [
+                {
+                    "filename": "matrix-batch.txt",
+                    "size_bytes": 1,
+                    "checksum_sha256": hashlib.sha256(b"x").hexdigest(),
+                }
+            ],
+        }
+    if path.endswith(":complete"):
+        return {"metadata": {}}
+    if path.endswith("/documents/{document_id}/search"):
+        return {"query": "authorization matrix"}
+    if path == "/api/v1/search":
+        return {
+            "query": "authorization matrix",
+            "knowledge_base_ids": [foreign_kb],
+            "ranking_profile": "upload_mock",
+        }
+    if path == "/api/v1/search:debug":
+        return {
+            "message": "authorization matrix",
+            "knowledge_base_ids": [foreign_kb],
+            "retrieval_profile": "upload_mock",
+        }
+    if path == "/api/v1/chat":
+        return {
+            "message": "authorization matrix",
+            "knowledge_base_ids": [foreign_kb],
+            "retrieval_profile": "upload_mock",
+            "stream": True,
+        }
+    if path.endswith("/feedback"):
+        return {"rating": "up"}
+    if path.endswith("/evaluation"):
+        return {"label": "useful"}
+    if path == "/api/v1/research-plans" and route.method == "POST":
+        return {"topic": "authorization matrix", "knowledge_base_id": foreign_kb, "retrieval_profile": "upload_mock"}
+    if path == "/api/v1/research-plans/{research_plan_id}" and route.method == "PATCH":
+        return {"notes": "matrix"}
+    if path == "/api/v1/research-runs" and route.method == "POST":
+        return {"topic": "authorization matrix", "knowledge_base_id": foreign_kb, "retrieval_profile": "upload_mock"}
+    return {} if route.method in {"POST", "PATCH", "PUT"} else None
+
+
+def _live_authorized_probe(response: httpx.Response, *, public: bool) -> dict[str, Any]:
+    """A 4xx validation/conflict can prove auth passed; 401/403 and 5xx cannot."""
+    summary = _safe_http_summary(response)
+    summary["passed"] = response.status_code < 500 and (public or response.status_code not in {401, 403})
+    return summary
+
+
+def _safe_http_summary(response: httpx.Response) -> dict[str, Any]:
+    from wikipediarag.operational_authorization import safe_response_summary
+
+    return safe_response_summary(response)
+
+
+def _response_contains_any(response: httpx.Response, values: tuple[str, ...]) -> bool:
+    from wikipediarag.operational_authorization import response_contains_forbidden_values
+
+    try:
+        payload: Any = response.json()
+    except ValueError:
+        payload = response.text
+    return response_contains_forbidden_values(payload, values)
+
+
+def _live_matrix_target_fingerprint(
+    client: httpx.Client, api: str, route: Any, fixtures: _LiveAuthorizationMatrixFixtures
+) -> str | None:
+    """Hash only a test-owned target representation to prove rejected writes did not alter it."""
+    path = str(route.path)
+    target: str | None = None
+    if "{document_id}" in path:
+        target = f"/api/v1/documents/{fixtures.identifiers['document_a']}"
+    elif "{source_id}" in path:
+        target = f"/api/v1/knowledge-bases/{fixtures.identifiers['kb_a']}/sources/{fixtures.identifiers['source_a']}"
+    elif "{grant_id}" in path:
+        target = f"/api/v1/knowledge-bases/{fixtures.identifiers['kb_a']}/grants"
+    elif "{group_id}" in path:
+        target = "/api/v1/groups"
+    elif "{kb_id}" in path:
+        target = f"/api/v1/knowledge-bases/{fixtures.identifiers['kb_a']}"
+    if target is None:
+        return None
+    response = client.get(f"{api}{target}", timeout=30)
+    if not response.is_success:
+        return None
+    return hashlib.sha256(response.content).hexdigest()
+
+
+def verify_provider_acl_revocation(args: argparse.Namespace) -> None:
+    """Run the provider-backed current-ACL read-surface revocation gate."""
+    from wikipediarag.operational_authorization import exposure_route_contracts, revocation_probe, safe_contract_report
+
+    api = str(args.api).rstrip("/")
+    report_dir = Path("artifacts/validation/provider-acl-revocation") / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    report_dir.mkdir(parents=True, exist_ok=True)
+    routes = exposure_route_contracts()
+    report: dict[str, Any] = {
+        "passed": False,
+        "api": api,
+        "report_dir": str(report_dir),
+        "exposure_routes": safe_contract_report(routes),
+        "checks": [],
+        "probes": [],
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    exit_code = 0
+    try:
+        if not args.operational_test_database_url:
+            raise OperationalGateBlocked("OPERATIONAL_TEST_DATABASE_URL_REQUIRED")
+        admin_secret = _resolve_hardening_admin_secret(args)
+        if not admin_secret:
+            raise OperationalGateBlocked("ADMIN_SECRET_REQUIRED")
+        with httpx.Client(timeout=180, follow_redirects=True) as admin_client:
+            try:
+                _wait_json_ready(admin_client, f"{api}/ready", "api", require_ok=True)
+            except RuntimeError as exc:
+                raise OperationalGateBlocked("API_READINESS_REQUIRED") from exc
+            _record_check(report, "api_ready", True)
+            smoke_models(str(args.gateway).rstrip("/"), "openrouter")
+            _record_check(report, "model_gateway_openrouter_canary", True)
+            _login_for_hardening(admin_client, api, str(args.admin_username), admin_secret)
+            session = _get_json(admin_client, f"{api}/api/v1/auth/session")
+            actor: dict[str, Any] = dict(session.get("user") or {}) if isinstance(session.get("user"), dict) else {}
+            admin_user_id = str(actor.get("id") or "")
+            if not admin_user_id:
+                raise OperationalGateBlocked("ADMIN_SESSION_USER_ID_REQUIRED")
+            suffix = time.strftime("%Y%m%d%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
+            tenant_id = _create_hardening_tenant(admin_client, api, suffix, "acl")
+            asyncio.run(
+                _seed_operational_tenant_membership(
+                    tenant_id=tenant_id,
+                    user_id=admin_user_id,
+                    database_url=str(args.operational_test_database_url),
+                )
+            )
+            viewer = asyncio.run(
+                _seed_deep_research_viewer_user(
+                    tenant_id=tenant_id,
+                    database_url=str(args.operational_test_database_url),
+                )
+            )
+            _select_hardening_tenant(admin_client, api, tenant_id)
+            kb_id = _create_deep_research_knowledge_base(admin_client, api, f"acl-revocation-{suffix}")
+            grant = admin_client.post(
+                f"{api}/api/v1/knowledge-bases/{kb_id}/grants",
+                json={"subject_type": "USER", "subject_id": viewer["user_id"], "role": "EDITOR"},
+                timeout=30,
+            )
+            grant.raise_for_status()
+            viewer_client = httpx.Client(timeout=180, follow_redirects=True)
+            try:
+                _login_deep_research_viewer(viewer_client, api, viewer["username"], viewer["password"])
+                marker = f"acl-revocation-{uuid.uuid4().hex}"
+                upload = _upload_operational_acl_fixture(admin_client, api, kb_id, marker)
+                job = _wait_job_terminal(admin_client, api, upload["job_id"])
+                if job.get("status") != "completed":
+                    raise RuntimeError("ACL_REVOCATION_UPLOAD_NOT_COMPLETED")
+                document_id = str(upload["document_id"])
+                baseline = viewer_client.post(
+                    f"{api}/api/v1/search",
+                    json={"query": marker, "knowledge_base_ids": [kb_id], "ranking_profile": "upload_sota_mvp"},
+                    timeout=180,
+                )
+                baseline.raise_for_status()
+                if marker not in baseline.text:
+                    raise RuntimeError("ACL_REVOCATION_BASELINE_NOT_VISIBLE")
+                run_id = _create_deep_research_run(
+                    viewer_client,
+                    api,
+                    kb_id,
+                    marker,
+                    retrieval_profile="upload_sota_mvp",
+                    tool_mode=DEFAULT_RESEARCH_TOOL_MODE,
+                    context_policy_override=None,
+                    run_deadline_seconds=max(120, int(args.timeout_seconds)),
+                )
+                detail = _wait_research_run_terminal(
+                    viewer_client, api, run_id, timeout_seconds=int(args.timeout_seconds)
+                )
+                evidence_raw = detail.get("evidence") if isinstance(detail, dict) else []
+                evidence = evidence_raw if isinstance(evidence_raw, list) else []
+                linked = [
+                    str(item.get("id"))
+                    for item in evidence
+                    if isinstance(item, dict) and item.get("document_id") == document_id
+                ]
+                if not linked:
+                    raise RuntimeError("ACL_REVOCATION_RESEARCH_EVIDENCE_MISSING")
+                debug_baseline = viewer_client.post(
+                    f"{api}/api/v1/search:debug",
+                    json={"message": marker, "knowledge_base_ids": [kb_id], "retrieval_profile": "upload_sota_mvp"},
+                    timeout=180,
+                )
+                debug_baseline.raise_for_status()
+                debug_payload = debug_baseline.json()
+                query_run_id = str(debug_payload.get("query_run_id") or "") if isinstance(debug_payload, dict) else ""
+                if not query_run_id:
+                    raise RuntimeError("ACL_REVOCATION_QUERY_RUN_MISSING")
+                revoke = admin_client.patch(
+                    f"{api}/api/v1/documents/{document_id}/access",
+                    json={"policy": "restricted", "user_ids": [], "group_ids": []},
+                    timeout=30,
+                )
+                revoke.raise_for_status()
+                _record_check(report, "document_acl_revoked", True)
+                forbidden = [marker, document_id, *linked]
+                for route, response in _post_revocation_exposure_requests(
+                    viewer_client, api, kb_id, document_id, run_id, marker, query_run_id
+                ):
+                    item = {
+                        "method": route[0],
+                        "path": route[1],
+                        **revocation_probe(response, forbidden_values=forbidden),
+                    }
+                    report["probes"].append(item)
+                missing = {(item.method, item.path) for item in routes} - {
+                    (str(item["method"]), str(item["path"])) for item in report["probes"]
+                }
+                if missing:
+                    raise RuntimeError("ACL_REVOCATION_EXPOSURE_ROUTE_NOT_INVOKED")
+                failures = [item for item in report["probes"] if not item["passed"]]
+                if failures:
+                    raise RuntimeError("ACL_REVOCATION_CONTENT_LEAK")
+            finally:
+                viewer_client.close()
+        report["passed"] = True
+    except OperationalGateBlocked as exc:
+        exit_code = 2
+        report["blocked"] = {"code": str(exc)}
+    except Exception as exc:
+        exit_code = 1
+        report["error"] = _safe_cli_failure(exc, stage="provider_acl_revocation")
+    finally:
+        report["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_operational_gate_report(report_dir, "provider-acl-revocation", report)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+async def _seed_operational_tenant_membership(*, tenant_id: str, user_id: str, database_url: str) -> None:
+    """Grant an existing test administrator membership in a generated tenant only."""
+    from sqlalchemy import text
+
+    from wikipediarag.config import get_settings
+    from wikipediarag.db import connect
+
+    settings = get_settings().model_copy(update={"database_url": database_url})
+    async with connect(settings) as conn:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO tenant_memberships(tenant_id, user_id, role)
+                VALUES (:tenant_id, :user_id, 'TENANT_ADMIN')
+                ON CONFLICT (tenant_id, user_id) DO UPDATE SET role = EXCLUDED.role
+                """
+            ),
+            {"tenant_id": tenant_id, "user_id": user_id},
+        )
+
+
+def _upload_operational_acl_fixture(
+    client: httpx.Client, api: str, knowledge_base_id: str, marker: str
+) -> dict[str, str]:
+    content = marker.encode("utf-8")
+    checksum = hashlib.sha256(content).hexdigest()
+    session_response = client.post(
+        f"{api}/api/v1/uploads/sessions",
+        json={
+            "filename": "acl-revocation.txt",
+            "content_type": "text/plain",
+            "size_bytes": len(content),
+            "checksum_sha256": checksum,
+            "knowledge_base_id": knowledge_base_id,
+            "parser_profile": "standard",
+            "metadata": {},
+        },
+        timeout=30,
+    )
+    session_response.raise_for_status()
+    session = session_response.json()
+    if not isinstance(session, dict):
+        raise RuntimeError("ACL_REVOCATION_UPLOAD_SESSION_INVALID")
+    upload_response = httpx.put(
+        str(session["upload_url"]), content=content, headers=dict(session.get("required_headers") or {}), timeout=120
+    )
+    upload_response.raise_for_status()
+    completion = client.post(
+        f"{api}/api/v1/uploads/sessions/{session['upload_session_id']}:complete", json={"metadata": {}}, timeout=30
+    )
+    completion.raise_for_status()
+    payload = completion.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("ACL_REVOCATION_UPLOAD_COMPLETION_INVALID")
+    required = {name: str(payload.get(name) or "") for name in ("document_id", "job_id")}
+    if not all(required.values()):
+        raise RuntimeError("ACL_REVOCATION_UPLOAD_IDENTIFIERS_MISSING")
+    return required
+
+
+def _post_revocation_exposure_requests(
+    client: httpx.Client,
+    api: str,
+    knowledge_base_id: str,
+    document_id: str,
+    research_run_id: str,
+    marker: str,
+    query_run_id: str = "",
+) -> list[tuple[tuple[str, str], httpx.Response]]:
+    """Invoke every metadata-tagged current-content route after an ACL revoke."""
+    requests: list[tuple[tuple[str, str], httpx.Response]] = []
+
+    def add(method: str, template: str, *, actual: str | None = None, **kwargs: Any) -> None:
+        requests.append(
+            ((method, template), client.request(method, f"{api}{actual or template}", timeout=180, **kwargs))
+        )
+
+    add("GET", "/api/v1/documents/{document_id}", actual=f"/api/v1/documents/{document_id}")
+    add("GET", "/api/v1/documents/{document_id}/versions", actual=f"/api/v1/documents/{document_id}/versions")
+    add("GET", "/api/v1/documents/{document_id}/structure", actual=f"/api/v1/documents/{document_id}/structure")
+    add("GET", "/api/v1/documents/{document_id}/context", actual=f"/api/v1/documents/{document_id}/context")
+    add(
+        "POST",
+        "/api/v1/documents/{document_id}/search",
+        actual=f"/api/v1/documents/{document_id}/search",
+        json={"query": marker},
+    )
+    add(
+        "POST",
+        "/api/v1/search",
+        json={"query": marker, "knowledge_base_ids": [knowledge_base_id], "ranking_profile": "upload_sota_mvp"},
+    )
+    add(
+        "POST",
+        "/api/v1/search:debug",
+        json={"message": marker, "knowledge_base_ids": [knowledge_base_id], "retrieval_profile": "upload_sota_mvp"},
+    )
+    add(
+        "POST",
+        "/api/v1/chat",
+        json={
+            "message": marker,
+            "knowledge_base_ids": [knowledge_base_id],
+            "retrieval_profile": "upload_sota_mvp",
+            "stream": True,
+        },
+    )
+    if query_run_id:
+        add("GET", "/api/v1/query-runs/{query_run_id}/retrieval", actual=f"/api/v1/query-runs/{query_run_id}/retrieval")
+    add("GET", "/api/v1/research-runs/{research_run_id}", actual=f"/api/v1/research-runs/{research_run_id}")
+    add(
+        "GET",
+        "/api/v1/research-runs/{research_run_id}/events",
+        actual=f"/api/v1/research-runs/{research_run_id}/events",
+    )
+    return requests
+
+
+def _verify_live_openapi_authorization_contracts(schema: dict[str, Any], routes: list[Any]) -> None:
+    from wikipediarag.api.route_contracts import OPENAPI_AUTHORIZATION_EXTENSION
+
+    paths: dict[str, Any] = dict(schema.get("paths") or {}) if isinstance(schema.get("paths"), dict) else {}
+    missing: list[str] = []
+    for route in routes:
+        operations = paths.get(route.path)
+        operation = operations.get(route.method.lower()) if isinstance(operations, dict) else None
+        if not isinstance(operation, dict) or OPENAPI_AUTHORIZATION_EXTENSION not in operation:
+            missing.append(f"{route.method} {route.path}")
+    if missing:
+        raise RuntimeError("LIVE_OPENAPI_AUTHORIZATION_CONTRACT_MISSING")
+
+
+def _write_operational_gate_report(report_dir: Path, name: str, report: dict[str, Any]) -> None:
+    (report_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    failures = 0 if report.get("passed") else 1
+    failure = "" if not failures else '<failure type="OperationalGateFailed"/>'
+    (report_dir / "junit.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<testsuite name="{escape(name)}" tests="1" failures="{failures}">'
+        f'<testcase classname="wikipediarag.cli" name="{escape(name)}">{failure}</testcase></testsuite>\n',
+        encoding="utf-8",
+    )
 
 
 def verify_deep_research_smoke(args: argparse.Namespace) -> None:

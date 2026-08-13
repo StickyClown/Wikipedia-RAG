@@ -4,7 +4,7 @@ TEST ?=
 PROVIDER ?= mock
 EVAL_COUNT ?= 150
 
-.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e test-functional-retrieval test-functional-ui test-functional-reliability test-functional-model-runtime test-architecture functional-up smoke eval eval-smoke eval-generate eval-full eval-document-prepare eval-document-ingest eval-document-run eval-document-status check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload reliability-smoke verify-document-corpus verify-cross-tenant-hardening deep-research-smoke deep-research-hard-smoke deep-research-hard-gate deep-research-matrix deep-research-tool-matrix
+.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e test-functional-retrieval test-functional-ui test-functional-reliability test-functional-model-runtime test-architecture functional-up smoke eval eval-smoke eval-generate eval-full eval-document-prepare eval-document-ingest eval-document-run eval-document-status check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload reliability-smoke verify-document-corpus verify-cross-tenant-hardening verify-live-http-authorization-matrix verify-provider-acl-revocation deep-research-smoke deep-research-hard-smoke deep-research-hard-gate deep-research-matrix deep-research-tool-matrix
 
 bootstrap:
 	uv sync --all-groups
@@ -119,6 +119,12 @@ verify-document-corpus:
 
 verify-cross-tenant-hardening:
 	uv run python -m wikipediarag.cli verify-cross-tenant-hardening $(CROSS_TENANT_HARDENING_ARGS)
+
+verify-live-http-authorization-matrix:
+	uv run python -m wikipediarag.cli verify-live-http-authorization-matrix $(LIVE_HTTP_AUTHORIZATION_MATRIX_ARGS)
+
+verify-provider-acl-revocation:
+	uv run python -m wikipediarag.cli verify-provider-acl-revocation $(PROVIDER_ACL_REVOCATION_ARGS)
 
 deep-research-smoke:
 	uv run python -m wikipediarag.cli deep-research-smoke $(DEEP_RESEARCH_SMOKE_ARGS)
