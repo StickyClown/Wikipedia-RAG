@@ -1018,6 +1018,12 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
             document_version_id=document_version_id,
             source_url=source_url,
             dimensions=target["embedding_dimensions"],
+            source_reference=(
+                dict(source_metadata.get("source_reference") or {})
+                if isinstance(source_metadata.get("source_reference"), dict)
+                else None
+            ),
+            source_version_metadata=dict(source_metadata.get("source_provenance") or {}),
         )
         chunks = _with_document_access(chunks, document_access)
         await _update_item_stage(item_id, stage, {"stage": stage, "chunks_staged": len(chunks)})

@@ -4,7 +4,7 @@ TEST ?=
 PROVIDER ?= mock
 EVAL_COUNT ?= 150
 
-.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e test-functional-retrieval test-functional-ui test-functional-reliability test-functional-model-runtime test-architecture functional-up smoke eval eval-smoke eval-generate eval-full eval-document-prepare eval-document-ingest eval-document-run eval-document-status check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload reliability-smoke verify-document-corpus verify-cross-tenant-hardening verify-live-http-authorization-matrix verify-provider-acl-revocation deep-research-smoke deep-research-hard-smoke deep-research-hard-gate deep-research-matrix deep-research-tool-matrix
+.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e test-functional-retrieval test-functional-ui test-functional-reliability test-functional-model-runtime test-architecture functional-up smoke eval eval-smoke eval-generate eval-full eval-document-prepare eval-document-ingest eval-document-run eval-document-status eval-quality-scaffold eval-quality-prepare eval-quality-review eval-quality-freeze eval-quality-ingest eval-quality-run eval-quality-status eval-quality-report check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload reliability-smoke verify-document-corpus verify-cross-tenant-hardening verify-live-http-authorization-matrix verify-provider-acl-revocation deep-research-smoke deep-research-hard-smoke deep-research-hard-gate deep-research-matrix deep-research-tool-matrix
 
 bootstrap:
 	uv sync --all-groups
@@ -87,6 +87,30 @@ eval-document-run:
 
 eval-document-status:
 	uv run python -m wikipediarag.cli eval-document-status --latest $(EVAL_DOCUMENT_STATUS_ARGS)
+
+eval-quality-scaffold:
+	uv run python -m wikipediarag.cli eval-quality-scaffold $(EVAL_QUALITY_SCAFFOLD_ARGS)
+
+eval-quality-prepare:
+	uv run python -m wikipediarag.cli eval-quality-prepare $(EVAL_QUALITY_PREPARE_ARGS)
+
+eval-quality-review:
+	uv run python -m wikipediarag.cli eval-quality-review $(EVAL_QUALITY_REVIEW_ARGS)
+
+eval-quality-freeze:
+	uv run python -m wikipediarag.cli eval-quality-freeze $(EVAL_QUALITY_FREEZE_ARGS)
+
+eval-quality-run:
+	uv run python -m wikipediarag.cli eval-quality-run $(EVAL_QUALITY_RUN_ARGS)
+
+eval-quality-ingest:
+	uv run python -m wikipediarag.cli eval-quality-ingest $(EVAL_QUALITY_INGEST_ARGS)
+
+eval-quality-status:
+	uv run python -m wikipediarag.cli eval-quality-status $(EVAL_QUALITY_STATUS_ARGS)
+
+eval-quality-report:
+	uv run python -m wikipediarag.cli eval-quality-report $(EVAL_QUALITY_REPORT_ARGS)
 
 check-all: lint format-check typecheck test-unit test-integration test-e2e smoke eval
 

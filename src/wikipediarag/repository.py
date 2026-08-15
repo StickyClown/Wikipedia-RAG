@@ -13,6 +13,7 @@ from wikipediarag.db import json_dumps
 from wikipediarag.document_access import DocumentAccessScope, document_access_bypass, normalize_document_access
 from wikipediarag.ids import new_uuid, scoped_id, stable_hash, stable_uuid
 from wikipediarag.observability import safe_telemetry_payload
+from wikipediarag.provenance import build_source_provenance, direct_upload_source_id
 from wikipediarag.schemas import JobStatus
 from wikipediarag.wiki_dump import Chunk, WikiPage
 
@@ -614,14 +615,45 @@ async def create_document_upload_records(
     document_version_id: str,
     content_hash: str,
     metadata: dict[str, Any],
+    source_reference: dict[str, Any] | None = None,
 ) -> tuple[uuid.UUID, str]:
     job_id = new_uuid()
     existing_batch_id = upload_session.get("batch_id")
     batch_id = uuid.UUID(str(existing_batch_id)) if existing_batch_id is not None else new_uuid()
     item_id = new_uuid()
-    source_id = stable_uuid([tenant_id, knowledge_base_id, "direct_upload"])
+    reference = dict(source_reference or {})
+    source_namespace = str(reference.get("namespace") or "")
+    has_source_reference = bool(source_namespace and reference.get("external_id"))
+    source_id = (
+        uuid.UUID(
+            direct_upload_source_id(
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                namespace=source_namespace,
+            )
+        )
+        if has_source_reference
+        else stable_uuid([tenant_id, knowledge_base_id, "direct_upload"])
+    )
     filename = str(upload_session["filename"])
     object_key = str(upload_session["object_key"])
+    if has_source_reference and not reference.get("source_version"):
+        reference["source_version"] = f"sha256:{content_hash}"
+    source_provenance = build_source_provenance(
+        source_reference=reference if has_source_reference else None,
+        document_id=document_id,
+        document_version_id=document_version_id,
+        checksum_sha256=content_hash,
+        filename=filename,
+        content_type=str(upload_session.get("content_type") or ""),
+        size_bytes=int(upload_session["size_bytes"]) if upload_session.get("size_bytes") is not None else None,
+        source_uri=f"upload://{document_id}",
+    )
+    source_metadata = {
+        **metadata,
+        "source_reference": reference if has_source_reference else None,
+        "source_provenance": source_provenance,
+    }
     now_payload = json_dumps(
         {"stage": "received", "documents_total": 1, "documents_completed": 0, "documents_failed": 0}
     )
@@ -672,8 +704,8 @@ async def create_document_upload_records(
             "id": str(source_id),
             "tenant_id": tenant_id,
             "kb_id": knowledge_base_id,
-            "config": json_dumps({"source_contract": "upload_sessions_v1"}),
-            "metadata": json_dumps({"created_by": "async_upload_pipeline"}),
+            "config": json_dumps({"source_contract": "upload_sessions_v1", "namespace": source_namespace or "legacy"}),
+            "metadata": json_dumps({"created_by": "async_upload_pipeline", "namespace": source_namespace or "legacy"}),
         },
     )
     if existing_batch_id is None:
@@ -763,11 +795,15 @@ async def create_document_upload_records(
     await conn.execute(
         text(
             """
-            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata)
-            VALUES (:id, :tenant_id, :kb_id, 'upload_document', :title, :source_uri, CAST(:metadata AS jsonb))
+            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata,
+                                  source_document_id, identity_scope)
+            VALUES (:id, :tenant_id, :kb_id, 'upload_document', :title, :source_uri, CAST(:metadata AS jsonb),
+                    :source_document_id, :identity_scope)
             ON CONFLICT (id) DO UPDATE
             SET title = EXCLUDED.title,
                 metadata = documents.metadata || EXCLUDED.metadata,
+                source_document_id = EXCLUDED.source_document_id,
+                identity_scope = EXCLUDED.identity_scope,
                 updated_at = now()
             """
         ),
@@ -783,8 +819,11 @@ async def create_document_upload_records(
                     "current_version_id": document_version_id,
                     "knowledge_source_id": str(source_id),
                     "source_kind": "direct_upload",
+                    "source_document_id": str(reference.get("external_id") or document_id),
                 }
             ),
+            "source_document_id": str(reference.get("external_id") or document_id),
+            "identity_scope": f"{tenant_id}:{knowledge_base_id}",
         },
     )
     await conn.execute(
@@ -796,7 +835,9 @@ async def create_document_upload_records(
               public_metadata, uploaded_at, upload_completed_at
             )
             VALUES (
-              :id, :document_id, :tenant_id, :kb_id, 1, 'received',
+              :id, :document_id, :tenant_id, :kb_id,
+              COALESCE((SELECT max(version_ordinal) + 1 FROM document_versions WHERE document_id = :document_id), 1),
+              'received',
               :content_hash, :original_artifact_key, CAST(:parser_options AS jsonb),
               CAST(:source_metadata AS jsonb), CAST(:public_metadata AS jsonb), now(), now()
             )
@@ -815,13 +856,14 @@ async def create_document_upload_records(
             "content_hash": content_hash,
             "original_artifact_key": object_key,
             "parser_options": json_dumps({"profile": upload_session.get("parser_profile") or "standard"}),
-            "source_metadata": json_dumps(metadata),
+            "source_metadata": json_dumps(source_metadata),
             "public_metadata": json_dumps(
                 {
                     "filename": filename,
                     "content_type": upload_session.get("content_type"),
                     "size_bytes": upload_session.get("size_bytes"),
                     "checksum_sha256": content_hash,
+                    "source_provenance": source_provenance,
                 }
             ),
         },
@@ -853,6 +895,23 @@ async def create_document_upload_records(
             "metadata": json_dumps({"artifact_contract": "document_artifact_v1"}),
         },
     )
+    if has_source_reference:
+        await upsert_source_document_state(
+            conn,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            source_id=str(source_id),
+            sync_run_id=None,
+            external_id=str(reference["external_id"]),
+            title=filename,
+            source_uri=f"upload://{document_id}",
+            source_url="",
+            source_version=str(reference["source_version"]),
+            content_hash=content_hash,
+            document_id=document_id,
+            document_version_id=document_version_id,
+            metadata={"source_provenance": source_provenance},
+        )
     await conn.execute(
         text(
             """
@@ -1347,7 +1406,7 @@ async def upsert_source_document_state(
     tenant_id: str,
     knowledge_base_id: str,
     source_id: str,
-    sync_run_id: str,
+    sync_run_id: str | None,
     external_id: str,
     title: str,
     source_uri: str,
@@ -2263,8 +2322,7 @@ async def upsert_wiki_page_and_chunks(
                 """
                 INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
                 VALUES (:tenant_id, :knowledge_base_id, 'document', :legacy_id, :scoped_id)
-                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
-                DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id) DO NOTHING
                 """
             ),
             {
@@ -2279,8 +2337,7 @@ async def upsert_wiki_page_and_chunks(
             """
             INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
             VALUES (:tenant_id, :knowledge_base_id, 'document', :legacy_id, :scoped_id)
-            ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
-            DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+            ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id) DO NOTHING
             """
         ),
         {
@@ -2372,8 +2429,7 @@ async def upsert_chunk(
                 """
                 INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
                 VALUES (:tenant_id, :knowledge_base_id, 'chunk', :legacy_id, :scoped_id)
-                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
-                DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id) DO NOTHING
                 """
             ),
             {
@@ -3347,8 +3403,7 @@ async def upsert_document(
                 """
                 INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
                 VALUES (:tenant_id, :knowledge_base_id, 'document', :legacy_id, :scoped_id)
-                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
-                DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id) DO NOTHING
                 """
             ),
             {
@@ -3419,8 +3474,7 @@ async def save_index_version(
                 """
                 INSERT INTO legacy_id_mappings(tenant_id, knowledge_base_id, entity_kind, legacy_id, scoped_id)
                 VALUES (:tenant_id, :knowledge_base_id, 'index_version', :legacy_id, :scoped_id)
-                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id)
-                DO UPDATE SET scoped_id = EXCLUDED.scoped_id
+                ON CONFLICT (tenant_id, knowledge_base_id, entity_kind, legacy_id) DO NOTHING
                 """
             ),
             {

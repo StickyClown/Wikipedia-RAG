@@ -1,12 +1,113 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from wikipediarag.research_tool_registry import DEFAULT_RESEARCH_TOOL_MODE, ResearchToolMode
+
+_SOURCE_ATTRIBUTE_RESERVED_KEYS = frozenset(
+    {
+        "acl",
+        "attributes",
+        "checksum_sha256",
+        "content_hash",
+        "content_type",
+        "document_id",
+        "document_version_id",
+        "external_id",
+        "filename",
+        "knowledge_base_id",
+        "locator",
+        "namespace",
+        "object_key",
+        "original_artifact_key",
+        "source_chunk_id",
+        "source_document_id",
+        "source_provenance",
+        "source_ref",
+        "source_uri",
+        "source_url",
+        "source_version",
+        "tenant_id",
+    }
+)
+
+
+def _validate_source_attributes(value: dict[str, Any]) -> dict[str, Any]:
+    if len(value) > 32:
+        raise ValueError("attributes must contain at most 32 keys")
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("attributes must be JSON serializable") from exc
+    if len(serialized.encode("utf-8")) > 8192:
+        raise ValueError("attributes must not exceed 8192 bytes")
+
+    def validate(item: Any, *, depth: int = 0) -> None:
+        if depth > 4:
+            raise ValueError("attributes nesting must not exceed four levels")
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str) or not key or len(key) > 80:
+                    raise ValueError("attributes keys must be non-empty strings up to 80 characters")
+                if key.casefold() in _SOURCE_ATTRIBUTE_RESERVED_KEYS:
+                    raise ValueError(f"attributes key is reserved: {key}")
+                validate(child, depth=depth + 1)
+        elif isinstance(item, list):
+            if len(item) > 32:
+                raise ValueError("attributes arrays must contain at most 32 items")
+            for child in item:
+                validate(child, depth=depth + 1)
+        elif item is not None and not isinstance(item, str | int | float | bool):
+            raise ValueError("attributes values must be JSON scalars, arrays, or objects")
+
+    validate(value)
+    return value
+
+
+class SourceReferenceInput(BaseModel):
+    """Client-declared external identity, scoped by a server-owned source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["source_ref_v1"] = "source_ref_v1"
+    namespace: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+    external_id: str = Field(min_length=1, max_length=240, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]*$")
+    source_version: str | None = Field(default=None, min_length=1, max_length=240)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("attributes")
+    @classmethod
+    def validate_attributes(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _validate_source_attributes(value)
+
+
+class SourceProvenance(BaseModel):
+    """Safe projection shared by document, search and evidence responses."""
+
+    schema_version: str = "source_provenance_v1"
+    origin: Literal["source_ref", "legacy_generated"] = "legacy_generated"
+    source_namespace: str = "legacy"
+    source_external_id: str = ""
+    source_version: str = ""
+    document_id: str = ""
+    document_version_id: str = ""
+    content_sha256: str = ""
+    original_filename: str = ""
+    content_type: str = ""
+    size_bytes: int | None = None
+    source_uri: str = ""
+    source_url: str = ""
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    processing_contract: dict[str, Any] = Field(default_factory=dict)
+    source_chunk_id: str = ""
+    fragment_content_hash: str = ""
+    chunk_ordinal: int | None = None
+    locator: dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelConnectionCreate(BaseModel):
@@ -190,6 +291,7 @@ class SearchResult(BaseModel):
     score: float
     ranks: dict[str, int] = Field(default_factory=dict)
     highlights: list[SearchHighlight] = Field(default_factory=list)
+    provenance: SourceProvenance = Field(default_factory=SourceProvenance)
 
 
 class SearchDocumentGroup(BaseModel):
@@ -239,6 +341,7 @@ class DocumentStructureResponse(BaseModel):
     public_metadata: dict[str, Any] = Field(default_factory=dict)
     document_access: dict[str, Any] = Field(default_factory=dict)
     document_access_origin: str | None = None
+    provenance: SourceProvenance = Field(default_factory=SourceProvenance)
 
 
 class DocumentContextChunk(BaseModel):
@@ -255,6 +358,7 @@ class DocumentContextChunk(BaseModel):
     next_chunk_id: str | None = None
     chunk_ordinal: int | None = None
     highlighted: bool = False
+    provenance: SourceProvenance = Field(default_factory=SourceProvenance)
 
 
 class DocumentContextResponse(BaseModel):
@@ -287,6 +391,7 @@ class DocumentSearchResult(BaseModel):
     next_chunk_id: str | None = None
     score: float
     ranks: dict[str, int] = Field(default_factory=dict)
+    provenance: SourceProvenance = Field(default_factory=SourceProvenance)
 
 
 class DocumentSearchResponse(BaseModel):
@@ -779,6 +884,7 @@ class Evidence(BaseModel):
     content_unit_id: str = ""
     supporting_chunk_ids: list[str] = Field(default_factory=list)
     provenance_refs: list[str] = Field(default_factory=list)
+    provenance: SourceProvenance = Field(default_factory=SourceProvenance)
 
 
 class AnswerabilityStatus(StrEnum):
@@ -934,6 +1040,7 @@ class UploadSessionCreate(BaseModel):
     knowledge_base_id: str | None = None
     parser_profile: str = Field(default="standard", max_length=40)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    source_ref: SourceReferenceInput | None = None
 
 
 class UploadSessionAccepted(BaseModel):
@@ -950,6 +1057,7 @@ class UploadBatchItemCreate(BaseModel):
     checksum_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
     parser_profile: str = Field(default="standard", max_length=40)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    source_ref: SourceReferenceInput | None = None
 
 
 class UploadBatchCreate(BaseModel):

@@ -20,6 +20,7 @@ services/ui/test-results/
 artifacts/
 RRNCB/
 data/
+eval-corpus/
 models/
 *.zim
 *.gguf

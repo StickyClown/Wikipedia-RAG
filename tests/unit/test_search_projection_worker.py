@@ -238,3 +238,36 @@ async def test_reconciliation_renews_before_repair_and_completes_when_owned(monk
     assert await worker._process_search_projection_reconciliation_once(Settings(), lease_id="owner") == 1
     assert renewals == 1
     assert completed[0]["document_id"] == "document"
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_persists_safe_index_unavailable_code(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    failed: list[dict[str, Any]] = []
+
+    async def schedule(*_args: object, **_kwargs: Any) -> int:
+        return 0
+
+    async def claim(*_args: object, **_kwargs: Any) -> list[dict[str, str]]:
+        return [{"document_id": "document", "tenant_id": "tenant", "knowledge_base_id": "kb"}]
+
+    async def repair(*_args: object, **_kwargs: Any) -> tuple[str | None, str]:
+        raise worker._SearchProjectionRepairError("SEARCH_PROJECTION_INDEX_UNAVAILABLE")
+
+    async def fail(*_args: object, **kwargs: Any) -> None:
+        failed.append(kwargs)
+
+    async def cleanup(*_args: object, **_kwargs: Any) -> int:
+        return 0
+
+    monkeypatch.setattr(worker, "connect", lambda *_args: _Connection())
+    monkeypatch.setattr(worker, "schedule_historical_search_projection_reconciliations", schedule)
+    monkeypatch.setattr(worker, "claim_due_search_projection_reconciliations", claim)
+    monkeypatch.setattr(worker, "_repair_search_projection_document", repair)
+    monkeypatch.setattr(worker, "fail_search_projection_reconciliation", fail)
+    monkeypatch.setattr(worker, "cleanup_completed_search_projection_events", cleanup)
+
+    assert await worker._process_search_projection_reconciliation_once(Settings(), lease_id="owner") == 1
+    assert failed[0]["error_code"] == "SEARCH_PROJECTION_INDEX_UNAVAILABLE"
+    assert "SEARCH_PROJECTION_INDEX_UNAVAILABLE" in caplog.text

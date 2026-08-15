@@ -32,8 +32,16 @@ from wikipediarag.eval.artifacts import (
 )
 from wikipediarag.eval.hashing import stable_json_hash
 from wikipediarag.eval.metrics import aggregate, percentile
+from wikipediarag.eval.retrieval_runner import run_retrieval_task
 from wikipediarag.eval.runner import _eval_overrides, run_task
-from wikipediarag.eval.schemas import EvalConfig, EvalDatasetManifest, EvalTask, EvalTaskResult, TaskScores
+from wikipediarag.eval.schemas import (
+    EvalConfig,
+    EvalDatasetManifest,
+    EvalTask,
+    EvalTaskResult,
+    RetrievalTaskResult,
+    TaskScores,
+)
 from wikipediarag.reliability import safe_failure_from_exception
 from wikipediarag.retrieval_profile import get_retrieval_profile
 
@@ -44,7 +52,11 @@ RRNCB_CSV_URL = (
     f"https://huggingface.co/datasets/FractalGPT/RRNCBPublic/resolve/{RRNCB_REVISION}/rrncb_public_dataset.csv"
 )
 RRNCB_ARCHIVE_URL = "https://drive.google.com/drive/folders/1B12Y-QX9UfI9RDJDZ8KZkfF7FUz5q3hy?usp=sharing"
+RRNCB_MULTILINGUAL_LANGUAGES = ("ru", "en", "uk", "de", "ko")
 NO_ANSWER_RE = re.compile(r"не\s+содержится\s+информац|информац\w*\s+отсутств", re.IGNORECASE)
+LATIN_RE = re.compile(r"[A-Za-z]")
+CYRILLIC_RE = re.compile(r"[А-Яа-яЁёІіЇїЄєҐґ]")
+HANGUL_RE = re.compile(r"[가-힣]")
 
 
 class RRNcBError(RuntimeError):
@@ -180,11 +192,216 @@ def _stable_split(rows: list[dict[str, str]]) -> dict[int, Literal["dev", "test"
     return {index: ("dev" if index in selected else "test") for index in range(len(rows))}
 
 
+def _load_reviewed_translations(path: Path, rows: list[dict[str, str]]) -> dict[tuple[str, str], dict[str, str]]:
+    """Load a complete reviewed translation matrix without trusting generated labels."""
+
+    if not path.is_file():
+        raise RRNcBError(f"reviewed translations are missing: {path}")
+    source_questions = {f"rrncb-{index:04d}": row["question"] for index, row in enumerate(rows, start=1)}
+    translations: dict[tuple[str, str], dict[str, str]] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RRNcBError(f"invalid translation JSON on line {line_number}") from exc
+        if not isinstance(payload, dict):
+            raise RRNcBError(f"translation line {line_number} must be an object")
+        base_task_id = str(payload.get("base_task_id") or "")
+        language = str(payload.get("language") or "")
+        question = str(payload.get("question") or "").strip()
+        reviewed_by = str(payload.get("reviewed_by") or "").strip()
+        reviewed_at = str(payload.get("reviewed_at") or "").strip()
+        if base_task_id not in source_questions or language not in RRNCB_MULTILINGUAL_LANGUAGES[1:]:
+            raise RRNcBError(f"invalid translation identity on line {line_number}")
+        if not question or not reviewed_by or not reviewed_at:
+            raise RRNcBError(f"translation is not reviewed on line {line_number}")
+        expected_hash = stable_json_hash(source_questions[base_task_id])
+        if str(payload.get("source_question_hash") or "") != expected_hash:
+            raise RRNcBError(f"translation source question changed: {base_task_id}")
+        source_question = source_questions[base_task_id]
+        if (
+            unicodedata.normalize("NFKC", question).casefold()
+            == unicodedata.normalize("NFKC", source_question).casefold()
+        ):
+            raise RRNcBError(f"translation repeats the Russian source: {base_task_id}/{language}")
+        latin_count = len(LATIN_RE.findall(question))
+        cyrillic_count = len(CYRILLIC_RE.findall(question))
+        if language in {"en", "de"} and latin_count < max(3, cyrillic_count):
+            raise RRNcBError(f"translation script mismatch: {base_task_id}/{language}")
+        if language == "uk" and cyrillic_count < 3:
+            raise RRNcBError(f"translation script mismatch: {base_task_id}/{language}")
+        if language == "ko" and len(HANGUL_RE.findall(question)) < 2:
+            raise RRNcBError(f"translation script mismatch: {base_task_id}/{language}")
+        key = (base_task_id, language)
+        if key in translations:
+            raise RRNcBError(f"duplicate translation: {base_task_id}/{language}")
+        translations[key] = {
+            "question": question,
+            "reviewed_by": reviewed_by,
+            "reviewed_at": reviewed_at,
+            "review_method": str(payload.get("review_method") or "manual"),
+        }
+    expected = {
+        (base_task_id, language) for base_task_id in source_questions for language in RRNCB_MULTILINGUAL_LANGUAGES[1:]
+    }
+    missing = sorted(expected - set(translations))
+    extra = sorted(set(translations) - expected)
+    if missing or extra:
+        raise RRNcBError(f"translation matrix mismatch: missing={len(missing)} extra={len(extra)}")
+    return translations
+
+
+def generate_rrncb_translations(
+    *,
+    csv_path: Path,
+    output_path: Path,
+    gateway_url: str = "http://localhost:8081",
+    batch_size: int = 10,
+    model_alias: str = "generator_main",
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    """Create a resumable structured translation matrix for later freeze validation."""
+
+    if batch_size < 1 or batch_size > 10:
+        raise ValueError("RRNCB translation batch size must be between 1 and 10")
+    rows = _load_csv(csv_path)
+    existing: dict[tuple[str, str], dict[str, Any]] = {}
+    if output_path.exists():
+        for line in output_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                payload = json.loads(line)
+                existing[(str(payload["base_task_id"]), str(payload["language"]))] = payload
+    owned_client = client is None
+    http_client = client or httpx.Client(timeout=180, follow_redirects=True)
+    try:
+        for start in range(0, len(rows), batch_size):
+            batch = rows[start : start + batch_size]
+            identities = [f"rrncb-{index:04d}" for index in range(start + 1, start + len(batch) + 1)]
+            if all(
+                (task_id, language) in existing
+                for task_id in identities
+                for language in RRNCB_MULTILINGUAL_LANGUAGES[1:]
+            ):
+                continue
+            source_items = [
+                {"base_task_id": task_id, "question_ru": row["question"]}
+                for task_id, row in zip(identities, batch, strict=True)
+            ]
+            item_schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["base_task_id", "en", "uk", "de", "ko"],
+                "properties": {
+                    "base_task_id": {"type": "string"},
+                    "en": {"type": "string"},
+                    "uk": {"type": "string"},
+                    "de": {"type": "string"},
+                    "ko": {"type": "string"},
+                },
+            }
+            request = {
+                "model": model_alias,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Translate each Russian legal question into English, Ukrainian, German and Korean. "
+                            "Preserve legal meaning, negation, numbers, article references and named entities. "
+                            "Review every translation before returning it. Return only the requested JSON."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(source_items, ensure_ascii=False)},
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "rrncb_multilingual_questions",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["translations"],
+                            "properties": {
+                                "translations": {
+                                    "type": "array",
+                                    "minItems": len(batch),
+                                    "maxItems": len(batch),
+                                    "items": item_schema,
+                                }
+                            },
+                        },
+                    },
+                },
+                "thinking": {"mode": "off", "effort": "none", "return_reasoning": False},
+                "max_output_tokens": 4096,
+                "stream": False,
+            }
+            response: httpx.Response | None = None
+            for attempt in range(5):
+                try:
+                    response = http_client.post(f"{gateway_url.rstrip('/')}/v1/chat/completions", json=request)
+                except (httpx.TimeoutException, httpx.NetworkError):
+                    if attempt == 4:
+                        raise
+                    time.sleep(min(2**attempt, 15))
+                    continue
+                if response.status_code not in {429, 502, 503, 504}:
+                    break
+                if attempt == 4:
+                    break
+                time.sleep(min(2**attempt, 15))
+            if response is None:
+                raise RRNcBError("translation request returned no response")
+            response.raise_for_status()
+            response_payload = response.json()
+            choices = response_payload.get("choices") if isinstance(response_payload, dict) else None
+            if not isinstance(choices, list) or not choices:
+                raise RRNcBError("translation response has no choices")
+            content = dict(choices[0].get("message") or {}).get("content")
+            translated = json.loads(str(content)) if isinstance(content, str) else content
+            items = translated.get("translations") if isinstance(translated, dict) else None
+            if not isinstance(items, list) or len(items) != len(batch):
+                raise RRNcBError("translation response has an invalid item count")
+            by_id = {str(item.get("base_task_id")): item for item in items if isinstance(item, dict)}
+            if set(by_id) != set(identities):
+                raise RRNcBError("translation response changed task identities")
+            reviewed_at = utc_now_iso()
+            for task_id, row in zip(identities, batch, strict=True):
+                item = by_id[task_id]
+                for language in RRNCB_MULTILINGUAL_LANGUAGES[1:]:
+                    question = str(item.get(language) or "").strip()
+                    if not question:
+                        raise RRNcBError(f"translation is empty: {task_id}/{language}")
+                    existing[(task_id, language)] = {
+                        "base_task_id": task_id,
+                        "language": language,
+                        "question": question,
+                        "source_question_hash": stable_json_hash(row["question"]),
+                        "reviewed_by": f"model-assisted:{model_alias}",
+                        "reviewed_at": reviewed_at,
+                        "review_method": "structured_translation_review_v1",
+                    }
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            write_jsonl(output_path, [existing[key] for key in sorted(existing)])
+    finally:
+        if owned_client:
+            http_client.close()
+    return {
+        "output_path": str(output_path),
+        "base_task_count": len(rows),
+        "translation_count": len(existing),
+        "languages": list(RRNCB_MULTILINGUAL_LANGUAGES),
+    }
+
+
 def prepare_rrncb(
     *,
     documents_dir: Path,
     suite: str = RRNCB_SUITE,
     csv_path: Path | None = None,
+    translations_path: Path | None = None,
     artifacts_dir: Path | None = None,
 ) -> dict[str, Any]:
     paths = rrncb_paths(suite, artifacts_dir)
@@ -220,38 +437,55 @@ def prepare_rrncb(
     if no_answer_count != 15:
         raise RRNcBError(f"expected exactly 15 RRNCB no-answer rows, got {no_answer_count}")
     split = _stable_split(rows)
+    translations = _load_reviewed_translations(translations_path, rows) if translations_path else {}
+    languages = RRNCB_MULTILINGUAL_LANGUAGES if translations else ("ru",)
     tasks: list[EvalTask] = []
     for index, row in enumerate(rows, start=1):
         source_name = _normal_name(row["document"])
         unanswerable = bool(NO_ANSWER_RE.search(row["answer"]))
-        tasks.append(
-            EvalTask(
-                task_id=f"rrncb-{index:04d}",
-                question=row["question"],
-                task_family="unanswerable" if unanswerable else "single_hop_factual",
-                reference_answer=row["answer"],
-                accepted_answers=[row["answer"]],
-                unanswerable=unanswerable,
-                expected_mode="unanswerable" if unanswerable else "normal_sufficient",
-                gold_page_ids=[source_name],
-                gold_section_ids=[],
-                gold_chunk_ids=[],
-                gold_evidence=[],
-                reasoning_path=[],
-                generator_alias="generator_main",
-                verifier_alias="verifier",
-                zim_checksum="",
-                snapshot_id="",
-                index_version="upload",
-                retrieval_profile_hash="",
-                language="ru",
-                tags=["rrncb", "document_level", "soft_unanswerable" if unanswerable else "answerable"],
-                gold_document_ids=[source_name],
-                evaluation_granularity="document",
-                split=split[index - 1],
-                source_document_name=source_name,
+        base_task_id = f"rrncb-{index:04d}"
+        for language in languages:
+            translation = translations.get((base_task_id, language), {})
+            task_id = f"{base_task_id}-{language}" if translations else base_task_id
+            tasks.append(
+                EvalTask(
+                    task_id=task_id,
+                    question=row["question"] if language == "ru" else translation["question"],
+                    task_family="unanswerable" if unanswerable else "single_hop_factual",
+                    reference_answer=row["answer"],
+                    accepted_answers=[row["answer"]],
+                    unanswerable=unanswerable,
+                    expected_mode="unanswerable" if unanswerable else "normal_sufficient",
+                    gold_page_ids=[source_name],
+                    gold_section_ids=[],
+                    gold_chunk_ids=[],
+                    gold_evidence=[],
+                    reasoning_path=[],
+                    generator_alias="generator_main",
+                    verifier_alias="verifier",
+                    zim_checksum="",
+                    snapshot_id="",
+                    index_version="upload",
+                    retrieval_profile_hash="",
+                    language=language,
+                    language_group=language,
+                    tags=[
+                        "rrncb",
+                        "document_level",
+                        "soft_unanswerable" if unanswerable else "answerable",
+                        f"base_task:{base_task_id}",
+                        f"query_language:{language}",
+                        "source_language:ru",
+                    ],
+                    gold_document_ids=[source_name],
+                    evaluation_granularity="document",
+                    split=split[index - 1],
+                    source_document_name=source_name,
+                    reviewed_by="rrncb-public" if language == "ru" else translation["reviewed_by"],
+                    reviewed_at=f"source-pinned:{RRNCB_REVISION}" if language == "ru" else translation["reviewed_at"],
+                    review_notes=[] if language == "ru" else [f"translation_review:{translation['review_method']}"],
+                )
             )
-        )
     paths.base.mkdir(parents=True, exist_ok=True)
     digest = dataset_hash(tasks)
     manifest = EvalDatasetManifest(
@@ -278,7 +512,13 @@ def prepare_rrncb(
             "unreferenced_documents": len(pdfs) - len(counts),
             "dev_count": sum(task.split == "dev" for task in tasks),
             "test_count": sum(task.split == "test" for task in tasks),
+            "base_task_count": len(rows),
+            "query_languages": list(languages),
+            "translations_sha256": _sha256(translations_path.read_bytes()) if translations_path else "",
         },
+        evaluation_schema_version="search_quality_eval_v1" if translations else "legacy_eval_v1",
+        required_language_counts={language: len(rows) for language in languages},
+        review_policy_version="rrncb_multilingual_review_v1" if translations else "",
     )
     write_jsonl(paths.tasks, tasks)
     write_json(paths.manifest, manifest.model_dump(mode="json"))
@@ -307,7 +547,7 @@ def prepare_rrncb(
         "suite": suite,
         "manifest": str(paths.manifest),
         "source_manifest": str(paths.source_manifest),
-        "task_count": 200,
+        "task_count": len(tasks),
         "dataset_hash": digest,
     }
 
@@ -494,7 +734,7 @@ def ingest_rrncb(
     started_suite = time.perf_counter()
     try:
         try:
-            _require_ready(api_url)
+            _require_ingestion_ready(api_url)
         except Exception as exc:
             raise RRNcBIngestionError("READINESS_FAILED") from exc
         kb_id = _create_or_resume_kb(client, suite, manifest.dataset_hash, actual_ingestion_run_id, state)
@@ -570,6 +810,13 @@ def ingest_rrncb(
                             "rrncb_dataset_hash": manifest.dataset_hash,
                             "rrncb_ingestion_run_id": actual_ingestion_run_id,
                             "rrncb_source_filename": doc["filename"],
+                        },
+                        "source_ref": {
+                            "schema_version": "source_ref_v1",
+                            "namespace": f"eval:{suite}:{manifest.dataset_hash}",
+                            "external_id": doc["filename"],
+                            "source_version": f"sha256:{doc['sha256']}",
+                            "attributes": {"original_system_name": doc["filename"]},
                         },
                     }
                     for doc in pending
@@ -686,7 +933,7 @@ def ingest_rrncb(
                 if time.perf_counter() - started_suite > suite_timeout:
                     raise RRNcBIngestionError("INGESTION_SUITE_TIMEOUT")
                 try:
-                    _require_ready(api_url)
+                    _require_ingestion_ready(api_url)
                 except Exception as exc:
                     raise RRNcBIngestionError("READINESS_FAILED") from exc
                 status_payload = client.request("GET", f"/api/v1/uploads/batches/{batch_id}").json()
@@ -1056,6 +1303,26 @@ def _require_ready(api_url: str) -> dict[str, Any]:
     return payload
 
 
+def _require_ingestion_ready(api_url: str) -> dict[str, Any]:
+    """Accept parser failover while keeping ingestion's authoritative dependencies strict."""
+
+    response = httpx.get(f"{api_url.rstrip('/')}/ready", timeout=30, follow_redirects=True)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RRNcBError("API readiness payload is invalid")
+    components = payload.get("components")
+    if not isinstance(components, dict):
+        raise RRNcBError(f"API ingestion dependencies are not ready: {payload}")
+    required = ("postgres", "worker", "search_projection", "opensearch", "minio")
+    failed = [name for name in required if components.get(name) != "ok"]
+    parser_statuses = [components.get(name) for name in ("xberg", "docling") if name in components]
+    parser_ready = not parser_statuses or any(status == "ok" for status in parser_statuses)
+    if failed or not parser_ready:
+        raise RRNcBError(f"API ingestion dependencies are not ready: failed={failed}, parser_ready={parser_ready}")
+    return payload
+
+
 async def _rrncb_preflight(
     *,
     paths: RRNcBPaths,
@@ -1382,6 +1649,7 @@ async def run_rrncb(
             },
         )
         client.close()
+
         raise RRNcBError("READINESS_FAILED", safe_code="READINESS_FAILED") from exc
     run_contract = _rrncb_run_contract(
         paths=run_paths,
@@ -1702,6 +1970,221 @@ async def run_rrncb(
     finally:
         heartbeat_task.cancel()
         await asyncio.gather(heartbeat_task, return_exceptions=True)
+        client.close()
+
+
+def _rrncb_base_task_id(task: EvalTask) -> str:
+    tag = next((item for item in task.tags if item.startswith("base_task:")), "")
+    return tag.removeprefix("base_task:") if tag else task.task_id.removesuffix(f"-{task.language_group}")
+
+
+def _retrieval_metric(result: RetrievalTaskResult, name: str) -> float:
+    scores = result.scores
+    if scores is None:
+        return 0.0
+    if name == "recall_at_10":
+        return float(scores.document_recall.get("10", 0.0))
+    if name == "mrr_at_10":
+        return float(scores.document_mrr_at_10)
+    if name == "ndcg_at_10":
+        return float(scores.document_ndcg_at_10)
+    raise ValueError(f"unsupported RRNCB retrieval metric: {name}")
+
+
+def _rrncb_multilingual_retrieval_report(tasks: list[EvalTask], results: list[RetrievalTaskResult]) -> dict[str, Any]:
+    task_by_id = {task.task_id: task for task in tasks}
+    latest = {result.task_id: result for result in results if result.task_id in task_by_id}
+    completed = [result for result in latest.values() if result.status == "completed" and result.scores is not None]
+
+    def metrics(rows: list[RetrievalTaskResult]) -> dict[str, float]:
+        latency = [float(row.latency_ms.get("total") or 0) for row in rows]
+        return {
+            "task_count": float(len(rows)),
+            "recall_at_10": sum(_retrieval_metric(row, "recall_at_10") for row in rows) / len(rows) if rows else 0.0,
+            "mrr_at_10": sum(_retrieval_metric(row, "mrr_at_10") for row in rows) / len(rows) if rows else 0.0,
+            "ndcg_at_10": sum(_retrieval_metric(row, "ndcg_at_10") for row in rows) / len(rows) if rows else 0.0,
+            "latency_p50_ms": percentile(latency, 50) if latency else 0.0,
+            "latency_p95_ms": percentile(latency, 95) if latency else 0.0,
+        }
+
+    by_language = {
+        language: metrics([row for row in completed if task_by_id[row.task_id].language_group == language])
+        for language in RRNCB_MULTILINGUAL_LANGUAGES
+    }
+    by_base_language = {
+        (_rrncb_base_task_id(task_by_id[row.task_id]), task_by_id[row.task_id].language_group): row for row in completed
+    }
+    paired_delta: dict[str, dict[str, float]] = {}
+    for language in RRNCB_MULTILINGUAL_LANGUAGES[1:]:
+        pairs = [
+            (by_base_language[(base_id, "ru")], by_base_language[(base_id, language)])
+            for base_id in sorted({_rrncb_base_task_id(task) for task in tasks})
+            if (base_id, "ru") in by_base_language and (base_id, language) in by_base_language
+        ]
+        paired_delta[language] = {
+            "pair_count": float(len(pairs)),
+            "recall_at_10_delta": sum(
+                _retrieval_metric(translated, "recall_at_10") - _retrieval_metric(russian, "recall_at_10")
+                for russian, translated in pairs
+            )
+            / len(pairs)
+            if pairs
+            else 0.0,
+            "mrr_at_10_delta": sum(
+                _retrieval_metric(translated, "mrr_at_10") - _retrieval_metric(russian, "mrr_at_10")
+                for russian, translated in pairs
+            )
+            / len(pairs)
+            if pairs
+            else 0.0,
+        }
+    comparison_keys = sorted({row.comparison_key for row in completed if row.comparison_key})
+    return {
+        "task_count": len(tasks),
+        "completed": len(completed),
+        "failed": len(tasks) - len(completed),
+        "metrics": metrics(completed),
+        "by_language": by_language,
+        "paired_delta_vs_ru": paired_delta,
+        "comparison_keys": comparison_keys,
+        "compatible": len(comparison_keys) <= 1,
+    }
+
+
+async def run_rrncb_retrieval(
+    *,
+    suite: str,
+    ingestion_run_id: str,
+    split: Literal["dev", "test"],
+    api_url: str = "http://localhost:8000",
+    profile_name: str = "upload_sota_mvp",
+    batch_size: int = 5,
+    run_id: str | None = None,
+    resume_run_id: str | None = None,
+    rerun_failed: bool = False,
+    artifacts_dir: Path | None = None,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Run the immutable RRNCB retrieval-only baseline without generation coupling."""
+
+    if run_id and resume_run_id:
+        raise RRNcBError("RRNCB retrieval accepts either run_id or resume_run_id, not both")
+    if batch_size < 1:
+        raise RRNcBError("RRNCB retrieval batch size must be positive")
+    if split == "test" and not resume_run_id:
+        raise RRNcBError("RRNCB retrieval test requires --resume-run-id from dev")
+    suite_paths = rrncb_paths(suite, artifacts_dir)
+    manifest, prepared_tasks = _load_tasks(suite_paths)
+    ingestion_paths = _rrncb_ingestion_paths(suite_paths, ingestion_run_id)
+    if not ingestion_paths.ingestion_state.exists() or not ingestion_paths.mapping.exists():
+        raise RRNcBError("completed ingestion artifacts were not found")
+    ingestion_state = read_json(ingestion_paths.ingestion_state)
+    if ingestion_state.get("status") != "completed":
+        raise RRNcBError("ingestion must complete before retrieval evaluation")
+    kb_id = str(ingestion_state.get("knowledge_base_id") or "")
+    mapping_payload = read_json(ingestion_paths.mapping)
+    mapping_records = dict(mapping_payload.get("documents") or {})
+    mapping = {
+        filename: str(record.get("document_id") or "")
+        for filename, record in mapping_records.items()
+        if isinstance(record, dict) and record.get("document_id")
+    }
+    if len(mapping) != 65:
+        raise RRNcBError("ingestion mapping must contain 65 documents")
+    tasks = _mapped_tasks(prepared_tasks, kb_id, mapping)
+    selected = _rrncb_selected_tasks(tasks, split)
+    actual_run_id = resume_run_id or run_id or f"{suite}-retrieval-{manifest.dataset_hash[:12]}"
+    run_paths = _rrncb_run_paths(suite_paths, actual_run_id)
+    run_paths.base.mkdir(parents=True, exist_ok=True)
+    results_path = run_paths.base / "retrieval.jsonl"
+    status_path = run_paths.base / "retrieval-status.json"
+    report_path = run_paths.base / "retrieval-report.json"
+    dev_marker = run_paths.base / "retrieval-dev.completed.json"
+    resolved = settings or get_settings()
+    _require_ready(api_url)
+    config = _rrncb_config(resolved, profile_name)
+    contract = _rrncb_run_contract(
+        paths=suite_paths,
+        manifest=manifest,
+        ingestion_state=ingestion_state,
+        kb_id=kb_id,
+        config=config,
+        mapping=mapping_payload,
+    )
+    contract["retrieval_only"] = True
+    _validate_or_write_run_contract(run_paths, contract)
+    if split == "test":
+        if not dev_marker.exists():
+            raise RRNcBError("RRNCB retrieval test requires a completed dev marker")
+        marker = read_json(dev_marker)
+        if marker.get("dataset_hash") != manifest.dataset_hash or marker.get("config_hash") != config.config_hash:
+            raise RRNcBError("RRNCB retrieval dev/test contract mismatch")
+    existing_rows = read_jsonl(results_path, RetrievalTaskResult) if results_path.exists() else []
+    existing = {row.task_id: row for row in existing_rows}
+    client = HttpEvalApiClient.from_settings(resolved, include_kiwix_urls=False)
+    started = time.perf_counter()
+    try:
+        for index, task in enumerate(selected, start=1):
+            previous = existing.get(task.task_id)
+            if previous is not None and (previous.status == "completed" or not rerun_failed):
+                continue
+            result = await run_retrieval_task(
+                task,
+                config,
+                api=api_url,
+                manifest=manifest,
+                client=client,
+                settings=resolved,
+                batch_index=(index - 1) // batch_size + 1,
+                task_index=index,
+            )
+            append_jsonl(results_path, result)
+            existing[task.task_id] = result
+            write_json(
+                status_path,
+                {
+                    "status": "running",
+                    "run_id": actual_run_id,
+                    "requested_split": split,
+                    "processed": sum(task_item.task_id in existing for task_item in selected),
+                    "total": len(selected),
+                    "current_task_id": task.task_id,
+                    "elapsed_seconds": round(time.perf_counter() - started, 3),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+        evaluated_tasks = [task for task in tasks if task.task_id in existing]
+        latest_results = [existing[task.task_id] for task in evaluated_tasks]
+        selected_results = [existing.get(task.task_id) for task in selected]
+        report = _rrncb_multilingual_retrieval_report(evaluated_tasks, latest_results)
+        report["full_suite_task_count"] = len(tasks)
+        complete = all(row is not None and row.status == "completed" for row in selected_results)
+        if not complete or not report["compatible"]:
+            raise RRNcBError("RRNCB retrieval split has failed or incompatible results")
+        if split == "dev":
+            write_json(
+                dev_marker,
+                {
+                    "dataset_hash": manifest.dataset_hash,
+                    "config_hash": config.config_hash,
+                    "completed_at": utc_now_iso(),
+                },
+            )
+        write_json(report_path, report)
+        write_json(
+            status_path,
+            {
+                "status": "completed",
+                "run_id": actual_run_id,
+                "requested_split": split,
+                "processed": len(selected),
+                "total": len(selected),
+                "report_path": str(report_path),
+                "updated_at": utc_now_iso(),
+            },
+        )
+        return {"run_id": actual_run_id, "status_path": str(status_path), "report_path": str(report_path), **report}
+    finally:
         client.close()
 
 

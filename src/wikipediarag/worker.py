@@ -44,6 +44,16 @@ class _SearchProjectionLeaseLost(RuntimeError):
     """A conditional lease update fenced this worker from further index I/O."""
 
 
+class _SearchProjectionRepairError(RuntimeError):
+    """Safe, typed reconciliation failure without exposing document content."""
+
+    retryable = False
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.safe_code = code
+
+
 def _expected_projection_records(chunks: list[Any]) -> list[dict[str, Any]]:
     return [
         {
@@ -115,7 +125,7 @@ async def _repair_search_projection_document(
             read_alias=str((kb or {}).get("active_index") or READ_ALIAS),
         )
     if index_version is None:
-        raise RuntimeError("SEARCH_PROJECTION_INDEX_UNAVAILABLE")
+        raise _SearchProjectionRepairError("SEARCH_PROJECTION_INDEX_UNAVAILABLE")
     limit = max(1, int(settings.search_projection_reconcile_max_chunks_per_document))
     read_alias = str(index_version["read_alias"])
     observed = await asyncio.to_thread(
@@ -310,12 +320,19 @@ async def _process_search_projection_reconciliation_once(settings: Any, *, lease
             # Do not overwrite another owner's state or falsely record success.
             continue
         except Exception as exc:
+            failure = safe_failure_from_exception(exc, stage="search_projection_reconciliation")
+            LOGGER.warning(
+                "search projection reconciliation failed document_id=%s code=%s",
+                document_id,
+                failure.error_code,
+                exc_info=True,
+            )
             async with connect(settings) as conn:
                 await fail_search_projection_reconciliation(
                     conn,
                     document_id=document_id,
                     lease_id=lease_id,
-                    error_code=safe_failure_from_exception(exc, stage="search_projection_reconciliation").error_code,
+                    error_code=failure.error_code,
                 )
     async with connect(settings) as conn:
         deleted = await cleanup_completed_search_projection_events(

@@ -14,6 +14,7 @@ import httpx
 from fastapi import File, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy import text
 
 from wikipediarag.answerability import should_try_extended_search
@@ -75,6 +76,12 @@ from wikipediarag.ids import stable_hash
 from wikipediarag.import_paths import ImportFileNameError, configured_or_requested_filename, resolve_import_filename
 from wikipediarag.observability import content_policy, safe_error_code, safe_telemetry_payload
 from wikipediarag.oidc_service import complete_oidc_callback, encrypt_server_tokens, oidc_login_enabled, start_oidc_flow
+from wikipediarag.provenance import (
+    direct_upload_source_id,
+    public_provenance_from_metadata,
+    source_document_id,
+    source_document_version_id,
+)
 from wikipediarag.reliability import (
     OperationDeadline,
     OperationDeadlineExceeded,
@@ -203,6 +210,8 @@ from wikipediarag.schemas import (
     SourceCreate,
     SourceHealthResponse,
     SourcePatch,
+    SourceProvenance,
+    SourceReferenceInput,
     SourceResponse,
     SourceSyncRequest,
     SourceSyncResponse,
@@ -1970,12 +1979,130 @@ async def _accepted_batch_from_sessions(
     )
 
 
+_UPLOAD_PROVENANCE_RESERVED_METADATA = frozenset(
+    {
+        "source_ref",
+        "source_reference",
+        "source_provenance",
+        "source_document_id",
+        "source_chunk_id",
+        "document_id",
+        "document_version_id",
+        "tenant_id",
+        "knowledge_base_id",
+        "object_key",
+        "checksum_sha256",
+        "filename",
+        "content_type",
+        "size_bytes",
+    }
+)
+
+
+def _parse_source_reference_json(raw: str) -> SourceReferenceInput | None:
+    if not raw.strip():
+        return None
+    try:
+        decoded = json.loads(raw)
+        if not isinstance(decoded, dict):
+            raise ValueError("source_ref_json must be a JSON object")
+        return SourceReferenceInput.model_validate(decoded)
+    except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": {"code": "INVALID_SOURCE_REFERENCE", "message": str(exc)}},
+        ) from None
+
+
+def _upload_session_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    source_ref: SourceReferenceInput | None = None,
+    multipart: bool = False,
+) -> dict[str, Any]:
+    """Keep client display metadata separate from server-owned provenance."""
+
+    values = dict(metadata or {})
+    reserved = sorted(key for key in values if key.casefold() in _UPLOAD_PROVENANCE_RESERVED_METADATA)
+    if reserved:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "code": "RESERVED_UPLOAD_METADATA",
+                    "message": f"metadata contains server-owned field: {reserved[0]}",
+                }
+            },
+        )
+    if source_ref is not None:
+        values["source_reference"] = source_ref.model_dump(mode="json", exclude_none=True)
+    if multipart:
+        values["upload_transport"] = "multipart"
+    return values
+
+
+def _upload_document_identity(
+    *,
+    tenant_id: str,
+    knowledge_base_id: str,
+    checksum_sha256: str,
+    filename: str,
+    parser_profile: str,
+    source_ref: SourceReferenceInput | None,
+) -> tuple[str, str, dict[str, Any] | None]:
+    """Derive upload identity.  Legacy callers keep the prior dedup semantics."""
+
+    if source_ref is None:
+        document_id = "doc:" + stable_hash([tenant_id, knowledge_base_id, checksum_sha256, filename], 24)
+        return (
+            document_id,
+            "docv:" + stable_hash([document_id, checksum_sha256, parser_profile, "normalized_document_v1"], 32),
+            None,
+        )
+    reference = source_ref.model_dump(mode="json", exclude_none=True)
+    reference.setdefault("source_version", f"sha256:{checksum_sha256}")
+    source_id = direct_upload_source_id(
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        namespace=str(reference["namespace"]),
+    )
+    document_id = source_document_id(
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        source_id=source_id,
+        external_id=str(reference["external_id"]),
+    )
+    return (
+        document_id,
+        source_document_version_id(
+            document_id=document_id,
+            source_version=str(reference["source_version"]),
+            content_sha256=checksum_sha256,
+            parser_profile=parser_profile,
+        ),
+        reference,
+    )
+
+
+def _merge_completion_metadata(
+    session_metadata: Mapping[str, Any] | None,
+    completion_metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Completion can add display metadata but cannot replace upload identity."""
+
+    additions = _upload_session_metadata(completion_metadata)
+    values = dict(session_metadata or {})
+    values.update(additions)
+    return values
+
+
 async def upload_document_multipart(
     kb_id: str,
     request: Request,
     file: Annotated[UploadFile, File()],
     parser_profile: Annotated[str, Form()] = "standard",
     metadata_json: Annotated[str, Form()] = "{}",
+    source_ref_json: Annotated[str, Form()] = "",
 ) -> UploadCompleteResponse:
     """Accept a small multipart document upload and enqueue asynchronous ingestion."""
     settings = get_settings()
@@ -1997,6 +2124,7 @@ async def upload_document_multipart(
             status_code=422,
             detail={"error": {"code": "INVALID_METADATA_JSON", "message": "metadata_json must be valid JSON object"}},
         )
+    source_ref = _parse_source_reference_json(source_ref_json)
     data = await file.read()
     if len(data) > settings.upload_max_bytes:
         raise HTTPException(status_code=413, detail="uploaded file exceeds configured upload size limit")
@@ -2018,6 +2146,7 @@ async def upload_document_multipart(
             "checksum_sha256": checksum,
             "parser_profile": parser_profile,
             "metadata": metadata,
+            "source_ref": source_ref.model_dump(mode="json") if source_ref else None,
         },
         settings=settings,
     )
@@ -2038,17 +2167,19 @@ async def upload_document_multipart(
             checksum_sha256=checksum,
             object_key=object_key,
             parser_profile=parser_profile,
-            metadata={**metadata, "api_multipart_upload": True},
+            metadata=_upload_session_metadata(metadata, source_ref=source_ref, multipart=True),
             ttl_seconds=settings.upload_session_ttl_seconds,
         )
         upload_session = await get_upload_session(conn, tenant_id=tenant_id, upload_session_id=str(session_id))
         if upload_session is None:
             raise HTTPException(status_code=500, detail="upload session was not created")
-        document_hash = stable_hash([tenant_id, kb_id, checksum, filename], 24)
-        document_id = f"doc:{document_hash}"
-        document_version_id = "docv:" + stable_hash(
-            [document_id, checksum, parser_profile, "normalized_document_v1"],
-            32,
+        document_id, document_version_id, source_reference = _upload_document_identity(
+            tenant_id=tenant_id,
+            knowledge_base_id=kb_id,
+            checksum_sha256=checksum,
+            filename=filename,
+            parser_profile=parser_profile,
+            source_ref=source_ref,
         )
         try:
             job_id, job_status = await create_document_upload_records(
@@ -2059,7 +2190,8 @@ async def upload_document_multipart(
                 document_id=document_id,
                 document_version_id=document_version_id,
                 content_hash=checksum,
-                metadata={**metadata, "api_multipart_upload": True},
+                metadata=_upload_session_metadata(metadata, source_ref=source_ref, multipart=True),
+                source_reference=source_reference,
             )
         except DocumentVersionLifecycleError as exc:
             raise HTTPException(
@@ -2150,7 +2282,7 @@ async def create_upload_session_endpoint(payload: UploadSessionCreate, request: 
             checksum_sha256=payload.checksum_sha256.lower(),
             object_key=object_key,
             parser_profile=payload.parser_profile,
-            metadata=payload.metadata,
+            metadata=_upload_session_metadata(payload.metadata, source_ref=payload.source_ref),
             ttl_seconds=settings.upload_session_ttl_seconds,
         )
     upload_url = await asyncio.to_thread(
@@ -2262,7 +2394,7 @@ async def create_upload_batch_endpoint(payload: UploadBatchCreate, request: Requ
                 checksum_sha256=checksum,
                 object_key=object_key,
                 parser_profile=item.parser_profile,
-                metadata=item.metadata,
+                metadata=_upload_session_metadata(item.metadata, source_ref=item.source_ref),
                 ttl_seconds=settings.upload_session_ttl_seconds,
             )
             upload_url = await asyncio.to_thread(
@@ -2374,28 +2506,18 @@ async def complete_upload_session_endpoint(
         raise HTTPException(status_code=409, detail="uploaded object is not available") from exc
     if int(head["content_length"]) != int(session["size_bytes"]):
         raise HTTPException(status_code=409, detail="uploaded object size mismatch")
-    document_hash = stable_hash(
-        [
-            tenant_id,
-            str(session["knowledge_base_id"]),
-            str(session["checksum_sha256"]),
-            str(session["filename"]),
-        ],
-        24,
-    )
-    document_id = f"doc:{document_hash}"
-    document_version_id = "docv:" + stable_hash(
-        [
-            document_id,
-            str(session["checksum_sha256"]),
-            str(session["parser_profile"]),
-            "normalized_document_v1",
-        ],
-        32,
-    )
     session_metadata = dict(session.get("metadata") or {})
-    if payload is not None:
-        session_metadata.update(payload.metadata)
+    source_reference = session_metadata.pop("source_reference", None)
+    source_ref = SourceReferenceInput.model_validate(source_reference) if isinstance(source_reference, dict) else None
+    document_id, document_version_id, normalized_source_reference = _upload_document_identity(
+        tenant_id=tenant_id,
+        knowledge_base_id=str(session["knowledge_base_id"]),
+        checksum_sha256=str(session["checksum_sha256"]),
+        filename=str(session["filename"]),
+        parser_profile=str(session["parser_profile"]),
+        source_ref=source_ref,
+    )
+    session_metadata = _merge_completion_metadata(session_metadata, payload.metadata if payload else None)
     async with connect() as conn:
         try:
             job_id, job_status = await create_document_upload_records(
@@ -2407,6 +2529,7 @@ async def complete_upload_session_endpoint(
                 document_version_id=document_version_id,
                 content_hash=str(session["checksum_sha256"]),
                 metadata=session_metadata,
+                source_reference=normalized_source_reference,
             )
         except DocumentVersionLifecycleError as exc:
             raise HTTPException(
@@ -2528,6 +2651,15 @@ async def get_document_structure(document_id: str, request: Request) -> Document
         public_metadata=dict(document.get("public_metadata") or {}),
         document_access=normalize_document_access(metadata.get("document_access")),
         document_access_origin=str(metadata.get("document_access_origin") or ""),
+        provenance=SourceProvenance.model_validate(
+            public_provenance_from_metadata(
+                dict(document.get("public_metadata") or {}),
+                document_id=document_id,
+                document_version_id=version_id or "",
+                source_uri=str(document.get("source_uri") or ""),
+                source_url=str(source_url or ""),
+            )
+        ),
     )
 
 
@@ -4750,6 +4882,13 @@ def _document_public_payload(row: dict[str, Any]) -> dict[str, Any]:
     payload = dict(row)
     payload["document_access"] = normalize_document_access(metadata.get("document_access"))
     payload["document_access_origin"] = str(metadata.get("document_access_origin") or "")
+    payload["provenance"] = public_provenance_from_metadata(
+        dict(row.get("public_metadata") or {}),
+        document_id=str(row.get("id") or ""),
+        document_version_id=str(row.get("current_version_id") or ""),
+        source_uri=str(row.get("source_uri") or ""),
+        source_url=str(metadata.get("source_url") or ""),
+    )
     return payload
 
 
@@ -4843,6 +4982,15 @@ def _document_context_chunk(row: dict[str, Any], *, anchor_chunk_id: str | None)
         next_chunk_id=str(row["next_chunk_id"]) if row.get("next_chunk_id") else None,
         chunk_ordinal=int(row["chunk_ordinal"]) if row.get("chunk_ordinal") is not None else None,
         highlighted=bool(anchor_chunk_id and chunk_id == anchor_chunk_id),
+        provenance=SourceProvenance.model_validate(
+            public_provenance_from_metadata(
+                chunk_metadata,
+                document_id=str(row.get("document_id") or ""),
+                document_version_id=str(row.get("document_version_id") or ""),
+                source_url=str(row.get("source_url") or ""),
+                chunk_id=chunk_id,
+            )
+        ),
     )
 
 
@@ -4862,6 +5010,7 @@ def _document_search_result(row: dict[str, Any], *, query: str) -> DocumentSearc
         next_chunk_id=context.next_chunk_id,
         score=float(row.get("score") or 0.0),
         ranks=dict(row.get("ranks") or {}),
+        provenance=context.provenance,
     )
 
 

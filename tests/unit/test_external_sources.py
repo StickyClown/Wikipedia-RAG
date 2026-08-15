@@ -414,4 +414,4 @@ async def test_multipart_upload_reuses_upload_records(monkeypatch: pytest.Monkey
 
     assert response.status == "received"
     assert [event for event, _payload in events] == ["session", "records"]
-    assert events[0][1]["metadata"] == {"api_multipart_upload": True}
+    assert events[0][1]["metadata"] == {"upload_transport": "multipart"}

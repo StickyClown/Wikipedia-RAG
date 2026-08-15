@@ -17,6 +17,7 @@ from wikipediarag.model_client import embeddings
 from wikipediarag.model_client import rerank as gateway_rerank
 from wikipediarag.model_registry import get_model_registry
 from wikipediarag.observability import retrieval_span, safe_error_code, safe_telemetry_payload
+from wikipediarag.provenance import public_provenance_from_metadata
 from wikipediarag.query_transforms import bounded_decomposition, bounded_rewrite, normalize_query
 from wikipediarag.reliability import OperationDeadline
 from wikipediarag.repository import (
@@ -26,7 +27,7 @@ from wikipediarag.repository import (
 )
 from wikipediarag.retrieval_contract import validate_active_retrieval_contract
 from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profile
-from wikipediarag.schemas import Evidence, RetrievalResult
+from wikipediarag.schemas import Evidence, RetrievalResult, SourceProvenance
 from wikipediarag.search_index import bm25_search, dense_search
 
 QUERY_EMBEDDING_INSTRUCTION = (
@@ -68,6 +69,22 @@ def query_embedding_instruction(profile: RetrievalProfile) -> str:
 
 
 NEGATIVE_EVIDENCE_POLICY_VERSION = "explicit_negative_title_v1"
+
+
+def _evidence_provenance(item: dict[str, Any]) -> SourceProvenance:
+    metadata = dict(item.get("metadata") or {})
+    return SourceProvenance.model_validate(
+        public_provenance_from_metadata(
+            metadata,
+            document_id=str(item.get("document_id") or ""),
+            document_version_id=str(metadata.get("document_version_id") or ""),
+            source_uri=str(item.get("source_uri") or ""),
+            source_url=str(item.get("source_url") or ""),
+            chunk_id=str(item.get("chunk_id") or ""),
+        )
+    )
+
+
 _NEGATIVE_TITLE_MARKERS = (
     "не используй",
     "не использовать",
@@ -291,6 +308,7 @@ async def retrieve(
                 dict(item.get("metadata") or {}).get("supporting_chunk_ids") or [item["chunk_id"]]
             ),
             provenance_refs=list(dict(item.get("metadata") or {}).get("provenance_refs") or []),
+            provenance=_evidence_provenance(item),
         )
         for index, item in enumerate(selected, start=1)
     ]
@@ -329,6 +347,7 @@ async def retrieve(
                     dict(item.get("metadata") or {}).get("supporting_chunk_ids") or [item["chunk_id"]]
                 ),
                 provenance_refs=list(dict(item.get("metadata") or {}).get("provenance_refs") or []),
+                provenance=_evidence_provenance(item),
             )
             for index, item in enumerate(selected, start=1)
         ]
@@ -620,6 +639,7 @@ async def retrieve_multi(
                 dict(item.get("metadata") or {}).get("supporting_chunk_ids") or [item["chunk_id"]]
             ),
             provenance_refs=list(dict(item.get("metadata") or {}).get("provenance_refs") or []),
+            provenance=_evidence_provenance(item),
         )
         for index, item in enumerate(selected, start=1)
     ]
@@ -658,6 +678,7 @@ async def retrieve_multi(
                     dict(item.get("metadata") or {}).get("supporting_chunk_ids") or [item["chunk_id"]]
                 ),
                 provenance_refs=list(dict(item.get("metadata") or {}).get("provenance_refs") or []),
+                provenance=_evidence_provenance(item),
             )
             for index, item in enumerate(selected, start=1)
         ]

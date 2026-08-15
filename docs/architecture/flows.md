@@ -1,335 +1,83 @@
 # Main Flows
 
-These flows show durable writes, transient calls, publication points, failure
-boundaries and user-visible results.
+These flows show ownership and failure boundaries. Public schemas are defined
+in the API code; executable invariants are indexed in [contract-map.md](contract-map.md).
 
-## Local Login And Application Session
+## Authentication and Scope
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant B as Browser
-    participant UI as Web UI
-    participant API as API
-    participant DB as PostgreSQL
+1. Login/OIDC callback creates a server-side session with hashed opaque tokens.
+2. Each request resolves `ActorContext` from the session.
+3. Tenant, KB role and document access are checked before the operation.
+4. Client-supplied KB/document/group/filter identifiers are inputs to authorize,
+   never authority by themselves.
+5. State-changing cookie requests require CSRF validation.
 
-    B->>UI: Submit username and password
-    UI->>API: POST /api/v1/auth/local/login
-    API->>DB: Verify Argon2id password hash
-    API->>DB: Insert auth_session with hashed session and CSRF tokens
-    API-->>B: Set opaque HttpOnly session cookie
-    API-->>UI: Auth session without CSRF token
-    UI->>API: GET /api/v1/auth/session with cookie
-    API->>DB: Rotate CSRF hash
-    API-->>UI: Session, active tenant, CSRF token
-    UI-->>B: Show authenticated screen
+## Upload and Publication
+
+```text
+authorize → create session → presigned upload → complete → durable job
+          → validate → parse → normalize → chunk/embed → index → publish
 ```
 
-Failure boundary: invalid credentials return a safe auth error; no session is
-created.
+- Object paths are generated after tenant/KB authorization.
+- Large files are never ingested synchronously inside the HTTP request.
+- Worker transitions are retryable and idempotent.
+- PostgreSQL owns current publication. Failed/cancelled work remains
+  non-searchable.
+- Projection reconciliation repairs bounded OpenSearch drift from canonical DB
+  state.
 
-## OIDC Authorization Code And PKCE
+Wikipedia/ZIM and external connectors enter the same normalized document,
+chunking and publication boundary after source-specific acquisition.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant B as Browser
-    participant UI as Web UI
-    participant API as API
-    participant IdP as OIDC Provider
-    participant DB as PostgreSQL
+## Search and Answer
 
-    B->>UI: Click OIDC
-    UI->>API: POST /api/v1/auth/oidc/start
-    API->>DB: Store OIDC state, nonce and PKCE verifier
-    API-->>UI: Authorization URL
-    UI-->>B: Redirect to provider
-    B->>IdP: Authenticate and consent
-    IdP-->>API: GET /api/v1/auth/oidc/callback with code and state
-    API->>DB: Consume flow state
-    API->>IdP: Exchange code and validate ID token via JWKS
-    API->>DB: Upsert identity by issuer plus subject
-    API->>DB: Store encrypted provider tokens server-side
-    API->>DB: Insert app auth_session
-    API-->>B: Set opaque HttpOnly app session cookie
+1. API authorizes the requested KB scope and retrieval filters.
+2. It verifies the active index/retrieval contract.
+3. BM25 and dense lanes retrieve tenant/KB-scoped candidates.
+4. Fusion, rerank and optional parent expansion produce candidates.
+5. PostgreSQL confirms current version, publication and ACL.
+6. The answer stage receives only authorized evidence through Model Gateway.
+7. Citations retain resolvable document/chunk/index provenance.
+
+A missing/incompatible index fails safely with `KB_NOT_READY`. Stale derived
+state may reduce recall but cannot broaden access.
+
+## Chat SSE
+
+The UI sends one authorized chat request and consumes ordered SSE events.
+Progress/heartbeat events keep the connection observable; terminal success
+contains answer/evidence/query-run identity and terminal failure contains a safe
+error. Cancellation or disconnect does not grant a second hidden execution.
+
+## Deep Research
+
+```text
+create scoped run → claim lease → plan → bounded tools → evaluate/verify
+                  → persist evidence/claims → synthesize → ACL-trimmed report
 ```
 
-Failure boundary: issuer, audience, nonce, signature or state mismatch aborts
-login before app session creation.
+- Scope is a server-owned snapshot of one to three same-tenant KBs.
+- Lease and compare-and-set protect concurrent state transitions.
+- Tool names and arguments are validated against a closed registry.
+- Document content is evidence, not executable instruction.
+- Pause, resume, cancel and stale-heartbeat recovery are durable.
+- Evidence is re-authorized before model context and public report projection.
 
-## Tenant And KB Selection
+## Delete and Purge
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant UI as Web UI
-    participant API as API
-    participant DB as PostgreSQL
+Delete authorization immediately marks the document/version out of retrieval,
+removes or invalidates derived search state and schedules deferred purge. The
+worker removes object artifacts and durable derived rows after retention.
+Failures end in a safe retryable/terminal lifecycle state rather than silently
+restoring visibility.
 
-    UI->>API: GET /api/v1/auth/session
-    API->>DB: Load session active_tenant_id and tenant role
-    API-->>UI: Active tenant and CSRF token
-    UI->>API: GET /api/v1/knowledge-bases
-    API->>DB: List KBs for active tenant
-    API-->>UI: KB list
-    UI-->>UI: Store selected primary KB and retrieval scope in memory
+## Model Call
+
+```text
+business operation → ModelClient alias → Gateway operation contract
+                   → endpoint adapter → configured endpoint
 ```
 
-Failure boundary: no active tenant returns a server-side authorization error for
-tenant-scoped operations.
-
-## Document Upload
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant B as Browser
-    participant UI as Web UI
-    participant API as API
-    participant DB as PostgreSQL
-    participant MinIO as MinIO
-
-    B->>UI: Select one or more files
-    UI-->>UI: Compute SHA-256 in browser memory
-    UI->>API: POST /api/v1/uploads/batches with Idempotency-Key
-    API->>DB: Claim idempotency record, create upload_batch and upload_sessions
-    API-->>UI: Presigned URLs and required headers
-    UI->>MinIO: PUT file bytes to presigned URL
-    UI->>API: POST /api/v1/uploads/sessions/{id}:complete with Idempotency-Key
-    API->>DB: Create document, version, artifact metadata, job and job item
-    API-->>UI: document_id, version_id and job_id
-    UI->>API: GET /api/v1/uploads/batches/{batch_id}
-    API->>DB: Read safe aggregate progress
-    API-->>UI: Per-file status without object keys
-```
-
-Failure boundary: unsafe filename, duplicate batch item, checksum mismatch or
-missing object fails with a safe error before publication. Repeating the same
-key and body returns the saved safe session/job response; a changed body gets
-`409 IDEMPOTENCY_KEY_REUSED`.
-
-## Parsing, Chunking, Embedding And Publication
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant W as Worker
-    participant DB as PostgreSQL
-    participant MinIO as MinIO
-    participant Meta as Metadata Service
-    participant Parser as Xberg or Docling
-    participant GW as Model Gateway
-    participant OS as OpenSearch
-
-    W->>DB: Claim ingestion_job_item with FOR UPDATE SKIP LOCKED
-    W->>MinIO: Read original upload bytes
-    W-->>W: Validate size, checksum, MIME and safety
-    W->>Meta: Extract language/date metadata
-    W->>Parser: Parse bytes or temp file
-    Parser-->>W: Parsed text and parser metadata
-    W-->>W: Normalize to app-owned contract
-    W->>MinIO: Write normalized.json and parser-report.json
-    W->>DB: Record normalized/parser artifacts and version metadata
-    W-->>W: Chunk with locators
-    W->>GW: Request embeddings
-    W->>DB: Stage chunks with publication_status staged
-    W->>OS: Bulk index published chunk documents
-    W->>DB: Publish chunks, document sections and document version
-    W-->>DB: Mark item/job completed
-```
-
-Publication point: chunks are queryable only after OpenSearch bulk index
-and PostgreSQL publication confirmation. OpenSearch and Redis are candidate
-layers; each returned candidate is batch-confirmed against current PostgreSQL
-publication, lifecycle and document-access state.
-succeeds and DB chunks/version are updated to published. Document sections are
-written from the same published chunk set; failed or cancelled ingestion does
-not publish document navigation state.
-
-## Chat Retrieval And Generation
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant UI as Web UI
-    participant API as API
-    participant DB as PostgreSQL
-    participant OS as OpenSearch
-    participant GW as Model Gateway
-
-    UI->>API: POST /api/v1/chat with cookie, CSRF, KB scope and idempotency key
-    API->>DB: Resolve ActorContext and require VIEWER on every KB
-    API->>DB: Check active compatible index for every requested KB
-    API->>DB: Create durable running query_run before external calls
-    API-->>UI: SSE run.started with safe search_plan and deadline fields
-    API->>OS: BM25 and vector searches with tenant and KB filters
-    API->>GW: Embedding and rerank alias calls
-    API-->>API: Fuse, rerank, dedup, expand parents and assess answerability
-    API->>GW: Chat completion alias call
-    API-->>UI: SSE stage.heartbeat every 10 s while generation is pending
-    API->>DB: Persist retrieval_events and exactly one terminal query_run state
-    API-->>UI: SSE message.delta with answer and evidence
-    API-->>UI: SSE usage.updated with safe diagnostics
-    API-->>UI: SSE run.completed
-```
-
-Failure boundary: missing role or not-ready KB fails safely before partial
-retrieval. Disconnect cancels the stream/model task and persists `cancelled`;
-completion/failure has one terminal SSE event. A repeated completed
-`client_request_id` replays its terminal result without another model call.
-
-## Extended Search
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant API as API
-    participant OS as OpenSearch
-    participant DB as PostgreSQL
-
-    API-->>API: Initial retrieval is PARTIAL or UNANSWERABLE
-    API-->>API: Confirm profile policy allows Extended Search
-    API-->>API: Build bounded subqueries and harness budgets
-    loop Bounded subqueries
-        API->>OS: Retrieve additional evidence for the primary KB
-        API-->>API: Update evidence ledger and coverage inventory
-    end
-    API-->>API: Select final evidence and answerability
-    API->>DB: Persist retrieval events
-    API->>DB: Persist completed agent_runs ledger for the query_run
-```
-
-Extended Search is implemented as single-KB in this slice. Multi-KB direct
-retrieval bypasses Extended Search. The persisted `agent_runs` ledger is a
-completed execution trace for diagnostics; durable Deep Research uses separate
-`research_runs` and typed memory tables rather than treating `agent_runs` as a
-resumable lifecycle.
-
-## Deep Research V1
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant UI as Web UI
-    participant API as API
-    participant DB as PostgreSQL
-    participant W as Worker
-    participant OS as OpenSearch
-    participant GW as Model Gateway
-
-    UI->>API: POST /api/v1/research-runs with topic and selected KB
-    API->>DB: Require VIEWER, validate active retrieval contract
-    API->>DB: Insert research_run, questions and deep_research ingestion_job
-    API-->>UI: run_id and job_id
-    W->>DB: Claim ingestion_job kind deep_research
-    loop One open question per episode
-        W->>DB: Create research_episode and query_run
-        W->>DB: Load ACL-visible evidence, coverage and compact checkpoint
-        W->>GW: Planner decision through alias or deterministic mock fallback
-        W->>DB: Persist safe tool metadata with normalized query hash
-        W->>OS: Run planner-approved Extended Search for the single KB
-        W->>DB: Persist retrieval_events on query_run
-        W->>GW: Verify claims through Model Gateway alias when profile requires
-        W->>DB: Upsert evidence, verified claims, coverage and reflection records
-        W->>DB: Append deduplicated derived questions with evidence lineage
-        W->>DB: Complete episode and checkpoint run progress
-    end
-    W->>DB: Build final_report from ACL-visible evidence and verified claims
-    UI->>API: GET /api/v1/research-runs/{id}
-    API->>DB: Reapply current document ACL trimming
-    API-->>UI: Progress, coverage, evidence, reflections and report
-```
-
-Pause and cancel requests are cooperative. The API marks the run and active job
-as requested; the worker stops at an episode boundary and records the stop
-reason. Resume enqueues a new `deep_research` job that continues from open
-questions and existing typed memory.
-
-The planner is bounded and can select only the internal `extended_search` tool
-in this version. Its raw tool query is not returned in public API detail or
-validation artifacts; the durable ledger contains only a normalized hash and
-safe result metadata. `conflicting` coverage appends a repair-style derived
-question before the report can present confident synthesis.
-
-Failure boundary: missing KB role or incompatible active index fails before run
-creation. If the original run creator later loses `VIEWER`, worker execution
-fails safely and public reads remain limited to actors authorized on the run KB.
-
-## Document Delete And Deferred Purge
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant UI as Client
-    participant API as API
-    participant DB as PostgreSQL
-    participant OS as OpenSearch
-    participant W as Worker
-    participant MinIO as MinIO
-
-    UI->>API: DELETE /api/v1/documents/{document_id}
-    API->>DB: Require KB OWNER and load lifecycle
-    API->>DB: Mark document/version deleting and DB chunks deleted
-    API->>OS: Delete derived chunks by tenant, KB and document
-    API->>DB: Schedule document_delete job with purge_after
-    API-->>UI: lifecycle_state deleting and optional job_id
-    W->>DB: Claim due document_delete job
-    W->>DB: List artifact keys
-    W->>MinIO: Delete artifact objects
-    W->>OS: Repeat derived chunk deletion idempotently
-    W->>DB: Delete DB chunks/artifact rows and mark lifecycle deleted
-```
-
-Failure boundary: purge failure records `purge_failed` and a safe error code so
-the job can be retried.
-
-## Reprocess And Reindex
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client as Client
-    participant API as API
-    participant DB as PostgreSQL
-    participant W as Worker
-    participant MinIO as MinIO
-    participant OS as OpenSearch
-
-    Client->>API: POST /api/v1/documents/{document_id}:reprocess
-    API->>DB: Require KB EDITOR and enqueue document_upload job
-    API-->>Client: New job_id
-    W->>DB: Claim job item
-    W->>MinIO: Read original artifact
-    W-->>W: Re-run validation, parsing, normalization, chunking and embedding
-    W->>OS: Write derived search docs
-    W->>DB: Publish updated chunk/version state
-```
-
-Reindexing uses the active KB index contract. OpenSearch can be rebuilt from
-PostgreSQL and MinIO; it is not the backup authority.
-
-## Readiness And Degraded Dependencies
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client as Client
-    participant API as API
-    participant DB as PostgreSQL
-    participant GW as Model Gateway
-    participant Provider as Model Provider
-
-    Client->>API: GET /health
-    API-->>Client: Liveness after startup
-    Client->>API: GET /ready
-    API->>DB: SELECT 1
-    API->>GW: GET /ready
-    GW->>Provider: Startup smoke when required or warned
-    GW-->>API: ok or degraded with safe reason
-    API-->>Client: ok or degraded
-```
-
-API `/ready` checks PostgreSQL, worker heartbeat, Model Gateway, MinIO and
-OpenSearch, plus required parser services when configured. Redis/Valkey is a
-non-fatal cache dependency and is intentionally not part of the hard readiness
-set.
+Provider-specific request/response mapping ends at the Gateway adapter. Remote
+and local endpoints use the same business boundary.

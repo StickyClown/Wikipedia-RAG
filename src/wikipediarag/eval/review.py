@@ -751,6 +751,11 @@ def _reviewed_task_from_candidate(row: dict[str, Any], *, source_dataset_hash: s
     provenance = _review_provenance(row, source, task, source_dataset_hash)
     task_payload = task.model_dump(mode="json")
     task_payload["split"] = _split(row, source)
+    # ``EvalTask`` now carries the public review notes as part of the P0.1
+    # evaluation contract.  ``ReviewedEvalTask`` historically supplied the
+    # same field while building the reviewed wrapper, so remove the inherited
+    # value before assigning the reviewed-pool notes below.
+    task_payload.pop("review_notes", None)
     return ReviewedEvalTask(
         **task_payload,
         decision_status=decision,

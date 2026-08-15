@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.ids import stable_hash
+from wikipediarag.provenance import build_source_provenance, source_chunk_id
 from wikipediarag.reliability import safe_failure_from_exception
 from wikipediarag.wiki_dump import Chunk
 
@@ -342,6 +343,8 @@ def chunks_for_normalized_document(
     document_version_id: str,
     source_url: str,
     dimensions: int,
+    source_reference: dict[str, Any] | None = None,
+    source_version_metadata: dict[str, Any] | None = None,
 ) -> list[Chunk]:
     words = document.text.split()
     if not words:
@@ -381,6 +384,17 @@ def chunks_for_normalized_document(
             section_path = list(fallback_section_path)
         section_id = _section_id(document_version_id, section_path)
         content_hash = stable_hash([body], 64)
+        parser_contract = f"{document.parser_name}:{document.parser_version}:{document.parser_route}"
+        locator = dict(locator)
+        native_chunk_id = source_chunk_id(
+            document_version_id=document_version_id,
+            normalized_hash=normalized_hash,
+            locator=locator,
+            ordinal=ordinal,
+            content_hash=content_hash,
+            parser_contract=parser_contract,
+            chunker_contract=DOCUMENT_CHUNKER_VERSION,
+        )
         chunk_id = "doc:" + stable_hash(
             [document_version_id, DOCUMENT_CHUNKER_VERSION, ordinal, stable_hash([body], 32)],
             32,
@@ -391,6 +405,7 @@ def chunks_for_normalized_document(
             "chunk_ordinal": ordinal,
             "locator": locator,
             "content_hash": content_hash,
+            "source_chunk_id": native_chunk_id,
             "normalized_hash": normalized_hash,
             "parser_route": document.parser_route,
             "parser_name": document.parser_name,
@@ -400,6 +415,26 @@ def chunks_for_normalized_document(
             "chunker_version": DOCUMENT_CHUNKER_VERSION,
             "section_id": section_id,
         }
+        metadata["source_provenance"] = build_source_provenance(
+            source_reference=source_reference,
+            document_id=document_id,
+            document_version_id=document_version_id,
+            checksum_sha256=str((source_version_metadata or {}).get("content_sha256") or ""),
+            filename=str((source_version_metadata or {}).get("original_filename") or ""),
+            content_type=str((source_version_metadata or {}).get("content_type") or ""),
+            size_bytes=(source_version_metadata or {}).get("size_bytes"),
+            source_uri=f"document://{document_version_id}#{ordinal}",
+            source_url=source_url,
+            processing_contract={
+                "normalizer": NORMALIZED_DOCUMENT_SCHEMA_VERSION,
+                "parser": parser_contract,
+                "chunker": DOCUMENT_CHUNKER_VERSION,
+            },
+            source_chunk_id_value=native_chunk_id,
+            fragment_content_hash=content_hash,
+            chunk_ordinal=ordinal,
+            locator=locator,
+        )
         chunks.append(
             Chunk(
                 id=chunk_id,

@@ -340,9 +340,21 @@ def build_parser() -> argparse.ArgumentParser:
     eval_document_prepare_parser.add_argument("--dataset", choices=["rrncb-public"], default="rrncb-public")
     eval_document_prepare_parser.add_argument("--documents-dir", required=True)
     eval_document_prepare_parser.add_argument("--csv", dest="csv_path", default=None)
+    eval_document_prepare_parser.add_argument(
+        "--reviewed-translations",
+        default=None,
+        help="reviewed JSONL matrix for ru/en/uk/de/ko query variants",
+    )
     eval_document_prepare_parser.add_argument("--output-suite", default="rrncb-public-v3")
     eval_document_prepare_parser.add_argument("--artifacts-dir", default="artifacts/eval")
     eval_document_prepare_parser.add_argument("--json", action="store_true")
+
+    eval_document_translate_parser = subparsers.add_parser("eval-document-translate")
+    eval_document_translate_parser.add_argument("--csv", dest="csv_path", required=True)
+    eval_document_translate_parser.add_argument("--output", required=True)
+    eval_document_translate_parser.add_argument("--gateway", default="http://localhost:8081")
+    eval_document_translate_parser.add_argument("--batch-size", type=int, default=10)
+    eval_document_translate_parser.add_argument("--model-alias", default="generator_main")
 
     eval_document_ingest_parser = subparsers.add_parser("eval-document-ingest")
     eval_document_ingest_parser.add_argument("--suite", default="rrncb-public-v3")
@@ -373,11 +385,65 @@ def build_parser() -> argparse.ArgumentParser:
     eval_document_run_parser.add_argument("--artifacts-dir", default="artifacts/eval")
     eval_document_run_parser.add_argument("--json", action="store_true")
 
+    eval_document_retrieval_parser = subparsers.add_parser("eval-document-retrieval-run")
+    eval_document_retrieval_parser.add_argument("--suite", default="rrncb-public-v3")
+    eval_document_retrieval_parser.add_argument("--api", default="http://localhost:8000")
+    eval_document_retrieval_parser.add_argument("--retrieval-profile", default="upload_sota_mvp")
+    eval_document_retrieval_parser.add_argument("--batch-size", type=int, default=5)
+    eval_document_retrieval_parser.add_argument("--run-id", default=None)
+    eval_document_retrieval_parser.add_argument("--resume-run-id", default=None)
+    eval_document_retrieval_parser.add_argument("--ingestion-run-id", required=True)
+    eval_document_retrieval_parser.add_argument("--split", choices=("dev", "test"), default="dev")
+    eval_document_retrieval_parser.add_argument("--rerun-failed", action="store_true")
+    eval_document_retrieval_parser.add_argument("--artifacts-dir", default="artifacts/eval")
+    eval_document_retrieval_parser.add_argument("--json", action="store_true")
+
     eval_document_status_parser = subparsers.add_parser("eval-document-status")
     eval_document_status_parser.add_argument("--suite", default="rrncb-public-v3")
     eval_document_status_parser.add_argument("--latest", action="store_true")
     eval_document_status_parser.add_argument("--json", action="store_true")
     eval_document_status_parser.add_argument("--artifacts-dir", default="artifacts/eval")
+
+    eval_quality_prepare_parser = subparsers.add_parser("eval-quality-prepare")
+    eval_quality_prepare_parser.add_argument("--corpus-dir", default="eval-corpus/p0-search-quality-v1")
+    eval_quality_prepare_parser.add_argument("--allow-incomplete", action="store_true")
+
+    eval_quality_scaffold_parser = subparsers.add_parser("eval-quality-scaffold")
+    eval_quality_scaffold_parser.add_argument("--corpus-dir", default="eval-corpus/p0-search-quality-v1")
+    eval_quality_scaffold_parser.add_argument("--overwrite", action="store_true")
+
+    eval_quality_review_parser = subparsers.add_parser("eval-quality-review")
+    eval_quality_review_parser.add_argument("--corpus-dir", default="eval-corpus/p0-search-quality-v1")
+    eval_quality_review_parser.add_argument("--decisions", default=None)
+
+    eval_quality_freeze_parser = subparsers.add_parser("eval-quality-freeze")
+    eval_quality_freeze_parser.add_argument("--corpus-dir", default="eval-corpus/p0-search-quality-v1")
+
+    eval_quality_run_parser = subparsers.add_parser("eval-quality-run")
+    eval_quality_run_parser.add_argument("--corpus-dir", default="eval-corpus/p0-search-quality-v1")
+    eval_quality_run_parser.add_argument("--api", default="http://localhost:8000")
+    eval_quality_run_parser.add_argument("--split", choices=["dev", "test"], default="dev")
+    eval_quality_run_parser.add_argument("--run-id", default=None)
+    eval_quality_run_parser.add_argument("--resume-run-id", default=None)
+    eval_quality_run_parser.add_argument("--rerun-failed", action="store_true")
+
+    eval_quality_ingest_parser = subparsers.add_parser("eval-quality-ingest")
+    eval_quality_ingest_parser.add_argument("--corpus-dir", default="eval-corpus/p0-search-quality-v1")
+    eval_quality_ingest_parser.add_argument("--api", default="http://localhost:8000")
+    eval_quality_ingest_parser.add_argument("--batch-size", type=int, default=5)
+    eval_quality_ingest_parser.add_argument("--upload-concurrency", type=int, default=2)
+    eval_quality_ingest_parser.add_argument("--timeout-seconds", type=int, default=900)
+    eval_quality_ingest_parser.add_argument("--run-id", default=None)
+    eval_quality_ingest_parser.add_argument("--resume-run-id", default=None)
+    eval_quality_ingest_parser.add_argument("--rerun-failed", action="store_true")
+
+    eval_quality_status_parser = subparsers.add_parser("eval-quality-status")
+    eval_quality_status_parser.add_argument("--corpus-dir", default="eval-corpus/p0-search-quality-v1")
+    eval_quality_status_parser.add_argument("--run-id", default=None)
+
+    eval_quality_report_parser = subparsers.add_parser("eval-quality-report")
+    eval_quality_report_parser.add_argument("--corpus-dir", default="eval-corpus/p0-search-quality-v1")
+    eval_quality_report_parser.add_argument("--results", default=None)
 
     eval_full_parser = subparsers.add_parser("eval-full")
     eval_full_parser.add_argument("--count", type=int, default=None)
@@ -601,12 +667,32 @@ def main() -> None:
         run_eval_profile_retrieval(args)
     elif args.command == "eval-document-prepare":
         run_eval_document_prepare(args)
+    elif args.command == "eval-document-translate":
+        run_eval_document_translate(args)
     elif args.command == "eval-document-ingest":
         run_eval_document_ingest(args)
     elif args.command == "eval-document-run":
         run_eval_document_run(args)
+    elif args.command == "eval-document-retrieval-run":
+        run_eval_document_retrieval(args)
     elif args.command == "eval-document-status":
         run_eval_document_status(args)
+    elif args.command == "eval-quality-prepare":
+        run_eval_quality_prepare(args)
+    elif args.command == "eval-quality-scaffold":
+        run_eval_quality_scaffold(args)
+    elif args.command == "eval-quality-review":
+        run_eval_quality_review(args)
+    elif args.command == "eval-quality-freeze":
+        run_eval_quality_freeze(args)
+    elif args.command == "eval-quality-run":
+        run_eval_quality_run(args)
+    elif args.command == "eval-quality-ingest":
+        run_eval_quality_ingest(args)
+    elif args.command == "eval-quality-status":
+        run_eval_quality_status(args)
+    elif args.command == "eval-quality-report":
+        run_eval_quality_report(args)
     elif args.command == "eval-full":
         run_eval_full(args)
     elif args.command == "smoke-models":
@@ -1084,7 +1170,21 @@ def run_eval_document_prepare(args: argparse.Namespace) -> None:
         documents_dir=Path(args.documents_dir),
         suite=str(args.output_suite),
         csv_path=Path(args.csv_path) if args.csv_path else None,
+        translations_path=Path(args.reviewed_translations) if args.reviewed_translations else None,
         artifacts_dir=Path(args.artifacts_dir),
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_document_translate(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.document_benchmark import generate_rrncb_translations
+
+    report = generate_rrncb_translations(
+        csv_path=Path(args.csv_path),
+        output_path=Path(args.output),
+        gateway_url=str(args.gateway),
+        batch_size=int(args.batch_size),
+        model_alias=str(args.model_alias),
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
@@ -1136,6 +1236,30 @@ def run_eval_document_run(args: argparse.Namespace) -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+def run_eval_document_retrieval(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.document_benchmark import run_rrncb_retrieval
+
+    try:
+        report = asyncio.run(
+            run_rrncb_retrieval(
+                suite=str(args.suite),
+                api_url=str(args.api),
+                profile_name=str(args.retrieval_profile),
+                batch_size=int(args.batch_size),
+                rerun_failed=bool(args.rerun_failed),
+                run_id=str(args.run_id) if args.run_id else None,
+                resume_run_id=str(args.resume_run_id) if args.resume_run_id else None,
+                ingestion_run_id=str(args.ingestion_run_id),
+                split=cast(Literal["dev", "test"], str(args.split)),
+                artifacts_dir=Path(args.artifacts_dir),
+            )
+        )
+    except Exception as exc:
+        print(json.dumps({"status": "failed", "failure": _safe_cli_failure(exc, stage="eval_document_retrieval")}))
+        raise SystemExit(1) from None
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
 def run_eval_document_status(args: argparse.Namespace) -> None:
     from wikipediarag.eval.document_benchmark import rrncb_status
 
@@ -1153,6 +1277,97 @@ def run_eval_document_status(args: argparse.Namespace) -> None:
             ]
         )
     )
+
+
+def run_eval_quality_prepare(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_quality_prepare
+
+    report = eval_quality_prepare(
+        corpus_dir=Path(args.corpus_dir),
+        strict_counts=not bool(args.allow_incomplete),
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_quality_scaffold(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_quality_scaffold
+
+    report = eval_quality_scaffold(corpus_dir=Path(args.corpus_dir), overwrite=bool(args.overwrite))
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_quality_review(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_quality_review
+
+    report = eval_quality_review(
+        corpus_dir=Path(args.corpus_dir),
+        decisions_path=Path(args.decisions) if args.decisions else None,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_quality_freeze(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_quality_freeze
+
+    report = eval_quality_freeze(corpus_dir=Path(args.corpus_dir))
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_quality_run(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_quality_run
+
+    try:
+        report = asyncio.run(
+            eval_quality_run(
+                corpus_dir=Path(args.corpus_dir),
+                api=str(args.api),
+                split=str(args.split),
+                run_id=str(args.run_id) if args.run_id else None,
+                resume_run_id=str(args.resume_run_id) if args.resume_run_id else None,
+                rerun_failed=bool(args.rerun_failed),
+            )
+        )
+    except Exception as exc:
+        print(json.dumps({"status": "failed", "failure": _safe_cli_failure(exc, stage="eval_quality_run")}))
+        raise SystemExit(1) from None
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_quality_ingest(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_quality_ingest
+
+    try:
+        report = eval_quality_ingest(
+            corpus_dir=Path(args.corpus_dir),
+            api=str(args.api),
+            batch_size=int(args.batch_size),
+            upload_concurrency=int(args.upload_concurrency),
+            timeout_seconds=int(args.timeout_seconds),
+            run_id=str(args.run_id) if args.run_id else None,
+            resume_run_id=str(args.resume_run_id) if args.resume_run_id else None,
+            rerun_failed=bool(args.rerun_failed),
+        )
+    except Exception as exc:
+        print(json.dumps({"status": "failed", "failure": _safe_cli_failure(exc, stage="eval_quality_ingest")}))
+        raise SystemExit(1) from None
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_quality_status(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_quality_status
+
+    report = eval_quality_status(corpus_dir=Path(args.corpus_dir), run_id=str(args.run_id) if args.run_id else None)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def run_eval_quality_report(args: argparse.Namespace) -> None:
+    from wikipediarag.eval.commands import eval_quality_report
+
+    report = eval_quality_report(
+        corpus_dir=Path(args.corpus_dir),
+        results_path=Path(args.results) if args.results else None,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 def run_eval_full(args: argparse.Namespace) -> None:

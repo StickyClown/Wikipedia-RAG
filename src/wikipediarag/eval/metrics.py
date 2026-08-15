@@ -246,6 +246,7 @@ def score_task(
         citation_precision=citation_precision,
         citation_recall=citation_recall,
         unsupported_claim_rate=unsupported,
+        answer_groundedness=1.0 - unsupported,
         cited_hard_negative_rate=cited_hard_negative,
         kiwix_url_ok=float(kiwix_url_ok),
         document_recall={str(k): recall_at(documents, gold_documents, k) for k in (1, 5, 10, 20)},

@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     kiwix_internal_base_url: str = "http://kiwix:8080"
     kiwix_book_name: str = ""
     api_public_base_url: str = "http://localhost:8000"
+    # Kept out of artifacts; required to attest that a runtime eval binding was
+    # created by this local deployment rather than edited after ingestion.
+    eval_binding_signing_key: str = ""
 
     xberg_url: str = "http://localhost:8091"
     xberg_urls: str = ""

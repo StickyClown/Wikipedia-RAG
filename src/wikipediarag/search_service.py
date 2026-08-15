@@ -386,6 +386,7 @@ def _search_result(evidence: Evidence, *, query: str, include_highlights: bool) 
         highlights=[SearchHighlight(field="content", fragments=[_snippet(evidence.content, query=query)])]
         if include_highlights
         else [],
+        provenance=evidence.provenance,
     )
 
 

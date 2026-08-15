@@ -14,6 +14,7 @@ from wikipediarag.eval.artifacts import ARTIFACT_ROOT, append_jsonl, read_json, 
 from wikipediarag.eval.corpus import load_chunk_refs
 from wikipediarag.eval.diagnostics import diagnose_retrieval_task, retrieval_result_diagnosis, root_cause_count_metrics
 from wikipediarag.eval.metrics import aggregate, percentile, score_retrieval_task
+from wikipediarag.eval.quality import comparison_key, normalize_stage_records
 from wikipediarag.eval.runner import eval_configs
 from wikipediarag.eval.schemas import (
     CandidateRef,
@@ -238,6 +239,7 @@ async def run_retrieval_task(
     task_index: int,
 ) -> RetrievalTaskResult:
     started = time.perf_counter()
+    payload: dict[str, Any] = {}
     try:
         debug_kwargs: dict[str, Any] = {
             "api": api,
@@ -283,6 +285,16 @@ async def run_retrieval_task(
             },
             model_aliases=config.model_aliases,
             contract_ids=contract_ids,
+            stage_records=normalize_stage_records(
+                [item for item in payload.get("events", []) if isinstance(item, dict)],
+                model_aliases=config.model_aliases,
+            ),
+            comparison_key=comparison_key(
+                dataset_hash=manifest.dataset_hash,
+                config_hash=config.config_hash,
+                contract_ids=contract_ids,
+                model_aliases=config.model_aliases,
+            ),
         )
     except Exception as exc:
         total_ms = int((time.perf_counter() - started) * 1000)
@@ -307,6 +319,17 @@ async def run_retrieval_task(
             },
             model_aliases=config.model_aliases,
             contract_ids={},
+            stage_records=normalize_stage_records(
+                [item for item in payload.get("events", []) if isinstance(item, dict)],
+                model_aliases=config.model_aliases,
+                failure_code=failure.error_code,
+            ),
+            comparison_key=comparison_key(
+                dataset_hash=manifest.dataset_hash,
+                config_hash=config.config_hash,
+                contract_ids={},
+                model_aliases=config.model_aliases,
+            ),
         )
 
 
@@ -319,8 +342,11 @@ async def extract_search_debug_candidates(
     prefusion_raw = _stage_candidates(events, ("rrf", "bm25", "dense"))
     reranked_raw = _stage_candidates(events, ("rerank", "context"))
     final_raw = _stage_candidates(events, ("context", "rerank"))
-    ids = [str(item.get("chunk_id")) for item in [*prefusion_raw, *reranked_raw, *final_raw] if item.get("chunk_id")]
-    refs = await load_chunk_refs(ids, settings=settings)
+    candidates = [*prefusion_raw, *reranked_raw, *final_raw]
+    missing_ids = [
+        str(item.get("chunk_id")) for item in candidates if item.get("chunk_id") and not item.get("document_id")
+    ]
+    refs = await load_chunk_refs(missing_ids, settings=settings) if missing_ids else {}
     return (
         _candidate_refs(prefusion_raw, refs, "prefusion"),
         _candidate_refs(reranked_raw, refs, "rerank"),
@@ -481,8 +507,12 @@ def _candidate_refs(
         output.append(
             CandidateRef(
                 chunk_id=chunk_id,
-                document_id=ref.document_id if ref else "",
-                section_id=ref.section_id if ref else "",
+                document_id=str(item.get("document_id") or (ref.document_id if ref else "")),
+                section_id=str(
+                    item.get("section_id")
+                    or dict(item.get("metadata") or {}).get("content_unit_id")
+                    or (ref.section_id if ref else "")
+                ),
                 title=str(item.get("title") or (ref.title if ref else "")),
                 source_url=str(item.get("source_url") or (ref.source_url if ref else "")),
                 rank=rank,

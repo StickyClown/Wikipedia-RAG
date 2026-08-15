@@ -14,6 +14,7 @@ from wikipediarag.eval.artifacts import ARTIFACT_ROOT, append_jsonl, read_json, 
 from wikipediarag.eval.diagnostics import answer_result_diagnosis, diagnose_answer_task, root_cause_count_metrics
 from wikipediarag.eval.hashing import stable_json_hash
 from wikipediarag.eval.metrics import aggregate, percentile, score_task
+from wikipediarag.eval.quality import comparison_key, normalize_stage_records
 from wikipediarag.eval.schemas import (
     CandidateRef,
     ConfigSummary,
@@ -23,6 +24,7 @@ from wikipediarag.eval.schemas import (
     EvalRunStatus,
     EvalTask,
     EvalTaskResult,
+    EvaluationOutcome,
     TaskScores,
 )
 from wikipediarag.reliability import RetryPolicy, safe_failure_from_exception
@@ -533,6 +535,17 @@ async def run_task(
             },
             model_aliases=config.model_aliases,
             contract_ids=contract_ids,
+            stage_records=normalize_stage_records(
+                [item for item in retrieval.get("events", []) if isinstance(item, dict)],
+                model_aliases=config.model_aliases,
+            ),
+            predicted_outcome=_predicted_quality_outcome(validation.get("answerability_status")),
+            comparison_key=comparison_key(
+                dataset_hash=manifest.dataset_hash,
+                config_hash=config.config_hash,
+                contract_ids=contract_ids,
+                model_aliases=config.model_aliases,
+            ),
         )
     total_ms = int((time.perf_counter() - started) * 1000)
     return _failed_result(
@@ -1042,7 +1055,28 @@ def _failed_result(
         },
         model_aliases=config.model_aliases,
         contract_ids={"run_contract_id": root_run_contract_id} if root_run_contract_id else {},
+        stage_records=normalize_stage_records(
+            [item for item in retrieval.get("events", []) if isinstance(item, dict)],
+            model_aliases=config.model_aliases,
+            failure_code=failure_code,
+        ),
+        comparison_key=comparison_key(
+            dataset_hash=manifest.dataset_hash,
+            config_hash=config.config_hash,
+            contract_ids={"run_contract_id": root_run_contract_id},
+            model_aliases=config.model_aliases,
+        ),
     )
+
+
+def _predicted_quality_outcome(status: Any) -> EvaluationOutcome | None:
+    outcomes: dict[str, EvaluationOutcome] = {
+        "answerable": "answered",
+        "partial": "partial",
+        "conflicting": "conflicting",
+        "unanswerable": "not_found_in_scope",
+    }
+    return outcomes.get(str(status))
 
 
 def _retrieval_latency_ms(retrieval: dict[str, Any]) -> int:

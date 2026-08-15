@@ -18,12 +18,15 @@ from wikipediarag.eval.document_benchmark import (
     RRNcBError,
     RRNcBPaths,
     _ingestion_item_failure_code,
+    _require_ingestion_ready,
+    _rrncb_multilingual_retrieval_report,
     prepare_rrncb,
     rrncb_paths,
     run_rrncb,
 )
+from wikipediarag.eval.hashing import stable_json_hash
 from wikipediarag.eval.metrics import rouge_l, score_task
-from wikipediarag.eval.schemas import CandidateRef, EvalConfig, EvalTask, EvalTaskResult
+from wikipediarag.eval.schemas import CandidateRef, EvalConfig, EvalTask, EvalTaskResult, RetrievalTaskResult
 
 
 def _write_fixture(root: Path, *, rows: int = 200, pdfs: int = 65) -> tuple[Path, Path]:
@@ -48,6 +51,34 @@ def _write_fixture(root: Path, *, rows: int = 200, pdfs: int = 65) -> tuple[Path
     return documents, csv_path
 
 
+def _write_reviewed_translations(root: Path) -> Path:
+    path = root / "reviewed-translations.jsonl"
+    records = []
+    questions = {
+        "en": "English question",
+        "uk": "Українське питання",
+        "de": "Deutsche Frage",
+        "ko": "한국어 질문",
+    }
+    for index in range(200):
+        base_task_id = f"rrncb-{index + 1:04d}"
+        source_question = f"Вопрос {index}"
+        for language in ("en", "uk", "de", "ko"):
+            records.append(
+                {
+                    "base_task_id": base_task_id,
+                    "language": language,
+                    "question": f"{questions[language]} {index}",
+                    "source_question_hash": stable_json_hash(source_question),
+                    "reviewed_by": "reviewer",
+                    "reviewed_at": "2026-08-15T00:00:00Z",
+                    "review_method": "manual",
+                }
+            )
+    path.write_text("".join(f"{json.dumps(record, ensure_ascii=False)}\n" for record in records), encoding="utf-8")
+    return path
+
+
 def test_prepare_rrncb_validates_manifest_and_stable_split(tmp_path: Path) -> None:
     documents, csv_path = _write_fixture(tmp_path)
 
@@ -70,6 +101,46 @@ def test_prepare_rrncb_rejects_missing_pdf(tmp_path: Path) -> None:
 
     with pytest.raises(RRNcBError, match="exactly 65"):
         prepare_rrncb(documents_dir=documents, csv_path=csv_path, suite="rrncb-missing")
+
+
+def test_prepare_rrncb_builds_complete_reviewed_multilingual_matrix(tmp_path: Path) -> None:
+    documents, csv_path = _write_fixture(tmp_path)
+    translations = _write_reviewed_translations(tmp_path)
+
+    report = prepare_rrncb(
+        documents_dir=documents,
+        csv_path=csv_path,
+        translations_path=translations,
+        suite="p0-search-quality-v2-unit",
+        artifacts_dir=tmp_path,
+    )
+
+    paths = rrncb_paths("p0-search-quality-v2-unit", tmp_path)
+    tasks = read_jsonl(paths.tasks, EvalTask)
+    assert report["task_count"] == 1000
+    assert sum(task.split == "dev" for task in tasks) == 200
+    assert {
+        language: sum(task.language_group == language for task in tasks) for language in ("ru", "en", "uk", "de", "ko")
+    } == {language: 200 for language in ("ru", "en", "uk", "de", "ko")}
+    assert len({next(tag for tag in task.tags if tag.startswith("base_task:")) for task in tasks}) == 200
+    manifest = read_json(paths.manifest)
+    assert manifest["required_language_counts"] == {language: 200 for language in ("ru", "en", "uk", "de", "ko")}
+
+
+def test_prepare_rrncb_rejects_stale_translation_source_hash(tmp_path: Path) -> None:
+    documents, csv_path = _write_fixture(tmp_path)
+    translations = _write_reviewed_translations(tmp_path)
+    payload = translations.read_text(encoding="utf-8").replace(stable_json_hash("Вопрос 0"), "stale", 1)
+    translations.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(RRNcBError, match="source question changed"):
+        prepare_rrncb(
+            documents_dir=documents,
+            csv_path=csv_path,
+            translations_path=translations,
+            suite="p0-search-quality-v2-stale",
+            artifacts_dir=tmp_path,
+        )
 
 
 def test_document_metrics_and_rouge_l() -> None:
@@ -113,6 +184,100 @@ def test_document_metrics_and_rouge_l() -> None:
     assert scores.document_citation_precision == 1.0
     assert scores.rouge_l == 1.0
     assert rouge_l("Москва столица России", ["Москва столица России"]) == 1.0
+
+
+def test_rrncb_multilingual_retrieval_report_has_language_and_paired_metrics() -> None:
+    tasks = [
+        EvalTask(
+            task_id=f"rrncb-0001-{language}",
+            question="Что?",
+            task_family="single_hop_factual",
+            reference_answer="Ответ",
+            accepted_answers=["Ответ"],
+            unanswerable=False,
+            expected_mode="normal_sufficient",
+            gold_page_ids=[],
+            gold_section_ids=[],
+            gold_chunk_ids=[],
+            gold_evidence=[],
+            reasoning_path=[],
+            generator_alias="generator_main",
+            verifier_alias="verifier",
+            zim_checksum="",
+            snapshot_id="",
+            index_version="upload",
+            retrieval_profile_hash="",
+            language=language,
+            language_group=language,
+            tags=["base_task:rrncb-0001"],
+            evaluation_granularity="document",
+        )
+        for language in ("ru", "en")
+    ]
+
+    def result(language: str, recall: float, mrr: float) -> RetrievalTaskResult:
+        return RetrievalTaskResult.model_validate(
+            {
+                "task_id": f"rrncb-0001-{language}",
+                "config_id": "upload_sota_mvp",
+                "config_hash": "config-hash",
+                "status": "completed",
+                "question": "Что?",
+                "task_family": "single_hop_factual",
+                "unanswerable": False,
+                "batch_index": 1,
+                "task_index": 1,
+                "latency_ms": {"total": 100},
+                "scores": {
+                    "page_recall": {},
+                    "section_recall": {},
+                    "chunk_recall": {},
+                    "mrr_at_10": mrr,
+                    "ndcg_at_10": mrr,
+                    "full_hop_recall": 0.0,
+                    "path_completion": 0.0,
+                    "document_recall": {"10": recall},
+                    "document_mrr_at_10": mrr,
+                    "document_ndcg_at_10": mrr,
+                },
+                "comparison_key": "same-contract",
+            }
+        )
+
+    report = _rrncb_multilingual_retrieval_report(tasks, [result("ru", 1.0, 0.8), result("en", 0.5, 0.3)])
+
+    assert report["failed"] == 0
+    assert report["by_language"]["ru"]["recall_at_10"] == 1.0
+    assert report["paired_delta_vs_ru"]["en"]["recall_at_10_delta"] == -0.5
+    assert report["paired_delta_vs_ru"]["en"]["mrr_at_10_delta"] == pytest.approx(-0.5)
+    assert report["compatible"] is True
+
+
+def test_rrncb_ingestion_readiness_accepts_healthy_parser_failover(monkeypatch: pytest.MonkeyPatch) -> None:
+    components = {
+        "postgres": "ok",
+        "worker": "ok",
+        "search_projection": "ok",
+        "opensearch": "ok",
+        "minio": "ok",
+        "xberg": "failed",
+        "docling": "ok",
+    }
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_args, **_kwargs: httpx.Response(
+            200,
+            json={"status": "degraded", "components": components},
+            request=httpx.Request("GET", "http://api/ready"),
+        ),
+    )
+
+    assert _require_ingestion_ready("http://api")["status"] == "degraded"
+
+    components["docling"] = "failed"
+    with pytest.raises(RRNcBError, match="parser_ready=False"):
+        _require_ingestion_ready("http://api")
 
 
 def test_eval_api_client_scopes_chat_and_debug_to_knowledge_base(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -4,6 +4,7 @@ import threading
 import time
 from typing import Any
 
+import httpx
 import pytest
 
 from wikipediarag.eval.corpus import CorpusChunk
@@ -12,6 +13,7 @@ from wikipediarag.eval.retrieval_runner import (
     extract_search_debug_candidates,
     format_retrieval_progress,
     run_retrieval_suite,
+    run_retrieval_task,
     summarize_retrieval_config,
 )
 from wikipediarag.eval.schemas import (
@@ -118,6 +120,37 @@ async def test_extract_search_debug_candidates_uses_stage_priority(monkeypatch: 
     assert final[0].section_id == "s1"
 
 
+@pytest.mark.asyncio
+async def test_extract_search_debug_candidates_uses_api_metadata_without_local_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_local_lookup(*_args: Any, **_kwargs: Any) -> dict[str, CorpusChunk]:
+        raise AssertionError("local DB lookup should not be needed when API metadata is complete")
+
+    monkeypatch.setattr("wikipediarag.eval.retrieval_runner.load_chunk_refs", fail_local_lookup)
+    payload = {
+        "events": [
+            {
+                "stage": "context",
+                "candidates": [
+                    {
+                        "chunk_id": "c1",
+                        "document_id": "p1",
+                        "title": "Document",
+                        "source_url": "http://api/doc",
+                        "metadata": {"content_unit_id": "s1"},
+                    }
+                ],
+            }
+        ]
+    }
+
+    _prefusion, _reranked, final = await extract_search_debug_candidates(payload)
+
+    assert final[0].document_id == "p1"
+    assert final[0].section_id == "s1"
+
+
 def test_hard_negative_metrics_track_rank_margin() -> None:
     task = _task(hard_negative_page_ids=["p2"])
     scores = score_retrieval_task(
@@ -132,6 +165,52 @@ def test_hard_negative_metrics_track_rank_margin() -> None:
     assert scores.dangerous_false_positive_evidence_rate == 0.5
     assert scores.gold_vs_hard_negative_rank_margin == -1.0
     assert scores.reranker_gold_delta == -1.0
+
+
+@pytest.mark.asyncio
+async def test_retrieval_task_failure_without_debug_payload_is_safe() -> None:
+    class FailingClient:
+        def run_search_debug(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            request = httpx.Request("GET", "http://api/api/v1/search:debug")
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("search failed", request=request, response=response)
+
+    config = EvalConfig(
+        config_id="upload_sota_mvp",
+        retrieval_profile="upload_sota_mvp",
+        retrieval_overrides={},
+        config_hash="config-hash",
+    )
+    manifest = EvalDatasetManifest(
+        dataset_name="suite",
+        dataset_version="v1",
+        dataset_hash="dataset-hash",
+        task_count=1,
+        created_at="2026-08-15T00:00:00Z",
+        snapshot_id="",
+        index_version="upload",
+        zim_checksum="",
+        retrieval_profile_hash="",
+        generator_alias="generator_main",
+        verifier_alias="verifier",
+        jsonl_path="tasks.jsonl",
+    )
+
+    result = await run_retrieval_task(
+        _task(),
+        config,
+        api="http://api",
+        manifest=manifest,
+        client=FailingClient(),
+        settings=object(),  # type: ignore[arg-type]
+        batch_index=1,
+        task_index=1,
+    )
+
+    assert result.status == "failed"
+    assert result.errors
+    assert len(result.stage_records) == 1
+    assert result.stage_records[0].stage == "unknown"
 
 
 def test_low_score_rank4_hard_negative_is_diagnostic_only() -> None:

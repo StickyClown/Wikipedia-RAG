@@ -11,9 +11,25 @@ TaskFamily = Literal[
     "comparison_multi_hop",
     "unanswerable",
     "hard_negative",
+    "exact_identifier",
+    "entity_alias",
+    "multilingual",
+    "cross_source",
+    "table_lookup",
+    "multi_hop",
+    "partial",
+    "conflicting",
+    "not_found_in_scope",
+    "freshness",
+    "citation_span",
 ]
 
 ExpectedMode = Literal["normal_sufficient", "extended_beneficial", "extended_required", "unanswerable"]
+EvaluationOutcome = Literal["answered", "partial", "conflicting", "not_found_in_scope"]
+EvaluationSchemaVersion = Literal["legacy_eval_v1", "search_quality_eval_v1"]
+ClaimStatus = Literal["supported", "missing", "conflicting"]
+SourceLocatorType = Literal["text", "page", "table"]
+StageStatus = Literal["completed", "failed", "not_observed"]
 EvalGeneratePhase = Literal["preparing", "family_generation", "writing_dataset", "completed", "failed"]
 EvalGenerateState = Literal["running", "completed", "failed"]
 EvalRunState = Literal["running", "completed", "failed"]
@@ -63,6 +79,70 @@ class GoldEvidence(BaseModel):
     hop: int = Field(default=1, ge=1)
     title: str = ""
     source_url: str = ""
+    source_id: str = ""
+    source_revision: str = ""
+    source_sha256: str = ""
+    locator_type: SourceLocatorType = "text"
+    start_offset: int | None = Field(default=None, ge=0)
+    end_offset: int | None = Field(default=None, ge=0)
+    page_number: int | None = Field(default=None, ge=1)
+    table_name: str = ""
+    row_key: str = ""
+    column_name: str = ""
+    valid_from: str = ""
+    valid_to: str = ""
+    contradicts_claim_ids: list[str] = Field(default_factory=list)
+    allow_continuous_span: bool = False
+
+
+class ExpectedClaim(BaseModel):
+    claim_id: str
+    statement: str
+    accepted_answers: list[str] = Field(default_factory=list)
+    status: ClaimStatus = "supported"
+    supports_evidence_ids: list[str] = Field(default_factory=list)
+    contradicts_evidence_ids: list[str] = Field(default_factory=list)
+
+
+class ScopeReview(BaseModel):
+    reviewed: bool = False
+    reviewed_by: str = ""
+    reviewed_at: str = ""
+    source_ids: list[str] = Field(default_factory=list)
+    checked_source_count: int = Field(default=0, ge=0)
+    notes: str = ""
+
+
+class EvalStageRecord(BaseModel):
+    stage: str
+    ordinal: int = Field(ge=1)
+    status: StageStatus
+    latency_ms: int = Field(default=0, ge=0)
+    input_count: int | None = Field(default=None, ge=0)
+    output_count: int | None = Field(default=None, ge=0)
+    discarded_count: int | None = Field(default=None, ge=0)
+    candidate_ids: list[str] = Field(default_factory=list)
+    candidate_ranks: list[int] = Field(default_factory=list)
+    candidate_scores: list[float] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+    model_alias: str = ""
+    model_calls: int | None = Field(default=None, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    attempts: int = Field(default=0, ge=0)
+
+
+class CorpusSource(BaseModel):
+    source_id: str
+    filename: str
+    language_group: str
+    source_kind: str
+    sha256: str
+    revision: str = ""
+    observed_at: str = ""
+    current: bool = True
+    allowed_task_ids: list[str] = Field(default_factory=list)
+    forbidden_task_ids: list[str] = Field(default_factory=list)
 
 
 class EvalTask(BaseModel):
@@ -98,6 +178,18 @@ class EvalTask(BaseModel):
     # external document benchmarks use only the deterministic dev/test split.
     split: Literal["train", "dev", "test"] = "test"
     source_document_name: str = ""
+    evaluation_schema_version: EvaluationSchemaVersion = "legacy_eval_v1"
+    language_group: str = ""
+    expected_outcome: EvaluationOutcome | None = None
+    source_ids: list[str] = Field(default_factory=list)
+    required_source_ids: list[str] = Field(default_factory=list)
+    forbidden_source_ids: list[str] = Field(default_factory=list)
+    expected_claims: list[ExpectedClaim] = Field(default_factory=list)
+    scope_review: ScopeReview = Field(default_factory=ScopeReview)
+    citation_match_mode: Literal["chunk_contains_quote"] = "chunk_contains_quote"
+    reviewed_by: str = ""
+    reviewed_at: str = ""
+    review_notes: list[str] = Field(default_factory=list)
 
 
 class EvalDatasetManifest(BaseModel):
@@ -114,6 +206,14 @@ class EvalDatasetManifest(BaseModel):
     verifier_alias: str
     jsonl_path: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+    evaluation_schema_version: EvaluationSchemaVersion = "legacy_eval_v1"
+    corpus_manifest_hash: str = ""
+    source_count: int = Field(default=0, ge=0)
+    required_family_counts: dict[str, int] = Field(default_factory=dict)
+    required_language_counts: dict[str, int] = Field(default_factory=dict)
+    review_policy_version: str = ""
+    source_manifest_path: str = ""
+    task_manifest_path: str = ""
 
 
 class EvalGenerateStats(BaseModel):
@@ -238,6 +338,7 @@ class TaskScores(BaseModel):
     document_citation_recall: float = 0.0
     gold_document_citation_hit: float = 0.0
     rouge_l: float = 0.0
+    answer_groundedness: float | None = None
 
 
 class EvalTaskResult(BaseModel):
@@ -248,7 +349,7 @@ class EvalTaskResult(BaseModel):
     report_id: str = ""
     run_started_at: str = ""
     dataset_hash: str = ""
-    status: Literal["completed", "failed", "reused"]
+    status: Literal["completed", "failed", "reused", "search_incomplete"]
     question: str
     answer: str = ""
     citations: list[str] = Field(default_factory=list)
@@ -282,6 +383,9 @@ class EvalTaskResult(BaseModel):
     corpus: dict[str, str] = Field(default_factory=dict)
     model_aliases: dict[str, str] = Field(default_factory=dict)
     contract_ids: dict[str, str] = Field(default_factory=dict)
+    stage_records: list[EvalStageRecord] = Field(default_factory=list)
+    predicted_outcome: EvaluationOutcome | None = None
+    comparison_key: str = ""
 
 
 class ConfigSummary(BaseModel):
@@ -361,7 +465,7 @@ class RetrievalTaskResult(BaseModel):
     task_id: str
     config_id: str
     config_hash: str
-    status: Literal["completed", "failed"]
+    status: Literal["completed", "failed", "search_incomplete"]
     question: str
     task_family: TaskFamily
     unanswerable: bool
@@ -378,6 +482,8 @@ class RetrievalTaskResult(BaseModel):
     corpus: dict[str, str] = Field(default_factory=dict)
     model_aliases: dict[str, str] = Field(default_factory=dict)
     contract_ids: dict[str, str] = Field(default_factory=dict)
+    stage_records: list[EvalStageRecord] = Field(default_factory=list)
+    comparison_key: str = ""
 
 
 class RetrievalConfigSummary(BaseModel):

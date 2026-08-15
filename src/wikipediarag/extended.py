@@ -15,11 +15,12 @@ from wikipediarag.db import connect_autocommit, json_dumps
 from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.embedding import normalize_for_embedding
 from wikipediarag.ids import new_uuid, stable_hash
+from wikipediarag.provenance import public_provenance_from_metadata
 from wikipediarag.reliability import OperationDeadline
 from wikipediarag.repository import fetch_chunk_by_id, insert_retrieval_event
 from wikipediarag.retrieval import make_query_context, query_ref_from_context, retrieve, retrieve_multi
 from wikipediarag.retrieval_profile import RetrievalProfile
-from wikipediarag.schemas import AnswerabilityStatus, Evidence, RetrievalResult
+from wikipediarag.schemas import AnswerabilityStatus, Evidence, RetrievalResult, SourceProvenance
 
 StopReason = Literal[
     "evidence_sufficient",
@@ -944,6 +945,7 @@ def _renumber_evidence(evidence: list[Evidence]) -> list[Evidence]:
             content_unit_id=item.content_unit_id,
             supporting_chunk_ids=item.supporting_chunk_ids,
             provenance_refs=item.provenance_refs,
+            provenance=item.provenance,
         )
         for index, item in enumerate(evidence, start=1)
     ]
@@ -1035,6 +1037,16 @@ def _evidence_from_chunk_row(row: dict[str, Any]) -> Evidence:
         scores={"neighbor": 1.0},
         ranks={},
         metadata=metadata,
+        provenance=SourceProvenance.model_validate(
+            public_provenance_from_metadata(
+                metadata,
+                document_id=str(row.get("document_id") or ""),
+                document_version_id=str(metadata.get("document_version_id") or ""),
+                source_uri=str(row.get("source_uri") or ""),
+                source_url=str(row.get("source_url") or ""),
+                chunk_id=str(row.get("id") or ""),
+            )
+        ),
     )
 
 
