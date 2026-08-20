@@ -137,6 +137,29 @@ def delete_objects(keys: list[str], settings: Settings | None = None) -> int:
     return deleted
 
 
+def delete_all_objects(settings: Settings | None = None) -> int:
+    """Delete every object from the configured application bucket.
+
+    This is used only by the explicit workspace-reset command.  It never
+    enumerates buckets and never deletes the bucket itself.
+    """
+    resolved = settings or get_settings()
+    client = _client(resolved)
+    deleted = 0
+    continuation: str | None = None
+    while True:
+        request: dict[str, str] = {"Bucket": resolved.minio_bucket}
+        if continuation:
+            request["ContinuationToken"] = continuation
+        page = client.list_objects_v2(**request)
+        deleted += delete_objects([str(item.get("Key") or "") for item in page.get("Contents", [])], resolved)
+        if not bool(page.get("IsTruncated")):
+            return deleted
+        continuation = str(page.get("NextContinuationToken") or "")
+        if not continuation:
+            raise RuntimeError("WORKSPACE_RESET_OBJECT_LIST_INCOMPLETE")
+
+
 def create_presigned_put_url(
     key: str,
     *,

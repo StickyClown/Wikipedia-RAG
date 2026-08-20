@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from wikipediarag.auth import PlatformRole, TenantRole
+from wikipediarag.auth import PlatformRole
 from wikipediarag.auth_service import (
     auth_disabled_actor,
     bootstrap_admin_password,
@@ -133,15 +133,13 @@ def test_local_login_mode_gating(auth_mode: Any, enabled: bool) -> None:
     assert local_login_enabled(settings) is enabled
 
 
-def test_auth_disabled_actor_is_platform_admin_in_default_tenant() -> None:
+def test_auth_disabled_actor_is_workspace_platform_admin() -> None:
     settings = Settings(auth_disabled=True)
 
     actor = auth_disabled_actor(settings, user_id="user-id", request_id="request-id", trace_id="trace-id")
 
     assert actor.user_id == "user-id"
     assert actor.platform_role == PlatformRole.platform_admin
-    assert actor.active_tenant_id == settings.default_tenant_id
-    assert actor.tenant_role == TenantRole.tenant_admin
     assert str(uuid.UUID(actor.session_id)) == actor.session_id
 
 

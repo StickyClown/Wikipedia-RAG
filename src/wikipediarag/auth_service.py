@@ -14,7 +14,7 @@ from argon2.low_level import Type
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole, TenantRole
+from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole
 from wikipediarag.config import Settings
 from wikipediarag.db import json_dumps
 from wikipediarag.ids import new_uuid
@@ -78,8 +78,6 @@ def auth_disabled_actor(settings: Settings, *, user_id: str, request_id: str, tr
     return ActorContext(
         user_id=user_id,
         platform_role=PlatformRole.platform_admin,
-        active_tenant_id=settings.default_tenant_id,
-        tenant_role=TenantRole.tenant_admin,
         session_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"auth-disabled:{user_id}")),
         authentication_method=AuthenticationMethod.local,
         request_id=request_id,
@@ -242,7 +240,6 @@ async def create_session(
     authentication_method: AuthenticationMethod,
     settings: Settings,
     remember_me: bool = False,
-    active_tenant_id: str | None = None,
     server_side_tokens: dict[str, Any] | None = None,
 ) -> CreatedSession:
     now = datetime.now(UTC)
@@ -257,11 +254,11 @@ async def create_session(
         text(
             """
             INSERT INTO auth_sessions(
-              id, user_id, session_token_hash, csrf_token_hash, active_tenant_id,
+              id, user_id, session_token_hash, csrf_token_hash,
               authentication_method, server_side_tokens, expires_at, idle_expires_at
             )
             VALUES (
-              :id, :user_id, :session_token_hash, :csrf_token_hash, :active_tenant_id,
+              :id, :user_id, :session_token_hash, :csrf_token_hash,
               :authentication_method, CAST(:server_side_tokens AS jsonb), :expires_at, :idle_expires_at
             )
             """
@@ -271,7 +268,6 @@ async def create_session(
             "user_id": user_id,
             "session_token_hash": hash_secret(session_token),
             "csrf_token_hash": hash_secret(csrf_token),
-            "active_tenant_id": active_tenant_id,
             "authentication_method": authentication_method.value,
             "server_side_tokens": json_dumps(server_side_tokens or {}),
             "expires_at": expires_at,
@@ -292,12 +288,10 @@ async def load_actor_for_session(
     result = await conn.execute(
         text(
             """
-            SELECT s.id AS session_id, s.user_id, s.active_tenant_id, s.authentication_method,
-                   u.platform_role, tm.role AS tenant_role
+            SELECT s.id AS session_id, s.user_id, s.authentication_method,
+                   u.platform_role
             FROM auth_sessions s
             JOIN users u ON u.id = s.user_id
-            LEFT JOIN tenant_memberships tm
-              ON tm.user_id = s.user_id AND tm.tenant_id = s.active_tenant_id
             WHERE s.session_token_hash = :session_token_hash
               AND s.revoked_at IS NULL
               AND s.expires_at > :now
@@ -317,8 +311,6 @@ async def load_actor_for_session(
     return ActorContext(
         user_id=str(row["user_id"]),
         platform_role=PlatformRole(row["platform_role"]),
-        active_tenant_id=str(row["active_tenant_id"]) if row["active_tenant_id"] is not None else None,
-        tenant_role=TenantRole(row["tenant_role"]) if row["tenant_role"] is not None else None,
         session_id=str(row["session_id"]),
         authentication_method=AuthenticationMethod(row["authentication_method"]),
         request_id=request_id,
@@ -372,40 +364,6 @@ async def revoke_session(conn: AsyncConnection, *, session_id: str) -> None:
         text("UPDATE auth_sessions SET revoked_at = now(), updated_at = now() WHERE id = :id"),
         {"id": session_id},
     )
-
-
-async def select_active_tenant(
-    conn: AsyncConnection,
-    *,
-    session_id: str,
-    user_id: str,
-    platform_role: PlatformRole,
-    tenant_id: str,
-) -> TenantRole | None:
-    tenant = await conn.execute(text("SELECT id FROM tenants WHERE id = :id"), {"id": tenant_id})
-    if tenant.first() is None:
-        raise AuthenticationError("TENANT_NOT_FOUND", "tenant not found", status_code=404)
-    tenant_role: TenantRole | None = None
-    if platform_role != PlatformRole.platform_admin:
-        membership = await conn.execute(
-            text(
-                """
-                SELECT role
-                FROM tenant_memberships
-                WHERE tenant_id = :tenant_id AND user_id = :user_id
-                """
-            ),
-            {"tenant_id": tenant_id, "user_id": user_id},
-        )
-        row = membership.mappings().first()
-        if row is None:
-            raise AuthenticationError("TENANT_ACCESS_DENIED", "tenant access denied", status_code=403)
-        tenant_role = TenantRole(row["role"])
-    await conn.execute(
-        text("UPDATE auth_sessions SET active_tenant_id = :tenant_id, updated_at = now() WHERE id = :session_id"),
-        {"tenant_id": tenant_id, "session_id": session_id},
-    )
-    return tenant_role
 
 
 async def change_local_password(
@@ -472,8 +430,6 @@ def test_actor_context(settings: Settings, *, request_id: str, trace_id: str) ->
     return ActorContext(
         user_id=settings.default_user_id,
         platform_role=PlatformRole.user,
-        active_tenant_id=settings.default_tenant_id,
-        tenant_role=TenantRole.tenant_admin,
         session_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"test-session:{request_id}")),
         authentication_method=AuthenticationMethod.test,
         request_id=request_id,

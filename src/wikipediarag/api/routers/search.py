@@ -13,7 +13,7 @@ router.add_contract_route(
     "/api/v1/search",
     handlers.search,
     methods=["POST"],
-    authorization=contract(B.knowledge_base, "kb_viewer", "read", "search", X.deny, exposure=(E.retrieval,)),
+    authorization=contract(B.resource, "resource_read", "read", "search", X.deny, exposure=(E.retrieval,)),
 )
 router.add_contract_route(
     "/api/v1/search:debug",

@@ -11,9 +11,7 @@ import wikipediarag.api.handlers as api_app
 from wikipediarag.auth import (
     ActorContext,
     AuthenticationMethod,
-    KnowledgeBaseRole,
     PlatformRole,
-    TenantRole,
 )
 from wikipediarag.retrieval_contract import KnowledgeBaseNotReady, RetrievalProfileIncompatible
 from wikipediarag.schemas import ResearchPlanCreate
@@ -92,8 +90,6 @@ def _actor() -> ActorContext:
     return ActorContext(
         user_id="22222222-2222-4222-8222-222222222222",
         platform_role=PlatformRole.user,
-        active_tenant_id="11111111-1111-4111-8111-111111111111",
-        tenant_role=TenantRole.member,
         session_id="44444444-4444-4444-8444-444444444444",
         authentication_method=AuthenticationMethod.local,
         request_id="33333333-3333-4333-8333-333333333333",
@@ -118,8 +114,8 @@ async def test_delete_empty_knowledge_base_removes_its_grants_first(
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def require_kb_role(_conn: object, **_kwargs: Any) -> KnowledgeBaseRole:
-        return KnowledgeBaseRole.owner
+    async def require_workspace_delete(*_args: Any, **_kwargs: Any) -> object:
+        return object()
 
     async def audit(*_args: Any, **_kwargs: Any) -> None:
         return None
@@ -135,7 +131,7 @@ async def test_delete_empty_knowledge_base_removes_its_grants_first(
 
     monkeypatch.setattr(api_app, "connect", lambda: _RecordingConnectionContext(connection))
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_kb_role)
+    monkeypatch.setattr(api_app, "_require_workspace_delete", require_workspace_delete)
     monkeypatch.setattr(api_app, "_audit", audit)
     monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
     monkeypatch.setattr(api_app, "delete_document_chunks", delete_chunks)
@@ -170,8 +166,8 @@ async def test_create_research_plan_returns_safe_kb_not_ready(
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def require_kb_role(_conn: object, **_kwargs: Any) -> KnowledgeBaseRole:
-        return KnowledgeBaseRole.viewer
+    async def require_workspace_read(_conn: object, _actor: ActorContext, _kb_id: str) -> str:
+        return "workspace-storage"
 
     async def resolve_profile(_conn: object, **_kwargs: Any) -> SimpleNamespace:
         raise KnowledgeBaseNotReady(
@@ -181,7 +177,7 @@ async def test_create_research_plan_returns_safe_kb_not_ready(
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_kb_role)
+    monkeypatch.setattr(api_app, "_require_workspace_kb_read", require_workspace_read)
     monkeypatch.setattr(api_app, "resolve_retrieval_profile", resolve_profile)
 
     with pytest.raises(HTTPException) as exc_info:
@@ -207,8 +203,8 @@ async def test_retrieval_profile_catalog_returns_incompatible_scope_without_500(
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def load_roles(_conn: object, **_kwargs: Any) -> dict[str, KnowledgeBaseRole]:
-        return {"first": KnowledgeBaseRole.viewer, "second": KnowledgeBaseRole.viewer}
+    async def require_workspace_read(_conn: object, _actor: ActorContext, _kb_id: str) -> str:
+        return "workspace-storage"
 
     async def get_kb(_conn: object, _tenant_id: str, kb_id: str) -> dict[str, str]:
         return {"id": kb_id, "active_index": "read_alias"}
@@ -221,7 +217,7 @@ async def test_retrieval_profile_catalog_returns_incompatible_scope_without_500(
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_load_kb_scope_roles", load_roles)
+    monkeypatch.setattr(api_app, "_require_workspace_kb_read", require_workspace_read)
     monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
     monkeypatch.setattr(api_app, "load_index_version_by_read_alias", load_index)
     monkeypatch.setattr(api_app, "resolve_retrieval_profile", resolve_profile)

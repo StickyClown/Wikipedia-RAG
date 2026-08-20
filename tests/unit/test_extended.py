@@ -4,9 +4,7 @@ from typing import cast
 
 import pytest
 
-from wikipediarag.auth import KnowledgeBaseRole
 from wikipediarag.config import Settings
-from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.extended import (
     HarnessState,
     _build_subqueries,
@@ -309,7 +307,7 @@ async def test_get_neighbors_uses_tenant_scoped_chunk_lookup(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_get_neighbors_trims_restricted_neighbor_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_get_neighbors_never_crosses_document_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     rows = {
         "c1": {
             "id": "c1",
@@ -363,7 +361,7 @@ async def test_get_neighbors_trims_restricted_neighbor_chunks(monkeypatch: pytes
         tenant_id="tenant",
         knowledge_base_id="kb",
         window=1,
-        filters={"document_access_scope": DocumentAccessScope(user_id="viewer", kb_role=KnowledgeBaseRole.viewer)},
+        filters=None,
     )
 
-    assert [item.chunk_id for item in neighbors] == ["c2"]
+    assert neighbors == []

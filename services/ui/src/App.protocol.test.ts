@@ -1,9 +1,10 @@
 import { createElement } from "react";
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App, parseSse } from "./App";
 
 afterEach(() => {
+  cleanup();
   vi.unstubAllGlobals();
 });
 
@@ -61,5 +62,62 @@ describe("public SSE protocol", () => {
       );
     });
     expect(screen.getByText("degraded")).toBeVisible();
+  });
+
+  it("exposes local group controls while keeping OIDC groups read-only", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/ready")) {
+          return Promise.resolve(new Response(JSON.stringify({ status: "ok" })));
+        }
+        if (url.endsWith("/api/v1/auth/session")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                authenticated: true,
+                user: {
+                  id: "admin",
+                  platform_role: "PLATFORM_ADMIN",
+                  password_change_required: false,
+                },
+              }),
+            ),
+          );
+        }
+        if (url.endsWith("/api/v1/knowledge-bases")) {
+          return Promise.resolve(new Response(JSON.stringify([])));
+        }
+        if (url.endsWith("/api/v1/groups")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify([
+                {
+                  id: "local-group",
+                  name: "Engineering",
+                  group_type: "LOCAL",
+                  member_user_ids: [],
+                },
+                {
+                  id: "oidc-group",
+                  name: "SRE",
+                  group_type: "OIDC",
+                  member_user_ids: [],
+                },
+              ]),
+            ),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url}`));
+      }),
+    );
+
+    render(createElement(App));
+
+    await waitFor(() => expect(screen.getByText(/Engineering \(LOCAL\)/)).toBeVisible());
+    expect(screen.getByRole("button", { name: "Edit" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeVisible();
+    expect(screen.getByText("OIDC managed")).toBeVisible();
   });
 });

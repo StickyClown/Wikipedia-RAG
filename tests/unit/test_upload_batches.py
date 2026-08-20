@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from starlette.requests import Request
 
 import wikipediarag.api.handlers as api_app
-from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole, TenantRole
+from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole
 from wikipediarag.config import Settings
 from wikipediarag.repository import DocumentVersionLifecycleError, create_document_upload_records
 from wikipediarag.schemas import UploadBatchCreate, UploadBatchItemCreate
@@ -48,6 +48,10 @@ class _CaptureConnection:
         return _FakeResult()
 
 
+async def _awaitable(value: str | None) -> str:
+    return str(value)
+
+
 def _request(*, method: str = "POST", path: str = "/api/v1/uploads/batches") -> Request:
     return Request(
         {
@@ -67,8 +71,6 @@ def _actor() -> ActorContext:
     return ActorContext(
         user_id="22222222-2222-4222-8222-222222222222",
         platform_role=PlatformRole.platform_admin,
-        active_tenant_id="11111111-1111-4111-8111-111111111111",
-        tenant_role=TenantRole.tenant_admin,
         session_id="session",
         authentication_method=AuthenticationMethod.local,
         request_id="33333333-3333-4333-8333-333333333333",
@@ -86,9 +88,6 @@ async def test_create_upload_batch_endpoint_creates_sessions_without_object_key_
     async def require_actor(_request: Request) -> ActorContext:
         return actor
 
-    async def require_role(*_args: object, **_kwargs: object) -> None:
-        return None
-
     async def get_kb(_conn: object, _tenant_id: str, kb_id: str) -> dict[str, str]:
         return {"id": kb_id}
 
@@ -103,7 +102,9 @@ async def test_create_upload_batch_endpoint_creates_sessions_without_object_key_
     monkeypatch.setattr(api_app, "get_settings", lambda: Settings(upload_session_ttl_seconds=300))
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+    monkeypatch.setattr(
+        api_app, "_require_workspace_kb_write", lambda *_args: _awaitable("11111111-1111-4111-8111-111111111111")
+    )
     monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
     monkeypatch.setattr(api_app, "create_upload_batch", create_batch)
     monkeypatch.setattr(api_app, "create_upload_session", create_session)
@@ -153,6 +154,7 @@ async def test_document_upload_completion_reuses_existing_batch_id() -> None:
         upload_session={
             "id": "55555555-5555-4555-8555-555555555555",
             "batch_id": batch_id,
+            "owner_user_id": "66666666-6666-4666-8666-666666666666",
             "filename": "a.txt",
             "object_key": "uploads/server-owned/key",
             "parser_profile": "standard",
@@ -174,6 +176,13 @@ async def test_document_upload_completion_reuses_existing_batch_id() -> None:
     assert upload_session_updates
     assert upload_session_updates[0] is not None
     assert upload_session_updates[0]["batch_id"] == batch_id
+    document_inserts = [
+        params
+        for statement, params in zip(conn.statements, conn.params, strict=True)
+        if "INSERT INTO documents" in statement
+    ]
+    assert document_inserts[0] is not None
+    assert document_inserts[0]["owner_user_id"] == "66666666-6666-4666-8666-666666666666"
     assert status == "received"
 
 

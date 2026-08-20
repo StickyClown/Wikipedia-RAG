@@ -62,7 +62,6 @@ def _expected_projection_records(chunks: list[Any]) -> list[dict[str, Any]]:
             "content_hash": chunk.content_hash,
             "metadata": {
                 "publication_status": str(chunk.metadata.get("publication_status") or "published"),
-                "document_access": chunk.metadata.get("document_access") or {},
             },
         }
         for chunk in chunks
@@ -84,7 +83,7 @@ def _projection_field_matches(expected: list[dict[str, Any]], observed: list[dic
             for key in expected_by_chunk
         ):
             return field
-    for field in ("publication_status", "document_access"):
+    for field in ("publication_status",):
         if any(
             (expected_by_chunk[key].get("metadata") or {}).get(field)
             != (observed_by_chunk[key].get("metadata") or {}).get(field)
@@ -236,7 +235,7 @@ async def _process_search_projection_once(settings: Any, *, lease_id: str) -> bo
     event_id = str(event["id"])
     try:
         payload = dict(event.get("payload") or {})
-        if event["event_kind"] not in {"document_access", "document_publication"}:
+        if event["event_kind"] != "document_publication":
             raise ValueError("unsupported search projection event")
         current_version_id, _fingerprint = await _repair_search_projection_document(
             settings,

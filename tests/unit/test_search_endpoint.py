@@ -9,17 +9,34 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 import wikipediarag.api.handlers as api_app
-from wikipediarag.auth import ActorContext, AuthenticationMethod, KnowledgeBaseRole, PlatformRole, TenantRole
+from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole
 from wikipediarag.auth_service import AuthenticationError
-from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.repository import search_public_chunks
 from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import SearchFilters, SearchRequest, SearchResponse, SearchResult
 
 
+class _MappingResult:
+    def __init__(self, rows: list[dict[str, str]]) -> None:
+        self._rows = rows
+
+    def mappings(self) -> _MappingResult:
+        return self
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return iter(self._rows)
+
+
+class _FakeConnection:
+    async def execute(self, *_args: object, **_kwargs: object) -> _MappingResult:
+        return _MappingResult(
+            [{"id": "33333333-3333-4333-8333-333333333333", "tenant_id": "11111111-1111-4111-8111-111111111111"}]
+        )
+
+
 class _FakeConnectionContext:
     async def __aenter__(self) -> object:
-        return object()
+        return _FakeConnection()
 
     async def __aexit__(
         self,
@@ -49,8 +66,6 @@ def _actor() -> ActorContext:
     return ActorContext(
         user_id="22222222-2222-4222-8222-222222222222",
         platform_role=PlatformRole.user,
-        active_tenant_id="11111111-1111-4111-8111-111111111111",
-        tenant_role=TenantRole.member,
         session_id="44444444-4444-4444-8444-444444444444",
         authentication_method=AuthenticationMethod.local,
         request_id="33333333-3333-4333-8333-333333333333",
@@ -72,28 +87,24 @@ async def test_search_endpoint_requires_authenticated_actor(monkeypatch: pytest.
 
 
 async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeypatch: pytest.MonkeyPatch) -> None:
-    loaded_roles: list[str] = []
     search_calls: list[dict[str, Any]] = []
 
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def load_kb_role(_conn: object, **kwargs: Any) -> KnowledgeBaseRole:
-        loaded_roles.append(str(kwargs["kb_id"]))
-        return KnowledgeBaseRole.viewer
+    class WorkspaceGrants:
+        def __init__(self, _conn: object) -> None:
+            pass
 
-    async def load_access_scope(_conn: object, **kwargs: Any) -> DocumentAccessScope:
-        return DocumentAccessScope(
-            tenant_id=kwargs["tenant_id"],
-            user_id="22222222-2222-4222-8222-222222222222",
-            kb_role=kwargs["effective_kb_role"],
-        )
-
-    async def get_kb(_conn: object, _tenant_id: str, kb_id: str) -> dict[str, str]:
-        return {"id": kb_id, "active_index": f"read-{kb_id}"}
-
-    async def load_index(_conn: object, **kwargs: Any) -> dict[str, str]:
-        return {"id": "index", "read_alias": kwargs["read_alias"]}
+        async def list_visible_knowledge_bases(self, **_kwargs: Any) -> list[tuple[Any, str, bool, bool]]:
+            return [
+                (
+                    cast(Any, type("Resource", (), {"resource_id": "33333333-3333-4333-8333-333333333333"})()),
+                    "full",
+                    False,
+                    False,
+                )
+            ]
 
     async def run_search(_conn: object, search_payload: SearchRequest, **kwargs: Any) -> SearchResponse:
         search_calls.append(
@@ -133,10 +144,7 @@ async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeyp
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_load_kb_role_optional", load_kb_role)
-    monkeypatch.setattr(api_app, "load_actor_document_access_scope", load_access_scope)
-    monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
-    monkeypatch.setattr(api_app, "load_index_version_by_read_alias", load_index)
+    monkeypatch.setattr(api_app, "WorkspaceGrantRepository", WorkspaceGrants)
     monkeypatch.setattr(api_app, "run_public_search", run_search)
     monkeypatch.setattr(api_app, "resolve_retrieval_profile", resolve_profile)
 
@@ -147,14 +155,8 @@ async def test_search_endpoint_uses_viewer_scope_and_public_result_shape(monkeyp
     )
     response = await api_app.search(payload, _request())
 
-    assert loaded_roles == ["33333333-3333-4333-8333-333333333333"]
-    assert search_calls[0]["document_access_scopes"] == {
-        "33333333-3333-4333-8333-333333333333": DocumentAccessScope(
-            tenant_id="11111111-1111-4111-8111-111111111111",
-            user_id="22222222-2222-4222-8222-222222222222",
-            kb_role=KnowledgeBaseRole.viewer,
-        )
-    }
+    assert search_calls[0]["actor_user_id"] == "22222222-2222-4222-8222-222222222222"
+    assert search_calls[0]["knowledge_base_ids"] == ["33333333-3333-4333-8333-333333333333"]
     assert search_calls[0]["filters"] == {"document_type": "pdf", "language": "ru"}
     result = response.results[0]
     assert result.chunk_id == "chunk:1"
@@ -169,16 +171,16 @@ async def test_search_endpoint_returns_safe_kb_not_ready(monkeypatch: pytest.Mon
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def load_kb_role(*_args: object, **_kwargs: object) -> None:
-        return None
+    class WorkspaceGrants:
+        def __init__(self, _conn: object) -> None:
+            pass
 
-    async def get_kb(_conn: object, _tenant_id: str, kb_id: str) -> dict[str, str]:
-        return {"id": kb_id, "active_index": ""}
+        async def list_visible_knowledge_bases(self, **_kwargs: Any) -> list[tuple[Any, str, bool, bool]]:
+            return []
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_load_kb_role_optional", load_kb_role)
-    monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
+    monkeypatch.setattr(api_app, "WorkspaceGrantRepository", WorkspaceGrants)
 
     with pytest.raises(HTTPException) as exc_info:
         await api_app.search(
@@ -186,10 +188,24 @@ async def test_search_endpoint_returns_safe_kb_not_ready(monkeypatch: pytest.Mon
             _request(),
         )
 
-    assert exc_info.value.status_code == 409
-    detail = cast(dict[str, Any], exc_info.value.detail)
-    error = cast(dict[str, Any], detail["error"])
-    assert error["code"] == "KB_NOT_READY"
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "knowledge base not found"
+
+
+async def test_workspace_retrieval_scope_requires_full_kb_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    class WorkspaceGrants:
+        def __init__(self, _conn: object) -> None:
+            pass
+
+        async def list_visible_knowledge_bases(self, **_kwargs: Any) -> list[tuple[Any, str, bool, bool]]:
+            return [(cast(Any, type("Resource", (), {"resource_id": "kb"})()), "partial", False, False)]
+
+    monkeypatch.setattr(api_app, "WorkspaceGrantRepository", WorkspaceGrants)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await api_app._require_full_workspace_kb_scope(cast(Any, _FakeConnection()), actor=_actor(), kb_ids=["kb"])
+
+    assert exc_info.value.status_code == 404
 
 
 def test_search_sql_is_tenant_scoped_and_excludes_deleted_documents() -> None:

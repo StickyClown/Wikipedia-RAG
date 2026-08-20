@@ -608,6 +608,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional output directory; defaults to artifacts/validation/deep-research-tool-matrix/<timestamp>",
     )
+
+    workspace_reset_parser = subparsers.add_parser("workspace-reset")
+    workspace_reset_parser.add_argument(
+        "--apply", action="store_true", help="required; otherwise no database changes occur"
+    )
+    workspace_reset_parser.add_argument(
+        "--all-data-confirmed",
+        action="store_true",
+        help="operator confirms all WikipediaRag data may be deleted",
+    )
     return parser
 
 
@@ -722,6 +732,35 @@ def main() -> None:
         verify_deep_research_matrix(args)
     elif args.command == "deep-research-tool-matrix":
         verify_deep_research_tool_matrix(args)
+    elif args.command == "workspace-reset":
+        run_workspace_reset(args)
+
+
+def run_workspace_reset(args: argparse.Namespace) -> None:
+    """Run the explicit clean-slate workspace reset boundary."""
+    from wikipediarag.config import get_settings
+    from wikipediarag.db import connect, ensure_schema
+    from wikipediarag.workspace_reset import WorkspaceResetSafetyError, apply_workspace_reset, preflight_workspace_reset
+
+    if args.apply and not args.all_data_confirmed:
+        print("WORKSPACE_RESET_CONFIRMATION_REQUIRED", file=sys.stderr)
+        raise SystemExit(2)
+
+    async def execute() -> dict[str, Any]:
+        async with connect() as conn:
+            settings = get_settings()
+            if not args.apply:
+                return (await preflight_workspace_reset(conn, settings)).public_report()
+            report = await apply_workspace_reset(conn, settings)
+        await ensure_schema(settings)
+        return report.public_report()
+
+    try:
+        report = asyncio.run(execute())
+    except WorkspaceResetSafetyError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from None
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
 
 def _add_eval_generate_arguments(parser: argparse.ArgumentParser) -> None:
@@ -3327,7 +3366,7 @@ def _run_deep_research_fixture(
                 result["uploads"].append(upload)
                 uploaded_document_ids[str(upload["fixture_document_id"])] = str(upload["document_id"])
                 if document.access is not None:
-                    _patch_deep_research_document_access(
+                    _replace_deep_research_document_grants(
                         admin_client,
                         api,
                         str(upload["document_id"]),
@@ -3597,15 +3636,25 @@ def _upload_deep_research_fixture_document(
     }
 
 
-def _patch_deep_research_document_access(
+def _replace_deep_research_document_grants(
     client: httpx.Client,
     api: str,
     document_id: str,
     access: dict[str, Any],
 ) -> None:
-    response = client.patch(
-        f"{api}/api/v1/documents/{document_id}/access",
-        json=access,
+    policy = str(access.get("policy") or "kb")
+    if policy not in {"kb", "tenant", "restricted"}:
+        raise RuntimeError("deep research fixture has an invalid legacy access policy")
+    grants = [
+        {"principal_type": "USER", "principal_id": str(user_id), "permission": "READ"}
+        for user_id in list(access.get("user_ids") or [])
+    ] + [
+        {"principal_type": "GROUP", "principal_id": str(group_id), "permission": "READ"}
+        for group_id in list(access.get("group_ids") or [])
+    ]
+    response = client.put(
+        f"{api}/api/v1/documents/{document_id}/access-grants",
+        json={"access_grants": grants, "inherits_kb_access": policy != "restricted"},
         timeout=60,
     )
     response.raise_for_status()

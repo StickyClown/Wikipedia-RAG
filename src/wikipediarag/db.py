@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -12,6 +13,24 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from wikipediarag.config import Settings, get_settings
+
+
+class WorkspaceResetRequiredError(RuntimeError):
+    """Raised instead of attempting an unsafe legacy tenant migration."""
+
+
+FINAL_SCHEMA_VERSION = "010_single_workspace_clean_reset_v1"
+HISTORICAL_SCHEMA_VERSIONS = (
+    "001_retrieval_correctness_v3",
+    "002_research_evidence_refs_and_job_leases",
+    "003_reliability_idempotency_records",
+    "004_reliability_ingestion_item_retry",
+    "005_model_control_plane",
+    "006_model_gateway_request_adapter",
+    "007_search_projection_events",
+    "008_search_projection_reconciliation",
+    "009_search_projection_historical_reconciliation",
+)
 
 SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS citext;
@@ -861,6 +880,114 @@ CREATE INDEX IF NOT EXISTS ix_research_claim_relations_run
   ON research_claim_relations(tenant_id, research_run_id, created_at);
 """
 
+def final_workspace_schema_sql(*, include_historical_additions: bool = True) -> str:
+    """Return the clean-workspace bootstrap schema.
+
+    ``SCHEMA_SQL`` remains the immutable historical bootstrap source while the
+    repository still carries migrations 001--009.  A clean deployment must not
+    replay that tenant-shaped DDL: it is normalized here before first use and
+    the resulting schema is marked through version 010.  Existing tenant
+    deployments are rejected by :func:`ensure_schema` before this function is
+    called.
+    """
+    schema = SCHEMA_SQL
+    schema = re.sub(r"(?ms)^CREATE TABLE IF NOT EXISTS tenants \(.*?^\);\n\n", "", schema)
+    tenant_memberships_pattern = (
+        r"(?ms)^CREATE TABLE IF NOT EXISTS tenant_memberships \(.*?"
+        r"^ALTER TABLE tenant_memberships ADD CONSTRAINT.*?;\n\n"
+    )
+    schema = re.sub(
+        tenant_memberships_pattern,
+        "",
+        schema,
+    )
+    knowledge_base_grants_pattern = (
+        r"(?ms)^CREATE TABLE IF NOT EXISTS knowledge_base_grants \(.*?"
+        r"^CREATE INDEX IF NOT EXISTS ix_knowledge_base_grants_subject\n.*?;\n\n"
+    )
+    schema = re.sub(
+        knowledge_base_grants_pattern,
+        "",
+        schema,
+    )
+    schema = re.sub(r"(?ms)^CREATE INDEX IF NOT EXISTS [^;]*tenant_id[^;]*;\n", "", schema)
+    schema = re.sub(r"(?m)^\s*tenant_id uuid [^\n]*\n", "", schema)
+    schema = schema.replace("  active_tenant_id uuid NULL REFERENCES tenants(id),\n", "")
+    schema = schema.replace("tenant_id, ", "")
+    schema = schema.replace("(tenant_id,", "(")
+    schema = schema.replace("tenant_id)", ")")
+    schema = schema.replace(
+        "identity_scope text NOT NULL DEFAULT 'legacy'", "identity_scope text NOT NULL DEFAULT 'workspace'"
+    )
+    schema = schema.replace(
+        "  id uuid PRIMARY KEY,\n  name text NOT NULL,\n  active_index",
+        "  id uuid PRIMARY KEY,\n  owner_user_id uuid NOT NULL REFERENCES users(id),\n"
+        "  name text NOT NULL,\n  active_index",
+    )
+    schema = schema.replace(
+        "  id text PRIMARY KEY,\n  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),",
+        "  id text PRIMARY KEY,\n  knowledge_base_id uuid NOT NULL REFERENCES knowledge_bases(id),\n"
+        "  owner_user_id uuid NOT NULL REFERENCES users(id),\n  inherits_kb_access boolean NOT NULL DEFAULT true,",
+    )
+    schema = schema.replace("membership_type", "membership_source")
+    schema = schema.replace(
+        "  external_id text NULL,\n  metadata",
+        "  external_id text NULL,\n  external_issuer text NULL,\n  description text NOT NULL DEFAULT '',\n  metadata",
+    )
+    schema = schema.replace(
+        "  UNIQUE (group_type, name),\n  UNIQUE (group_type, external_id)\n);",
+        "  UNIQUE (group_type, name),\n  UNIQUE (external_issuer, external_id)\n);",
+    )
+    schema = schema.replace(
+        "  UNIQUE (group_type, name),\n  UNIQUE (group_type, external_id)\n);",
+        "  UNIQUE (group_type, name),\n  UNIQUE (external_issuer, external_id)\n);",
+    )
+    schema = schema.replace(
+        "  event_kind text NOT NULL CHECK (event_kind IN ('document_access','document_publication')),",
+        "  event_kind text NOT NULL CHECK (event_kind IN ('document_publication')),",
+    )
+    historical_additions: list[str] = []
+    if include_historical_additions:
+        for _version, statements in ADDITIVE_MIGRATIONS:
+            for statement in statements:
+                normalized = re.sub(r"(?m)^\s*tenant_id uuid [^\n]*\n", "", statement)
+                if "tenant_id" in normalized and "CREATE INDEX" in normalized:
+                    continue
+                normalized = normalized.replace("tenant_id, ", "").replace("(tenant_id,", "(").replace(
+                    "tenant_id)", ")"
+                )
+                normalized = normalized.replace("document_access','document_publication", "document_publication")
+                if normalized.strip():
+                    historical_additions.append(normalized)
+    additions = """
+
+CREATE TABLE IF NOT EXISTS resource_grants (
+  id uuid PRIMARY KEY,
+  resource_type text NOT NULL CHECK (resource_type IN ('KNOWLEDGE_BASE','DOCUMENT')),
+  resource_id text NOT NULL,
+  principal_type text NOT NULL CHECK (principal_type IN ('USER','GROUP')),
+  principal_id uuid NOT NULL,
+  permission text NOT NULL CHECK (permission IN ('READ','WRITE')),
+  created_by_user_id uuid NULL REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(resource_type, resource_id, principal_type, principal_id, permission)
+);
+CREATE INDEX IF NOT EXISTS ix_resource_grants_resource
+  ON resource_grants(resource_type, resource_id, created_at, id);
+CREATE INDEX IF NOT EXISTS ix_resource_grants_principal
+  ON resource_grants(principal_type, principal_id, resource_type);
+
+CREATE TABLE IF NOT EXISTS workspace_authorization_state (
+  id boolean PRIMARY KEY DEFAULT true CHECK (id),
+  revision bigint NOT NULL DEFAULT 1,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO workspace_authorization_state(id) VALUES (true) ON CONFLICT (id) DO NOTHING;
+"""
+    return schema + ";\n".join(historical_additions) + ";\n" + additions
+
+
 # Additive migrations are deliberately kept separate from the bootstrap schema.
 # This lets an already-running installation converge without rewriting the
 # historical schema marker or losing existing rows.
@@ -1178,35 +1305,34 @@ async def ensure_schema(settings: Settings | None = None) -> None:
     engine = get_engine(resolved)
     async with engine.begin() as conn:
         await conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('wikipediarag_schema_v1'))"))
-        for statement in SCHEMA_SQL.split(";"):
-            if statement.strip():
-                await conn.execute(text(statement))
-        await conn.execute(
+        legacy = await conn.execute(
             text(
-                """
-                INSERT INTO schema_migrations(version)
-                VALUES ('001_retrieval_correctness_v3')
-                ON CONFLICT (version) DO NOTHING
-                """
+                "SELECT to_regclass('public.tenants') IS NOT NULL "
+                "OR to_regclass('public.tenant_memberships') IS NOT NULL"
             )
         )
-        for version, statements in ADDITIVE_MIGRATIONS:
-            already_applied = await conn.execute(
-                text("SELECT 1 FROM schema_migrations WHERE version = :version"),
-                {"version": version},
+        if bool(legacy.scalar_one()):
+            raise WorkspaceResetRequiredError("WORKSPACE_RESET_REQUIRED")
+        initialized = await conn.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = 'schema_migrations')"
             )
-            if already_applied.first() is not None:
-                continue
-            for statement in statements:
+        )
+        has_schema_ledger = bool(initialized.scalar_one())
+        has_final_marker = False
+        if has_schema_ledger:
+            marker = await conn.execute(
+                text("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = :version)"),
+                {"version": FINAL_SCHEMA_VERSION},
+            )
+            has_final_marker = bool(marker.scalar_one())
+        for statement in final_workspace_schema_sql(include_historical_additions=not has_final_marker).split(";"):
+            if statement.strip():
                 await conn.execute(text(statement))
+        for version in (*HISTORICAL_SCHEMA_VERSIONS, FINAL_SCHEMA_VERSION):
             await conn.execute(
-                text(
-                    """
-                    INSERT INTO schema_migrations(version)
-                    VALUES (:version)
-                    ON CONFLICT (version) DO NOTHING
-                    """
-                ),
+                text("INSERT INTO schema_migrations(version) VALUES (:version) ON CONFLICT (version) DO NOTHING"),
                 {"version": version},
             )
         await seed_development_data(conn, resolved)
@@ -1216,18 +1342,8 @@ async def seed_development_data(conn: AsyncConnection, settings: Settings) -> No
     await conn.execute(
         text(
             """
-            INSERT INTO tenants(id, slug, name)
-            VALUES (:tenant_id, 'local', 'Local development tenant')
-            ON CONFLICT (id) DO NOTHING
-            """
-        ),
-        {"tenant_id": settings.default_tenant_id},
-    )
-    await conn.execute(
-        text(
-            """
             INSERT INTO users(id, email, username, display_name, platform_role)
-            VALUES (:user_id, 'local@example.test', 'local', 'Local User', 'USER')
+            VALUES (:user_id, 'local@example.test', 'local', 'Local User', 'PLATFORM_ADMIN')
             ON CONFLICT (id) DO NOTHING
             """
         ),
@@ -1236,22 +1352,12 @@ async def seed_development_data(conn: AsyncConnection, settings: Settings) -> No
     await conn.execute(
         text(
             """
-            INSERT INTO tenant_memberships(tenant_id, user_id, role)
-            VALUES (:tenant_id, :user_id, 'TENANT_ADMIN')
-            ON CONFLICT (tenant_id, user_id) DO NOTHING
-            """
-        ),
-        {"tenant_id": settings.default_tenant_id, "user_id": settings.default_user_id},
-    )
-    await conn.execute(
-        text(
-            """
-            INSERT INTO knowledge_bases(id, tenant_id, name)
-            VALUES (:kb_id, :tenant_id, 'Russian Wikipedia')
+            INSERT INTO knowledge_bases(id, owner_user_id, name)
+            VALUES (:kb_id, :user_id, 'Russian Wikipedia')
             ON CONFLICT (id) DO NOTHING
             """
         ),
-        {"kb_id": settings.default_kb_id, "tenant_id": settings.default_tenant_id},
+        {"kb_id": settings.default_kb_id, "user_id": settings.default_user_id},
     )
     await conn.execute(
         text(
@@ -1393,35 +1499,9 @@ async def seed_model_control_plane(conn: AsyncConnection, settings: Settings) ->
     await conn.execute(
         text(
             """
-            INSERT INTO knowledge_base_grants(
-              id, tenant_id, knowledge_base_id, subject_type, subject_id, role, created_by_user_id
-            )
-            VALUES (
-              '55555555-5555-4555-8555-555555555555',
-              :tenant_id,
-              :kb_id,
-              'USER',
-              :subject_id,
-              'OWNER',
-              :user_id
-            )
-            ON CONFLICT (tenant_id, knowledge_base_id, subject_type, subject_id) DO NOTHING
-            """
-        ),
-        {
-            "tenant_id": settings.default_tenant_id,
-            "kb_id": settings.default_kb_id,
-            "user_id": settings.default_user_id,
-            "subject_id": str(settings.default_user_id),
-        },
-    )
-    await conn.execute(
-        text(
-            """
-            INSERT INTO knowledge_sources(id, tenant_id, knowledge_base_id, kind, name, config, metadata)
+            INSERT INTO knowledge_sources(id, knowledge_base_id, kind, name, config, metadata)
             VALUES (
               '44444444-4444-4444-8444-444444444444',
-              :tenant_id,
               :kb_id,
               'kiwix_zim',
               'Kiwix Russian Wikipedia',
@@ -1435,7 +1515,6 @@ async def seed_model_control_plane(conn: AsyncConnection, settings: Settings) ->
             """
         ),
         {
-            "tenant_id": settings.default_tenant_id,
             "kb_id": settings.default_kb_id,
             "config": json_dumps(
                 {

@@ -5,17 +5,16 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from wikipediarag.auth import ActorContext, KnowledgeBaseRole, PlatformRole, TenantRole, effective_knowledge_base_role
+from wikipediarag.auth import ActorContext, PlatformRole
 from wikipediarag.db import json_dumps
-from wikipediarag.document_access import DocumentAccessScope, document_access_bypass, normalize_document_access
 from wikipediarag.ids import new_uuid, scoped_id, stable_hash, stable_uuid
 from wikipediarag.observability import safe_telemetry_payload
 from wikipediarag.provenance import build_source_provenance, direct_upload_source_id
 from wikipediarag.schemas import JobStatus
 from wikipediarag.wiki_dump import Chunk, WikiPage
+from wikipediarag.workspace_sql import text
 
 
 class StaleWorkerLeaseError(RuntimeError):
@@ -399,6 +398,7 @@ async def create_upload_session(
     *,
     tenant_id: str,
     knowledge_base_id: str,
+    owner_user_id: str,
     batch_id: str | None = None,
     filename: str,
     content_type: str,
@@ -415,11 +415,11 @@ async def create_upload_session(
         text(
             """
             INSERT INTO upload_sessions(
-              id, tenant_id, knowledge_base_id, batch_id, status, filename, content_type, size_bytes,
+              id, tenant_id, knowledge_base_id, owner_user_id, batch_id, status, filename, content_type, size_bytes,
               checksum_sha256, object_key, parser_profile, metadata, expires_at
             )
             VALUES (
-              :id, :tenant_id, :kb_id, :batch_id, 'created', :filename, :content_type, :size_bytes,
+              :id, :tenant_id, :kb_id, :owner_user_id, :batch_id, 'created', :filename, :content_type, :size_bytes,
               :checksum_sha256, :object_key, :parser_profile, CAST(:metadata AS jsonb), :expires_at
             )
             """
@@ -428,6 +428,7 @@ async def create_upload_session(
             "id": str(session_id),
             "tenant_id": tenant_id,
             "kb_id": knowledge_base_id,
+            "owner_user_id": owner_user_id,
             "batch_id": batch_id,
             "filename": filename,
             "content_type": content_type,
@@ -447,6 +448,7 @@ async def create_upload_batch(
     *,
     tenant_id: str,
     knowledge_base_id: str,
+    owner_user_id: str,
     total_items: int,
     metadata: dict[str, Any],
 ) -> uuid.UUID:
@@ -454,14 +456,15 @@ async def create_upload_batch(
     await conn.execute(
         text(
             """
-            INSERT INTO upload_batches(id, tenant_id, knowledge_base_id, status, total_items, metadata)
-            VALUES (:id, :tenant_id, :kb_id, 'received', :total_items, CAST(:metadata AS jsonb))
+            INSERT INTO upload_batches(id, tenant_id, knowledge_base_id, owner_user_id, status, total_items, metadata)
+            VALUES (:id, :tenant_id, :kb_id, :owner_user_id, 'received', :total_items, CAST(:metadata AS jsonb))
             """
         ),
         {
             "id": str(batch_id),
             "tenant_id": tenant_id,
             "kb_id": knowledge_base_id,
+            "owner_user_id": owner_user_id,
             "total_items": total_items,
             "metadata": json_dumps(metadata),
         },
@@ -649,8 +652,11 @@ async def create_document_upload_records(
         size_bytes=int(upload_session["size_bytes"]) if upload_session.get("size_bytes") is not None else None,
         source_uri=f"upload://{document_id}",
     )
+    safe_metadata = {
+        key: value for key, value in metadata.items() if key not in {"document_access", "document_access_origin"}
+    }
     source_metadata = {
-        **metadata,
+        **safe_metadata,
         "source_reference": reference if has_source_reference else None,
         "source_provenance": source_provenance,
     }
@@ -795,10 +801,10 @@ async def create_document_upload_records(
     await conn.execute(
         text(
             """
-            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata,
-                                  source_document_id, identity_scope)
-            VALUES (:id, :tenant_id, :kb_id, 'upload_document', :title, :source_uri, CAST(:metadata AS jsonb),
-                    :source_document_id, :identity_scope)
+            INSERT INTO documents(id, tenant_id, knowledge_base_id, owner_user_id, inherits_kb_access,
+                                  source_type, title, source_uri, metadata, source_document_id, identity_scope)
+            VALUES (:id, :tenant_id, :kb_id, :owner_user_id, true, 'upload_document', :title, :source_uri,
+                    CAST(:metadata AS jsonb), :source_document_id, :identity_scope)
             ON CONFLICT (id) DO UPDATE
             SET title = EXCLUDED.title,
                 metadata = documents.metadata || EXCLUDED.metadata,
@@ -811,6 +817,7 @@ async def create_document_upload_records(
             "id": document_id,
             "tenant_id": tenant_id,
             "kb_id": knowledge_base_id,
+            "owner_user_id": str(upload_session["owner_user_id"]),
             "title": filename,
             "source_uri": f"upload://{document_id}",
             "metadata": json_dumps(
@@ -1102,33 +1109,6 @@ async def update_knowledge_source(
     )
 
 
-async def update_knowledge_source_document_access_default(
-    conn: AsyncConnection,
-    *,
-    tenant_id: str,
-    knowledge_base_id: str,
-    source_id: str,
-    document_access: dict[str, Any],
-) -> None:
-    access = normalize_document_access(document_access)
-    await conn.execute(
-        text(
-            """
-            UPDATE knowledge_sources
-            SET metadata = metadata || jsonb_build_object('document_access_default', CAST(:document_access AS jsonb)),
-                updated_at = now()
-            WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id AND id = :source_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "kb_id": knowledge_base_id,
-            "source_id": source_id,
-            "document_access": json_dumps(access),
-        },
-    )
-
-
 async def list_source_active_document_refs(
     conn: AsyncConnection,
     *,
@@ -1260,13 +1240,18 @@ async def create_source_document_ingestion_item(
         "source_uri": source_uri,
         "source_url": source_url,
     }
-    document_access = normalize_document_access(metadata.get("document_access"))
-    document_access_origin = str(metadata.get("document_access_origin") or "")
     await conn.execute(
         text(
             """
-            INSERT INTO documents(id, tenant_id, knowledge_base_id, source_type, title, source_uri, metadata)
-            VALUES (:id, :tenant_id, :kb_id, 'external_source', :title, :source_uri, CAST(:metadata AS jsonb))
+            INSERT INTO documents(
+              id, tenant_id, knowledge_base_id, owner_user_id, inherits_kb_access,
+              source_type, title, source_uri, metadata
+            )
+            VALUES (
+              :id, :tenant_id, :kb_id,
+              (SELECT owner_user_id FROM knowledge_bases WHERE id = :kb_id), true,
+              'external_source', :title, :source_uri, CAST(:metadata AS jsonb)
+            )
             ON CONFLICT (id) DO UPDATE
             SET title = EXCLUDED.title,
                 source_uri = EXCLUDED.source_uri,
@@ -1291,8 +1276,6 @@ async def create_source_document_ingestion_item(
                     "source_external_id": external_id,
                     "source_url": source_url,
                     "current_version_id": document_version_id,
-                    "document_access": document_access,
-                    "document_access_origin": document_access_origin,
                 }
             ),
         },
@@ -2592,106 +2575,6 @@ async def fetch_chunks_for_dense_scan(
     return [dict(row) for row in result.mappings()]
 
 
-async def update_document_access_metadata(
-    conn: AsyncConnection,
-    *,
-    tenant_id: str,
-    knowledge_base_id: str,
-    document_id: str,
-    document_version_id: str | None,
-    document_access: dict[str, Any],
-    origin: str | None = None,
-) -> None:
-    """Update DB-side document/chunk access metadata without changing content."""
-    access = normalize_document_access(document_access)
-    metadata_patch: dict[str, Any] = {"document_access": access}
-    if origin is not None:
-        metadata_patch["document_access_origin"] = origin
-    await conn.execute(
-        text(
-            """
-            UPDATE documents
-            SET metadata = metadata || CAST(:metadata_patch AS jsonb),
-                updated_at = now()
-            WHERE tenant_id = :tenant_id
-              AND knowledge_base_id = :kb_id
-              AND id = :document_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "kb_id": knowledge_base_id,
-            "document_id": document_id,
-            "metadata_patch": json_dumps(metadata_patch),
-        },
-    )
-    await conn.execute(
-        text(
-            """
-            UPDATE chunks
-            SET metadata = metadata || CAST(:metadata_patch AS jsonb)
-            WHERE tenant_id = :tenant_id
-              AND knowledge_base_id = :kb_id
-              AND document_id = :document_id
-              AND (
-                (CAST(:document_version_id AS text) IS NULL AND document_version_id IS NULL)
-                OR document_version_id = CAST(:document_version_id AS text)
-                OR CAST(:document_version_id AS text) IS NULL
-              )
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "kb_id": knowledge_base_id,
-            "document_id": document_id,
-            "document_version_id": document_version_id,
-            "metadata_patch": json_dumps(metadata_patch),
-        },
-    )
-
-
-async def enqueue_document_access_projection(
-    conn: AsyncConnection,
-    *,
-    tenant_id: str,
-    knowledge_base_id: str,
-    document_id: str,
-    document_access: dict[str, Any],
-    origin: str | None,
-) -> None:
-    """Durably schedule the derived index update in the same DB transaction.
-
-    PostgreSQL remains the access authority.  The event is intentionally
-    separate from ingestion jobs: it is small, retryable projection work and
-    must not be lost when an HTTP request finishes before OpenSearch responds.
-    """
-    access = normalize_document_access(document_access)
-    payload = {"document_access": access, "origin": origin or ""}
-    dedupe_key = stable_hash(["document_access", tenant_id, knowledge_base_id, document_id, json_dumps(payload)], 64)
-    await conn.execute(
-        text(
-            """
-            INSERT INTO search_projection_events(
-              id, tenant_id, knowledge_base_id, document_id, event_kind, dedupe_key, payload
-            )
-            VALUES (
-              :id, :tenant_id, :knowledge_base_id, :document_id, 'document_access', :dedupe_key,
-              CAST(:payload AS jsonb)
-            )
-            ON CONFLICT (dedupe_key) DO NOTHING
-            """
-        ),
-        {
-            "id": str(new_uuid()),
-            "tenant_id": tenant_id,
-            "knowledge_base_id": knowledge_base_id,
-            "document_id": document_id,
-            "dedupe_key": dedupe_key,
-            "payload": json_dumps(payload),
-        },
-    )
-
-
 async def enqueue_document_publication_projection(
     conn: AsyncConnection,
     *,
@@ -2862,8 +2745,6 @@ async def load_current_document_projection(
             continue
         metadata = dict(row.get("metadata") or {})
         metadata["publication_status"] = "published"
-        if "document_access" in document_metadata:
-            metadata["document_access"] = document_metadata["document_access"]
         chunks.append(
             Chunk(
                 id=str(row["id"]),
@@ -3230,16 +3111,10 @@ async def fetch_chunk_by_id(
 async def fetch_current_retrieval_chunks(
     conn: AsyncConnection,
     *,
-    tenant_id: str,
     knowledge_base_id: str,
     chunk_ids: list[str],
 ) -> dict[str, dict[str, Any]]:
-    """Return the currently publishable candidates for a search result set.
-
-    OpenSearch and Redis are candidate/cache layers, not authorization owners.
-    A single PostgreSQL read therefore confirms publication, document lifecycle,
-    and the current document access metadata before a candidate is exposed.
-    """
+    """Return currently publishable KB-scoped candidates for a search result set."""
     requested = sorted({str(chunk_id) for chunk_id in chunk_ids if str(chunk_id)})
     if not requested:
         return {}
@@ -3254,15 +3129,12 @@ async def fetch_current_retrieval_chunks(
             FROM chunks AS c
             JOIN documents AS d
               ON d.id = c.document_id
-             AND d.tenant_id = c.tenant_id
              AND d.knowledge_base_id = c.knowledge_base_id
             JOIN document_versions AS dv
               ON dv.id = c.document_version_id
              AND dv.document_id = d.id
-             AND dv.tenant_id = d.tenant_id
              AND dv.knowledge_base_id = d.knowledge_base_id
-            WHERE c.tenant_id = :tenant_id
-              AND c.knowledge_base_id = :knowledge_base_id
+            WHERE c.knowledge_base_id = :knowledge_base_id
               AND c.id = ANY(CAST(:chunk_ids AS text[]))
               AND c.publication_status = 'published'
               AND d.lifecycle_state = 'active'
@@ -3271,21 +3143,13 @@ async def fetch_current_retrieval_chunks(
               AND dv.lifecycle_state = 'active'
             """
         ),
-        {
-            "tenant_id": tenant_id,
-            "knowledge_base_id": knowledge_base_id,
-            "chunk_ids": requested,
-        },
+        {"knowledge_base_id": knowledge_base_id, "chunk_ids": requested},
     )
     rows: dict[str, dict[str, Any]] = {}
     for row in result.mappings():
         item = dict(row)
         metadata = dict(item.pop("chunk_metadata") or {})
-        # Document ACL is the current authority.  It intentionally overwrites
-        # stale copied metadata from an indexed chunk.
-        document_metadata = dict(item.pop("document_metadata") or {})
-        if "document_access" in document_metadata:
-            metadata["document_access"] = document_metadata["document_access"]
+        item.pop("document_metadata", None)
         rows[str(item["chunk_id"])] = {**item, "metadata": metadata}
     return rows
 
@@ -4189,7 +4053,7 @@ async def insert_audit_event(
         ),
         {
             "id": str(new_uuid()),
-            "tenant_id": tenant_id if tenant_id is not None else actor.active_tenant_id if actor else None,
+            "tenant_id": tenant_id,
             "actor_user_id": actor.user_id if actor else None,
             "actor_session_id": actor.session_id if actor else None,
             "request_id": actor.request_id if actor else str(new_uuid()),
@@ -4203,95 +4067,6 @@ async def insert_audit_event(
     )
 
 
-async def load_effective_knowledge_base_role(
-    conn: AsyncConnection,
-    *,
-    user_id: str,
-    tenant_id: str,
-    knowledge_base_id: str,
-) -> KnowledgeBaseRole | None:
-    platform_role = await load_platform_role(conn, user_id=user_id)
-    if platform_role is None:
-        return None
-    tenant_role = await load_tenant_role(conn, user_id=user_id, tenant_id=tenant_id)
-    direct_user_role = await _load_direct_kb_role(
-        conn,
-        tenant_id=tenant_id,
-        knowledge_base_id=knowledge_base_id,
-        subject_type="USER",
-        subject_id=user_id,
-    )
-    local_group_roles = await _load_group_kb_roles(
-        conn,
-        user_id=user_id,
-        tenant_id=tenant_id,
-        knowledge_base_id=knowledge_base_id,
-        membership_type="LOCAL",
-    )
-    oidc_group_roles = await _load_group_kb_roles(
-        conn,
-        user_id=user_id,
-        tenant_id=tenant_id,
-        knowledge_base_id=knowledge_base_id,
-        membership_type="OIDC",
-    )
-    return effective_knowledge_base_role(
-        platform_role=platform_role,
-        tenant_role=tenant_role,
-        direct_user_role=direct_user_role,
-        local_group_roles=local_group_roles,
-        oidc_group_roles=oidc_group_roles,
-    )
-
-
-async def load_actor_document_access_scope(
-    conn: AsyncConnection,
-    *,
-    actor: ActorContext,
-    tenant_id: str,
-    knowledge_base_id: str,
-    effective_kb_role: KnowledgeBaseRole | None = None,
-) -> DocumentAccessScope:
-    kb_role = effective_kb_role
-    if kb_role is None and actor.platform_role != PlatformRole.platform_admin:
-        kb_role = await load_effective_knowledge_base_role(
-            conn,
-            user_id=actor.user_id,
-            tenant_id=tenant_id,
-            knowledge_base_id=knowledge_base_id,
-        )
-    if document_access_bypass(
-        platform_role=actor.platform_role,
-        tenant_role=actor.tenant_role,
-        kb_role=kb_role,
-    ):
-        return DocumentAccessScope(bypass=True, tenant_id=tenant_id, user_id=actor.user_id, kb_role=kb_role)
-    return DocumentAccessScope(
-        bypass=False,
-        tenant_id=tenant_id,
-        user_id=actor.user_id,
-        kb_role=kb_role,
-        group_ids=frozenset(await load_actor_group_ids(conn, user_id=actor.user_id, tenant_id=tenant_id)),
-    )
-
-
-async def load_actor_group_ids(conn: AsyncConnection, *, user_id: str, tenant_id: str) -> list[str]:
-    result = await conn.execute(
-        text(
-            """
-            SELECT gm.group_id::text AS group_id
-            FROM group_memberships gm
-            JOIN groups g ON g.id = gm.group_id
-            WHERE gm.user_id = :user_id
-              AND g.tenant_id = :tenant_id
-            ORDER BY gm.group_id::text
-            """
-        ),
-        {"user_id": user_id, "tenant_id": tenant_id},
-    )
-    return [str(row["group_id"]) for row in result.mappings()]
-
-
 async def load_platform_role(conn: AsyncConnection, *, user_id: str) -> PlatformRole | None:
     result = await conn.execute(
         text("SELECT platform_role FROM users WHERE id = :user_id AND is_disabled = false"),
@@ -4299,86 +4074,6 @@ async def load_platform_role(conn: AsyncConnection, *, user_id: str) -> Platform
     )
     row = result.mappings().first()
     return PlatformRole(str(row["platform_role"])) if row is not None else None
-
-
-async def load_tenant_role(conn: AsyncConnection, *, user_id: str, tenant_id: str) -> TenantRole | None:
-    result = await conn.execute(
-        text(
-            """
-            SELECT role
-            FROM tenant_memberships
-            WHERE tenant_id = :tenant_id AND user_id = :user_id
-            """
-        ),
-        {"tenant_id": tenant_id, "user_id": user_id},
-    )
-    row = result.mappings().first()
-    return TenantRole(str(row["role"])) if row is not None else None
-
-
-async def _load_direct_kb_role(
-    conn: AsyncConnection,
-    *,
-    tenant_id: str,
-    knowledge_base_id: str,
-    subject_type: str,
-    subject_id: str,
-) -> KnowledgeBaseRole | None:
-    result = await conn.execute(
-        text(
-            """
-            SELECT role
-            FROM knowledge_base_grants
-            WHERE tenant_id = :tenant_id
-              AND knowledge_base_id = :kb_id
-              AND subject_type = :subject_type
-              AND subject_id = :subject_id
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "kb_id": knowledge_base_id,
-            "subject_type": subject_type,
-            "subject_id": subject_id,
-        },
-    )
-    row = result.mappings().first()
-    return KnowledgeBaseRole(str(row["role"])) if row is not None else None
-
-
-async def _load_group_kb_roles(
-    conn: AsyncConnection,
-    *,
-    user_id: str,
-    tenant_id: str,
-    knowledge_base_id: str,
-    membership_type: str,
-) -> list[KnowledgeBaseRole]:
-    result = await conn.execute(
-        text(
-            """
-            SELECT kbg.role
-            FROM group_memberships gm
-            JOIN knowledge_base_grants kbg
-              ON kbg.subject_type = 'GROUP'
-             AND kbg.subject_id = gm.group_id::text
-            JOIN groups g
-              ON g.id = gm.group_id
-            WHERE gm.user_id = :user_id
-              AND gm.membership_type = :membership_type
-              AND g.tenant_id = :tenant_id
-              AND kbg.tenant_id = :tenant_id
-              AND kbg.knowledge_base_id = :kb_id
-            """
-        ),
-        {
-            "user_id": user_id,
-            "membership_type": membership_type,
-            "tenant_id": tenant_id,
-            "kb_id": knowledge_base_id,
-        },
-    )
-    return [KnowledgeBaseRole(str(row["role"])) for row in result.mappings()]
 
 
 async def complete_query_run(

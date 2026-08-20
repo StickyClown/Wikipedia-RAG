@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.answerability import decide_answerability, is_insufficient
 from wikipediarag.config import Settings
-from wikipediarag.document_access import is_document_visible
 from wikipediarag.extended import run_extended_search
 from wikipediarag.ids import stable_hash
 from wikipediarag.observability import ModelGatewayError, safe_error_code
@@ -434,15 +433,11 @@ async def _execute_document_tool(
     document_id = str(source.get("document_id") or "")
     document_version_id = str(source.get("document_version_id") or "") or None
     source_metadata = dict(source.get("metadata") or {})
-    document_metadata = dict(source_metadata.get("document_metadata") or {})
-    access_scope = None
-    scoped_access = search_filters.get("document_access_scopes")
-    if isinstance(scoped_access, dict):
-        access_scope = scoped_access.get(source_kb_id)
-    if access_scope is None:
-        access_scope = search_filters.get("document_access_scope")
-    if access_scope is not None and not is_document_visible(document_metadata, access_scope):
-        raise PermissionError("research source evidence is no longer visible")
+    document_metadata = {
+        key: value
+        for key, value in dict(source_metadata.get("document_metadata") or {}).items()
+        if key not in {"document_access", "document_access_origin"}
+    }
     if not document_id:
         raise ValueError("source evidence does not contain a document handle")
 

@@ -11,11 +11,10 @@ from opensearchpy import NotFoundError
 from starlette.requests import Request
 
 import wikipediarag.api.handlers as api_app
-from wikipediarag.auth import ActorContext, AuthenticationMethod, KnowledgeBaseRole, PlatformRole, TenantRole
+from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole
 from wikipediarag.config import Settings
 from wikipediarag.db import SCHEMA_SQL
-from wikipediarag.ingestion import _document_access_for_ingestion, _source_document_access
-from wikipediarag.schemas import SourceAccessPatch, SourceCreate
+from wikipediarag.schemas import SourceCreate
 from wikipediarag.search_index import delete_document_version_chunks
 from wikipediarag.source_connectors import (
     ConnectorError,
@@ -24,6 +23,7 @@ from wikipediarag.source_connectors import (
     SundukMockConnector,
     connector_http_options,
 )
+from wikipediarag.workspace_grants import WorkspaceGrantRepository
 
 
 class _FakeConnectionContext:
@@ -53,8 +53,6 @@ def _actor() -> ActorContext:
     return ActorContext(
         user_id="22222222-2222-4222-8222-222222222222",
         platform_role=PlatformRole.platform_admin,
-        active_tenant_id="11111111-1111-4111-8111-111111111111",
-        tenant_role=TenantRole.tenant_admin,
         session_id="session",
         authentication_method=AuthenticationMethod.local,
         request_id="33333333-3333-4333-8333-333333333333",
@@ -67,48 +65,6 @@ def test_external_source_schema_is_forward_only() -> None:
     assert "CREATE TABLE IF NOT EXISTS source_sync_runs" in SCHEMA_SQL
     assert "CREATE TABLE IF NOT EXISTS source_document_states" in SCHEMA_SQL
     assert "tombstone_version text NULL" in SCHEMA_SQL
-
-
-def test_document_access_trusts_source_sync_but_not_direct_upload_metadata() -> None:
-    restricted = {"policy": "restricted", "user_ids": ["user:1"], "group_ids": []}
-
-    assert _document_access_for_ingestion(
-        document_id="doc:client-upload",
-        source_metadata={"document_access": restricted},
-    ) == {"policy": "kb", "user_ids": [], "group_ids": []}
-    assert (
-        _document_access_for_ingestion(
-            document_id="src:connector-document",
-            source_metadata={"document_access": restricted},
-        )
-        == restricted
-    )
-
-
-def test_source_document_access_prefers_manual_then_source_default_then_connector() -> None:
-    manual_access, manual_origin = _source_document_access(
-        document_metadata={"document_access": {"policy": "tenant"}},
-        source_default={"policy": "kb"},
-        existing_metadata={
-            "document_access_origin": "manual",
-            "document_access": {"policy": "restricted", "user_ids": ["u1"], "group_ids": []},
-        },
-    )
-    source_access, source_origin = _source_document_access(
-        document_metadata={"document_access": {"policy": "restricted", "user_ids": ["u2"], "group_ids": []}},
-        source_default={"policy": "tenant"},
-    )
-    connector_access, connector_origin = _source_document_access(
-        document_metadata={"document_access": {"policy": "restricted", "user_ids": ["u3"], "group_ids": []}},
-        source_default=None,
-    )
-
-    assert manual_access == {"policy": "restricted", "user_ids": ["u1"], "group_ids": []}
-    assert manual_origin == "manual"
-    assert source_access == {"policy": "tenant", "user_ids": [], "group_ids": []}
-    assert source_origin == "source_default"
-    assert connector_access == {"policy": "restricted", "user_ids": ["u3"], "group_ids": []}
-    assert connector_origin == "connector"
 
 
 def test_connector_http_options_keep_tls_verification_enabled() -> None:
@@ -128,7 +84,7 @@ def test_connector_http_options_keep_tls_verification_enabled() -> None:
         connector_http_options({"mtls_cert_path": "/run/certs/client.crt"})
 
 
-def test_opensearch_delete_by_document_version_is_tenant_and_kb_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_opensearch_delete_by_document_version_is_kb_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
 
     class Client:
@@ -139,7 +95,6 @@ def test_opensearch_delete_by_document_version_is_tenant_and_kb_scoped(monkeypat
     monkeypatch.setattr("wikipediarag.search_index.get_client", lambda _settings: Client())
 
     deleted = delete_document_version_chunks(
-        tenant_id="tenant",
         knowledge_base_id="kb",
         document_version_id="docv:old",
         read_alias="alias",
@@ -148,7 +103,7 @@ def test_opensearch_delete_by_document_version_is_tenant_and_kb_scoped(monkeypat
     assert deleted == 2
     assert calls[0]["index"] == "alias"
     filters = calls[0]["body"]["query"]["bool"]["filter"]
-    assert {"term": {"tenant_id": "tenant"}} in filters
+    assert not any("tenant_id" in str(item) for item in filters)
     assert {"term": {"knowledge_base_id": "kb"}} in filters
     assert {"term": {"document_version_id": "docv:old"}} in filters
 
@@ -164,7 +119,6 @@ def test_opensearch_delete_by_document_version_accepts_missing_derived_index(
 
     assert (
         delete_document_version_chunks(
-            tenant_id="tenant",
             knowledge_base_id="kb",
             document_version_id="docv:first",
         )
@@ -205,11 +159,8 @@ async def test_source_create_encrypts_credentials_and_returns_safe_payload(monke
     async def require_actor(_request: Request) -> ActorContext:
         return actor
 
-    async def require_role(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    async def get_kb(_conn: object, _tenant_id: str, _kb_id: str) -> dict[str, str]:
-        return {"id": _kb_id}
+    async def require_workspace_write(*_args: object, **_kwargs: object) -> str:
+        return "11111111-1111-4111-8111-111111111111"
 
     async def create_source_record(_conn: object, **kwargs: Any) -> uuid.UUID:
         created.update(kwargs)
@@ -238,8 +189,7 @@ async def test_source_create_encrypts_credentials_and_returns_safe_payload(monke
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
-    monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
+    monkeypatch.setattr(api_app, "_require_workspace_kb_write", require_workspace_write)
     monkeypatch.setattr(api_app, "create_knowledge_source", create_source_record)
     monkeypatch.setattr(api_app, "get_knowledge_source", get_source_record)
     monkeypatch.setattr(api_app, "encrypt_server_tokens", lambda _settings, payload: {"ciphertext": "encrypted"})
@@ -260,61 +210,6 @@ async def test_source_create_encrypts_credentials_and_returns_safe_payload(monke
     assert created["encrypted_credentials"] == {"ciphertext": "encrypted"}
     assert "raw-secret" not in str(response.model_dump(mode="json"))
     assert "encrypted_credentials" not in str(response.model_dump(mode="json"))
-
-
-async def test_patch_source_access_applies_default_to_existing_documents(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, dict[str, Any]]] = []
-
-    async def require_actor(_request: Request) -> ActorContext:
-        return _actor()
-
-    async def require_role(_conn: object, **kwargs: Any) -> KnowledgeBaseRole:
-        calls.append(("role", kwargs))
-        return KnowledgeBaseRole.manager
-
-    async def get_source(*_args: object, **_kwargs: object) -> dict[str, Any]:
-        return {"id": "source:1", "metadata": {}}
-
-    async def update_default(*_args: object, **kwargs: Any) -> None:
-        calls.append(("source_default", kwargs))
-
-    async def list_refs(*_args: object, **_kwargs: object) -> list[dict[str, str]]:
-        return [
-            {"document_id": "doc:1", "document_version_id": "docv:1"},
-            {"document_id": "doc:2", "document_version_id": "docv:2"},
-        ]
-
-    async def update_db(*_args: object, **kwargs: Any) -> None:
-        calls.append(("document_access", kwargs))
-
-    async def enqueue(*_args: object, **kwargs: Any) -> None:
-        calls.append(("projection", kwargs))
-
-    async def audit(*_args: object, **kwargs: Any) -> None:
-        calls.append(("audit", kwargs))
-
-    monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
-    monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
-    monkeypatch.setattr(api_app, "get_knowledge_source", get_source)
-    monkeypatch.setattr(api_app, "update_knowledge_source_document_access_default", update_default)
-    monkeypatch.setattr(api_app, "list_source_active_document_refs", list_refs)
-    monkeypatch.setattr(api_app, "update_document_access_metadata", update_db)
-    monkeypatch.setattr(api_app, "enqueue_document_access_projection", enqueue)
-    monkeypatch.setattr(api_app, "_audit", audit)
-
-    response = await api_app.patch_source_access(
-        "33333333-3333-4333-8333-333333333333",
-        "44444444-4444-4444-8444-444444444444",
-        SourceAccessPatch(policy="tenant"),
-        _request(method="PATCH"),
-    )
-
-    assert response.updated_documents == 2
-    assert response.document_access_default == {"policy": "tenant", "user_ids": [], "group_ids": []}
-    assert [name for name, _payload in calls].count("document_access") == 2
-    assert [name for name, _payload in calls].count("projection") == 2
-    assert all(payload.get("origin") == "source_default" for name, payload in calls if name == "document_access")
 
 
 async def test_access_groups_for_kb_manager_omit_members(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -344,12 +239,16 @@ async def test_access_groups_for_kb_manager_omit_members(monkeypatch: pytest.Mon
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def require_role(*_args: object, **_kwargs: object) -> KnowledgeBaseRole:
-        return KnowledgeBaseRole.manager
+    async def require_workspace_share(*_args: object, **_kwargs: object) -> Any:
+        return (True, True, True, False)
+
+    async def load_workspace_kb(*_args: object, **_kwargs: object) -> object:
+        return object()
 
     monkeypatch.setattr(api_app, "connect", lambda: _Context())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
+    monkeypatch.setattr(WorkspaceGrantRepository, "authorize", require_workspace_share)
+    monkeypatch.setattr(WorkspaceGrantRepository, "load_knowledge_base", load_workspace_kb)
 
     response = await api_app.list_access_groups("33333333-3333-4333-8333-333333333333", _request(method="GET"))
 
@@ -366,11 +265,8 @@ async def test_multipart_upload_reuses_upload_records(monkeypatch: pytest.Monkey
     async def require_actor(_request: Request) -> ActorContext:
         return actor
 
-    async def require_role(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    async def get_kb(_conn: object, _tenant_id: str, _kb_id: str) -> dict[str, str]:
-        return {"id": _kb_id}
+    async def require_workspace_write(*_args: object, **_kwargs: object) -> str:
+        return "11111111-1111-4111-8111-111111111111"
 
     async def create_session(_conn: object, **kwargs: Any) -> tuple[uuid.UUID, datetime]:
         events.append(("session", kwargs))
@@ -397,8 +293,7 @@ async def test_multipart_upload_reuses_upload_records(monkeypatch: pytest.Monkey
     monkeypatch.setattr(api_app, "get_settings", lambda: Settings(upload_max_bytes=1024))
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
-    monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
+    monkeypatch.setattr(api_app, "_require_workspace_kb_write", require_workspace_write)
     monkeypatch.setattr(api_app, "put_bytes", lambda *_args, **_kwargs: "s3://bucket/key")
     monkeypatch.setattr(api_app, "create_upload_session", create_session)
     monkeypatch.setattr(api_app, "get_upload_session", get_session)

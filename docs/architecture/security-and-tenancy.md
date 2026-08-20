@@ -1,13 +1,13 @@
-# Security and Tenancy
+# Security and Workspace Access
 
 ## Authority
 
-- `ActorContext` is built from a server-side session; request fields never
-  create tenant, role or group authority.
-- Every tenant/KB/document operation re-authorizes supplied identifiers at its
-  public boundary.
-- Platform, tenant and KB roles are evaluated server-side. Document ACL is an
-  additional restriction, not a replacement for KB access.
+- `ActorContext` is built from a server-side session and contains no tenant or
+  group authority; group membership is read from PostgreSQL at authorization.
+- Every KB/document operation re-authorizes supplied identifiers at its public
+  boundary through workspace ownership and additive `READ`/`WRITE` grants.
+- Platform administrators, resource owners and workspace grants are evaluated
+  server-side. Documents inherit their KB grants unless explicitly private.
 - UI visibility and disabled controls are usability features only; backend
   authorization is mandatory.
 
@@ -27,14 +27,14 @@
   validated and authorized before retrieval or mutation.
 - Search engines and caches only generate candidates. PostgreSQL confirms
   current publication and document access before exposure.
-- ACL changes create durable projection work; stale projection may hide data but
-  cannot grant broader access.
+- Grant and membership changes bump workspace authorization state and do not
+  create ACL projection work or OpenSearch ACL updates.
 - Presigned uploads authorize a bounded object write; they do not expose storage
   credentials.
 
 ## Research Access
 
-- A research run stores a same-tenant, server-authorized KB scope.
+- A research run stores a server-authorized workspace KB scope.
 - Durable evidence does not imply permanent visibility. Context, report,
   citations and mixed-evidence claims are rebuilt from evidence visible to the
   current actor.
@@ -45,7 +45,7 @@
 
 - Business code calls models through Model Gateway; provider credentials and
   payloads terminate at the Gateway/driver boundary.
-- Parser services receive bounded bytes/text only. They receive no tenant
+- Parser services receive bounded bytes/text only. They receive no workspace
   authority, storage credentials, arbitrary object URLs or model secrets.
 - PostgreSQL and object storage are authoritative. Search and cache compromise
   must not bypass current-state confirmation.
@@ -59,7 +59,7 @@ component, alias, operation, revision, bounded counts and normalized error code.
 
 ## Required Verification
 
-Changes to an authorization boundary cover allowed, insufficient-role and
-cross-tenant paths and assert denied writes create no jobs or mutations.
+Changes to an authorization boundary cover allowed, insufficient-grant and
+cross-resource paths and assert denied writes create no jobs or mutations.
 Retrieval/research changes cover stale projection and post-persistence ACL
 revocation where applicable.

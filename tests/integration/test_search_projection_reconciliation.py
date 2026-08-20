@@ -274,7 +274,6 @@ async def test_real_reconciliation_repairs_missing_and_extra_projection_and_is_i
         )
     bulk_index_chunks(
         chunks,
-        tenant_id=case.tenant_id,
         knowledge_base_id=case.knowledge_base_id,
         settings=settings,
         write_alias=case.write_alias,
@@ -311,7 +310,6 @@ async def test_real_reconciliation_repairs_missing_and_extra_projection_and_is_i
     )
     bulk_index_chunks(
         [extra],
-        tenant_id=case.tenant_id,
         knowledge_base_id=case.knowledge_base_id,
         settings=settings,
         write_alias=case.write_alias,
@@ -325,7 +323,6 @@ async def test_real_reconciliation_repairs_missing_and_extra_projection_and_is_i
     first = await worker._process_search_projection_reconciliation_once(settings, lease_id="exact-owner")
     assert first == 1
     observed = read_document_projection(
-        tenant_id=case.tenant_id,
         knowledge_base_id=case.knowledge_base_id,
         document_id=document_id,
         limit=10,
@@ -410,7 +407,6 @@ async def test_lease_loss_reclaim_converges_after_successful_previous_mutation(
     chunks = list(case.chunks_by_document[document_id])
     bulk_index_chunks(
         chunks,
-        tenant_id=case.tenant_id,
         knowledge_base_id=case.knowledge_base_id,
         settings=settings,
         write_alias=case.write_alias,
@@ -447,7 +443,6 @@ async def test_lease_loss_reclaim_converges_after_successful_previous_mutation(
     )
     bulk_index_chunks(
         [extra],
-        tenant_id=case.tenant_id,
         knowledge_base_id=case.knowledge_base_id,
         settings=settings,
         write_alias=case.write_alias,
@@ -499,7 +494,6 @@ async def test_lease_loss_reclaim_converges_after_successful_previous_mutation(
     monkeypatch.setattr(worker_api, "renew_search_projection_reconciliation_lease", original_renew)
     assert await worker._process_search_projection_reconciliation_once(settings, lease_id="reclaimer") == 1
     observed = read_document_projection(
-        tenant_id=case.tenant_id,
         knowledge_base_id=case.knowledge_base_id,
         document_id=document_id,
         limit=10,

@@ -279,7 +279,6 @@ async def _inject_corrupted_staged_projection(
     # metadata.  This is the only test-only bypass of normal publication.
     bulk_index_chunks(
         chunks,
-        tenant_id=tenant_id,
         knowledge_base_id=kb_id,
         settings=_functional_settings(),
         write_alias=str(index_version["write_alias"]),
@@ -416,7 +415,6 @@ async def _assert_corrupted_staged_projection_is_never_exposed(
     # The index is deliberately corrupt and both real candidate paths rank it.
     bm25 = bm25_search(
         marker,
-        tenant_id=tenant_id,
         knowledge_base_id=kb_id,
         top_k=10,
         settings=_functional_settings(),
@@ -424,7 +422,6 @@ async def _assert_corrupted_staged_projection_is_never_exposed(
     )
     dense = dense_search(
         vector,
-        tenant_id=tenant_id,
         knowledge_base_id=kb_id,
         top_k=10,
         settings=_functional_settings(),
@@ -434,7 +431,7 @@ async def _assert_corrupted_staged_projection_is_never_exposed(
     assert chunk_id in {str(item["chunk_id"]) for item in dense}
     async with connect(_functional_settings()) as conn:
         confirmed = await fetch_current_retrieval_chunks(
-            conn, tenant_id=tenant_id, knowledge_base_id=kb_id, chunk_ids=[chunk_id]
+            conn, knowledge_base_id=kb_id, chunk_ids=[chunk_id]
         )
     assert confirmed == {}
     public = client.post(f"{API}/api/v1/search", json={"query": marker, "knowledge_base_ids": [kb_id], "limit": 10})

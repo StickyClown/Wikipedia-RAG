@@ -4,9 +4,9 @@
 
 | Store | Authoritative data | Rebuildable |
 | --- | --- | --- |
-| PostgreSQL | Identity, tenancy, ACL, KB/source/document lifecycle, jobs, chunks, publication, query events, active model revisions and Deep Research state | No |
-| S3-compatible object storage | Original uploads, normalized documents and parser artifacts | Originals: no; derived artifacts: conditionally |
-| OpenSearch | Tenant/KB-scoped BM25 and vector documents | Yes |
+| PostgreSQL | Identity, workspace grants, KB/source/document lifecycle, jobs, chunks, publication, query events, active model revisions and Deep Research state | No |
+| S3-compatible object storage | Original uploads, normalized documents and parser artifacts, scoped by KB/document identity | Originals: no; derived artifacts: conditionally |
+| OpenSearch | KB-scoped BM25 and vector documents | Yes |
 | Redis/Valkey | Search windows and facet snapshots with bounded TTL | Yes |
 | ZIM/Kiwix | Operator-managed Wikipedia source snapshot | Imported projections are rebuildable only from the preserved snapshot |
 | `artifacts/` | Eval and validation evidence | Reruns create new evidence; important reports should be retained separately |
@@ -18,7 +18,7 @@ and objects must be restored consistently. OpenSearch and Redis are derived.
 ## Document Lifecycle
 
 1. API authorizes the actor and creates an upload session with a server-owned
-   tenant/KB object prefix.
+   KB/document object prefix.
 2. The browser uploads bytes to a presigned object URL.
 3. Completion records the document/version and queues durable work.
 4. A worker validates, parses, normalizes, chunks and embeds the document.
@@ -31,7 +31,7 @@ and objects must be restored consistently. OpenSearch and Redis are derived.
 
 ## Identity and Provenance
 
-- Source identity is server-scoped by tenant, KB, namespace and external ID.
+- Source identity is server-scoped by KB, namespace and external ID.
 - Content/source-version changes create a new document version; an unchanged
   version is idempotent.
 - Object keys, checksums, publication state and ACL fields are server-owned.
@@ -59,6 +59,6 @@ Normal logs, public APIs and validation reports exclude:
 - raw private document contents and model tool queries;
 - object-storage keys and database URLs.
 
-Public identifiers are returned only after current tenant/KB/document
+Public identifiers are returned only after current workspace KB/document
 authorization. Retention and purge preserve lifecycle auditability without
 keeping derived search exposure.

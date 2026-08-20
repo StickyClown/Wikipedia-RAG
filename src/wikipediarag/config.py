@@ -90,9 +90,11 @@ class Settings(BaseSettings):
     upload_max_bytes: int = 100 * 1024 * 1024
     upload_json_max_depth: int = 32
 
-    default_tenant_id: str = "11111111-1111-4111-8111-111111111111"
     default_user_id: str = "22222222-2222-4222-8222-222222222222"
     default_kb_id: str = "33333333-3333-4333-8333-333333333333"
+    # A full reset is intentionally impossible unless an operator enables it
+    # in the environment as well as passing the CLI confirmation flag.
+    workspace_reset_enabled: bool = False
 
     auth_disabled: bool = False
     auth_mode: Literal["local", "oidc", "hybrid", "test"] = "local"
@@ -125,6 +127,11 @@ class Settings(BaseSettings):
     oidc_auto_provision_groups: str = ""
     oidc_auto_provision_roles: str = ""
     oidc_platform_admin_roles: str = ""
+    # Workspace resource grants use live PostgreSQL membership.  Synchronizing
+    # an OIDC claim is intentionally opt-in; unknown groups are ignored unless
+    # an operator explicitly enables JIT creation.
+    oidc_group_sync_enabled: bool = False
+    oidc_group_jit_creation_enabled: bool = False
     oidc_group_catalog_sync_enabled: bool = False
 
     eval_auth_mode: Literal["none", "local"] = "local"

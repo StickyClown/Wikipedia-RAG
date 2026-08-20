@@ -5,6 +5,11 @@ knowledge bases. This page defines system boundaries and ownership. Executable
 contract evidence is indexed in [contract-map.md](architecture/contract-map.md);
 current work belongs in [STATUS.md](STATUS.md).
 
+XML multistream fallback remains supported for Wikipedia ingestion when Kiwix
+is unavailable or cannot serve the requested source.
+Its resume offsets are monotonic non-decreasing offsets. ZIM/libzim + Kiwix is the primary local Wikipedia path. Retrieval returns `KB_NOT_READY` until an
+`index_contract_id` is active and projected as `metadata.index_contract_id`.
+
 ## System Boundary
 
 ```mermaid

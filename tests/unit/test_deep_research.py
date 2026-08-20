@@ -9,7 +9,6 @@ import pytest
 
 import wikipediarag.deep_research as deep_research
 import wikipediarag.research_tools as research_tools
-from wikipediarag.auth import KnowledgeBaseRole
 from wikipediarag.deep_research import (
     EpisodeExecutionOutcome,
     ResearchContextBudget,
@@ -32,7 +31,6 @@ from wikipediarag.deep_research import (
     pack_research_context,
     visible_research_evidence,
 )
-from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.repository import (
     _derived_question_priority,
     append_research_questions,
@@ -440,7 +438,7 @@ def test_context_packer_trims_in_order_and_does_not_leak_full_trace() -> None:
     assert "DRAFT_REPORT_SHOULD_NOT_LEAK" not in serialized
 
 
-def test_visible_research_evidence_applies_current_document_acl() -> None:
+def test_visible_research_evidence_uses_current_retrievability_only() -> None:
     records = [
         {
             "id": "visible",
@@ -460,15 +458,12 @@ def test_visible_research_evidence_applies_current_document_acl() -> None:
         },
     ]
 
-    visible = visible_research_evidence(
-        records,
-        DocumentAccessScope(user_id="u1", kb_role=KnowledgeBaseRole.viewer),
-    )
+    visible = visible_research_evidence(records)
 
-    assert [row["id"] for row in visible] == ["visible", "kb-visible"]
+    assert [row["id"] for row in visible] == ["visible", "hidden", "kb-visible"]
 
 
-def test_visible_research_evidence_applies_per_kb_scope_map() -> None:
+def test_visible_research_evidence_does_not_read_legacy_acl_metadata() -> None:
     records = [
         {
             "id": "kb-a-visible",
@@ -486,14 +481,9 @@ def test_visible_research_evidence_applies_per_kb_scope_map() -> None:
         },
     ]
 
-    visible = visible_research_evidence(
-        records,
-        {
-            "kb-a": DocumentAccessScope(user_id="u1", kb_role=KnowledgeBaseRole.viewer),
-        },
-    )
+    visible = visible_research_evidence(records)
 
-    assert [row["id"] for row in visible] == ["kb-a-visible"]
+    assert [row["id"] for row in visible] == ["kb-a-visible", "kb-b-hidden"]
 
 
 def test_public_report_uses_only_passed_visible_evidence_and_reports_gaps() -> None:

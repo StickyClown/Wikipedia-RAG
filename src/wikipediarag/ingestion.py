@@ -9,11 +9,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
-from sqlalchemy import text
-
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.db import connect
-from wikipediarag.document_access import normalize_document_access
 from wikipediarag.document_ingestion import (
     ParserServiceError,
     UploadValidationError,
@@ -33,10 +30,8 @@ from wikipediarag.repository import (
     claim_next_ingestion_job_item,
     create_document_deletion_job,
     create_source_document_ingestion_item,
-    enqueue_document_access_projection,
     enqueue_document_publication_projection,
     finish_knowledge_source_sync,
-    get_document_public,
     get_job,
     get_knowledge_base,
     get_knowledge_source,
@@ -56,7 +51,6 @@ from wikipediarag.repository import (
     set_knowledge_base_active_index,
     soft_delete_document,
     summarize_ingestion_job_items,
-    update_document_access_metadata,
     update_document_version,
     update_ingestion_job_item,
     update_job,
@@ -87,6 +81,7 @@ from wikipediarag.wiki_dump import (
     read_bzip2_stream,
     validate_index,
 )
+from wikipediarag.workspace_sql import text
 from wikipediarag.zim_dump import ZimArchiveAdapter, ZimPage, ZimRedirect, chunks_for_zim_page, resolve_zim_path
 
 EMBEDDING_INPUT_BATCH_SIZE = 96
@@ -137,7 +132,6 @@ async def process_wiki_import(job: dict[str, Any], settings: Settings | None = N
             retrieval_profile=profile.name,
             embedding_alias=embed_alias,
             embedding_dimensions=dimensions,
-            tenant_id=tenant_id,
             knowledge_base_id=kb_id,
         )
         index_version_id = index_names["version_id"]
@@ -340,7 +334,6 @@ async def process_zim_import(job: dict[str, Any], settings: Settings | None = No
             retrieval_profile=profile.name,
             embedding_alias=embed_alias,
             embedding_dimensions=dimensions,
-            tenant_id=tenant_id,
             knowledge_base_id=kb_id,
         )
         index_contract = build_index_contract(
@@ -1010,7 +1003,6 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
         await _update_item_stage(item_id, stage, {"stage": stage})
         target = await _resolve_upload_index_target(tenant_id, kb_id, settings)
         source_url = f"{settings.api_public_base_url.rstrip('/')}/api/v1/documents/{quote(document_id, safe='')}"
-        document_access = _document_access_for_ingestion(document_id=document_id, source_metadata=source_metadata)
         chunks = await asyncio.to_thread(
             chunks_for_normalized_document,
             normalized,
@@ -1025,7 +1017,6 @@ async def _process_document_upload_item(item: dict[str, Any], settings: Settings
             ),
             source_version_metadata=dict(source_metadata.get("source_provenance") or {}),
         )
-        chunks = _with_document_access(chunks, document_access)
         await _update_item_stage(item_id, stage, {"stage": stage, "chunks_staged": len(chunks)})
 
         stage = "embedding"
@@ -1130,13 +1121,14 @@ async def _resolve_upload_index_target(tenant_id: str, kb_id: str, settings: Set
         profile = get_retrieval_profile(profile_name, settings)
         embed_alias = profile.model_aliases.embed
         dimensions = profile.embedding_dimensions(settings.embedding_dimensions)
-        upload_snapshot_id = f"default-upload-{stable_hash([tenant_id, kb_id], 16)}"
+        upload_snapshot_id = f"default-upload-{stable_hash([kb_id], 16)}"
         index_names = build_index_names(
             source_type="upload",
             snapshot_id=upload_snapshot_id,
             retrieval_profile=profile.name,
             embedding_alias=embed_alias,
             embedding_dimensions=dimensions,
+            knowledge_base_id=kb_id,
         )
         index_contract = build_index_contract(
             index_version=index_names["version_id"],
@@ -1374,42 +1366,6 @@ def _with_publication_status(chunks: list[Chunk], status: str) -> list[Chunk]:
     return [replace(chunk, metadata={**chunk.metadata, "publication_status": status}) for chunk in chunks]
 
 
-def _with_document_access(chunks: list[Chunk], document_access: dict[str, Any]) -> list[Chunk]:
-    access = normalize_document_access(document_access)
-    return [
-        replace(
-            chunk,
-            metadata={
-                **chunk.metadata,
-                "document_access": access,
-                "document_access_origin": str(document_access.get("document_access_origin") or ""),
-            },
-        )
-        for chunk in chunks
-    ]
-
-
-def _document_access_for_ingestion(*, document_id: str, source_metadata: dict[str, Any]) -> dict[str, Any]:
-    if document_id.startswith("src:"):
-        return normalize_document_access(source_metadata.get("document_access"))
-    return normalize_document_access(None)
-
-
-def _source_document_access(
-    *,
-    document_metadata: dict[str, Any],
-    source_default: dict[str, Any] | None,
-    existing_metadata: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], str]:
-    if existing_metadata and existing_metadata.get("document_access_origin") == "manual":
-        return normalize_document_access(existing_metadata.get("document_access")), "manual"
-    if source_default is not None:
-        return normalize_document_access(source_default), "source_default"
-    if "document_access" in document_metadata:
-        return normalize_document_access(document_metadata.get("document_access")), "connector"
-    return normalize_document_access(None), "default"
-
-
 async def process_source_sync(job: dict[str, Any], settings: Settings | None = None) -> None:
     resolved = settings or get_settings()
     job_id = str(job["id"])
@@ -1464,12 +1420,6 @@ async def process_source_sync(job: dict[str, Any], settings: Settings | None = N
         refresh_interval_seconds = (
             int(source["refresh_interval_seconds"]) if source.get("refresh_interval_seconds") is not None else None
         )
-        source_metadata = dict(source.get("metadata") or {})
-        source_default_access = (
-            normalize_document_access(source_metadata.get("document_access_default"))
-            if "document_access_default" in source_metadata
-            else None
-        )
         connector = connector_for_kind(
             str(source["kind"]),
             dict(source.get("config") or {}),
@@ -1496,7 +1446,6 @@ async def process_source_sync(job: dict[str, Any], settings: Settings | None = N
                 tenant_id=tenant_id,
                 kb_id=kb_id,
                 document=document,
-                source_default_access=source_default_access,
                 settings=resolved,
             )
             stats[result] += 1
@@ -1606,7 +1555,6 @@ async def _ingest_source_document(
     tenant_id: str,
     kb_id: str,
     document: SourceDocument,
-    source_default_access: dict[str, Any] | None,
     settings: Settings,
 ) -> str:
     parser_profile = str(document.metadata.get("parser_profile") or "standard")
@@ -1624,19 +1572,7 @@ async def _ingest_source_document(
         and str(existing.get("source_version")) == document.source_version
         and str(existing.get("content_hash")) == document.content_hash
     ):
-        existing_document_metadata: dict[str, Any] = {}
         async with connect() as conn:
-            existing_document = (
-                await get_document_public(conn, tenant_id, str(existing["document_id"]))
-                if existing.get("document_id")
-                else None
-            )
-            existing_document_metadata = dict((existing_document or {}).get("metadata") or {})
-            document_access, document_access_origin = _source_document_access(
-                document_metadata=document.metadata,
-                source_default=source_default_access,
-                existing_metadata=existing_document_metadata,
-            )
             await upsert_source_document_state(
                 conn,
                 tenant_id=tenant_id,
@@ -1651,28 +1587,7 @@ async def _ingest_source_document(
                 content_hash=document.content_hash,
                 document_id=str(existing["document_id"]),
                 document_version_id=str(existing["document_version_id"]),
-                metadata={
-                    **document.metadata,
-                    "document_access": document_access,
-                    "document_access_origin": document_access_origin,
-                },
-            )
-            await update_document_access_metadata(
-                conn,
-                tenant_id=tenant_id,
-                knowledge_base_id=kb_id,
-                document_id=str(existing["document_id"]),
-                document_version_id=str(existing["document_version_id"]),
-                document_access=document_access,
-                origin=document_access_origin,
-            )
-            await enqueue_document_access_projection(
-                conn,
-                tenant_id=tenant_id,
-                knowledge_base_id=kb_id,
-                document_id=str(existing["document_id"]),
-                document_access=document_access,
-                origin=document_access_origin,
+                metadata=dict(document.metadata),
             )
         return "documents_skipped"
 
@@ -1685,16 +1600,6 @@ async def _ingest_source_document(
         document.content_bytes,
         content_type=document.content_type,
         settings=settings,
-    )
-    existing_document_metadata = {}
-    if existing is not None and existing.get("document_id"):
-        async with connect() as conn:
-            existing_document = await get_document_public(conn, tenant_id, str(existing["document_id"]))
-            existing_document_metadata = dict((existing_document or {}).get("metadata") or {})
-    document_access, document_access_origin = _source_document_access(
-        document_metadata=document.metadata,
-        source_default=source_default_access,
-        existing_metadata=existing_document_metadata,
     )
     async with connect() as conn:
         document_id, document_version_id, item_id = await create_source_document_ingestion_item(
@@ -1714,11 +1619,7 @@ async def _ingest_source_document(
             content_type=document.content_type,
             size_bytes=len(document.content_bytes),
             parser_profile=parser_profile,
-            metadata={
-                **document.metadata,
-                "document_access": document_access,
-                "document_access_origin": document_access_origin,
-            },
+            metadata=dict(document.metadata),
         )
     await _process_document_upload_item(
         {

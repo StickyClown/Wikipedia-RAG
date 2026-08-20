@@ -31,17 +31,26 @@ def _tenant(
     )
 
 
-_tenant("/api/v1/groups", handlers.list_groups, ["GET"], "read", "group_collection", cross=X.actor_scoped)
-_tenant("/api/v1/groups", handlers.create_group, ["POST"], "create", "group_collection", cross=X.actor_scoped)
-_tenant("/api/v1/groups/{group_id}", handlers.patch_group, ["PATCH"], "update", "group")
-_tenant("/api/v1/groups/{group_id}", handlers.delete_group, ["DELETE"], "delete", "group")
-_tenant(
+def _workspace_admin(
+    path: str, endpoint: Callable[..., Any], methods: list[str], operation: str, scenario: str
+) -> None:
+    router.add_contract_route(
+        path,
+        endpoint,
+        methods=methods,
+        authorization=contract(B.platform, "platform_admin", operation, scenario, X.actor_scoped),
+    )
+
+
+_workspace_admin("/api/v1/groups", handlers.list_groups, ["GET"], "read", "group_collection")
+_workspace_admin("/api/v1/groups", handlers.create_group, ["POST"], "create", "group_collection")
+_workspace_admin("/api/v1/groups/{group_id}", handlers.patch_group, ["PATCH"], "update", "group")
+_workspace_admin("/api/v1/groups/{group_id}", handlers.delete_group, ["DELETE"], "delete", "group")
+router.add_contract_route(
     "/api/v1/knowledge-bases",
     handlers.get_knowledge_bases,
-    ["GET"],
-    "read",
-    "knowledge_base_collection",
-    cross=X.actor_scoped,
+    methods=["GET"],
+    authorization=contract(B.session, "authenticated", "read", "knowledge_base_collection", X.actor_scoped),
 )
 _tenant(
     "/api/v1/retrieval-profiles",
@@ -51,13 +60,11 @@ _tenant(
     "retrieval_profile_collection",
     boundary=B.knowledge_base,
 )
-_tenant(
+router.add_contract_route(
     "/api/v1/knowledge-bases",
     handlers.create_knowledge_base,
-    ["POST"],
-    "create",
-    "knowledge_base_collection",
-    cross=X.actor_scoped,
+    methods=["POST"],
+    authorization=contract(B.session, "authenticated", "create", "knowledge_base_collection", X.actor_scoped),
 )
 _tenant(
     "/api/v1/knowledge-bases/{kb_id}/access-groups",
@@ -67,13 +74,11 @@ _tenant(
     "knowledge_base",
     boundary=B.knowledge_base,
 )
-_tenant(
+router.add_contract_route(
     "/api/v1/knowledge-bases/{kb_id}",
     handlers.get_knowledge_base_endpoint,
-    ["GET"],
-    "read",
-    "knowledge_base",
-    boundary=B.knowledge_base,
+    methods=["GET"],
+    authorization=contract(B.resource, "resource_read", "read", "knowledge_base", X.deny),
 )
 _tenant(
     "/api/v1/knowledge-bases/{kb_id}",
@@ -92,34 +97,18 @@ _tenant(
     boundary=B.knowledge_base,
 )
 _tenant(
-    "/api/v1/knowledge-bases/{kb_id}/grants",
-    handlers.list_kb_grants,
+    "/api/v1/knowledge-bases/{kb_id}/access-grants",
+    handlers.list_knowledge_base_access_grants,
     ["GET"],
     "read",
-    "knowledge_base_grant_collection",
-    boundary=B.knowledge_base,
-)
-_tenant(
-    "/api/v1/knowledge-bases/{kb_id}/grants",
-    handlers.create_kb_grant,
-    ["POST"],
-    "create",
-    "knowledge_base_grant_collection",
-    boundary=B.knowledge_base,
-)
-_tenant(
-    "/api/v1/knowledge-bases/{kb_id}/grants/{grant_id}",
-    handlers.patch_kb_grant,
-    ["PATCH"],
-    "update",
-    "knowledge_base_grant",
+    "knowledge_base_access_grants",
     boundary=B.resource,
 )
 _tenant(
-    "/api/v1/knowledge-bases/{kb_id}/grants/{grant_id}",
-    handlers.delete_kb_grant,
-    ["DELETE"],
-    "delete",
-    "knowledge_base_grant",
+    "/api/v1/knowledge-bases/{kb_id}/access-grants",
+    handlers.replace_knowledge_base_access_grants,
+    ["PUT"],
+    "replace",
+    "knowledge_base_access_grants",
     boundary=B.resource,
 )

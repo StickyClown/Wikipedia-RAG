@@ -53,15 +53,3 @@ router.add_contract_route(
         AuthorizationBoundary.session, "anonymous_or_session", "read", "session", CrossTenantBehavior.not_applicable
     ),
 )
-router.add_contract_route(
-    "/api/v1/auth/session/tenant",
-    handlers.select_session_tenant,
-    methods=["POST"],
-    authorization=contract(
-        AuthorizationBoundary.active_tenant,
-        "tenant_member",
-        "update",
-        "session_tenant",
-        CrossTenantBehavior.actor_scoped,
-    ),
-)

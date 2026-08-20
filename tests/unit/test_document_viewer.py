@@ -8,15 +8,15 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 import wikipediarag.api.handlers as api_app
-from wikipediarag.auth import ActorContext, AuthenticationMethod, KnowledgeBaseRole, PlatformRole, TenantRole
-from wikipediarag.document_access import DocumentAccessScope
+from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole
 from wikipediarag.repository import (
     fetch_document_context_chunks,
     list_document_sections,
     replace_document_sections_from_chunks,
     search_document_chunks,
 )
-from wikipediarag.schemas import DocumentAccessPatch, DocumentSearchRequest
+from wikipediarag.schemas import DocumentSearchRequest
+from wikipediarag.workspace_access import ResourceAccess, ResourceType
 
 
 class _FakeConnectionContext:
@@ -51,8 +51,6 @@ def _actor() -> ActorContext:
     return ActorContext(
         user_id="22222222-2222-4222-8222-222222222222",
         platform_role=PlatformRole.user,
-        active_tenant_id="11111111-1111-4111-8111-111111111111",
-        tenant_role=TenantRole.member,
         session_id="44444444-4444-4444-8444-444444444444",
         authentication_method=AuthenticationMethod.local,
         request_id="33333333-3333-4333-8333-333333333333",
@@ -72,41 +70,21 @@ def _document() -> dict[str, Any]:
     }
 
 
-def _restricted_document() -> dict[str, Any]:
+async def _workspace_document(*_args: object, **_kwargs: object) -> tuple[dict[str, Any], ResourceAccess, bool, bool]:
     document = _document()
-    document["metadata"] = {
-        "source_url": "http://localhost/doc",
-        "document_access": {"policy": "restricted", "user_ids": ["other-user"], "group_ids": []},
-    }
-    return document
+    document["tenant_id"] = "11111111-1111-4111-8111-111111111111"
+    return document, ResourceAccess(ResourceType.document, "doc:1", _actor().user_id), False, False
 
 
-async def _viewer_kb_role(*_args: object, **_kwargs: object) -> KnowledgeBaseRole:
-    return KnowledgeBaseRole.viewer
-
-
-async def _viewer_access_scope(*_args: object, **_kwargs: object) -> DocumentAccessScope:
-    return DocumentAccessScope(
-        tenant_id="11111111-1111-4111-8111-111111111111",
-        user_id="22222222-2222-4222-8222-222222222222",
-        kb_role=KnowledgeBaseRole.viewer,
-    )
+async def _workspace_document_denied(
+    *_args: object, **_kwargs: object
+) -> tuple[dict[str, Any], ResourceAccess, bool, bool]:
+    raise HTTPException(status_code=404, detail="document not found")
 
 
 async def test_document_structure_uses_viewer_scope_and_safe_shape(monkeypatch: pytest.MonkeyPatch) -> None:
-    required_roles: list[tuple[str, KnowledgeBaseRole]] = []
-
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
-
-    async def get_document(_conn: object, tenant_id: str, document_id: str) -> dict[str, Any] | None:
-        assert tenant_id == "11111111-1111-4111-8111-111111111111"
-        assert document_id == "doc:1"
-        return _document()
-
-    async def kb_role(_conn: object, **kwargs: Any) -> KnowledgeBaseRole:
-        required_roles.append((str(kwargs["kb_id"]), KnowledgeBaseRole.viewer))
-        return KnowledgeBaseRole.viewer
 
     async def sections(_conn: object, **kwargs: Any) -> list[dict[str, Any]]:
         assert kwargs["knowledge_base_id"] == "55555555-5555-4555-8555-555555555555"
@@ -127,14 +105,11 @@ async def test_document_structure_uses_viewer_scope_and_safe_shape(monkeypatch: 
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "get_document_public", get_document)
-    monkeypatch.setattr(api_app, "_load_kb_role_optional", kb_role)
-    monkeypatch.setattr(api_app, "load_actor_document_access_scope", _viewer_access_scope)
+    monkeypatch.setattr(api_app, "_load_workspace_viewer_document", _workspace_document)
     monkeypatch.setattr(api_app, "list_document_sections", sections)
 
     response = await api_app.get_document_structure("doc:1", _request())
 
-    assert required_roles == [("55555555-5555-4555-8555-555555555555", KnowledgeBaseRole.viewer)]
     assert response.document_id == "doc:1"
     assert response.sections[0].section_id == "section:1"
     assert "object_key" not in response.public_metadata
@@ -146,20 +121,9 @@ async def test_document_structure_hides_restricted_document_from_unauthorized_vi
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def get_document(*_args: object) -> dict[str, Any]:
-        return _restricted_document()
-
-    async def access_scope(*_args: object, **_kwargs: object) -> DocumentAccessScope:
-        return DocumentAccessScope(
-            tenant_id="11111111-1111-4111-8111-111111111111",
-            user_id="22222222-2222-4222-8222-222222222222",
-        )
-
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "get_document_public", get_document)
-    monkeypatch.setattr(api_app, "_load_kb_role_optional", _viewer_kb_role)
-    monkeypatch.setattr(api_app, "load_actor_document_access_scope", access_scope)
+    monkeypatch.setattr(api_app, "_load_workspace_viewer_document", _workspace_document_denied)
 
     with pytest.raises(HTTPException) as exc_info:
         await api_app.get_document_structure("doc:1", _request())
@@ -167,127 +131,23 @@ async def test_document_structure_hides_restricted_document_from_unauthorized_vi
     assert exc_info.value.status_code == 404
 
 
-async def test_document_structure_allows_restricted_document_for_admin_scope(
+async def test_document_structure_returns_workspace_authorized_document(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
-
-    async def get_document(*_args: object) -> dict[str, Any]:
-        return _restricted_document()
-
-    async def access_scope(*_args: object, **_kwargs: object) -> DocumentAccessScope:
-        return DocumentAccessScope(
-            bypass=True,
-            tenant_id="11111111-1111-4111-8111-111111111111",
-            user_id="22222222-2222-4222-8222-222222222222",
-            kb_role=KnowledgeBaseRole.manager,
-        )
 
     async def sections(*_args: object, **_kwargs: object) -> list[dict[str, Any]]:
         return []
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "get_document_public", get_document)
-    monkeypatch.setattr(api_app, "_load_kb_role_optional", _viewer_kb_role)
-    monkeypatch.setattr(api_app, "load_actor_document_access_scope", access_scope)
+    monkeypatch.setattr(api_app, "_load_workspace_viewer_document", _workspace_document)
     monkeypatch.setattr(api_app, "list_document_sections", sections)
 
     response = await api_app.get_document_structure("doc:1", _request())
 
     assert response.document_id == "doc:1"
-
-
-async def test_document_structure_allows_tenant_public_document_without_kb_grant(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    document = _document()
-    document["metadata"] = {
-        "source_url": "http://localhost/doc",
-        "document_access": {"policy": "tenant", "user_ids": [], "group_ids": []},
-    }
-
-    async def require_actor(_request: Request) -> ActorContext:
-        return _actor()
-
-    async def get_document(*_args: object) -> dict[str, Any]:
-        return document
-
-    async def no_kb_role(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    async def access_scope(*_args: object, **_kwargs: object) -> DocumentAccessScope:
-        return DocumentAccessScope(
-            tenant_id="11111111-1111-4111-8111-111111111111",
-            user_id="22222222-2222-4222-8222-222222222222",
-        )
-
-    async def sections(*_args: object, **_kwargs: object) -> list[dict[str, Any]]:
-        return []
-
-    monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
-    monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "get_document_public", get_document)
-    monkeypatch.setattr(api_app, "_load_kb_role_optional", no_kb_role)
-    monkeypatch.setattr(api_app, "load_actor_document_access_scope", access_scope)
-    monkeypatch.setattr(api_app, "list_document_sections", sections)
-
-    response = await api_app.get_document_structure("doc:1", _request())
-
-    assert response.document_id == "doc:1"
-    assert response.document_access["policy"] == "tenant"
-
-
-async def test_patch_document_access_requires_manager_and_durably_queues_search_projection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, dict[str, Any]]] = []
-
-    async def require_actor(_request: Request) -> ActorContext:
-        return _actor()
-
-    async def get_document(*_args: object) -> dict[str, Any]:
-        return _document()
-
-    async def require_role(_conn: object, **kwargs: Any) -> KnowledgeBaseRole:
-        calls.append(("role", kwargs))
-        return KnowledgeBaseRole.manager
-
-    async def update_db(*_args: object, **kwargs: Any) -> None:
-        calls.append(("db", kwargs))
-
-    async def enqueue(*_args: object, **kwargs: Any) -> None:
-        calls.append(("projection", kwargs))
-
-    async def audit(*_args: object, **kwargs: Any) -> None:
-        calls.append(("audit", kwargs))
-
-    monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
-    monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "get_document_public", get_document)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
-
-    async def validate_principals(*_args: object, **_kwargs: Any) -> None:
-        return None
-
-    monkeypatch.setattr(api_app, "_validate_document_access_principals", validate_principals)
-    monkeypatch.setattr(api_app, "update_document_access_metadata", update_db)
-    monkeypatch.setattr(api_app, "enqueue_document_access_projection", enqueue)
-    monkeypatch.setattr(api_app, "_audit", audit)
-
-    response = await api_app.patch_document_access(
-        "doc:1",
-        DocumentAccessPatch(policy="restricted", user_ids=["user:1"], group_ids=["group:1"]),
-        _request(),
-    )
-
-    assert response.document_access == {"policy": "restricted", "user_ids": ["user:1"], "group_ids": ["group:1"]}
-    assert calls[0][0] == "role"
-    assert calls[1][1]["origin"] == "manual"
-    assert calls[-1][0] == "audit"
-    assert calls[-2][0] == "projection"
-    assert calls[-2][1]["origin"] == "manual"
 
 
 async def test_document_context_resolves_section_id_server_side(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,9 +183,7 @@ async def test_document_context_resolves_section_id_server_side(monkeypatch: pyt
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_load_kb_role_optional", _viewer_kb_role)
-    monkeypatch.setattr(api_app, "load_actor_document_access_scope", _viewer_access_scope)
-    monkeypatch.setattr(api_app, "get_document_public", get_document)
+    monkeypatch.setattr(api_app, "_load_workspace_viewer_document", _workspace_document)
     monkeypatch.setattr(api_app, "list_document_sections", sections)
     monkeypatch.setattr(api_app, "fetch_document_context_chunks", context_chunks)
 
@@ -372,9 +230,7 @@ async def test_document_search_returns_safe_chunk_results(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_load_kb_role_optional", _viewer_kb_role)
-    monkeypatch.setattr(api_app, "load_actor_document_access_scope", _viewer_access_scope)
-    monkeypatch.setattr(api_app, "get_document_public", get_document)
+    monkeypatch.setattr(api_app, "_load_workspace_viewer_document", _workspace_document)
     monkeypatch.setattr(api_app, "search_document_chunks", search_chunks)
 
     response = await api_app.search_document("doc:1", DocumentSearchRequest(query="verification"), _request())
@@ -395,9 +251,7 @@ async def test_document_context_returns_404_for_unknown_chunk(monkeypatch: pytes
 
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_load_kb_role_optional", _viewer_kb_role)
-    monkeypatch.setattr(api_app, "load_actor_document_access_scope", _viewer_access_scope)
-    monkeypatch.setattr(api_app, "get_document_public", get_document)
+    monkeypatch.setattr(api_app, "_load_workspace_viewer_document", _workspace_document)
     monkeypatch.setattr(api_app, "fetch_document_context_chunks", context_chunks)
 
     with pytest.raises(HTTPException) as exc_info:

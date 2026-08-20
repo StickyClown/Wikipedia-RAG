@@ -4,7 +4,7 @@ import pytest
 from starlette.requests import Request
 
 import wikipediarag.api.handlers as api_app
-from wikipediarag.auth import AuthenticationMethod, PlatformRole, TenantRole
+from wikipediarag.auth import AuthenticationMethod, PlatformRole
 from wikipediarag.auth_service import AuthenticatedUser, AuthenticationError, auth_disabled_actor
 from wikipediarag.config import Settings
 
@@ -55,8 +55,6 @@ async def test_auth_disabled_load_actor_uses_bootstrap_admin(monkeypatch: pytest
     assert actor is not None
     assert actor.user_id == user.user_id
     assert actor.platform_role == PlatformRole.platform_admin
-    assert actor.active_tenant_id == settings.default_tenant_id
-    assert actor.tenant_role == TenantRole.tenant_admin
     assert actor.authentication_method == AuthenticationMethod.local
 
 

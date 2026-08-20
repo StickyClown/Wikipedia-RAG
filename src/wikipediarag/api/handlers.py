@@ -15,7 +15,6 @@ from fastapi import File, Form, Header, HTTPException, Query, Request, Response,
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
-from sqlalchemy import text
 
 from wikipediarag.answerability import should_try_extended_search
 from wikipediarag.answering import generate_answer
@@ -23,15 +22,10 @@ from wikipediarag.auth import (
     ActorContext,
     AuthenticationMethod,
     AuthorizationError,
-    GrantSubjectType,
     GroupType,
-    KnowledgeBaseRole,
     PlatformRole,
-    has_kb_role,
     require_active_tenant,
-    require_tenant_admin,
 )
-from wikipediarag.auth import require_kb_role as enforce_kb_role
 from wikipediarag.auth_service import (
     AuthenticationError,
     auth_disabled_actor,
@@ -46,8 +40,6 @@ from wikipediarag.auth_service import (
     local_login_enabled,
     revoke_session,
     rotate_csrf_token,
-    rotate_session_token,
-    select_active_tenant,
     test_actor_context,
 )
 from wikipediarag.config import Settings, get_settings
@@ -64,11 +56,6 @@ from wikipediarag.diagnostics import (
     build_search_plan,
     initial_route_decision,
     repair_route_decision,
-)
-from wikipediarag.document_access import (
-    DocumentAccessScope,
-    is_document_visible,
-    normalize_document_access,
 )
 from wikipediarag.document_ingestion import UploadValidationError, safe_upload_filename, sha256_hex
 from wikipediarag.extended import run_extended_search, should_start_extended
@@ -107,11 +94,8 @@ from wikipediarag.repository import (
     create_source_sync_job,
     create_upload_batch,
     create_upload_session,
-    enqueue_document_access_projection,
     fail_query_run,
     fetch_document_context_chunks,
-    get_document_lifecycle,
-    get_document_public,
     get_knowledge_base,
     get_knowledge_source,
     get_research_plan,
@@ -123,14 +107,10 @@ from wikipediarag.repository import (
     insert_retrieval_event,
     list_document_sections,
     list_document_versions_public,
-    list_knowledge_bases,
     list_knowledge_sources_public,
     list_research_plans,
     list_research_runs,
-    list_source_active_document_refs,
     list_upload_batch_sessions_private,
-    load_actor_document_access_scope,
-    load_effective_knowledge_base_role,
     load_index_version_by_read_alias,
     load_research_detail_records,
     load_research_run_scopes,
@@ -143,9 +123,7 @@ from wikipediarag.repository import (
     search_document_chunks,
     search_projection_health,
     soft_delete_document,
-    update_document_access_metadata,
     update_knowledge_source,
-    update_knowledge_source_document_access_default,
     update_query_run_usage,
     update_research_plan,
 )
@@ -160,14 +138,15 @@ from wikipediarag.retrieval_profile import get_profile_catalog, get_retrieval_pr
 from wikipediarag.retrieval_profile_resolver import normalize_retrieval_profile_request
 from wikipediarag.retrieval_profile_resolver import resolve_retrieval_profile as _resolve_retrieval_profile
 from wikipediarag.schemas import (
+    AccessGrantListResponse,
+    AccessGrantReplaceRequest,
+    AccessGrantResponse,
     AccessGroupResponse,
     AuthOidcStartResponse,
     AuthSessionResponse,
     AuthUserResponse,
     ChatRequest,
     DebugSearchRequest,
-    DocumentAccessPatch,
-    DocumentAccessResponse,
     DocumentContextChunk,
     DocumentContextResponse,
     DocumentDeleteResponse,
@@ -181,8 +160,6 @@ from wikipediarag.schemas import (
     GroupPatch,
     ImportRequest,
     KnowledgeBaseCreate,
-    KnowledgeBaseGrantCreate,
-    KnowledgeBaseGrantPatch,
     KnowledgeBasePatch,
     LocalLoginRequest,
     LocalPasswordChangeRequest,
@@ -205,8 +182,6 @@ from wikipediarag.schemas import (
     RetrievalResult,
     SearchRequest,
     SearchResponse,
-    SourceAccessPatch,
-    SourceAccessResponse,
     SourceCreate,
     SourceHealthResponse,
     SourcePatch,
@@ -217,9 +192,6 @@ from wikipediarag.schemas import (
     SourceSyncResponse,
     SourceSyncRunResponse,
     SseEvent,
-    TenantCreate,
-    TenantPatch,
-    TenantSelectionRequest,
     UploadBatchAccepted,
     UploadBatchCreate,
     UploadBatchItemAccepted,
@@ -236,6 +208,17 @@ from wikipediarag.search_index import READ_ALIAS, delete_document_chunks
 from wikipediarag.search_service import run_public_search
 from wikipediarag.source_connectors import ConnectorError, connector_for_kind
 from wikipediarag.storage import create_presigned_put_url, delete_objects, head_object, put_bytes
+from wikipediarag.workspace_access import (
+    AccessGrant,
+    PrincipalType,
+    ResourcePermission,
+    ResourceType,
+)
+from wikipediarag.workspace_access import (
+    PlatformRole as WorkspacePlatformRole,
+)
+from wikipediarag.workspace_grants import InvalidGrantError, WorkspaceGrantRepository
+from wikipediarag.workspace_sql import text
 
 
 async def resolve_retrieval_profile(conn: Any, **kwargs: Any) -> Any:
@@ -421,18 +404,12 @@ async def local_login(
         raise AuthenticationError("LOCAL_LOGIN_DISABLED", "local login is disabled", status_code=403)
     async with connect() as conn:
         user = await authenticate_local_user(conn, username=payload.username, password=payload.password)
-        active_tenant_id = (
-            settings.default_tenant_id
-            if user.platform_role == PlatformRole.platform_admin
-            else await _default_active_tenant(conn, user.user_id)
-        )
         created = await create_session(
             conn,
             user_id=user.user_id,
             authentication_method=AuthenticationMethod.local,
             settings=settings,
             remember_me=payload.remember_me,
-            active_tenant_id=active_tenant_id,
         )
         await _audit(
             conn,
@@ -448,8 +425,6 @@ async def local_login(
     return AuthSessionResponse(
         authenticated=True,
         user=_auth_user_response(user),
-        active_tenant_id=active_tenant_id,
-        tenant_role=None,
         authentication_method=AuthenticationMethod.local.value,
         session_id=created.session_id,
         csrf_token=None,
@@ -498,8 +473,6 @@ async def oidc_callback(
             platform_role=login.platform_role.value,
             password_change_required=login.password_change_required,
         ),
-        active_tenant_id=login.active_tenant_id,
-        tenant_role=None,
         authentication_method=AuthenticationMethod.oidc.value,
         session_id=login.session_id,
         csrf_token=None,
@@ -583,8 +556,6 @@ async def get_session(request: Request) -> AuthSessionResponse:
                     password_change_required=False,
                 )
             ),
-            active_tenant_id=actor.active_tenant_id,
-            tenant_role=actor.tenant_role.value if actor.tenant_role is not None else None,
             authentication_method=actor.authentication_method.value,
             session_id=actor.session_id,
             csrf_token=None,
@@ -598,52 +569,10 @@ async def get_session(request: Request) -> AuthSessionResponse:
     return AuthSessionResponse(
         authenticated=True,
         user=_auth_user_response(user),
-        active_tenant_id=actor.active_tenant_id,
-        tenant_role=actor.tenant_role.value if actor.tenant_role is not None else None,
         authentication_method=actor.authentication_method.value,
         session_id=actor.session_id,
         csrf_token=csrf_token,
         expires_at=None,
-    )
-
-
-async def select_session_tenant(
-    payload: TenantSelectionRequest,
-    request: Request,
-    response: Response,
-    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
-) -> AuthSessionResponse:
-    """Switch the active tenant for the current session after authorization checks."""
-    actor = await _require_actor(request)
-    await _require_csrf(actor, x_csrf_token)
-    settings = get_settings()
-    async with connect() as conn:
-        tenant_role = await select_active_tenant(
-            conn,
-            session_id=actor.session_id,
-            user_id=actor.user_id,
-            platform_role=actor.platform_role,
-            tenant_id=payload.tenant_id,
-        )
-        session_token = await rotate_session_token(conn, session_id=actor.session_id)
-        user = await load_session_user(conn, user_id=actor.user_id)
-        await _audit(
-            conn,
-            request=request,
-            actor=actor,
-            action="auth.tenant_selected",
-            target_type="tenant",
-            target_id=payload.tenant_id,
-            outcome="success",
-        )
-    _set_session_cookie(response, session_token, settings, max_age=settings.session_max_seconds)
-    return AuthSessionResponse(
-        authenticated=True,
-        user=_auth_user_response(user) if user is not None else None,
-        active_tenant_id=payload.tenant_id,
-        tenant_role=tenant_role.value if tenant_role is not None else None,
-        authentication_method=actor.authentication_method.value,
-        session_id=actor.session_id,
     )
 
 
@@ -731,132 +660,73 @@ async def admin_patch_user(user_id: str, payload: UserPatch, request: Request) -
     return {"status": "updated"}
 
 
-async def admin_list_tenants(request: Request) -> list[dict[str, Any]]:
-    """List tenants for platform administrators."""
-    actor = await _require_actor(request)
-    _require_platform_admin(actor)
-    async with connect() as conn:
-        result = await conn.execute(text("SELECT id, slug, name, created_at, updated_at FROM tenants ORDER BY slug"))
-        return [cast(dict[str, Any], _jsonable(dict(row))) for row in result.mappings()]
-
-
-async def admin_create_tenant(payload: TenantCreate, request: Request) -> dict[str, str]:
-    """Create a tenant record for platform administrators."""
-    actor = await _require_actor(request)
-    _require_platform_admin(actor)
-    tenant_id = str(uuid.uuid4())
-    async with connect() as conn:
-        await conn.execute(
-            text("INSERT INTO tenants(id, slug, name) VALUES (:id, :slug, :name)"),
-            {"id": tenant_id, "slug": payload.slug, "name": payload.name},
-        )
-        await _audit(
-            conn,
-            request=request,
-            actor=actor,
-            action="admin.tenant_created",
-            target_type="tenant",
-            target_id=tenant_id,
-            outcome="success",
-        )
-    return {"id": tenant_id, "slug": payload.slug, "name": payload.name}
-
-
-async def admin_patch_tenant(tenant_id: str, payload: TenantPatch, request: Request) -> dict[str, str]:
-    """Update mutable tenant attributes for platform administrators."""
-    actor = await _require_actor(request)
-    _require_platform_admin(actor)
-    if payload.name is None:
-        return {"status": "unchanged"}
-    async with connect() as conn:
-        await conn.execute(
-            text("UPDATE tenants SET name = :name, updated_at = now() WHERE id = :id"),
-            {"id": tenant_id, "name": payload.name},
-        )
-        await _audit(
-            conn,
-            request=request,
-            actor=actor,
-            action="admin.tenant_updated",
-            target_type="tenant",
-            target_id=tenant_id,
-            outcome="success",
-        )
-    return {"status": "updated"}
-
-
 async def list_groups(request: Request) -> list[dict[str, Any]]:
-    """List tenant groups and local membership summaries."""
+    """List global workspace groups for platform administrators."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
-    require_tenant_admin(actor)
+    _require_platform_admin(actor)
     async with connect() as conn:
         result = await conn.execute(
             text(
                 """
-                SELECT g.id, g.name, g.group_type, g.external_id, g.created_at, g.updated_at,
+                SELECT g.id, g.name, g.description, g.group_type, g.external_id, g.created_at, g.updated_at,
+                       count(gm.user_id)::int AS member_count,
                        COALESCE(json_agg(gm.user_id) FILTER (WHERE gm.user_id IS NOT NULL), '[]') AS member_user_ids
                 FROM groups g
                 LEFT JOIN group_memberships gm ON gm.group_id = g.id
-                WHERE g.tenant_id = :tenant_id
                 GROUP BY g.id
                 ORDER BY g.name
                 """
-            ),
-            {"tenant_id": tenant_id},
+            )
         )
         return [cast(dict[str, Any], _jsonable(dict(row))) for row in result.mappings()]
 
 
 async def list_access_groups(kb_id: str, request: Request) -> list[AccessGroupResponse]:
-    """List tenant groups that KB managers can use in document ACL allowlists."""
+    """List workspace groups that a KB sharer may select for a grant."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
+        resource = await WorkspaceGrantRepository(conn).load_knowledge_base(kb_id)
+        if resource is None:
+            raise HTTPException(status_code=404, detail="knowledge base not found")
+        _read, _write, share, _delete = await WorkspaceGrantRepository(conn).authorize(
+            user_id=actor.user_id,
+            platform_role=WorkspacePlatformRole(actor.platform_role.value),
+            resource=resource,
+        )
+        if not share:
+            raise HTTPException(status_code=404, detail="knowledge base not found")
         result = await conn.execute(
             text(
                 """
                 SELECT id, name, group_type, external_id
                 FROM groups
-                WHERE tenant_id = :tenant_id
                 ORDER BY name
                 """
-            ),
-            {"tenant_id": tenant_id},
+            )
         )
         return [AccessGroupResponse.model_validate(_jsonable(dict(row))) for row in result.mappings()]
 
 
 async def create_group(payload: GroupCreate, request: Request) -> dict[str, str]:
-    """Create a tenant-local or OIDC-backed group."""
+    """Create a global local group. OIDC groups are provider-managed only."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
-    require_tenant_admin(actor)
-    group_type = GroupType(payload.group_type)
-    if group_type == GroupType.oidc and not (payload.external_id or payload.name.startswith("/")):
-        raise HTTPException(status_code=422, detail="OIDC groups require a full external group path")
+    _require_platform_admin(actor)
     group_id = str(uuid.uuid4())
     async with connect() as conn:
         await conn.execute(
             text(
                 """
-                INSERT INTO groups(id, tenant_id, name, group_type, external_id)
-                VALUES (:id, :tenant_id, :name, :group_type, :external_id)
+                INSERT INTO groups(id, name, description, group_type)
+                VALUES (:id, :name, :description, 'LOCAL')
                 """
             ),
             {
                 "id": group_id,
-                "tenant_id": tenant_id,
                 "name": payload.name,
-                "group_type": group_type.value,
-                "external_id": payload.external_id,
+                "description": payload.description,
             },
         )
-        if group_type == GroupType.local:
-            await _replace_local_group_members(
-                conn, group_id=group_id, member_user_ids=payload.member_user_ids, tenant_id=tenant_id
-            )
+        await _replace_workspace_local_group_members(conn, group_id=group_id, member_user_ids=payload.member_user_ids)
         await _audit(
             conn,
             request=request,
@@ -872,10 +742,9 @@ async def create_group(payload: GroupCreate, request: Request) -> dict[str, str]
 async def patch_group(group_id: str, payload: GroupPatch, request: Request) -> dict[str, str]:
     """Update group metadata and local group membership where allowed."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
-    require_tenant_admin(actor)
+    _require_platform_admin(actor)
     async with connect() as conn:
-        group = await _load_group(conn, tenant_id=tenant_id, group_id=group_id)
+        group = await _load_workspace_group(conn, group_id=group_id)
         if group is None:
             raise HTTPException(status_code=404, detail="group not found")
         if payload.name is not None:
@@ -883,11 +752,16 @@ async def patch_group(group_id: str, payload: GroupPatch, request: Request) -> d
                 text("UPDATE groups SET name = :name, updated_at = now() WHERE id = :id"),
                 {"id": group_id, "name": payload.name},
             )
+        if payload.description is not None:
+            await conn.execute(
+                text("UPDATE groups SET description = :description, updated_at = now() WHERE id = :id"),
+                {"id": group_id, "description": payload.description},
+            )
         if payload.member_user_ids is not None:
             if GroupType(group["group_type"]) != GroupType.local:
                 raise HTTPException(status_code=409, detail="OIDC group membership is externally managed")
-            await _replace_local_group_members(
-                conn, group_id=group_id, member_user_ids=payload.member_user_ids, tenant_id=tenant_id
+            await _replace_workspace_local_group_members(
+                conn, group_id=group_id, member_user_ids=payload.member_user_ids
             )
         await _audit(
             conn,
@@ -902,16 +776,22 @@ async def patch_group(group_id: str, payload: GroupPatch, request: Request) -> d
 
 
 async def delete_group(group_id: str, request: Request) -> dict[str, str]:
-    """Delete a tenant group and its membership rows."""
+    """Delete an unused global group; group grants are never silently removed."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
-    require_tenant_admin(actor)
+    _require_platform_admin(actor)
     async with connect() as conn:
-        await conn.execute(text("DELETE FROM group_memberships WHERE group_id = :id"), {"id": group_id})
-        await conn.execute(
-            text("DELETE FROM groups WHERE id = :id AND tenant_id = :tenant_id"),
-            {"id": group_id, "tenant_id": tenant_id},
+        group = await _load_workspace_group(conn, group_id=group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail="group not found")
+        references = await conn.execute(
+            text("SELECT count(*) FROM resource_grants WHERE principal_type = 'GROUP' AND principal_id = :id::uuid"),
+            {"id": group_id},
         )
+        count = int(references.scalar_one())
+        if count:
+            raise HTTPException(status_code=409, detail={"code": "GROUP_IN_USE", "reference_count": min(count, 1000)})
+        await conn.execute(text("DELETE FROM group_memberships WHERE group_id = :id"), {"id": group_id})
+        await conn.execute(text("DELETE FROM groups WHERE id = :id"), {"id": group_id})
         await _audit(
             conn,
             request=request,
@@ -925,11 +805,30 @@ async def delete_group(group_id: str, request: Request) -> dict[str, str]:
 
 
 async def get_knowledge_bases(request: Request) -> list[dict[str, Any]]:
-    """List knowledge bases visible in the active tenant."""
+    """List full KBs plus minimal shells for directly shared documents."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        return await list_knowledge_bases(conn, tenant_id)
+        visible = await WorkspaceGrantRepository(conn).list_visible_knowledge_bases(
+            user_id=actor.user_id,
+            platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        )
+        result = await conn.execute(
+            text("SELECT id, name, active_index FROM knowledge_bases WHERE id = ANY(:ids)"),
+            {"ids": [resource.resource_id for resource, _, _, _ in visible]},
+        )
+        details = {str(row["id"]): dict(row) for row in result.mappings()}
+    return [
+        {
+            "id": resource.resource_id,
+            "name": str(details[resource.resource_id]["name"]),
+            "active_index": str(details[resource.resource_id].get("active_index") or ""),
+            "access_scope": access_scope,
+            "write_access": write_access,
+            "share_access": share_access,
+            "owned_by_current_user": resource.owner_user_id == actor.user_id,
+        }
+        for resource, access_scope, write_access, share_access in visible
+    ]
 
 
 async def retrieval_profiles(
@@ -943,12 +842,8 @@ async def retrieval_profiles(
     tenant_id = require_active_tenant(actor)
     kb_ids = _kb_scope_ids(knowledge_base_ids or [], settings.default_kb_id)
     async with connect() as conn:
-        await _load_kb_scope_roles(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_ids=kb_ids,
-        )
+        for kb_id in kb_ids:
+            await _require_workspace_kb_read(conn, actor, kb_id)
         rows: list[dict[str, Any]] = []
         for kb_id in kb_ids:
             kb = await get_knowledge_base(conn, tenant_id, kb_id)
@@ -1017,36 +912,18 @@ async def retrieval_profiles(
 
 
 async def create_knowledge_base(payload: KnowledgeBaseCreate, request: Request) -> dict[str, str]:
-    """Create a tenant knowledge base and grant the creator owner access."""
+    """Create a workspace KB owned by the authenticated creator."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     kb_id = str(uuid.uuid4())
     async with connect() as conn:
         await conn.execute(
             text(
                 """
-                INSERT INTO knowledge_bases(id, tenant_id, name)
-                VALUES (:id, :tenant_id, :name)
+                INSERT INTO knowledge_bases(id, name, owner_user_id)
+                VALUES (:id, :name, :owner_user_id)
                 """
             ),
-            {"id": kb_id, "tenant_id": tenant_id, "name": payload.name},
-        )
-        await conn.execute(
-            text(
-                """
-                INSERT INTO knowledge_base_grants(
-                  id, tenant_id, knowledge_base_id, subject_type, subject_id, role, created_by_user_id
-                )
-                VALUES (:id, :tenant_id, :kb_id, 'USER', :user_id_text, 'OWNER', :user_id)
-                """
-            ),
-            {
-                "id": str(uuid.uuid4()),
-                "tenant_id": tenant_id,
-                "kb_id": kb_id,
-                "user_id": actor.user_id,
-                "user_id_text": actor.user_id,
-            },
+            {"id": kb_id, "name": payload.name, "owner_user_id": actor.user_id},
         )
         await _audit(
             conn,
@@ -1061,15 +938,44 @@ async def create_knowledge_base(payload: KnowledgeBaseCreate, request: Request) 
 
 
 async def get_knowledge_base_endpoint(kb_id: str, request: Request) -> dict[str, Any]:
-    """Read a knowledge base after viewer-role enforcement."""
+    """Read a full KB or safe partial shell under current workspace grants."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
-        kb = await get_knowledge_base(conn, tenant_id, kb_id)
-    if kb is None:
+        repository = WorkspaceGrantRepository(conn)
+        visible = await repository.list_visible_knowledge_bases(
+            user_id=actor.user_id,
+            platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        )
+        selected = next((item for item in visible if item[0].resource_id == kb_id), None)
+        if selected is None:
+            raise HTTPException(status_code=404, detail="knowledge base not found")
+        resource, access_scope, write_access, share_access = selected
+        kb_result = await conn.execute(
+            text("SELECT id, name, active_index, created_at, updated_at FROM knowledge_bases WHERE id = :id"),
+            {"id": kb_id},
+        )
+        kb_row = kb_result.mappings().first()
+    if kb_row is None:
         raise HTTPException(status_code=404, detail="knowledge base not found")
-    return cast(dict[str, Any], _jsonable(kb))
+    if access_scope == "partial":
+        return {
+            "id": kb_id,
+            "name": str(kb_row["name"]),
+            "access_scope": "partial",
+            "write_access": False,
+            "share_access": False,
+            "owned_by_current_user": False,
+        }
+    result = cast(dict[str, Any], _jsonable(dict(kb_row)))
+    result.update(
+        {
+            "access_scope": "full",
+            "write_access": write_access,
+            "share_access": share_access,
+            "owned_by_current_user": resource.owner_user_id == actor.user_id,
+        }
+    )
+    return result
 
 
 async def patch_knowledge_base(kb_id: str, payload: KnowledgeBasePatch, request: Request) -> dict[str, str]:
@@ -1079,7 +985,7 @@ async def patch_knowledge_base(kb_id: str, payload: KnowledgeBasePatch, request:
     if payload.name is None:
         return {"status": "unchanged"}
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
+        await _require_workspace_kb_write(conn, actor, kb_id)
         await conn.execute(
             text(
                 """
@@ -1111,7 +1017,7 @@ async def delete_knowledge_base(kb_id: str, request: Request) -> dict[str, str]:
     artifact_keys: list[str] = []
     read_alias = READ_ALIAS
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.owner)
+        await _require_workspace_delete(WorkspaceGrantRepository(conn), actor, ResourceType.knowledge_base, kb_id)
         kb = await get_knowledge_base(conn, tenant_id, kb_id)
         if kb is None:
             raise HTTPException(status_code=404, detail="knowledge base not found")
@@ -1220,176 +1126,198 @@ async def delete_knowledge_base(kb_id: str, request: Request) -> dict[str, str]:
     return {"status": "deleted"}
 
 
-async def list_kb_grants(kb_id: str, request: Request) -> list[dict[str, Any]]:
-    """List knowledge-base grants for managers and owners."""
+def _workspace_grant_response(grant: AccessGrant) -> AccessGrantResponse:
+    if grant.id is None:
+        raise RuntimeError("persisted access grant must have an id")
+    return AccessGrantResponse(
+        id=grant.id,
+        principal_type=grant.principal_type.value,
+        principal_id=grant.principal_id,
+        permission=grant.permission.value,
+    )
+
+
+async def _workspace_resource_or_404(
+    repository: WorkspaceGrantRepository, resource_type: ResourceType, resource_id: str
+) -> Any:
+    resource = (
+        await repository.load_knowledge_base(resource_id)
+        if resource_type == ResourceType.knowledge_base
+        else await repository.load_document(resource_id)
+    )
+    if resource is None:
+        raise HTTPException(status_code=404, detail="resource not found")
+    return resource
+
+
+async def _require_workspace_share(
+    repository: WorkspaceGrantRepository, actor: ActorContext, resource_type: ResourceType, resource_id: str
+) -> Any:
+    resource = await _workspace_resource_or_404(repository, resource_type, resource_id)
+    _, _, share, _ = await repository.authorize(
+        user_id=actor.user_id,
+        platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        resource=resource,
+    )
+    if not share:
+        raise HTTPException(status_code=404, detail="resource not found")
+    return resource
+
+
+async def _require_workspace_delete(
+    repository: WorkspaceGrantRepository, actor: ActorContext, resource_type: ResourceType, resource_id: str
+) -> Any:
+    resource = await _workspace_resource_or_404(repository, resource_type, resource_id)
+    _read, _write, _share, delete = await repository.authorize(
+        user_id=actor.user_id,
+        platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        resource=resource,
+    )
+    if not delete:
+        raise HTTPException(status_code=404, detail="resource not found")
+    return resource
+
+
+async def _require_workspace_kb_write(conn: Any, actor: ActorContext, kb_id: str) -> str:
+    """Authorize workspace KB writes and resolve the temporary storage key."""
+    return await _require_workspace_kb_permission(conn, actor, kb_id, write_required=True)
+
+
+async def _require_workspace_kb_read(conn: Any, actor: ActorContext, kb_id: str) -> str:
+    """Authorize workspace KB reads and resolve the temporary storage key."""
+    return await _require_workspace_kb_permission(conn, actor, kb_id, write_required=False)
+
+
+async def _require_workspace_kb_permission(conn: Any, actor: ActorContext, kb_id: str, *, write_required: bool) -> str:
+    """Keep tenant IDs an internal legacy storage key, never request authority."""
+    repository = WorkspaceGrantRepository(conn)
+    resource = await repository.load_knowledge_base(kb_id)
+    if resource is None:
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+    _read, write_access, _share, _delete = await repository.authorize(
+        user_id=actor.user_id,
+        platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        resource=resource,
+    )
+    if not (write_access if write_required else _read):
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+    legacy_row = await conn.execute(text("SELECT tenant_id FROM knowledge_bases WHERE id = :id"), {"id": kb_id})
+    row = legacy_row.mappings().first()
+    if row is None or row["tenant_id"] is None:
+        raise HTTPException(status_code=409, detail="knowledge base migration is incomplete")
+    return str(row["tenant_id"])
+
+
+async def _require_full_workspace_kb_scope(conn: Any, *, actor: ActorContext, kb_ids: Sequence[str]) -> str:
+    """Authorize a retrieval scope before resolving its transitional storage key.
+
+    Chat and research currently need one legacy storage partition for their
+    durable query rows.  That partition is derived only after the workspace
+    resolver has accepted every requested KB; it is never read from a session.
+    """
+    repository = WorkspaceGrantRepository(conn)
+    visible = await repository.list_visible_knowledge_bases(
+        user_id=actor.user_id,
+        platform_role=WorkspacePlatformRole(actor.platform_role.value),
+    )
+    scopes = {resource.resource_id: scope for resource, scope, _write, _share in visible}
+    if not kb_ids or any(scopes.get(kb_id) != "full" for kb_id in kb_ids):
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+    result = await conn.execute(
+        text("SELECT tenant_id FROM knowledge_bases WHERE id::text = ANY(:ids)"), {"ids": list(kb_ids)}
+    )
+    tenant_ids = {str(row["tenant_id"]) for row in result.mappings() if row["tenant_id"] is not None}
+    if len(tenant_ids) != 1:
+        raise HTTPException(status_code=409, detail="workspace retrieval migration is incomplete")
+    return next(iter(tenant_ids))
+
+
+async def list_workspace_access_grants(
+    resource_type: ResourceType, resource_id: str, request: Request
+) -> AccessGrantListResponse:
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
-        result = await conn.execute(
-            text(
-                """
-                SELECT id, subject_type, subject_id, role, created_by_user_id, metadata, created_at, updated_at
-                FROM knowledge_base_grants
-                WHERE tenant_id = :tenant_id AND knowledge_base_id = :kb_id
-                ORDER BY created_at DESC
-                """
-            ),
-            {"tenant_id": tenant_id, "kb_id": kb_id},
-        )
-        return [cast(dict[str, Any], _jsonable(dict(row))) for row in result.mappings()]
+        repository = WorkspaceGrantRepository(conn)
+        resource = await _require_workspace_share(repository, actor, resource_type, resource_id)
+        grants = await repository.load_grants(resource_type, resource_id)
+    return AccessGrantListResponse(
+        access_grants=[_workspace_grant_response(grant) for grant in grants],
+        inherits_kb_access=resource.inherits_kb_access if resource_type == ResourceType.document else None,
+    )
 
 
-async def create_kb_grant(kb_id: str, payload: KnowledgeBaseGrantCreate, request: Request) -> dict[str, Any]:
-    """Create or update a knowledge-base grant with ACL metadata."""
-    actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
-    role = KnowledgeBaseRole(payload.role)
-    subject_type = GrantSubjectType(payload.subject_type)
-    async with connect() as conn:
-        required = KnowledgeBaseRole.owner if role == KnowledgeBaseRole.owner else KnowledgeBaseRole.manager
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=required)
-        grant_id = str(uuid.uuid4())
-        metadata = await _kb_grant_acl_metadata(
-            conn,
-            tenant_id=tenant_id,
-            subject_type=subject_type,
-            subject_id=payload.subject_id,
-            role=role,
-            actor=actor,
-        )
-        await conn.execute(
-            text(
-                """
-                INSERT INTO knowledge_base_grants(
-                  id, tenant_id, knowledge_base_id, subject_type, subject_id, role, created_by_user_id, metadata
-                )
-                VALUES (
-                  :id, :tenant_id, :kb_id, :subject_type, :subject_id, :role,
-                  :created_by_user_id, CAST(:metadata AS jsonb)
-                )
-                ON CONFLICT (tenant_id, knowledge_base_id, subject_type, subject_id)
-                DO UPDATE SET role = EXCLUDED.role, metadata = EXCLUDED.metadata, updated_at = now()
-                """
-            ),
-            {
-                "id": grant_id,
-                "tenant_id": tenant_id,
-                "kb_id": kb_id,
-                "subject_type": subject_type.value,
-                "subject_id": payload.subject_id,
-                "role": role.value,
-                "created_by_user_id": actor.user_id,
-                "metadata": json.dumps(metadata, ensure_ascii=False),
-            },
-        )
-        await _audit(
-            conn,
-            request=request,
-            actor=actor,
-            action="knowledge_base.grant_created",
-            target_type="knowledge_base",
-            target_id=kb_id,
-            outcome="success",
-        )
-    return {"id": grant_id, "role": role.value, "metadata": metadata}
-
-
-async def patch_kb_grant(
-    kb_id: str,
-    grant_id: str,
-    payload: KnowledgeBaseGrantPatch,
+async def replace_workspace_access_grants(
+    resource_type: ResourceType,
+    resource_id: str,
+    payload: AccessGrantReplaceRequest,
     request: Request,
-) -> dict[str, Any]:
-    """Update a knowledge-base grant role and refresh ACL metadata."""
+) -> AccessGrantListResponse:
+    if resource_type == ResourceType.knowledge_base and payload.inherits_kb_access is not None:
+        raise HTTPException(status_code=422, detail="inherits_kb_access applies only to documents")
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
-    role = KnowledgeBaseRole(payload.role)
+    requested = [
+        AccessGrant(
+            PrincipalType(grant.principal_type),
+            grant.principal_id,
+            ResourcePermission(grant.permission),
+        )
+        for grant in payload.access_grants
+    ]
     async with connect() as conn:
-        required = KnowledgeBaseRole.owner if role == KnowledgeBaseRole.owner else KnowledgeBaseRole.manager
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=required)
-        existing = await conn.execute(
-            text(
-                """
-                SELECT subject_type, subject_id
-                FROM knowledge_base_grants
-                WHERE id = :id AND tenant_id = :tenant_id AND knowledge_base_id = :kb_id
-                """
-            ),
-            {"id": grant_id, "tenant_id": tenant_id, "kb_id": kb_id},
-        )
-        grant = existing.mappings().first()
-        if grant is None:
-            raise HTTPException(status_code=404, detail="knowledge base grant not found")
-        metadata = await _kb_grant_acl_metadata(
-            conn,
-            tenant_id=tenant_id,
-            subject_type=GrantSubjectType(str(grant["subject_type"])),
-            subject_id=str(grant["subject_id"]),
-            role=role,
-            actor=actor,
-        )
-        await conn.execute(
-            text(
-                """
-                UPDATE knowledge_base_grants
-                SET role = :role, metadata = CAST(:metadata AS jsonb), updated_at = now()
-                WHERE id = :id AND tenant_id = :tenant_id AND knowledge_base_id = :kb_id
-                """
-            ),
-            {
-                "id": grant_id,
-                "tenant_id": tenant_id,
-                "kb_id": kb_id,
-                "role": role.value,
-                "metadata": json.dumps(metadata, ensure_ascii=False),
-            },
-        )
+        repository = WorkspaceGrantRepository(conn)
+        resource = await _require_workspace_share(repository, actor, resource_type, resource_id)
+        try:
+            grants = await repository.replace_grants(
+                resource_type=resource_type, resource_id=resource_id, grants=requested
+            )
+        except InvalidGrantError as exc:
+            raise HTTPException(status_code=422, detail="invalid grant principal") from exc
+        if resource_type == ResourceType.document and payload.inherits_kb_access is not None:
+            await conn.execute(
+                text("UPDATE documents SET inherits_kb_access = :inherits WHERE id = :id"),
+                {"inherits": payload.inherits_kb_access, "id": resource_id},
+            )
+            resource = await _workspace_resource_or_404(repository, resource_type, resource_id)
         await _audit(
             conn,
             request=request,
             actor=actor,
-            action="knowledge_base.grant_updated",
-            target_type="knowledge_base_grant",
-            target_id=grant_id,
+            action="workspace_resource.grants_replaced",
+            target_type=resource_type.value,
+            target_id=resource_id,
             outcome="success",
         )
-    return {"status": "updated", "metadata": metadata}
+    return AccessGrantListResponse(
+        access_grants=[_workspace_grant_response(grant) for grant in grants],
+        inherits_kb_access=resource.inherits_kb_access if resource_type == ResourceType.document else None,
+    )
 
 
-async def delete_kb_grant(kb_id: str, grant_id: str, request: Request) -> dict[str, str]:
-    """Remove a knowledge-base grant for a manager-scoped request."""
-    actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
-    async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
-        await conn.execute(
-            text(
-                """
-                DELETE FROM knowledge_base_grants
-                WHERE id = :id AND tenant_id = :tenant_id AND knowledge_base_id = :kb_id
-                """
-            ),
-            {"id": grant_id, "tenant_id": tenant_id, "kb_id": kb_id},
-        )
-        await _audit(
-            conn,
-            request=request,
-            actor=actor,
-            action="knowledge_base.grant_deleted",
-            target_type="knowledge_base_grant",
-            target_id=grant_id,
-            outcome="success",
-        )
-    return {"status": "deleted"}
+async def list_knowledge_base_access_grants(kb_id: str, request: Request) -> AccessGrantListResponse:
+    return await list_workspace_access_grants(ResourceType.knowledge_base, kb_id, request)
+
+
+async def replace_knowledge_base_access_grants(
+    kb_id: str, payload: AccessGrantReplaceRequest, request: Request
+) -> AccessGrantListResponse:
+    return await replace_workspace_access_grants(ResourceType.knowledge_base, kb_id, payload, request)
+
+
+async def list_document_access_grants(document_id: str, request: Request) -> AccessGrantListResponse:
+    return await list_workspace_access_grants(ResourceType.document, document_id, request)
+
+
+async def replace_document_access_grants(
+    document_id: str, payload: AccessGrantReplaceRequest, request: Request
+) -> AccessGrantListResponse:
+    return await replace_workspace_access_grants(ResourceType.document, document_id, payload, request)
 
 
 async def list_sources(kb_id: str, request: Request) -> dict[str, Any]:
     """List external knowledge sources without exposing stored credentials."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
+        tenant_id = await _require_workspace_kb_read(conn, actor, kb_id)
         rows = await list_knowledge_sources_public(conn, tenant_id=tenant_id, knowledge_base_id=kb_id)
     sources = [SourceResponse.model_validate(_source_public_payload(row)).model_dump(mode="json") for row in rows]
     return {"sources": sources}
@@ -1399,15 +1327,10 @@ async def create_source(kb_id: str, payload: SourceCreate, request: Request) -> 
     """Create an external source with credentials stored only in encrypted server state."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     _reject_secrets_in_config(payload.config)
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
-        if await get_knowledge_base(conn, tenant_id, kb_id) is None:
-            raise HTTPException(status_code=404, detail="knowledge base not found")
+        tenant_id = await _require_workspace_kb_write(conn, actor, kb_id)
         metadata = {**payload.metadata, "source_contract": "external_source_v1"}
-        if payload.document_access_default is not None:
-            metadata["document_access_default"] = normalize_document_access(payload.document_access_default)
         source_id = await create_knowledge_source(
             conn,
             tenant_id=tenant_id,
@@ -1437,94 +1360,22 @@ async def create_source(kb_id: str, payload: SourceCreate, request: Request) -> 
 async def get_source(kb_id: str, source_id: str, request: Request) -> SourceResponse:
     """Read a source configuration after viewer-role enforcement."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.viewer)
+        tenant_id = await _require_workspace_kb_read(conn, actor, kb_id)
         row = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
     if row is None:
         raise HTTPException(status_code=404, detail="source not found")
     return SourceResponse.model_validate(_source_public_payload(row))
 
 
-async def patch_source_access(
-    kb_id: str,
-    source_id: str,
-    payload: SourceAccessPatch,
-    request: Request,
-) -> SourceAccessResponse:
-    """Update default document access for a source and optionally existing source documents."""
-    actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
-    document_access = normalize_document_access(payload.model_dump(mode="json"))
-    updated_documents = 0
-    async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
-        source = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
-        if source is None:
-            raise HTTPException(status_code=404, detail="source not found")
-        await _validate_document_access_principals(conn, tenant_id=tenant_id, document_access=document_access)
-        await update_knowledge_source_document_access_default(
-            conn,
-            tenant_id=tenant_id,
-            knowledge_base_id=kb_id,
-            source_id=source_id,
-            document_access=document_access,
-        )
-        targets = (
-            await list_source_active_document_refs(
-                conn,
-                tenant_id=tenant_id,
-                knowledge_base_id=kb_id,
-                source_id=source_id,
-            )
-            if payload.apply_to_existing
-            else []
-        )
-        for target in targets:
-            await update_document_access_metadata(
-                conn,
-                tenant_id=tenant_id,
-                knowledge_base_id=kb_id,
-                document_id=str(target["document_id"]),
-                document_version_id=str(target["document_version_id"]) if target.get("document_version_id") else None,
-                document_access=document_access,
-                origin="source_default",
-            )
-            await enqueue_document_access_projection(
-                conn,
-                tenant_id=tenant_id,
-                knowledge_base_id=kb_id,
-                document_id=str(target["document_id"]),
-                document_access=document_access,
-                origin="source_default",
-            )
-        updated_documents = len(targets)
-        await _audit(
-            conn,
-            request=request,
-            actor=actor,
-            action="source.document_access_updated",
-            target_type="knowledge_source",
-            target_id=source_id,
-            outcome="success",
-        )
-    return SourceAccessResponse(
-        source_id=source_id,
-        knowledge_base_id=kb_id,
-        document_access_default=document_access,
-        updated_documents=updated_documents,
-    )
-
-
 async def patch_source(kb_id: str, source_id: str, payload: SourcePatch, request: Request) -> SourceResponse:
     """Update source settings while keeping credentials out of public responses."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     if payload.config is not None:
         _reject_secrets_in_config(payload.config)
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
+        tenant_id = await _require_workspace_kb_write(conn, actor, kb_id)
         existing = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="source not found")
@@ -1562,9 +1413,8 @@ async def healthcheck_source(kb_id: str, source_id: str, request: Request) -> So
     """Run a bounded connector healthcheck using decrypted server-side credentials."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
+        tenant_id = await _require_workspace_kb_write(conn, actor, kb_id)
         row = await get_knowledge_source(
             conn,
             tenant_id=tenant_id,
@@ -1595,9 +1445,8 @@ async def sync_source(
     """Queue a full or incremental source sync job for the worker."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
+        tenant_id = await _require_workspace_kb_write(conn, actor, kb_id)
         source = await get_knowledge_source(conn, tenant_id=tenant_id, knowledge_base_id=kb_id, source_id=source_id)
         if source is None:
             raise HTTPException(status_code=404, detail="source not found")
@@ -1655,13 +1504,7 @@ async def get_source_sync_run(run_id: str, request: Request) -> SourceSyncRunRes
     async with connect() as conn:
         row = await get_source_sync_run_public(conn, tenant_id=tenant_id, run_id=run_id)
         if row is not None:
-            await _require_kb_role(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_id=str(row["knowledge_base_id"]),
-                role=KnowledgeBaseRole.viewer,
-            )
+            await _require_workspace_kb_read(conn, actor, str(row["knowledge_base_id"]))
     if row is None:
         raise HTTPException(status_code=404, detail="source sync run not found")
     return SourceSyncRunResponse.model_validate(_sync_run_public_payload(row))
@@ -1685,13 +1528,7 @@ async def create_wikipedia_import(payload: ImportRequest, request: Request) -> d
         "retrieval_profile": settings.retrieval_profile,
     }
     async with connect() as conn:
-        await _require_kb_role(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_id=settings.default_kb_id,
-            role=KnowledgeBaseRole.editor,
-        )
+        await _require_workspace_kb_write(conn, actor, settings.default_kb_id)
     idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
         request=request,
         actor=actor,
@@ -1753,13 +1590,7 @@ async def create_zim_import(payload: ZimImportRequest, request: Request) -> dict
         "retrieval_profile": settings.retrieval_profile,
     }
     async with connect() as conn:
-        await _require_kb_role(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_id=settings.default_kb_id,
-            role=KnowledgeBaseRole.editor,
-        )
+        await _require_workspace_kb_write(conn, actor, settings.default_kb_id)
     idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
         request=request,
         actor=actor,
@@ -1833,13 +1664,7 @@ async def cancel_ingestion_job(job_id: str, request: Request) -> dict[str, str]:
         job = await _load_job_for_actor(conn, tenant_id=tenant_id, job_id=job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        await _require_kb_role(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_id=str(job["knowledge_base_id"]),
-            role=KnowledgeBaseRole.editor,
-        )
+        await _require_workspace_kb_write(conn, actor, str(job["knowledge_base_id"]))
         await request_cancel(conn, job_id)
     return {"status": "cancel_requested"}
 
@@ -1852,13 +1677,7 @@ async def resume_ingestion_job(job_id: str, request: Request) -> dict[str, str]:
         job = await _load_job_for_actor(conn, tenant_id=tenant_id, job_id=job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        await _require_kb_role(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_id=str(job["knowledge_base_id"]),
-            role=KnowledgeBaseRole.editor,
-        )
+        await _require_workspace_kb_write(conn, actor, str(job["knowledge_base_id"]))
         await request_resume(conn, job_id)
     return {"status": "resume_requested"}
 
@@ -2107,7 +1926,6 @@ async def upload_document_multipart(
     """Accept a small multipart document upload and enqueue asynchronous ingestion."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     try:
         filename = safe_upload_filename(file.filename or "document")
     except UploadValidationError as exc:
@@ -2130,11 +1948,9 @@ async def upload_document_multipart(
         raise HTTPException(status_code=413, detail="uploaded file exceeds configured upload size limit")
     checksum = sha256_hex(data)
     content_type = file.content_type or "application/octet-stream"
-    object_key = f"uploads/{tenant_id}/{kb_id}/api/{stable_hash([filename, checksum], 16)}/{checksum}"
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
-        if await get_knowledge_base(conn, tenant_id, kb_id) is None:
-            raise HTTPException(status_code=404, detail="knowledge base not found")
+        tenant_id = await _require_workspace_kb_write(conn, actor, kb_id)
+    object_key = f"uploads/{tenant_id}/{kb_id}/api/{stable_hash([filename, checksum], 16)}/{checksum}"
     idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
         request=request,
         actor=actor,
@@ -2161,6 +1977,7 @@ async def upload_document_multipart(
             conn,
             tenant_id=tenant_id,
             knowledge_base_id=kb_id,
+            owner_user_id=actor.user_id,
             filename=filename,
             content_type=content_type,
             size_bytes=len(data),
@@ -2229,17 +2046,13 @@ async def create_upload_session_endpoint(payload: UploadSessionCreate, request: 
     """Create a presigned object-storage upload session without exposing object keys."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     try:
         filename = safe_upload_filename(payload.filename)
     except UploadValidationError as exc:
         raise HTTPException(status_code=422, detail={"error": {"code": exc.code, "message": exc.safe_message}}) from exc
     kb_id = payload.knowledge_base_id or settings.default_kb_id
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
-        kb = await get_knowledge_base(conn, tenant_id, kb_id)
-    if kb is None:
-        raise HTTPException(status_code=404, detail="knowledge base not found")
+        tenant_id = await _require_workspace_kb_write(conn, actor, kb_id)
     idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
         request=request,
         actor=actor,
@@ -2276,6 +2089,7 @@ async def create_upload_session_endpoint(payload: UploadSessionCreate, request: 
             conn,
             tenant_id=tenant_id,
             knowledge_base_id=kb_id,
+            owner_user_id=actor.user_id,
             filename=filename,
             content_type=payload.content_type,
             size_bytes=payload.size_bytes,
@@ -2314,7 +2128,6 @@ async def create_upload_batch_endpoint(payload: UploadBatchCreate, request: Requ
     """Create presigned upload sessions for a batch of validated files."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     kb_id = payload.knowledge_base_id or settings.default_kb_id
     sanitized_items: list[tuple[int, str]] = []
     seen_items: set[tuple[str, str]] = set()
@@ -2341,10 +2154,7 @@ async def create_upload_batch_endpoint(payload: UploadBatchCreate, request: Requ
         seen_items.add(duplicate_key)
         sanitized_items.append((index, filename))
     async with connect() as conn:
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.editor)
-        kb = await get_knowledge_base(conn, tenant_id, kb_id)
-    if kb is None:
-        raise HTTPException(status_code=404, detail="knowledge base not found")
+        tenant_id = await _require_workspace_kb_write(conn, actor, kb_id)
 
     idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
         request=request,
@@ -2372,6 +2182,7 @@ async def create_upload_batch_endpoint(payload: UploadBatchCreate, request: Requ
             conn,
             tenant_id=tenant_id,
             knowledge_base_id=kb_id,
+            owner_user_id=actor.user_id,
             total_items=len(payload.items),
             metadata={**payload.metadata, "upload_contract": "upload_batches_v1"},
         )
@@ -2387,6 +2198,7 @@ async def create_upload_batch_endpoint(payload: UploadBatchCreate, request: Requ
                 conn,
                 tenant_id=tenant_id,
                 knowledge_base_id=kb_id,
+                owner_user_id=actor.user_id,
                 batch_id=str(batch_id),
                 filename=filename,
                 content_type=item.content_type,
@@ -2442,13 +2254,7 @@ async def get_upload_batch_endpoint(batch_id: str, request: Request) -> UploadBa
     async with connect() as conn:
         status = await get_upload_batch_status(conn, tenant_id=tenant_id, batch_id=batch_id)
         if status is not None:
-            await _require_kb_role(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_id=str(status["knowledge_base_id"]),
-                role=KnowledgeBaseRole.editor,
-            )
+            await _require_workspace_kb_write(conn, actor, str(status["knowledge_base_id"]))
     if status is None:
         raise HTTPException(status_code=404, detail="upload batch not found")
     return UploadBatchStatus.model_validate(status)
@@ -2470,13 +2276,7 @@ async def complete_upload_session_endpoint(
             upload_session_id=upload_session_id,
         )
         if session is not None:
-            await _require_kb_role(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_id=str(session["knowledge_base_id"]),
-                role=KnowledgeBaseRole.editor,
-            )
+            await _require_workspace_kb_write(conn, actor, str(session["knowledge_base_id"]))
     if session is None:
         raise HTTPException(status_code=404, detail="upload session not found")
     idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
@@ -2555,81 +2355,44 @@ async def complete_upload_session_endpoint(
 
 
 async def get_document(document_id: str, request: Request) -> dict[str, Any]:
-    """Read public document metadata after viewer-role enforcement."""
+    """Read a document only after current workspace grant authorization."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        document = await _load_viewer_document(conn, actor=actor, tenant_id=tenant_id, document_id=document_id)
-    return cast(dict[str, Any], _jsonable(_document_public_payload(document)))
+        document, resource, write_access, share_access = await _load_workspace_viewer_document(
+            conn, actor=actor, document_id=document_id
+        )
+    payload = _document_public_payload(document)
+    payload.update(
+        {
+            "inherits_kb_access": resource.inherits_kb_access,
+            "write_access": write_access,
+            "share_access": share_access,
+            "owned_by_current_user": resource.owner_user_id == actor.user_id,
+        }
+    )
+    return cast(dict[str, Any], _jsonable(payload))
 
 
 async def get_document_versions(document_id: str, request: Request) -> dict[str, Any]:
     """List public document versions after viewer-role enforcement."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        await _load_viewer_document(conn, actor=actor, tenant_id=tenant_id, document_id=document_id)
+        document, resource, write_access, share_access = await _load_workspace_viewer_document(
+            conn, actor=actor, document_id=document_id
+        )
+        tenant_id = str(document["tenant_id"])
         versions = await list_document_versions_public(conn, tenant_id, document_id)
     return {"document_id": document_id, "versions": _jsonable(versions)}
-
-
-async def patch_document_access(
-    document_id: str,
-    payload: DocumentAccessPatch,
-    request: Request,
-) -> DocumentAccessResponse:
-    """Update document access metadata for a manager-scoped document."""
-    actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
-    document_access = normalize_document_access(payload.model_dump(mode="json"))
-    async with connect() as conn:
-        document = await get_document_public(conn, tenant_id, document_id)
-        if document is None:
-            raise HTTPException(status_code=404, detail="document not found")
-        kb_id = str(document["knowledge_base_id"])
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.manager)
-        await _validate_document_access_principals(conn, tenant_id=tenant_id, document_access=document_access)
-        version_id = str(document["current_version_id"]) if document.get("current_version_id") else None
-        await update_document_access_metadata(
-            conn,
-            tenant_id=tenant_id,
-            knowledge_base_id=kb_id,
-            document_id=document_id,
-            document_version_id=version_id,
-            document_access=document_access,
-            origin="manual",
-        )
-        await enqueue_document_access_projection(
-            conn,
-            tenant_id=tenant_id,
-            knowledge_base_id=kb_id,
-            document_id=document_id,
-            document_access=document_access,
-            origin="manual",
-        )
-        await _audit(
-            conn,
-            request=request,
-            actor=actor,
-            action="document.access_updated",
-            target_type="document",
-            target_id=document_id,
-            outcome="success",
-        )
-    return DocumentAccessResponse(
-        document_id=document_id,
-        knowledge_base_id=kb_id,
-        document_access=document_access,
-        document_access_origin="manual",
-    )
 
 
 async def get_document_structure(document_id: str, request: Request) -> DocumentStructureResponse:
     """Return the published document section tree for the viewer."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        document = await _load_viewer_document(conn, actor=actor, tenant_id=tenant_id, document_id=document_id)
+        document, resource, write_access, share_access = await _load_workspace_viewer_document(
+            conn, actor=actor, document_id=document_id
+        )
+        tenant_id = str(document["tenant_id"])
         version_id = str(document["current_version_id"]) if document.get("current_version_id") else None
         sections = await list_document_sections(
             conn,
@@ -2649,8 +2412,10 @@ async def get_document_structure(document_id: str, request: Request) -> Document
         source_url=str(source_url) if source_url else None,
         sections=[_document_section(row) for row in sections],
         public_metadata=dict(document.get("public_metadata") or {}),
-        document_access=normalize_document_access(metadata.get("document_access")),
-        document_access_origin=str(metadata.get("document_access_origin") or ""),
+        inherits_kb_access=resource.inherits_kb_access,
+        write_access=write_access,
+        share_access=share_access,
+        owned_by_current_user=resource.owner_user_id == actor.user_id,
         provenance=SourceProvenance.model_validate(
             public_provenance_from_metadata(
                 dict(document.get("public_metadata") or {}),
@@ -2675,9 +2440,11 @@ async def get_document_context(
 ) -> DocumentContextResponse:
     """Return neighboring chunks around a document chunk or section."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        document = await _load_viewer_document(conn, actor=actor, tenant_id=tenant_id, document_id=document_id)
+        document, _resource, _write, _share = await _load_workspace_viewer_document(
+            conn, actor=actor, document_id=document_id
+        )
+        tenant_id = str(document["tenant_id"])
         version_id = str(document["current_version_id"]) if document.get("current_version_id") else None
         section_path: list[str] | None = None
         if section_id:
@@ -2723,9 +2490,11 @@ async def get_document_context(
 async def search_document(document_id: str, payload: DocumentSearchRequest, request: Request) -> DocumentSearchResponse:
     """Search within a single authorized document."""
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        document = await _load_viewer_document(conn, actor=actor, tenant_id=tenant_id, document_id=document_id)
+        document, _resource, _write, _share = await _load_workspace_viewer_document(
+            conn, actor=actor, document_id=document_id
+        )
+        tenant_id = str(document["tenant_id"])
         version_id = str(document["current_version_id"]) if document.get("current_version_id") else None
         rows = await search_document_chunks(
             conn,
@@ -2752,16 +2521,35 @@ async def delete_document(document_id: str, request: Request) -> DocumentDeleteR
     """Soft-delete a document, remove searchable chunks, and schedule deferred purge."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     purge_after = datetime.now(UTC) + timedelta(days=max(0, settings.document_soft_delete_retention_days))
     async with connect() as conn:
-        document = await get_document_lifecycle(conn, tenant_id, document_id)
-        if document is None:
+        repository = WorkspaceGrantRepository(conn)
+        resource = await repository.load_document(document_id)
+        if resource is None:
             raise HTTPException(status_code=404, detail="document not found")
+        _, _, _, delete_access = await repository.authorize(
+            user_id=actor.user_id,
+            platform_role=WorkspacePlatformRole(actor.platform_role.value),
+            resource=resource,
+        )
+        if not delete_access:
+            raise HTTPException(status_code=404, detail="document not found")
+        document_result = await conn.execute(
+            text(
+                "SELECT tenant_id, knowledge_base_id, lifecycle_state, deleted_at, purge_after "
+                "FROM documents WHERE id = :id"
+            ),
+            {"id": document_id},
+        )
+        row = document_result.mappings().first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="document not found")
+        document = dict(row)
+        tenant_id = str(document["tenant_id"])
         kb_id = str(document["knowledge_base_id"])
-        await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=KnowledgeBaseRole.owner)
-        kb = await get_knowledge_base(conn, tenant_id, kb_id)
-        read_alias = str(kb.get("active_index") or READ_ALIAS) if kb else READ_ALIAS
+        kb_result = await conn.execute(text("SELECT active_index FROM knowledge_bases WHERE id = :id"), {"id": kb_id})
+        kb = kb_result.mappings().first()
+        read_alias = str(kb["active_index"] or READ_ALIAS) if kb else READ_ALIAS
         if document.get("lifecycle_state") == "deleted":
             return DocumentDeleteResponse(
                 document_id=document_id,
@@ -2814,18 +2602,17 @@ async def reprocess_document(document_id: str, request: Request) -> DocumentRepr
     """Queue reprocessing for the current published document version."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     async with connect() as conn:
-        document = await get_document_public(conn, tenant_id, document_id)
-        if document is None or not document.get("current_version_id"):
-            raise HTTPException(status_code=404, detail="document not found")
-        await _require_kb_role(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_id=str(document["knowledge_base_id"]),
-            role=KnowledgeBaseRole.editor,
+        document, _resource, write_access, _share_access = await _load_workspace_viewer_document(
+            conn, actor=actor, document_id=document_id
         )
+        if not document.get("current_version_id") or not write_access:
+            raise HTTPException(status_code=404, detail="document not found")
+        tenant_result = await conn.execute(text("SELECT tenant_id FROM documents WHERE id = :id"), {"id": document_id})
+        tenant_row = tenant_result.mappings().first()
+        if tenant_row is None:
+            raise HTTPException(status_code=404, detail="document not found")
+        tenant_id = str(tenant_row["tenant_id"])
     idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
         request=request,
         actor=actor,
@@ -2866,19 +2653,27 @@ async def reprocess_document(document_id: str, request: Request) -> DocumentRepr
 
 
 async def search(payload: SearchRequest, request: Request) -> SearchResponse:
-    """Run public hybrid search for the viewer-scoped KB set."""
+    """Run search over KBs currently readable through workspace grants."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
     kb_ids = _kb_scope_ids(payload.knowledge_base_ids, settings.default_kb_id)
     try:
         async with connect() as conn:
-            kb_roles = await _load_kb_scope_roles(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_ids=kb_ids,
+            workspace_repository = WorkspaceGrantRepository(conn)
+            visible = await workspace_repository.list_visible_knowledge_bases(
+                user_id=actor.user_id,
+                platform_role=WorkspacePlatformRole(actor.platform_role.value),
             )
+            readable_kbs = {resource.resource_id for resource, scope, _write, _share in visible if scope == "full"}
+            if not set(kb_ids).issubset(readable_kbs):
+                raise HTTPException(status_code=404, detail="knowledge base not found")
+            tenant_rows = await conn.execute(
+                text("SELECT id, tenant_id FROM knowledge_bases WHERE id::text = ANY(:ids)"), {"ids": kb_ids}
+            )
+            tenant_ids = {str(row["tenant_id"]) for row in tenant_rows.mappings() if row["tenant_id"] is not None}
+            if len(tenant_ids) != 1:
+                raise HTTPException(status_code=409, detail="workspace retrieval migration is incomplete")
+            tenant_id = next(iter(tenant_ids))
             resolved_profile = await resolve_retrieval_profile(
                 conn,
                 tenant_id=tenant_id,
@@ -2887,27 +2682,14 @@ async def search(payload: SearchRequest, request: Request) -> SearchResponse:
                 settings=settings,
             )
             payload = payload.model_copy(update={"ranking_profile": resolved_profile.name})
-            access_scopes = await _document_access_scopes(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_ids=kb_ids,
-                kb_roles=kb_roles,
-            )
-            await _authorize_search_identity_filters(
-                conn,
-                tenant_id=tenant_id,
-                kb_ids=kb_ids,
-                access_scopes=access_scopes,
-                payload=payload,
-            )
             return await run_public_search(
                 conn,
                 payload,
                 tenant_id=tenant_id,
                 knowledge_base_ids=kb_ids,
                 settings=settings,
-                document_access_scopes=access_scopes,
+                actor_user_id=actor.user_id,
+                actor_platform_role=WorkspacePlatformRole(actor.platform_role.value),
             )
     except KnowledgeBaseNotReady as exc:
         raise _kb_not_ready_http(exc, actor.request_id) from exc
@@ -2918,7 +2700,9 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
     """Run retrieval, answer generation, diagnostics persistence, and SSE streaming for chat."""
     settings = get_settings()
     actor = await _require_actor(request)
-    tenant_id = require_active_tenant(actor)
+    kb_ids = _kb_scope_ids(payload.knowledge_base_ids, settings.default_kb_id)
+    async with connect() as conn:
+        tenant_id = await _require_full_workspace_kb_scope(conn, actor=actor, kb_ids=kb_ids)
     request_id = str(uuid.uuid4())
     effective_message = payload.message
     conversation_id = payload.conversation_id or str(uuid.uuid4())
@@ -2960,7 +2744,6 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
         )
     except (KeyError, ValueError) as exc:
         raise _unknown_retrieval_profile_http(exc, request_id) from exc
-    kb_ids = _kb_scope_ids(payload.knowledge_base_ids, settings.default_kb_id)
     if payload.conversation_id:
         assert previous_run is not None
         previous_scope = {
@@ -2989,12 +2772,6 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
     )
     try:
         async with connect() as conn:
-            kb_roles = await _load_kb_scope_roles(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_ids=kb_ids,
-            )
             if requested_profile is None:
                 active_profile = await resolve_retrieval_profile(
                     conn,
@@ -3028,20 +2805,13 @@ async def stream_chat_response(payload: ChatRequest, request: Request) -> Stream
                     overrides=chat_overrides,
                     settings=settings,
                 )
-            access_scopes = await _document_access_scopes(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_ids=kb_ids,
-                kb_roles=kb_roles,
-            )
     except KnowledgeBaseNotReady as exc:
         raise _kb_not_ready_http(exc, request_id) from exc
     except RetrievalProfileIncompatible as exc:
         raise _retrieval_profile_incompatible_http(exc, request_id) from exc
     except (KeyError, ValueError) as exc:
         raise _unknown_retrieval_profile_http(exc, request_id) from exc
-    search_filters = {"document_access_scopes": access_scopes}
+    search_filters: dict[str, Any] = {}
     async with connect() as conn:
         initial_usage = _initial_query_run_usage(
             mode=payload.mode.value,
@@ -3707,13 +3477,8 @@ async def query_run_retrieval(query_run_id: str, request: Request) -> dict[str, 
         run = await _load_query_run_for_actor(conn, tenant_id=tenant_id, query_run_id=query_run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="query run not found")
-        await _require_kb_scope_role(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_ids=_query_run_kb_scope(run),
-            role=KnowledgeBaseRole.editor,
-        )
+        for kb_id in _query_run_kb_scope(run):
+            await _require_workspace_kb_write(conn, actor, kb_id)
         events = await load_retrieval_events(conn, tenant_id, query_run_id)
     return {"query_run_id": query_run_id, "run": _query_run_summary(run), "events": _jsonable(events)}
 
@@ -3727,13 +3492,8 @@ async def query_run_feedback(query_run_id: str, payload: QueryRunFeedbackRequest
         run = await _load_query_run_for_actor(conn, tenant_id=tenant_id, query_run_id=query_run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="query run not found")
-        await _require_kb_scope_role(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_ids=_query_run_kb_scope(run),
-            role=KnowledgeBaseRole.editor,
-        )
+        for kb_id in _query_run_kb_scope(run):
+            await _require_workspace_kb_write(conn, actor, kb_id)
         event_payload = {
             "stage": "feedback",
             "rating": payload.rating,
@@ -3762,13 +3522,8 @@ async def query_run_evaluation(
         run = await _load_query_run_for_actor(conn, tenant_id=tenant_id, query_run_id=query_run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="query run not found")
-        await _require_kb_scope_role(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_ids=_query_run_kb_scope(run),
-            role=KnowledgeBaseRole.editor,
-        )
+        for kb_id in _query_run_kb_scope(run):
+            await _require_workspace_kb_write(conn, actor, kb_id)
         event_payload = {
             "stage": "evaluation",
             "evaluator": payload.evaluator,
@@ -3860,13 +3615,7 @@ async def create_research_plan_endpoint(
     try:
         async with connect() as conn:
             for scoped_kb_id in kb_ids:
-                await _require_kb_role(
-                    conn,
-                    actor=actor,
-                    tenant_id=tenant_id,
-                    kb_id=scoped_kb_id,
-                    role=KnowledgeBaseRole.viewer,
-                )
+                await _require_workspace_kb_read(conn, actor, scoped_kb_id)
             profile = await resolve_retrieval_profile(
                 conn,
                 tenant_id=tenant_id,
@@ -3905,18 +3654,18 @@ async def list_research_plans_endpoint(
     tenant_id = require_active_tenant(actor)
     async with connect() as conn:
         rows = await list_research_plans(conn, tenant_id=tenant_id, limit=limit)
+        repository = WorkspaceGrantRepository(conn)
         visible: list[dict[str, Any]] = []
         for row in rows:
-            kb_role = await _load_kb_role_optional(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_id=str(row["knowledge_base_id"]),
+            resource = await repository.load_knowledge_base(str(row["knowledge_base_id"]))
+            if resource is None:
+                continue
+            read, _write, _share, _delete = await repository.authorize(
+                user_id=actor.user_id,
+                platform_role=WorkspacePlatformRole(actor.platform_role.value),
+                resource=resource,
             )
-            is_creator = str(row.get("user_id") or "") == actor.user_id
-            if (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
-                kb_role, KnowledgeBaseRole.editor
-            ):
+            if read:
                 visible.append(_research_plan_summary(row))
     return ResearchPlanListResponse.model_validate({"plans": _jsonable(visible)})
 
@@ -3928,17 +3677,16 @@ async def get_research_plan_endpoint(research_plan_id: str, request: Request) ->
         row = await get_research_plan(conn, tenant_id=tenant_id, research_plan_id=research_plan_id)
         if row is None:
             raise HTTPException(status_code=404, detail="research plan not found")
-        kb_role = await _load_kb_role_optional(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_id=str(row["knowledge_base_id"]),
-        )
-        is_creator = str(row.get("user_id") or "") == actor.user_id
-        can_view = (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
-            kb_role, KnowledgeBaseRole.editor
-        )
-        if not can_view:
+        repository = WorkspaceGrantRepository(conn)
+        resource = await repository.load_knowledge_base(str(row["knowledge_base_id"]))
+        read = False
+        if resource is not None:
+            read, _write, _share, _delete = await repository.authorize(
+                user_id=actor.user_id,
+                platform_role=WorkspacePlatformRole(actor.platform_role.value),
+                resource=resource,
+            )
+        if not read:
             raise HTTPException(status_code=404, detail="research plan not found")
     return ResearchPlanDetail.model_validate(_jsonable(_research_plan_detail(row)))
 
@@ -3966,13 +3714,7 @@ async def patch_research_plan_endpoint(
             next_kb_id,
         )
         for scoped_kb_id in next_scope_ids:
-            await _require_kb_role(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_id=scoped_kb_id,
-                role=KnowledgeBaseRole.viewer,
-            )
+            await _require_workspace_kb_read(conn, actor, scoped_kb_id)
         profile = get_retrieval_profile(
             payload.retrieval_profile or str(row.get("retrieval_profile") or settings.retrieval_profile),
             settings,
@@ -4030,13 +3772,7 @@ async def approve_research_plan_endpoint(research_plan_id: str, request: Request
         kb_id = str(row["knowledge_base_id"])
         kb_ids = _research_plan_scope_ids(row.get("knowledge_base_ids"), kb_id)
         for scoped_kb_id in kb_ids:
-            await _require_kb_role(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_id=scoped_kb_id,
-                role=KnowledgeBaseRole.viewer,
-            )
+            await _require_workspace_kb_read(conn, actor, scoped_kb_id)
         profile = get_retrieval_profile(
             str(row.get("retrieval_profile") or settings.retrieval_profile),
             settings,
@@ -4140,13 +3876,7 @@ async def create_research_run_endpoint(payload: ResearchRunCreate, request: Requ
                 else build_research_questions(payload.topic)
             )
             for scoped_kb_id in kb_ids:
-                await _require_kb_role(
-                    conn,
-                    actor=actor,
-                    tenant_id=tenant_id,
-                    kb_id=scoped_kb_id,
-                    role=KnowledgeBaseRole.viewer,
-                )
+                await _require_workspace_kb_read(conn, actor, scoped_kb_id)
             idempotency_record, owns_idempotency_record = await _claim_operation_idempotency(
                 request=request,
                 actor=actor,
@@ -4225,6 +3955,7 @@ async def list_research_runs_endpoint(
     tenant_id = require_active_tenant(actor)
     async with connect() as conn:
         rows = await list_research_runs(conn, tenant_id=tenant_id, limit=limit)
+        repository = WorkspaceGrantRepository(conn)
         visible: list[dict[str, Any]] = []
         for row in rows:
             scope_rows = await load_research_run_scopes(
@@ -4232,16 +3963,15 @@ async def list_research_runs_endpoint(
                 tenant_id=tenant_id,
                 research_run_id=str(row["id"]),
             )
-            kb_role = await _load_kb_role_optional(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_id=str(row["knowledge_base_id"]),
+            resource = await repository.load_knowledge_base(str(row["knowledge_base_id"]))
+            if resource is None:
+                continue
+            read, _write, _share, _delete = await repository.authorize(
+                user_id=actor.user_id,
+                platform_role=WorkspacePlatformRole(actor.platform_role.value),
+                resource=resource,
             )
-            is_creator = str(row.get("user_id") or "") == actor.user_id
-            if (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
-                kb_role, KnowledgeBaseRole.editor
-            ):
+            if read:
                 visible.append(_research_run_summary(row, knowledge_base_ids=_research_scope_ids(scope_rows)))
     return ResearchRunListResponse.model_validate({"runs": _jsonable(visible)})
 
@@ -4252,38 +3982,15 @@ async def get_research_run_endpoint(research_run_id: str, request: Request) -> R
     tenant_id = require_active_tenant(actor)
     async with connect() as conn:
         run = await _load_research_run_or_404(conn, tenant_id=tenant_id, research_run_id=research_run_id)
-        kb_role = await _authorize_research_run(conn, actor=actor, tenant_id=tenant_id, run=run, action="read")
+        await _authorize_research_run(conn, actor=actor, tenant_id=tenant_id, run=run, action="read")
         scope_rows = await load_research_run_scopes(conn, tenant_id=tenant_id, research_run_id=research_run_id)
         scope_ids = _research_scope_ids(scope_rows) or [str(run["knowledge_base_id"])]
-        access_scopes: dict[str, DocumentAccessScope] = {
-            str(run["knowledge_base_id"]): await load_actor_document_access_scope(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                knowledge_base_id=str(run["knowledge_base_id"]),
-                effective_kb_role=kb_role,
-            )
-        }
-        for scoped_kb_id in scope_ids:
-            if scoped_kb_id in access_scopes:
-                continue
-            scoped_role = await _load_kb_role_optional(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                kb_id=scoped_kb_id,
-            )
-            if not has_kb_role(scoped_role, KnowledgeBaseRole.viewer):
-                continue
-            access_scopes[scoped_kb_id] = await load_actor_document_access_scope(
-                conn,
-                actor=actor,
-                tenant_id=tenant_id,
-                knowledge_base_id=scoped_kb_id,
-                effective_kb_role=scoped_role,
-            )
         records = await load_research_detail_records(conn, tenant_id=tenant_id, research_run_id=research_run_id)
-    detail = _research_detail(run, records=records, access_scope=access_scopes, knowledge_base_ids=scope_ids)
+        records = {
+            **records,
+            "evidence": await _reauthorize_research_evidence(conn, records["evidence"], actor=actor),
+        }
+    detail = _research_detail(run, records=records, knowledge_base_ids=scope_ids)
     return ResearchRunDetail.model_validate(_jsonable(detail))
 
 
@@ -4382,20 +4089,10 @@ async def run_debug_search(payload: DebugSearchRequest, request: Request) -> dic
     )
     query_run_id: str | None = None
     async with connect() as conn:
-        kb_roles = await _require_kb_scope_role(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_ids=kb_ids,
-            role=KnowledgeBaseRole.editor,
-        )
-        access_scopes = await _document_access_scopes(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            kb_ids=kb_ids,
-            kb_roles=kb_roles,
-        )
+        storage_tenants = [await _require_workspace_kb_write(conn, actor, kb_id) for kb_id in kb_ids]
+        if len(set(storage_tenants)) != 1:
+            raise HTTPException(status_code=409, detail="knowledge bases are not yet in one workspace storage scope")
+        tenant_id = storage_tenants[0]
         profile = await resolve_retrieval_profile(
             conn,
             tenant_id=tenant_id,
@@ -4465,7 +4162,6 @@ async def run_debug_search(payload: DebugSearchRequest, request: Request) -> dic
                 top_k=payload.top_k,
                 profile=profile,
                 profile_overrides=payload.retrieval_overrides,
-                search_filters={"document_access_scopes": access_scopes},
             )
         except KnowledgeBaseNotReady as exc:
             await fail_query_run(conn, query_run_id=query_run_id, error_code=exc.code)
@@ -4550,7 +4246,6 @@ async def _require_actor(request: Request) -> ActorContext:
         "/api/v1/auth/local/password",
         "/api/v1/auth/logout",
         "/api/v1/auth/session",
-        "/api/v1/auth/session/tenant",
     }:
         async with connect() as conn:
             user = await load_session_user(conn, user_id=actor.user_id)
@@ -4564,130 +4259,37 @@ def _require_platform_admin(actor: ActorContext) -> None:
         raise AuthorizationError("PLATFORM_ADMIN_REQUIRED", "platform administrator access is required")
 
 
-async def _require_kb_role(
-    conn: Any,
-    *,
-    actor: ActorContext,
-    tenant_id: str,
-    kb_id: str,
-    role: KnowledgeBaseRole,
-) -> KnowledgeBaseRole:
-    """Enforce the effective knowledge-base role unless the actor is platform admin."""
-    actual = await _load_kb_role_optional(
-        conn,
-        actor=actor,
-        tenant_id=tenant_id,
-        kb_id=kb_id,
-    )
-    enforce_kb_role(actual, role)
-    return actual or role
-
-
-async def _load_kb_role_optional(
-    conn: Any,
-    *,
-    actor: ActorContext,
-    tenant_id: str,
-    kb_id: str,
-) -> KnowledgeBaseRole | None:
-    if actor.platform_role == PlatformRole.platform_admin:
-        return KnowledgeBaseRole.owner
-    return await load_effective_knowledge_base_role(
-        conn,
-        user_id=actor.user_id,
-        tenant_id=tenant_id,
-        knowledge_base_id=kb_id,
-    )
-
-
-async def _kb_grant_acl_metadata(
-    conn: Any,
-    *,
-    tenant_id: str,
-    subject_type: GrantSubjectType,
-    subject_id: str,
-    role: KnowledgeBaseRole,
-    actor: ActorContext,
-) -> dict[str, Any]:
-    """Build public ACL sync metadata for KB grant changes."""
-    source = "direct_user_grant"
-    external_group_path = None
-    if subject_type == GrantSubjectType.group:
-        group = await _load_group(conn, tenant_id=tenant_id, group_id=subject_id)
-        group_type = str(group.get("group_type") or "") if group else ""
-        source = "oidc_group_grant" if group_type == GroupType.oidc.value else "local_group_grant"
-        if group is not None and group_type == GroupType.oidc.value:
-            external_group_path = str(group.get("external_id") or group.get("name") or "")
-    synced_at = datetime.now(UTC).isoformat()
-    acl_sync: dict[str, Any] = {
-        "source": source,
-        "status": "in_sync",
-        "last_synced_at": synced_at,
-    }
-    if external_group_path:
-        acl_sync["external_group_path"] = external_group_path
-    return {
-        "schema_version": "kb_grant_acl_metadata_v1",
-        "acl_snapshot": {
-            "scope": "knowledge_base",
-            "subject_type": subject_type.value,
-            "subject_id": subject_id,
-            "role": role.value,
-            "source": "knowledge_base_grants",
-        },
-        "acl_sync": acl_sync,
-        "updated_by_user_id": actor.user_id,
-    }
-
-
-async def _validate_document_access_principals(conn: Any, *, tenant_id: str, document_access: dict[str, Any]) -> None:
-    """Reject foreign users and groups before an ACL is persisted.
-
-    Client identifiers carry no authority.  The check intentionally returns a
-    generic safe validation error instead of confirming a foreign principal.
-    """
-    user_ids = sorted({str(value) for value in document_access.get("user_ids") or [] if str(value)})
-    group_ids = sorted({str(value) for value in document_access.get("group_ids") or [] if str(value)})
-    for table, ids in (("users", user_ids), ("groups", group_ids)):
-        if not ids:
-            continue
+async def _replace_workspace_local_group_members(conn: Any, *, group_id: str, member_user_ids: list[str]) -> None:
+    unique_ids = sorted(set(member_user_ids))
+    if unique_ids:
         result = await conn.execute(
-            text(f"SELECT count(*) FROM {table} WHERE tenant_id=:tenant_id AND id = ANY(CAST(:ids AS uuid[]))"),  # noqa: S608
-            {"tenant_id": tenant_id, "ids": ids},
+            text("SELECT id::text AS id FROM users WHERE id::text = ANY(:ids)"), {"ids": unique_ids}
         )
-        if int(result.scalar_one() or 0) != len(ids):
-            raise HTTPException(status_code=422, detail={"code": "ACCESS_PRINCIPAL_OUT_OF_SCOPE"})
-
-
-async def _replace_local_group_members(
-    conn: Any, *, group_id: str, member_user_ids: list[str], tenant_id: str | None = None
-) -> None:
-    if tenant_id is not None:
-        await _validate_document_access_principals(
-            conn, tenant_id=tenant_id, document_access={"user_ids": member_user_ids, "group_ids": []}
-        )
+        if {str(row["id"]) for row in result.mappings()} != set(unique_ids):
+            raise HTTPException(status_code=422, detail="invalid group member")
     await conn.execute(
-        text("DELETE FROM group_memberships WHERE group_id = :group_id AND membership_type = 'LOCAL'"),
+        text(
+            "DELETE FROM group_memberships WHERE group_id = :group_id "
+            "AND membership_source = 'LOCAL'"
+        ),
         {"group_id": group_id},
     )
-    for user_id in member_user_ids:
+    for user_id in unique_ids:
         await conn.execute(
             text(
                 """
-                INSERT INTO group_memberships(group_id, user_id, membership_type)
+                INSERT INTO group_memberships(group_id, user_id, membership_source)
                 VALUES (:group_id, :user_id, 'LOCAL')
-                ON CONFLICT (group_id, user_id, membership_type) DO NOTHING
+                ON CONFLICT (group_id, user_id, membership_source) DO NOTHING
                 """
             ),
             {"group_id": group_id, "user_id": user_id},
         )
+    await conn.execute(text("UPDATE workspace_authorization_state SET revision = revision + 1 WHERE id = true"))
 
 
-async def _load_group(conn: Any, *, tenant_id: str, group_id: str) -> dict[str, Any] | None:
-    result = await conn.execute(
-        text("SELECT * FROM groups WHERE id = :id AND tenant_id = :tenant_id"),
-        {"id": group_id, "tenant_id": tenant_id},
-    )
+async def _load_workspace_group(conn: Any, *, group_id: str) -> dict[str, Any] | None:
+    result = await conn.execute(text("SELECT * FROM groups WHERE id = :id"), {"id": group_id})
     row = result.mappings().first()
     return dict(row) if row is not None else None
 
@@ -4745,71 +4347,6 @@ def _import_file_name_error() -> HTTPException:
     )
 
 
-def _authority_filter_forbidden() -> HTTPException:
-    return HTTPException(
-        status_code=422,
-        detail={
-            "error": {
-                "code": "AUTHORITY_FILTER_FORBIDDEN",
-                "message": "authority fields cannot be used in a search filter",
-            }
-        },
-    )
-
-
-def _filter_identity_values(payload: SearchRequest, field_name: str) -> list[str]:
-    values: list[str] = []
-    if field_name == "source_id" and payload.filters.source_id:
-        values.append(payload.filters.source_id)
-    for expression in payload.filter_expressions:
-        if expression.field.casefold() != field_name:
-            continue
-        raw_values = expression.value if isinstance(expression.value, list) else [expression.value]
-        values.extend(str(value) for value in raw_values if str(value))
-    return list(dict.fromkeys(values))
-
-
-async def _authorize_search_identity_filters(
-    conn: Any,
-    *,
-    tenant_id: str,
-    kb_ids: list[str],
-    access_scopes: Mapping[str, DocumentAccessScope],
-    payload: SearchRequest,
-) -> None:
-    """Authorize resource identifiers carried by public search filters before retrieval."""
-    forbidden_fields = {"group_id", "group_ids", "object_key", "object_prefix", "prefix", "storage_prefix"}
-    if any(expression.field.casefold() in forbidden_fields for expression in payload.filter_expressions):
-        raise _authority_filter_forbidden()
-
-    requested_kb_ids = _filter_identity_values(payload, "knowledge_base_id")
-    if any(kb_id not in kb_ids for kb_id in requested_kb_ids):
-        raise HTTPException(status_code=404, detail="search filter resource not found")
-
-    for source_id in _filter_identity_values(payload, "source_id"):
-        try:
-            uuid.UUID(source_id)
-        except ValueError:
-            raise HTTPException(status_code=404, detail="search filter resource not found") from None
-        result = await conn.execute(
-            text("SELECT knowledge_base_id FROM knowledge_sources WHERE id = :id AND tenant_id = :tenant_id"),
-            {"id": source_id, "tenant_id": tenant_id},
-        )
-        source = result.mappings().first()
-        if source is None or str(source["knowledge_base_id"]) not in kb_ids:
-            raise HTTPException(status_code=404, detail="search filter resource not found")
-
-    for document_id in _filter_identity_values(payload, "document_id"):
-        document = await get_document_public(conn, tenant_id, document_id)
-        if document is None:
-            raise HTTPException(status_code=404, detail="search filter resource not found")
-        kb_id = str(document["knowledge_base_id"])
-        if kb_id not in kb_ids or not is_document_visible(
-            dict(document.get("metadata") or {}), access_scopes.get(kb_id)
-        ):
-            raise HTTPException(status_code=404, detail="search filter resource not found")
-
-
 async def _require_search_scope_ready(conn: Any, *, tenant_id: str, kb_ids: list[str]) -> None:
     """Validate every requested KB has a registered active search index."""
     for kb_id in kb_ids:
@@ -4832,28 +4369,46 @@ async def _require_search_scope_ready(conn: Any, *, tenant_id: str, kb_ids: list
             )
 
 
-async def _load_viewer_document(conn: Any, *, actor: ActorContext, tenant_id: str, document_id: str) -> dict[str, Any]:
-    """Load an active document and enforce document-level visibility."""
-    document = await get_document_public(conn, tenant_id, document_id)
-    if document is None:
+async def _load_workspace_viewer_document(
+    conn: Any, *, actor: ActorContext, document_id: str
+) -> tuple[dict[str, Any], Any, bool, bool]:
+    """Use live grants/memberships for a public document read."""
+    repository = WorkspaceGrantRepository(conn)
+    resource = await repository.load_document(document_id)
+    if resource is None:
         raise HTTPException(status_code=404, detail="document not found")
-    kb_role = await _load_kb_role_optional(
-        conn,
-        actor=actor,
-        tenant_id=tenant_id,
-        kb_id=str(document["knowledge_base_id"]),
+    read, write, share, _ = await repository.authorize(
+        user_id=actor.user_id,
+        platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        resource=resource,
     )
-    metadata = dict(document.get("metadata") or {})
-    access_scope = await load_actor_document_access_scope(
-        conn,
-        actor=actor,
-        tenant_id=tenant_id,
-        knowledge_base_id=str(document["knowledge_base_id"]),
-        effective_kb_role=kb_role,
-    )
-    if not is_document_visible(metadata, access_scope):
+    if not read:
         raise HTTPException(status_code=404, detail="document not found")
-    return document
+    result = await conn.execute(
+        text(
+            """
+            SELECT d.id, d.tenant_id, d.knowledge_base_id, d.title, d.source_type,
+                   COALESCE(d.metadata ->> 'source_kind', d.source_type) AS source_kind,
+                   d.metadata, d.created_at, d.updated_at,
+                   d.lifecycle_state, d.deleted_at, d.purge_after,
+                   v.id AS current_version_id, v.status AS version_status, v.status AS status,
+                   v.public_metadata ->> 'filename' AS filename, v.public_metadata,
+                   v.parser_route, v.parser_name, v.parser_version, v.content_hash, v.normalized_hash,
+                   v.uploaded_at, v.upload_completed_at, v.ingested_at, v.published_at
+            FROM documents d
+            LEFT JOIN LATERAL (
+              SELECT * FROM document_versions WHERE document_id = d.id
+              ORDER BY created_at DESC LIMIT 1
+            ) v ON true
+            WHERE d.id = :document_id AND d.lifecycle_state = 'active'
+            """
+        ),
+        {"document_id": document_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    return dict(row), resource, write, share
 
 
 def _source_public_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -4866,7 +4421,6 @@ def _source_public_payload(row: dict[str, Any]) -> dict[str, Any]:
         "status": str(row["status"]),
         "config": dict(row.get("config") or {}),
         "metadata": metadata,
-        "document_access_default": normalize_document_access(metadata.get("document_access_default")),
         "refresh_interval_seconds": row.get("refresh_interval_seconds"),
         "last_sync_run_id": str(row["last_sync_run_id"]) if row.get("last_sync_run_id") is not None else None,
         "last_sync_status": str(row["last_sync_status"]) if row.get("last_sync_status") is not None else None,
@@ -4880,8 +4434,6 @@ def _source_public_payload(row: dict[str, Any]) -> dict[str, Any]:
 def _document_public_payload(row: dict[str, Any]) -> dict[str, Any]:
     metadata = dict(row.get("metadata") or {})
     payload = dict(row)
-    payload["document_access"] = normalize_document_access(metadata.get("document_access"))
-    payload["document_access_origin"] = str(metadata.get("document_access_origin") or "")
     payload["provenance"] = public_provenance_from_metadata(
         dict(row.get("public_metadata") or {}),
         document_id=str(row.get("id") or ""),
@@ -5042,54 +4594,6 @@ def _search_snippet(content: str, *, query: str, max_chars: int = 360) -> str:
     return prefix + normalized_content[start:end].strip() + suffix
 
 
-async def _require_kb_scope_role(
-    conn: Any,
-    *,
-    actor: ActorContext,
-    tenant_id: str,
-    kb_ids: list[str],
-    role: KnowledgeBaseRole,
-) -> dict[str, KnowledgeBaseRole]:
-    roles: dict[str, KnowledgeBaseRole] = {}
-    for kb_id in kb_ids:
-        actual = await _require_kb_role(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id, role=role)
-        if actual is not None:
-            roles[kb_id] = actual
-    return roles
-
-
-async def _load_kb_scope_roles(
-    conn: Any,
-    *,
-    actor: ActorContext,
-    tenant_id: str,
-    kb_ids: list[str],
-) -> dict[str, KnowledgeBaseRole | None]:
-    return {
-        kb_id: await _load_kb_role_optional(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id) for kb_id in kb_ids
-    }
-
-
-async def _document_access_scopes(
-    conn: Any,
-    *,
-    actor: ActorContext,
-    tenant_id: str,
-    kb_ids: list[str],
-    kb_roles: Mapping[str, KnowledgeBaseRole | None],
-) -> dict[str, DocumentAccessScope]:
-    return {
-        kb_id: await load_actor_document_access_scope(
-            conn,
-            actor=actor,
-            tenant_id=tenant_id,
-            knowledge_base_id=kb_id,
-            effective_kb_role=kb_roles.get(kb_id),
-        )
-        for kb_id in kb_ids
-    }
-
-
 def _query_run_kb_scope(run: dict[str, Any]) -> list[str]:
     usage = run.get("usage")
     if isinstance(usage, dict):
@@ -5176,30 +4680,49 @@ async def _authorize_research_run(
     tenant_id: str,
     run: dict[str, Any],
     action: str,
-) -> KnowledgeBaseRole:
+) -> None:
+    del tenant_id
     kb_id = str(run["knowledge_base_id"])
-    kb_role = await _load_kb_role_optional(conn, actor=actor, tenant_id=tenant_id, kb_id=kb_id)
+    repository = WorkspaceGrantRepository(conn)
+    resource = await repository.load_knowledge_base(kb_id)
+    if resource is None:
+        raise HTTPException(status_code=404, detail="research run not found")
+    read, write, share, delete = await repository.authorize(
+        user_id=actor.user_id,
+        platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        resource=resource,
+    )
     is_creator = str(run.get("user_id") or "") == actor.user_id
     if action == "read":
-        if (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
-            kb_role, KnowledgeBaseRole.editor
-        ):
-            return cast(KnowledgeBaseRole, kb_role)
-    elif (is_creator and has_kb_role(kb_role, KnowledgeBaseRole.viewer)) or has_kb_role(
-        kb_role, KnowledgeBaseRole.editor
-    ):
-        return cast(KnowledgeBaseRole, kb_role)
+        if read:
+            return
+    elif read and (is_creator or write or share or delete):
+        return
     raise HTTPException(status_code=403, detail="research run access denied")
+
+
+async def _reauthorize_research_evidence(
+    conn: Any,
+    evidence: list[dict[str, Any]],
+    *,
+    actor: ActorContext,
+) -> list[dict[str, Any]]:
+    """Persisted evidence cannot preserve access after document revocation."""
+    allowed = await WorkspaceGrantRepository(conn).authorized_document_ids(
+        user_id=actor.user_id,
+        platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        document_ids=[str(row.get("document_id") or "") for row in evidence],
+    )
+    return [row for row in evidence if str(row.get("document_id") or "") in allowed]
 
 
 def _research_detail(
     run: dict[str, Any],
     *,
     records: dict[str, list[dict[str, Any]]],
-    access_scope: DocumentAccessScope | Mapping[str, DocumentAccessScope],
     knowledge_base_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    evidence = visible_research_evidence(records["evidence"], access_scope)
+    evidence = visible_research_evidence(records["evidence"])
     visible_evidence_ids = {str(row.get("id")) for row in evidence}
     claims = []
     for row in records["claims"]:

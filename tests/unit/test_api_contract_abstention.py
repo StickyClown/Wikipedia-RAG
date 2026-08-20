@@ -7,7 +7,7 @@ import pytest
 from starlette.requests import Request
 
 import wikipediarag.api.handlers as api_app
-from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole, TenantRole
+from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole
 from wikipediarag.config import Settings
 from wikipediarag.retrieval_profile import get_retrieval_profile
 from wikipediarag.schemas import ChatRequest, Evidence, RetrievalResult
@@ -49,8 +49,6 @@ def _actor() -> ActorContext:
     return ActorContext(
         user_id="22222222-2222-4222-8222-222222222222",
         platform_role=PlatformRole.platform_admin,
-        active_tenant_id="11111111-1111-4111-8111-111111111111",
-        tenant_role=TenantRole.tenant_admin,
         session_id="session",
         authentication_method=AuthenticationMethod.local,
         request_id="33333333-3333-4333-8333-333333333333",
@@ -117,11 +115,8 @@ async def test_chat_contract_abstention_completes_and_exposes_safe_sse_usage(mon
     async def require_actor(_request: Request) -> ActorContext:
         return _actor()
 
-    async def load_roles(_conn: object, **_kwargs: Any) -> dict[str, object]:
-        return {"kb": None}
-
-    async def document_scopes(_conn: object, **_kwargs: Any) -> dict[str, object]:
-        return {"kb": object()}
+    async def workspace_scope(_conn: object, **_kwargs: Any) -> str:
+        return "11111111-1111-4111-8111-111111111111"
 
     async def resolve_profile(_conn: object, **_kwargs: Any) -> Any:
         return get_retrieval_profile("test_mock", Settings())
@@ -164,8 +159,7 @@ async def test_chat_contract_abstention_completes_and_exposes_safe_sse_usage(mon
     monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "connect_autocommit", lambda: _FakeConnectionContext())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "_load_kb_scope_roles", load_roles)
-    monkeypatch.setattr(api_app, "_document_access_scopes", document_scopes)
+    monkeypatch.setattr(api_app, "_require_full_workspace_kb_scope", workspace_scope)
     monkeypatch.setattr(api_app, "resolve_retrieval_profile", resolve_profile)
     monkeypatch.setattr(api_app, "create_query_run", create_run)
     monkeypatch.setattr(api_app, "retrieve", retrieve)

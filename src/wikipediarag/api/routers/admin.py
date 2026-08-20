@@ -23,6 +23,3 @@ def _admin(path: str, endpoint: Callable[..., Any], methods: list[str], operatio
 _admin("/api/v1/admin/users", handlers.admin_list_users, ["GET"], "read", "admin_user_collection")
 _admin("/api/v1/admin/users", handlers.admin_create_user, ["POST"], "create", "admin_user_collection")
 _admin("/api/v1/admin/users/{user_id}", handlers.admin_patch_user, ["PATCH"], "update", "admin_user")
-_admin("/api/v1/admin/tenants", handlers.admin_list_tenants, ["GET"], "read", "admin_tenant_collection")
-_admin("/api/v1/admin/tenants", handlers.admin_create_tenant, ["POST"], "create", "admin_tenant_collection")
-_admin("/api/v1/admin/tenants/{tenant_id}", handlers.admin_patch_tenant, ["PATCH"], "update", "admin_tenant")

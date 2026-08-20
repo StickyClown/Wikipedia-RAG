@@ -8,12 +8,13 @@ from botocore.exceptions import ClientError
 from starlette.requests import Request
 
 import wikipediarag.api.handlers as api_app
-from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole, TenantRole
+from wikipediarag.auth import ActorContext, AuthenticationMethod, PlatformRole
 from wikipediarag.config import Settings
 from wikipediarag.db import SCHEMA_SQL
 from wikipediarag.repository import claim_next_job, get_document_public, mark_document_chunks_deleted
 from wikipediarag.search_index import delete_document_chunks
 from wikipediarag.storage import delete_objects
+from wikipediarag.workspace_access import ResourceAccess, ResourceType
 
 
 class _FakeConnectionContext:
@@ -66,7 +67,7 @@ def test_soft_delete_unpublishes_db_chunks_and_claims_only_due_purge_jobs() -> N
     assert "(config ->> 'purge_after')::timestamptz <= now()" in claim_sql
 
 
-def test_opensearch_document_delete_is_tenant_and_kb_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_opensearch_document_delete_is_kb_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
 
     class Client:
@@ -77,7 +78,6 @@ def test_opensearch_document_delete_is_tenant_and_kb_scoped(monkeypatch: pytest.
     monkeypatch.setattr("wikipediarag.search_index.get_client", lambda _settings: Client())
 
     deleted = delete_document_chunks(
-        tenant_id="tenant",
         knowledge_base_id="kb",
         document_id="doc",
         read_alias="alias",
@@ -86,7 +86,7 @@ def test_opensearch_document_delete_is_tenant_and_kb_scoped(monkeypatch: pytest.
     assert deleted == 3
     assert calls[0]["index"] == "alias"
     filters = calls[0]["body"]["query"]["bool"]["filter"]
-    assert {"term": {"tenant_id": "tenant"}} in filters
+    assert not any("tenant_id" in str(item) for item in filters)
     assert {"term": {"knowledge_base_id": "kb"}} in filters
     assert {"term": {"document_id": "doc"}} in filters
 
@@ -147,14 +147,51 @@ async def test_delete_document_endpoint_returns_safe_lifecycle_payload(monkeypat
     actor = ActorContext(
         user_id="22222222-2222-4222-8222-222222222222",
         platform_role=PlatformRole.platform_admin,
-        active_tenant_id="11111111-1111-4111-8111-111111111111",
-        tenant_role=TenantRole.tenant_admin,
         session_id="session",
         authentication_method=AuthenticationMethod.local,
         request_id="33333333-3333-4333-8333-333333333333",
         trace_id="trace",
     )
     events: list[tuple[str, dict[str, Any]]] = []
+
+    class Result:
+        def __init__(self, row: dict[str, Any]) -> None:
+            self.row = row
+
+        def mappings(self) -> Result:
+            return self
+
+        def first(self) -> dict[str, Any]:
+            return self.row
+
+    class Conn:
+        async def execute(self, statement: object, _params: object = None) -> Result:
+            if "SELECT active_index" in str(statement):
+                return Result({"active_index": "kb-read-alias"})
+            return Result(
+                {
+                    "tenant_id": "11111111-1111-4111-8111-111111111111",
+                    "knowledge_base_id": "33333333-3333-4333-8333-333333333333",
+                    "lifecycle_state": "active",
+                }
+            )
+
+    class Context:
+        async def __aenter__(self) -> Conn:
+            return Conn()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class Repository:
+        def __init__(self, _conn: object) -> None:
+            pass
+
+        async def load_document(self, _document_id: str) -> ResourceAccess:
+            return ResourceAccess(ResourceType.document, "doc:1", actor.user_id)
+
+        async def authorize(self, **_kwargs: object) -> tuple[bool, bool, bool, bool]:
+            return True, True, True, True
 
     async def require_actor(_request: Request) -> ActorContext:
         return actor
@@ -187,11 +224,9 @@ async def test_delete_document_endpoint_returns_safe_lifecycle_payload(monkeypat
         return 2
 
     monkeypatch.setattr(api_app, "get_settings", lambda: Settings(document_soft_delete_retention_days=30))
-    monkeypatch.setattr(api_app, "connect", lambda: _FakeConnectionContext())
+    monkeypatch.setattr(api_app, "connect", lambda: Context())
     monkeypatch.setattr(api_app, "_require_actor", require_actor)
-    monkeypatch.setattr(api_app, "get_document_lifecycle", get_lifecycle)
-    monkeypatch.setattr(api_app, "_require_kb_role", require_role)
-    monkeypatch.setattr(api_app, "get_knowledge_base", get_kb)
+    monkeypatch.setattr(api_app, "WorkspaceGrantRepository", Repository)
     monkeypatch.setattr(api_app, "soft_delete_document", soft_delete)
     monkeypatch.setattr(api_app, "create_document_deletion_job", create_job)
     monkeypatch.setattr(api_app, "_audit", audit)
@@ -205,7 +240,7 @@ async def test_delete_document_endpoint_returns_safe_lifecycle_payload(monkeypat
     assert payload["lifecycle_state"] == "deleting"
     assert "object_key" not in str(payload)
     search_delete = [payload for event, payload in events if event == "search_delete"][0]
-    assert search_delete["tenant_id"] == actor.active_tenant_id
+    assert search_delete["tenant_id"] == "11111111-1111-4111-8111-111111111111"
     assert search_delete["knowledge_base_id"] == "33333333-3333-4333-8333-333333333333"
     assert search_delete["document_id"] == "doc:1"
     assert search_delete["read_alias"] == "kb-read-alias"

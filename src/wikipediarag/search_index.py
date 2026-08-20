@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import Any, cast
@@ -9,7 +8,6 @@ from opensearchpy import NotFoundError, OpenSearch
 from opensearchpy.helpers import bulk
 
 from wikipediarag.config import Settings, get_settings
-from wikipediarag.document_access import document_access_filter
 from wikipediarag.ids import stable_hash
 from wikipediarag.wiki_dump import Chunk
 
@@ -25,13 +23,13 @@ def build_index_names(
     retrieval_profile: str,
     embedding_alias: str,
     embedding_dimensions: int,
-    tenant_id: str | None = None,
     knowledge_base_id: str | None = None,
 ) -> dict[str, str]:
-    scope_prefix = stable_hash([tenant_id or "legacy", knowledge_base_id or "legacy"], 10)
+    # Kept as an ignored keyword while callers are being cut over.  Tenant
+    # identity is never stored in, queried from, or used to name an index.
+    scope_prefix = stable_hash([knowledge_base_id or "workspace"], 10)
     suffix = stable_hash(
         [
-            tenant_id or "legacy",
             knowledge_base_id or "legacy",
             source_type,
             snapshot_id,
@@ -84,7 +82,6 @@ def ensure_index(
                 "settings": {"index": {"knn": True, "number_of_shards": 1, "number_of_replicas": 0}},
                 "mappings": {
                     "properties": {
-                        "tenant_id": {"type": "keyword"},
                         "knowledge_base_id": {"type": "keyword"},
                         "document_id": {"type": "keyword"},
                         "document_version_id": {"type": "keyword"},
@@ -118,7 +115,6 @@ def ensure_index(
 def bulk_index_chunks(
     chunks: Iterable[Chunk],
     *,
-    tenant_id: str,
     knowledge_base_id: str,
     settings: Settings | None = None,
     write_alias: str = WRITE_ALIAS,
@@ -140,9 +136,8 @@ def bulk_index_chunks(
         {
             "_op_type": "index",
             "_index": write_alias,
-            "_id": f"{tenant_id}:{knowledge_base_id}:{chunk.id}",
+            "_id": f"{knowledge_base_id}:{chunk.id}",
             "_source": {
-                "tenant_id": tenant_id,
                 "knowledge_base_id": knowledge_base_id,
                 "document_id": chunk.document_id,
                 "document_version_id": str(chunk.metadata.get("document_version_id") or ""),
@@ -181,7 +176,6 @@ def bulk_index_chunks(
 def bm25_search(
     query: str,
     *,
-    tenant_id: str,
     knowledge_base_id: str,
     top_k: int,
     settings: Settings | None = None,
@@ -191,7 +185,6 @@ def bm25_search(
     resolved = settings or get_settings()
     client = get_client(resolved)
     filter_clauses = [
-        {"term": {"tenant_id": tenant_id}},
         {"term": {"knowledge_base_id": knowledge_base_id}},
         # OpenSearch is a derived candidate index.  Publication in PostgreSQL is
         # authoritative, but this cheap predicate keeps staged rows out of the
@@ -225,7 +218,6 @@ def bm25_search(
 def dense_search(
     query_vector: list[float],
     *,
-    tenant_id: str,
     knowledge_base_id: str,
     top_k: int,
     settings: Settings | None = None,
@@ -235,7 +227,6 @@ def dense_search(
     resolved = settings or get_settings()
     client = get_client(resolved)
     filter_clauses = [
-        {"term": {"tenant_id": tenant_id}},
         {"term": {"knowledge_base_id": knowledge_base_id}},
         {"term": {"metadata.publication_status.keyword": "published"}},
         *_public_filter_clauses(filters or {}),
@@ -258,7 +249,6 @@ def dense_search(
 
 def delete_document_chunks(
     *,
-    tenant_id: str,
     knowledge_base_id: str,
     document_id: str,
     settings: Settings | None = None,
@@ -273,7 +263,6 @@ def delete_document_chunks(
                 "query": {
                     "bool": {
                         "filter": [
-                            {"term": {"tenant_id": tenant_id}},
                             {"term": {"knowledge_base_id": knowledge_base_id}},
                             {"term": {"document_id": document_id}},
                         ]
@@ -290,7 +279,6 @@ def delete_document_chunks(
 
 def delete_document_version_chunks(
     *,
-    tenant_id: str,
     knowledge_base_id: str,
     document_version_id: str,
     settings: Settings | None = None,
@@ -305,7 +293,6 @@ def delete_document_version_chunks(
                 "query": {
                     "bool": {
                         "filter": [
-                            {"term": {"tenant_id": tenant_id}},
                             {"term": {"knowledge_base_id": knowledge_base_id}},
                             {"term": {"document_version_id": document_version_id}},
                         ]
@@ -324,7 +311,6 @@ def delete_document_version_chunks(
 
 def read_document_projection(
     *,
-    tenant_id: str,
     knowledge_base_id: str,
     document_id: str,
     limit: int,
@@ -345,7 +331,6 @@ def read_document_projection(
                 "query": {
                     "bool": {
                         "filter": [
-                            {"term": {"tenant_id": tenant_id}},
                             {"term": {"knowledge_base_id": knowledge_base_id}},
                             {"term": {"document_id": document_id}},
                         ]
@@ -355,7 +340,6 @@ def read_document_projection(
                     "chunk_id",
                     "document_version_id",
                     "content_hash",
-                    "metadata.document_access",
                     "metadata.publication_status",
                 ],
             },
@@ -420,57 +404,9 @@ def projection_fingerprint(records: Iterable[dict[str, Any]]) -> str:
                 str(source.get("document_version_id") or ""),
                 str(source.get("content_hash") or metadata.get("content_hash") or ""),
                 str(metadata.get("publication_status") or ""),
-                json.dumps(
-                    metadata.get("document_access") or {},
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
             ]
         )
     return stable_hash(sorted(normalized), 64)
-
-
-def update_document_access(
-    *,
-    tenant_id: str,
-    knowledge_base_id: str,
-    document_id: str,
-    document_access: dict[str, Any],
-    origin: str | None = None,
-    settings: Settings | None = None,
-    read_alias: str = READ_ALIAS,
-) -> int:
-    resolved = settings or get_settings()
-    client = get_client(resolved)
-    script_source = "if (ctx._source.metadata == null) { ctx._source.metadata = new HashMap(); } "
-    script_source += "ctx._source.metadata.document_access = params.document_access;"
-    params: dict[str, Any] = {"document_access": document_access}
-    if origin is not None:
-        script_source += "ctx._source.metadata.document_access_origin = params.origin;"
-        params["origin"] = origin
-    response = client.update_by_query(
-        index=read_alias,
-        body={
-            "script": {
-                "source": script_source,
-                "lang": "painless",
-                "params": params,
-            },
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"tenant_id": tenant_id}},
-                        {"term": {"knowledge_base_id": knowledge_base_id}},
-                        {"term": {"document_id": document_id}},
-                    ]
-                }
-            },
-        },
-        conflicts="proceed",
-        refresh=True,
-    )
-    return int(response.get("updated") or 0)
 
 
 def _public_filter_clauses(filters: dict[str, Any]) -> list[dict[str, Any]]:
@@ -534,7 +470,6 @@ def _public_filter_clauses(filters: dict[str, Any]) -> list[dict[str, Any]]:
         clauses.append({"term": {"document_id": document_id}})
     if title:
         clauses.append({"match_phrase": {"title": title}})
-    clauses.extend(document_access_filter(filters.get("document_access_scope")))
     return clauses
 
 

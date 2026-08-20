@@ -4,10 +4,8 @@ from typing import Any, cast
 
 import pytest
 
-from wikipediarag.auth import KnowledgeBaseRole
-from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.retrieval import _confirm_current_candidates
-from wikipediarag.search_index import bm25_search, dense_search
+from wikipediarag.search_index import bm25_search, dense_search, ensure_index
 
 
 class _SearchClient:
@@ -22,11 +20,35 @@ class _SearchClient:
 def test_bm25_and_dense_queries_require_published_index_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _SearchClient()
     monkeypatch.setattr("wikipediarag.search_index.get_client", lambda _settings: client)
-    bm25_search("needle", tenant_id="t", knowledge_base_id="kb", top_k=5)
-    dense_search([0.1], tenant_id="t", knowledge_base_id="kb", top_k=5)
+    bm25_search("needle", knowledge_base_id="kb", top_k=5)
+    dense_search([0.1], knowledge_base_id="kb", top_k=5)
     for call in client.calls:
         filters = call["body"]["query"]["bool"]["filter"]
         assert {"term": {"metadata.publication_status.keyword": "published"}} in filters
+        assert not any("tenant_id" in str(item) for item in filters)
+
+
+def test_workspace_index_mapping_does_not_store_tenant_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class Indices:
+        def exists(self, **_kwargs: Any) -> bool:
+            return False
+
+        def create(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def exists_alias(self, **_kwargs: Any) -> bool:
+            return True
+
+    class Client:
+        indices = Indices()
+
+    monkeypatch.setattr("wikipediarag.search_index.get_client", lambda _settings: Client())
+    ensure_index()
+
+    properties = captured["body"]["mappings"]["properties"]
+    assert "tenant_id" not in properties
 
 
 @pytest.mark.asyncio
@@ -43,7 +65,7 @@ async def test_candidates_are_confirmed_in_postgresql_before_fusion(monkeypatch:
                 "chunk_id": "restricted",
                 "document_id": "document",
                 "document_version_id": "version",
-                "metadata": {"document_access": {"policy": "restricted", "user_ids": ["other"], "group_ids": []}},
+                "metadata": {},
             },
         }
 
@@ -51,13 +73,11 @@ async def test_candidates_are_confirmed_in_postgresql_before_fusion(monkeypatch:
     candidates = [
         {"chunk_id": value, "metadata": {}, "scores": {"bm25": 1.0}} for value in ("allowed", "staged", "restricted")
     ]
-    scope = DocumentAccessScope(user_id="viewer", kb_role=KnowledgeBaseRole.viewer)
     confirmed = await _confirm_current_candidates(
         cast(Any, object()),
         {"bm25:v0": candidates},
-        tenant_id="tenant",
         knowledge_base_by_label={"bm25:v0": "kb"},
-        search_filters={"document_access_scopes": {"kb": scope}},
+        search_filters=None,
     )
-    assert [item["chunk_id"] for item in confirmed["bm25:v0"]] == ["allowed"]
+    assert [item["chunk_id"] for item in confirmed["bm25:v0"]] == ["allowed", "restricted"]
     assert confirmed["bm25:v0"][0]["scores"] == {"bm25": 1.0}

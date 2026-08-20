@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.answerability import decide_answerability, is_insufficient
 from wikipediarag.config import Settings, get_settings
-from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.embedding import cosine, normalize_for_embedding
 from wikipediarag.ids import stable_hash
 from wikipediarag.model_client import embeddings
@@ -222,7 +221,6 @@ async def retrieve(
     result_sets = await _confirm_current_candidates(
         conn,
         result_sets,
-        tenant_id=tenant_id,
         knowledge_base_by_label={label: knowledge_base_id for label in result_sets},
         search_filters=search_filters,
     )
@@ -543,7 +541,6 @@ async def retrieve_multi(
     result_sets = await _confirm_current_candidates(
         conn,
         result_sets,
-        tenant_id=tenant_id,
         knowledge_base_by_label={label: label.partition(":")[2] for label in result_sets},
         search_filters=search_filters,
     )
@@ -801,7 +798,6 @@ def _safe_bm25(
     try:
         candidates = bm25_search(
             query,
-            tenant_id=tenant_id,
             knowledge_base_id=knowledge_base_id,
             top_k=top_k,
             settings=settings,
@@ -929,7 +925,6 @@ async def dense_search_profile(
             candidates = await asyncio.to_thread(
                 dense_search,
                 query_vector,
-                tenant_id=tenant_id,
                 knowledge_base_id=knowledge_base_id,
                 top_k=top_k,
                 settings=settings,
@@ -963,11 +958,8 @@ async def dense_search_db(
     filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     rows = await fetch_chunks_for_dense_scan(conn, tenant_id, knowledge_base_id, limit=50000)
-    access_scope = _document_access_scope_from_filters(filters)
     candidates: list[dict[str, Any]] = []
     for row in rows:
-        if not is_document_visible(dict(row.get("metadata") or {}), access_scope):
-            continue
         embedding = row["embedding"]
         if not isinstance(embedding, list):
             continue
@@ -1001,29 +993,14 @@ async def dense_search_db(
 
 
 def _filters_for_kb(filters: dict[str, Any] | None, knowledge_base_id: str) -> dict[str, Any] | None:
-    if not filters:
-        return None
-    scoped = {key: value for key, value in filters.items() if key != "document_access_scopes"}
-    scopes = filters.get("document_access_scopes")
-    if isinstance(scopes, dict):
-        scope = scopes.get(knowledge_base_id)
-        if scope is not None:
-            scoped["document_access_scope"] = scope
-    return scoped
-
-
-def _document_access_scope_from_filters(filters: dict[str, Any] | None) -> DocumentAccessScope | None:
-    if not filters:
-        return None
-    scope = filters.get("document_access_scope")
-    return scope if isinstance(scope, DocumentAccessScope) else None
+    del knowledge_base_id
+    return filters
 
 
 async def _confirm_current_candidates(
     conn: AsyncConnection,
     result_sets: dict[str, list[dict[str, Any]]],
     *,
-    tenant_id: str,
     knowledge_base_by_label: dict[str, str],
     search_filters: dict[str, Any] | None,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -1038,19 +1015,15 @@ async def _confirm_current_candidates(
         knowledge_base_id = knowledge_base_by_label.get(label, "")
         rows = await fetch_current_retrieval_chunks(
             conn,
-            tenant_id=tenant_id,
             knowledge_base_id=knowledge_base_id,
             chunk_ids=[str(item.get("chunk_id") or "") for item in candidates],
         )
-        access_scope = _document_access_scope_from_filters(_filters_for_kb(search_filters, knowledge_base_id))
         safe_candidates: list[dict[str, Any]] = []
         for candidate in candidates:
             current = rows.get(str(candidate.get("chunk_id") or ""))
             if current is None:
                 continue
             metadata = {**dict(candidate.get("metadata") or {}), **dict(current.get("metadata") or {})}
-            if not is_document_visible(metadata, access_scope):
-                continue
             safe_candidates.append(
                 {
                     **candidate,

@@ -12,7 +12,6 @@ from redis import asyncio as redis_async
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.config import Settings, get_settings
-from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.ids import stable_hash
 from wikipediarag.repository import (
     fetch_current_retrieval_chunks,
@@ -32,6 +31,8 @@ from wikipediarag.schemas import (
     SearchResponse,
     SearchResult,
 )
+from wikipediarag.workspace_access import PlatformRole
+from wikipediarag.workspace_grants import WorkspaceGrantRepository
 
 SEARCH_MAX_WINDOW = 1000
 SEARCH_INITIAL_WINDOW = 50
@@ -59,7 +60,8 @@ async def run_public_search(
     tenant_id: str,
     knowledge_base_ids: list[str],
     settings: Settings | None = None,
-    document_access_scopes: dict[str, DocumentAccessScope] | None = None,
+    actor_user_id: str | None = None,
+    actor_platform_role: PlatformRole | None = None,
 ) -> SearchResponse:
     resolved = settings or get_settings()
     document_scope_marker = await retrieval_document_scope_marker(
@@ -67,12 +69,12 @@ async def run_public_search(
         tenant_id=tenant_id,
         knowledge_base_ids=knowledge_base_ids,
     )
+    workspace_access_marker = await _workspace_cache_access_marker(conn, actor_user_id)
     fingerprint = _search_fingerprint(
         payload,
-        tenant_id=tenant_id,
         knowledge_base_ids=knowledge_base_ids,
-        document_access_scopes=document_access_scopes,
         document_scope_marker=document_scope_marker,
+        workspace_access_marker=workspace_access_marker,
     )
     offset, cursor_fingerprint = _decode_cursor(payload.cursor) if payload.cursor else (payload.offset, None)
     if cursor_fingerprint is not None and cursor_fingerprint != fingerprint:
@@ -87,18 +89,20 @@ async def run_public_search(
         knowledge_base_ids=knowledge_base_ids,
     )
     search_filters = _opensearch_filter_payload(payload)
-    if document_access_scopes:
-        search_filters["document_access_scopes"] = document_access_scopes
-    trace_id = stable_hash([tenant_id, *knowledge_base_ids, payload.query, offset, window], 32)
-    cache_key = _redis_key(tenant_id, fingerprint)
+    trace_id = stable_hash([*knowledge_base_ids, payload.query, offset, window], 32)
+    cache_key = _redis_key(fingerprint)
     cached_payload = await _redis_get(cache_key, resolved)
     if cached_payload is not None and len(cached_payload.get("results", [])) >= window:
         cached_results = [SearchResult.model_validate(item) for item in cached_payload["results"]]
         cached_results = await _confirm_current_search_results(
             conn,
             cached_results,
-            tenant_id=tenant_id,
-            document_access_scopes=document_access_scopes,
+        )
+        cached_results = await _confirm_workspace_search_results(
+            conn,
+            cached_results,
+            actor_user_id=actor_user_id,
+            actor_platform_role=actor_platform_role,
         )
         page = cached_results[offset : offset + payload.limit + 1]
         has_more = len(page) > payload.limit
@@ -144,23 +148,19 @@ async def run_public_search(
             search_filters=search_filters,
             persist_events=False,
         )
-    filtered = (
-        [
-            item
-            for item in retrieval.evidence
-            if _matches_document_access(item, document_access_scopes) and _matches_request(item, payload)
-        ]
-        if retrieval is not None
-        else []
-    )
+    filtered = [item for item in retrieval.evidence if _matches_request(item, payload)] if retrieval is not None else []
     search_results = [
         _search_result(item, query=payload.query, include_highlights=payload.include_highlights) for item in filtered
     ]
     search_results = await _confirm_current_search_results(
         conn,
         search_results,
-        tenant_id=tenant_id,
-        document_access_scopes=document_access_scopes,
+    )
+    search_results = await _confirm_workspace_search_results(
+        conn,
+        search_results,
+        actor_user_id=actor_user_id,
+        actor_platform_role=actor_platform_role,
     )
     facets = _facets(filtered) if payload.include_facets else []
     await _redis_set(
@@ -187,6 +187,31 @@ async def run_public_search(
     )
 
 
+async def _confirm_workspace_search_results(
+    conn: AsyncConnection,
+    results: list[SearchResult],
+    *,
+    actor_user_id: str | None,
+    actor_platform_role: PlatformRole | None,
+) -> list[SearchResult]:
+    """Reauthorize cached/index candidates in one PostgreSQL batch."""
+    if actor_user_id is None or actor_platform_role is None:
+        return results
+    allowed = await WorkspaceGrantRepository(conn).authorized_document_ids(
+        user_id=actor_user_id,
+        platform_role=actor_platform_role,
+        document_ids=[str(result.document_id or "") for result in results],
+    )
+    return [result for result in results if result.document_id in allowed]
+
+
+async def _workspace_cache_access_marker(conn: AsyncConnection, actor_user_id: str | None) -> str:
+    """Partition search caches by current workspace authority when available."""
+    if actor_user_id is None:
+        return "legacy"
+    return await WorkspaceGrantRepository(conn).cache_access_marker(actor_user_id)
+
+
 def _cache_window(required: int) -> int:
     window = SEARCH_INITIAL_WINDOW
     while window < required and window < SEARCH_MAX_WINDOW:
@@ -194,8 +219,8 @@ def _cache_window(required: int) -> int:
     return window
 
 
-def _redis_key(tenant_id: str, fingerprint: str) -> str:
-    return f"wikipediarag:search:{stable_hash([tenant_id, fingerprint], 32)}"
+def _redis_key(fingerprint: str) -> str:
+    return f"wikipediarag:search:{stable_hash([fingerprint], 32)}"
 
 
 async def _redis_get(key: str, settings: Settings) -> dict[str, Any] | None:
@@ -305,20 +330,11 @@ def _matches_request(evidence: Evidence, payload: SearchRequest) -> bool:
     return all(_matches_expression(evidence, expression) for expression in payload.filter_expressions)
 
 
-def _matches_document_access(evidence: Evidence, scopes: dict[str, DocumentAccessScope] | None) -> bool:
-    if not scopes:
-        return True
-    return is_document_visible(dict(evidence.metadata or {}), scopes.get(evidence.knowledge_base_id))
-
-
 async def _confirm_current_search_results(
     conn: AsyncConnection,
     results: list[SearchResult],
-    *,
-    tenant_id: str,
-    document_access_scopes: dict[str, DocumentAccessScope] | None,
 ) -> list[SearchResult]:
-    """Recheck cache and retrieval output against current publication and ACL state."""
+    """Recheck cache and retrieval output against current publication state."""
     by_kb: dict[str, list[SearchResult]] = defaultdict(list)
     for item in results:
         by_kb[item.knowledge_base_id].append(item)
@@ -326,14 +342,12 @@ async def _confirm_current_search_results(
     for knowledge_base_id, scoped_results in by_kb.items():
         rows = await fetch_current_retrieval_chunks(
             conn,
-            tenant_id=tenant_id,
             knowledge_base_id=knowledge_base_id,
             chunk_ids=[item.chunk_id for item in scoped_results],
         )
-        scope = (document_access_scopes or {}).get(knowledge_base_id)
         for item in scoped_results:
             row = rows.get(item.chunk_id)
-            if row is not None and is_document_visible(dict(row.get("metadata") or {}), scope):
+            if row is not None:
                 allowed.append(item)
     return allowed
 
@@ -554,33 +568,20 @@ def _decode_cursor(cursor: str | None) -> tuple[int, str | None]:
 def _search_fingerprint(
     payload: SearchRequest,
     *,
-    tenant_id: str,
     knowledge_base_ids: list[str],
-    document_access_scopes: dict[str, DocumentAccessScope] | None,
     document_scope_marker: str = "none",
+    workspace_access_marker: str = "legacy",
 ) -> str:
-    scope_payload = {
-        str(kb_id): {
-            "bypass": bool(scope.bypass),
-            "tenant": stable_hash([scope.tenant_id], 16),
-            "user": stable_hash([scope.user_id], 16),
-            "role": str(scope.kb_role or ""),
-            "groups": sorted(stable_hash([item], 16) for item in scope.group_ids),
-        }
-        for kb_id, scope in (document_access_scopes or {}).items()
-    }
-    scope_hash = stable_hash([json.dumps(scope_payload, sort_keys=True)], 32)
     return stable_hash(
         [
             "search_cursor_v3",
-            tenant_id,
             *sorted(knowledge_base_ids),
             " ".join(payload.query.split()).casefold(),
             json.dumps(payload.filters.model_dump(mode="json"), sort_keys=True),
             json.dumps([item.model_dump(mode="json") for item in payload.filter_expressions], sort_keys=True),
             payload.ranking_profile or "",
-            scope_hash,
             document_scope_marker,
+            workspace_access_marker,
         ],
         32,
     )

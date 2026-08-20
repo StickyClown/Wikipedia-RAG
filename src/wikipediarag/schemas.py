@@ -339,8 +339,10 @@ class DocumentStructureResponse(BaseModel):
     source_url: str | None = None
     sections: list[DocumentSection] = Field(default_factory=list)
     public_metadata: dict[str, Any] = Field(default_factory=dict)
-    document_access: dict[str, Any] = Field(default_factory=dict)
-    document_access_origin: str | None = None
+    inherits_kb_access: bool = True
+    write_access: bool = False
+    share_access: bool = False
+    owned_by_current_user: bool = False
     provenance: SourceProvenance = Field(default_factory=SourceProvenance)
 
 
@@ -790,35 +792,39 @@ class UserPatch(BaseModel):
     is_disabled: bool | None = None
 
 
-class TenantCreate(BaseModel):
-    slug: str = Field(min_length=1, max_length=120, pattern=r"^[a-z0-9][a-z0-9-]*$")
-    name: str = Field(min_length=1, max_length=200)
-
-
-class TenantPatch(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=200)
-
-
 class GroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=240)
-    group_type: str = "LOCAL"
-    external_id: str | None = Field(default=None, max_length=500)
+    description: str | None = Field(default=None, max_length=1000)
     member_user_ids: list[str] = Field(default_factory=list, max_length=1000)
 
 
 class GroupPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=240)
+    description: str | None = Field(default=None, max_length=1000)
     member_user_ids: list[str] | None = Field(default=None, max_length=1000)
 
 
-class KnowledgeBaseGrantCreate(BaseModel):
-    subject_type: str
-    subject_id: str = Field(min_length=1, max_length=500)
-    role: str
+class AccessGrantInput(BaseModel):
+    principal_type: str = Field(pattern=r"^(USER|GROUP)$")
+    principal_id: str = Field(min_length=1, max_length=64)
+    permission: str = Field(pattern=r"^(READ|WRITE)$")
 
 
-class KnowledgeBaseGrantPatch(BaseModel):
-    role: str
+class AccessGrantReplaceRequest(BaseModel):
+    access_grants: list[AccessGrantInput] = Field(default_factory=list, max_length=1000)
+    inherits_kb_access: bool | None = None
+
+
+class AccessGrantResponse(BaseModel):
+    id: str
+    principal_type: str
+    principal_id: str
+    permission: str
+
+
+class AccessGrantListResponse(BaseModel):
+    access_grants: list[AccessGrantResponse] = Field(default_factory=list)
+    inherits_kb_access: bool | None = None
 
 
 class LocalLoginRequest(BaseModel):
@@ -832,10 +838,6 @@ class LocalPasswordChangeRequest(BaseModel):
     new_password: str = Field(min_length=12, max_length=1024)
 
 
-class TenantSelectionRequest(BaseModel):
-    tenant_id: str = Field(min_length=1, max_length=64)
-
-
 class AuthUserResponse(BaseModel):
     id: str
     username: str | None = None
@@ -847,8 +849,6 @@ class AuthUserResponse(BaseModel):
 class AuthSessionResponse(BaseModel):
     authenticated: bool
     user: AuthUserResponse | None = None
-    active_tenant_id: str | None = None
-    tenant_role: str | None = None
     authentication_method: str | None = None
     session_id: str | None = None
     csrf_token: str | None = None
@@ -935,7 +935,6 @@ class SourceCreate(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     credentials: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    document_access_default: dict[str, Any] | None = None
     refresh_interval_seconds: int | None = Field(default=None, ge=60)
 
 
@@ -956,7 +955,6 @@ class SourceResponse(BaseModel):
     status: str
     config: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    document_access_default: dict[str, Any] = Field(default_factory=dict)
     refresh_interval_seconds: int | None = None
     last_sync_run_id: str | None = None
     last_sync_status: str | None = None
@@ -964,30 +962,6 @@ class SourceResponse(BaseModel):
     next_sync_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
-
-
-class DocumentAccessPatch(BaseModel):
-    policy: str = Field(pattern=r"^(kb|tenant|restricted)$")
-    user_ids: list[str] = Field(default_factory=list, max_length=1000)
-    group_ids: list[str] = Field(default_factory=list, max_length=1000)
-
-
-class SourceAccessPatch(DocumentAccessPatch):
-    apply_to_existing: bool = True
-
-
-class DocumentAccessResponse(BaseModel):
-    document_id: str
-    knowledge_base_id: str
-    document_access: dict[str, Any]
-    document_access_origin: str
-
-
-class SourceAccessResponse(BaseModel):
-    source_id: str
-    knowledge_base_id: str
-    document_access_default: dict[str, Any]
-    updated_documents: int = 0
 
 
 class AccessGroupResponse(BaseModel):

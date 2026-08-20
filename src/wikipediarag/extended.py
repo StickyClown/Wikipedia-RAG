@@ -6,13 +6,11 @@ import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from wikipediarag.answerability import decide_answerability, is_insufficient
 from wikipediarag.config import Settings
 from wikipediarag.db import connect_autocommit, json_dumps
-from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.embedding import normalize_for_embedding
 from wikipediarag.ids import new_uuid, stable_hash
 from wikipediarag.provenance import public_provenance_from_metadata
@@ -21,6 +19,7 @@ from wikipediarag.repository import fetch_chunk_by_id, insert_retrieval_event
 from wikipediarag.retrieval import make_query_context, query_ref_from_context, retrieve, retrieve_multi
 from wikipediarag.retrieval_profile import RetrievalProfile
 from wikipediarag.schemas import AnswerabilityStatus, Evidence, RetrievalResult, SourceProvenance
+from wikipediarag.workspace_sql import text
 
 StopReason = Literal[
     "evidence_sufficient",
@@ -819,15 +818,15 @@ async def get_neighbors(
     window: int = 1,
     filters: dict[str, Any] | None = None,
 ) -> list[Evidence]:
-    access_scope = _document_access_scope_from_filters(filters, knowledge_base_id)
     center = await fetch_chunk_by_id(
         conn,
         tenant_id=tenant_id,
         knowledge_base_id=knowledge_base_id,
         chunk_id=chunk_id,
     )
-    if center is None or not is_document_visible(dict(center.get("metadata") or {}), access_scope):
+    if center is None:
         return []
+    document_id = str(center.get("document_id") or "")
     rows: list[dict[str, Any]] = []
     previous_id = center.get("prev_chunk_id")
     for _ in range(window):
@@ -841,7 +840,7 @@ async def get_neighbors(
         )
         if row is None:
             break
-        if is_document_visible(dict(row.get("metadata") or {}), access_scope):
+        if str(row.get("document_id") or "") == document_id:
             rows.insert(0, row)
         previous_id = row.get("prev_chunk_id")
     next_id = center.get("next_chunk_id")
@@ -856,26 +855,10 @@ async def get_neighbors(
         )
         if row is None:
             break
-        if is_document_visible(dict(row.get("metadata") or {}), access_scope):
+        if str(row.get("document_id") or "") == document_id:
             rows.append(row)
         next_id = row.get("next_chunk_id")
     return [_evidence_from_chunk_row(row) for row in rows]
-
-
-def _document_access_scope_from_filters(
-    filters: dict[str, Any] | None,
-    knowledge_base_id: str,
-) -> DocumentAccessScope | None:
-    if not filters:
-        return None
-    direct = filters.get("document_access_scope")
-    if isinstance(direct, DocumentAccessScope):
-        return direct
-    scopes = filters.get("document_access_scopes")
-    if isinstance(scopes, dict):
-        scope = scopes.get(knowledge_base_id)
-        return scope if isinstance(scope, DocumentAccessScope) else None
-    return None
 
 
 def _coverage_inventory(query: str, evidence: list[Evidence], profile: RetrievalProfile) -> list[CoverageItem]:

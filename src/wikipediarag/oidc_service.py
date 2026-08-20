@@ -55,7 +55,6 @@ class OidcLoginResult:
     session_id: str
     session_token: str
     expires_at: datetime
-    active_tenant_id: str | None
 
 
 def oidc_login_enabled(settings: Settings) -> bool:
@@ -218,6 +217,14 @@ async def complete_oidc_callback(
         client=client,
     )
     user = await _upsert_oidc_user(conn, settings=settings, issuer=metadata.issuer, claims=claims)
+    if settings.oidc_group_sync_enabled:
+        await sync_workspace_oidc_group_memberships(
+            conn,
+            issuer=metadata.issuer,
+            user_id=str(user["id"]),
+            external_group_ids=normalized_oidc_group_ids(claims, settings.oidc_claim_groups),
+            jit_creation_enabled=settings.oidc_group_jit_creation_enabled,
+        )
     server_tokens = encrypt_server_tokens(
         settings,
         {
@@ -229,24 +236,13 @@ async def complete_oidc_callback(
             "expires_in": token_response.get("expires_in"),
         },
     )
-    active_tenant_id = (
-        None if user["platform_role"] == PlatformRole.platform_admin else await _default_user_tenant(conn, user["id"])
-    )
     created = await create_session(
         conn,
         user_id=user["id"],
         authentication_method=AuthenticationMethod.oidc,
         settings=settings,
-        active_tenant_id=active_tenant_id,
         server_side_tokens=server_tokens,
     )
-    if active_tenant_id is not None:
-        await sync_oidc_group_memberships(
-            conn,
-            tenant_id=active_tenant_id,
-            user_id=user["id"],
-            group_paths=_claim_values(claims, settings.oidc_claim_groups),
-        )
     return OidcLoginResult(
         user_id=user["id"],
         username=user["username"],
@@ -256,7 +252,6 @@ async def complete_oidc_callback(
         session_id=created.session_id,
         session_token=created.session_token,
         expires_at=created.expires_at,
-        active_tenant_id=active_tenant_id,
     )
 
 
@@ -468,61 +463,91 @@ async def _upsert_oidc_user(
     }
 
 
-async def sync_oidc_group_memberships(
+def normalized_oidc_group_ids(claims: dict[str, Any], claim_path: str) -> set[str]:
+    """Parse a nested group claim without retaining its raw value."""
+    value = _claim_value(claims, claim_path)
+    values = value if isinstance(value, list) else [value] if isinstance(value, str) else []
+    return {item.strip() for item in values if isinstance(item, str) and item.strip()}
+
+
+async def sync_workspace_oidc_group_memberships(
     conn: AsyncConnection,
     *,
-    tenant_id: str,
+    issuer: str,
     user_id: str,
-    group_paths: set[str],
-) -> None:
-    await conn.execute(
+    external_group_ids: set[str],
+    jit_creation_enabled: bool,
+) -> dict[str, int]:
+    """Replace OIDC memberships while preserving every local membership."""
+    normalized = sorted(group_id.strip() for group_id in external_group_ids if group_id.strip())
+    removed = await conn.execute(
         text(
             """
-            DELETE FROM group_memberships gm
-            USING groups g
-            WHERE gm.group_id = g.id
-              AND g.tenant_id = :tenant_id
-              AND gm.user_id = :user_id
-              AND gm.membership_type = 'OIDC'
+            DELETE FROM group_memberships gm USING groups g
+            WHERE gm.group_id = g.id AND gm.user_id = :user_id
+              AND gm.membership_source = 'OIDC'
             """
         ),
-        {"tenant_id": tenant_id, "user_id": user_id},
+        {"user_id": user_id},
     )
-    for group_path in sorted(path for path in group_paths if path.startswith("/")):
-        group_id = str(new_uuid())
-        await conn.execute(
-            text(
-                """
-                INSERT INTO groups(id, tenant_id, name, group_type, external_id)
-                VALUES (:id, :tenant_id, :name, 'OIDC', :external_id)
-                ON CONFLICT (tenant_id, group_type, external_id) DO NOTHING
-                """
-            ),
-            {"id": group_id, "tenant_id": tenant_id, "name": group_path, "external_id": group_path},
-        )
+    matched = created = added = ignored = 0
+    for external_id in normalized:
         result = await conn.execute(
             text(
-                """
-                SELECT id
-                FROM groups
-                WHERE tenant_id = :tenant_id AND group_type = 'OIDC' AND external_id = :external_id
-                """
+                "SELECT id FROM groups WHERE group_type = 'OIDC' "
+                "AND external_issuer = :issuer AND external_id = :external_id"
             ),
-            {"tenant_id": tenant_id, "external_id": group_path},
+            {"issuer": issuer, "external_id": external_id},
         )
         row = result.mappings().first()
+        if row is None and jit_creation_enabled:
+            created_result = await conn.execute(
+                text(
+                    """
+                    INSERT INTO groups(id, name, group_type, external_issuer, external_id)
+                    VALUES (:id, :name, 'OIDC', :issuer, :external_id)
+                    ON CONFLICT (external_issuer, external_id) WHERE group_type = 'OIDC' DO NOTHING
+                    RETURNING id
+                    """
+                ),
+                {"id": str(new_uuid()), "name": external_id, "issuer": issuer, "external_id": external_id},
+            )
+            created += int(created_result.mappings().first() is not None)
+            result = await conn.execute(
+                text(
+                    "SELECT id FROM groups WHERE group_type = 'OIDC' "
+                    "AND external_issuer = :issuer AND external_id = :external_id"
+                ),
+                {"issuer": issuer, "external_id": external_id},
+            )
+            row = result.mappings().first()
         if row is None:
+            ignored += 1
             continue
-        await conn.execute(
+        matched += 1
+        membership = await conn.execute(
             text(
                 """
-                INSERT INTO group_memberships(group_id, user_id, membership_type)
+                INSERT INTO group_memberships(group_id, user_id, membership_source)
                 VALUES (:group_id, :user_id, 'OIDC')
-                ON CONFLICT (group_id, user_id, membership_type) DO NOTHING
+                ON CONFLICT (group_id, user_id, membership_source) DO NOTHING
                 """
             ),
             {"group_id": row["id"], "user_id": user_id},
         )
+        added += int(bool(getattr(membership, "rowcount", 0)))
+    if int(getattr(removed, "rowcount", 0) or 0) or added:
+        await conn.execute(text("UPDATE workspace_authorization_state SET revision = revision + 1 WHERE id = true"))
+    return {
+        "received": len(
+            normalized,
+        ),
+        "matched": matched,
+        "created": created,
+        "added": added,
+        "removed": int(getattr(removed, "rowcount", 0) or 0),
+        "ignored": ignored,
+    }
 
 
 async def _unique_username(conn: AsyncConnection, preferred: str) -> str:
@@ -531,23 +556,6 @@ async def _unique_username(conn: AsyncConnection, preferred: str) -> str:
     if result.first() is None:
         return cleaned
     return f"{cleaned[:160]}-{stable_hash([cleaned, new_uuid()], 10)}"
-
-
-async def _default_user_tenant(conn: AsyncConnection, user_id: str) -> str | None:
-    result = await conn.execute(
-        text(
-            """
-            SELECT tenant_id
-            FROM tenant_memberships
-            WHERE user_id = :user_id
-            ORDER BY tenant_id
-            LIMIT 1
-            """
-        ),
-        {"user_id": user_id},
-    )
-    row = result.mappings().first()
-    return str(row["tenant_id"]) if row is not None else None
 
 
 def _profile_from_claims(settings: Settings, claims: dict[str, Any]) -> dict[str, str | None]:

@@ -21,7 +21,12 @@ def _source(
     boundary: B = B.resource,
 ) -> None:
     router.add_contract_route(
-        path, endpoint, methods=methods, authorization=contract(boundary, "kb_editor", operation, scenario, X.deny)
+        path,
+        endpoint,
+        methods=methods,
+        authorization=contract(
+            boundary, "resource_read" if operation == "read" else "resource_write", operation, scenario, X.deny
+        ),
     )
 
 
@@ -43,13 +48,6 @@ _source(
 )
 _source("/api/v1/knowledge-bases/{kb_id}/sources/{source_id}", handlers.get_source, ["GET"], "read", "source")
 _source("/api/v1/knowledge-bases/{kb_id}/sources/{source_id}", handlers.patch_source, ["PATCH"], "update", "source")
-_source(
-    "/api/v1/knowledge-bases/{kb_id}/sources/{source_id}/access",
-    handlers.patch_source_access,
-    ["PATCH"],
-    "update",
-    "source",
-)
 _source(
     "/api/v1/knowledge-bases/{kb_id}/sources/{source_id}:healthcheck",
     handlers.healthcheck_source,

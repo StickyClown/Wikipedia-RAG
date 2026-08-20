@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -15,15 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from wikipediarag.auth import (
     ActorContext,
     AuthenticationMethod,
-    KnowledgeBaseRole,
     PlatformRole,
-    TenantRole,
-    has_kb_role,
 )
 from wikipediarag.claim_verifier import verify_claims
 from wikipediarag.config import Settings, get_settings
 from wikipediarag.db import connect, connect_autocommit
-from wikipediarag.document_access import DocumentAccessScope, is_document_visible
 from wikipediarag.embedding import normalize_for_embedding
 from wikipediarag.ids import stable_hash, stable_uuid
 from wikipediarag.model_client import chat_completion, count_tokens
@@ -42,15 +38,12 @@ from wikipediarag.repository import (
     insert_research_claim_relation,
     insert_research_decision,
     insert_research_reflection,
-    load_actor_document_access_scope,
-    load_effective_knowledge_base_role,
     load_next_research_question,
     load_platform_role,
     load_research_detail_records,
     load_research_run_questions,
     load_research_run_scopes,
     load_resumable_research_episode,
-    load_tenant_role,
     mark_stalled_research_tool_calls,
     record_research_question_rewrites,
     release_research_run_lease,
@@ -88,6 +81,8 @@ from wikipediarag.research_tools import (
 )
 from wikipediarag.retrieval_profile import RetrievalProfile, get_retrieval_profile
 from wikipediarag.schemas import AnswerabilityStatus, Evidence, JobStatus, RetrievalResult
+from wikipediarag.workspace_access import PlatformRole as WorkspacePlatformRole
+from wikipediarag.workspace_grants import WorkspaceGrantRepository
 
 MAX_RESEARCH_QUESTIONS = 8
 EVIDENCE_ABSTRACT_CHARS = 700
@@ -675,28 +670,24 @@ def pack_research_context(
     }
 
 
-def visible_research_evidence(
+def visible_research_evidence(evidence_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return lifecycle-visible evidence after the caller's batch grant check."""
+    return [row for row in evidence_records if bool(row.get("current_retrievable", True))]
+
+
+async def authorize_research_evidence(
+    conn: AsyncConnection,
     evidence_records: list[dict[str, Any]],
-    access_scope: DocumentAccessScope | Mapping[str, DocumentAccessScope],
+    *,
+    actor: ActorContext,
 ) -> list[dict[str, Any]]:
-    visible: list[dict[str, Any]] = []
-    for row in evidence_records:
-        if not bool(row.get("current_retrievable", True)):
-            continue
-        metadata = dict(row.get("metadata") or {})
-        document_metadata = dict(metadata.get("document_metadata") or {})
-        scoped_access: DocumentAccessScope | None = (
-            access_scope if isinstance(access_scope, DocumentAccessScope) else None
-        )
-        if isinstance(access_scope, Mapping):
-            scoped_access = access_scope.get(
-                str(row.get("knowledge_base_id") or document_metadata.get("knowledge_base_id") or "")
-            )
-            if scoped_access is None:
-                continue
-        if is_document_visible(document_metadata, scoped_access):
-            visible.append(row)
-    return visible
+    """Batch-revalidate durable evidence against current workspace authority."""
+    allowed = await WorkspaceGrantRepository(conn).authorized_document_ids(
+        user_id=actor.user_id,
+        platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        document_ids=[str(row.get("document_id") or "") for row in evidence_records],
+    )
+    return visible_research_evidence([row for row in evidence_records if str(row.get("document_id") or "") in allowed])
 
 
 def build_public_research_report(
@@ -1723,9 +1714,8 @@ async def _run_single_episode(
         tool_mode = normalize_research_tool_mode(str(run.get("tool_mode") or DEFAULT_RESEARCH_TOOL_MODE))
         allowed_tools = allowed_research_tools_for_mode(tool_mode)
         actor: ActorContext | None = None
-        access_scopes: dict[str, DocumentAccessScope] = {}
         for scoped_kb_id in scope_ids:
-            scoped_actor, scoped_access_scope = await _actor_and_access_scope(
+            scoped_actor = await _actor_and_access_scope(
                 conn,
                 run=run,
                 tenant_id=tenant_id,
@@ -1733,10 +1723,9 @@ async def _run_single_episode(
             )
             if actor is None:
                 actor = scoped_actor
-            access_scopes[scoped_kb_id] = scoped_access_scope
         assert actor is not None
         budget = context_budget_for_profile(profile, dict(run.get("context_policy") or {}))
-        visible_evidence = visible_research_evidence(previous_records["evidence"], access_scopes)
+        visible_evidence = await authorize_research_evidence(conn, previous_records["evidence"], actor=actor)
         context = pack_research_context(
             topic=str(run["topic"]),
             current_question=str(question["question"]),
@@ -2015,10 +2004,7 @@ async def _run_single_episode(
             exc=exc,
         )
 
-    search_filters = {
-        "document_access_scope": access_scopes[knowledge_base_id],
-        "document_access_scopes": access_scopes,
-    }
+    search_filters: dict[str, Any] = {}
     question_budget = dict(question.get("budget") or {})
     max_rewrites = int(
         question_budget["max_rewrites"]
@@ -2528,36 +2514,30 @@ async def _actor_and_access_scope(
     run: dict[str, Any],
     tenant_id: str,
     knowledge_base_id: str,
-) -> tuple[ActorContext, DocumentAccessScope]:
+) -> ActorContext:
     user_id = str(run.get("user_id") or "")
     platform_role = await load_platform_role(conn, user_id=user_id)
-    tenant_role = await load_tenant_role(conn, user_id=user_id, tenant_id=tenant_id)
-    kb_role = await load_effective_knowledge_base_role(
-        conn,
-        user_id=user_id,
-        tenant_id=tenant_id,
-        knowledge_base_id=knowledge_base_id,
-    )
-    if platform_role is None or not has_kb_role(kb_role, KnowledgeBaseRole.viewer):
+    if platform_role is None:
         raise PermissionError("research run creator no longer has VIEWER access to the knowledge base")
     actor = ActorContext(
         user_id=user_id,
         platform_role=platform_role if isinstance(platform_role, PlatformRole) else PlatformRole.user,
-        active_tenant_id=tenant_id,
-        tenant_role=tenant_role if isinstance(tenant_role, TenantRole) else None,
         session_id=f"research:{run['id']}",
         authentication_method=AuthenticationMethod.local,
         request_id=str(uuid.uuid4()),
         trace_id=stable_hash([run["id"], "actor"], 32),
     )
-    access_scope = await load_actor_document_access_scope(
-        conn,
-        actor=actor,
-        tenant_id=tenant_id,
-        knowledge_base_id=knowledge_base_id,
-        effective_kb_role=kb_role,
+    resource = await WorkspaceGrantRepository(conn).load_knowledge_base(knowledge_base_id)
+    if resource is None:
+        raise PermissionError("research run creator no longer has access to the knowledge base")
+    read, _write, _share, _delete = await WorkspaceGrantRepository(conn).authorize(
+        user_id=user_id,
+        platform_role=WorkspacePlatformRole(actor.platform_role.value),
+        resource=resource,
     )
-    return actor, access_scope
+    if not read:
+        raise PermissionError("research run creator no longer has access to the knowledge base")
+    return actor
 
 
 async def _persist_episode_outputs(

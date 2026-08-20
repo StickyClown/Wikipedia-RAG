@@ -26,7 +26,6 @@ def test_projection_fingerprint_is_independent_of_json_object_field_order() -> N
             "content_hash": "hash",
             "metadata": {
                 "publication_status": "published",
-                "document_access": {"policy": "restricted", "users": ["u"]},
             },
         }
     ]
@@ -37,7 +36,6 @@ def test_projection_fingerprint_is_independent_of_json_object_field_order() -> N
                 "document_version_id": "version",
                 "content_hash": "hash",
                 "metadata": {
-                    "document_access": {"users": ["u"], "policy": "restricted"},
                     "publication_status": "published",
                 },
             }
@@ -58,17 +56,17 @@ def test_projection_bulk_rejects_http_success_with_failed_item(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_access_projection_is_retried_after_index_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_publication_projection_is_retried_after_index_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     retried: list[dict[str, Any]] = []
 
     async def claim(*_args: object, **_kwargs: Any) -> dict[str, Any]:
         return {
             "id": "event",
-            "event_kind": "document_access",
+            "event_kind": "document_publication",
             "tenant_id": "tenant",
             "knowledge_base_id": "kb",
             "document_id": "document",
-            "payload": {"document_access": {"policy": "restricted"}, "origin": "manual"},
+            "payload": {"document_version_id": "version"},
         }
 
     async def kb(*_args: object) -> dict[str, str]:
@@ -91,18 +89,20 @@ async def test_access_projection_is_retried_after_index_failure(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_access_projection_is_completed_after_idempotent_index_update(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_publication_projection_is_completed_after_idempotent_index_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     completed: list[dict[str, Any]] = []
     repairs: list[dict[str, Any]] = []
 
     async def claim(*_args: object, **_kwargs: Any) -> dict[str, Any]:
         return {
             "id": "event",
-            "event_kind": "document_access",
+            "event_kind": "document_publication",
             "tenant_id": "tenant",
             "knowledge_base_id": "kb",
             "document_id": "document",
-            "payload": {"document_access": {"policy": "restricted"}, "origin": "manual"},
+            "payload": {"document_version_id": "version"},
         }
 
     async def kb(*_args: object) -> dict[str, str]:

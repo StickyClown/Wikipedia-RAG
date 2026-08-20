@@ -1,7 +1,7 @@
 # WikipediaRag
 
 WikipediaRag is a Docker-first RAG platform for Russian Wikipedia and uploaded
-document knowledge bases. It provides authenticated multi-tenant ingestion,
+document knowledge bases. It provides workspace resource-grant authorization,
 hybrid retrieval, grounded answers, Extended Search and durable Deep Research.
 
 The repository is a production-shaped MVP, not a finished external production
@@ -11,8 +11,8 @@ deployment. See [current status](docs/STATUS.md) for the active goal and blocker
 
 - React/Vite UI for login, knowledge bases, Wikipedia import, uploads, search,
   chat, research, citations and retrieval debugging.
-- FastAPI API with local/OIDC authentication, server-owned tenant context, KB
-  roles, document ACLs, CSRF protection and safe errors.
+- FastAPI API with local/OIDC authentication, PostgreSQL-authoritative
+  workspace grants, global groups, CSRF protection and safe errors.
 - Asynchronous Wikipedia and document ingestion with validation, parsing,
   normalization, chunking, embedding and versioned publication.
 - Hybrid BM25/vector retrieval, fusion, rerank, parent expansion,
@@ -50,6 +50,22 @@ make up
 
 Default development credentials are `admin` / `admin`. Do not use them outside
 an explicit development environment.
+
+### Clean workspace reset
+
+Legacy tenant databases are not migrated. A fresh workspace deployment may be
+initialized with the dry-run inventory command below. Applying it deletes all
+WikipediaRag data in the configured PostgreSQL schema, MinIO bucket, Redis DB
+and `wiki-chunks-*` OpenSearch indices; it never targets other deployments.
+
+```bash
+make workspace-reset
+WORKSPACE_RESET_ENABLED=true make workspace-reset \
+  WORKSPACE_RESET_ARGS="--apply --all-data-confirmed"
+```
+
+Stop API and worker writers before applying a reset. Production use requires a
+separate approved maintenance window and verified target configuration.
 
 For Wikipedia import, place a ZIM file under ignored `zim/*.zim`, then run:
 

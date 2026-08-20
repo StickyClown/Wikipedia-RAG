@@ -25,7 +25,7 @@ def _document(
         path,
         endpoint,
         methods=methods,
-        authorization=contract(B.resource, "kb_viewer", operation, scenario, X.deny, exposure=exposure),
+        authorization=contract(B.resource, "resource_read", operation, scenario, X.deny, exposure=exposure),
     )
 
 
@@ -39,7 +39,18 @@ _document(
     exposure=(E.document,),
 )
 _document(
-    "/api/v1/documents/{document_id}/access", handlers.patch_document_access, ["PATCH"], "update", "document_access"
+    "/api/v1/documents/{document_id}/access-grants",
+    handlers.list_document_access_grants,
+    ["GET"],
+    "read",
+    "document_access_grants",
+)
+_document(
+    "/api/v1/documents/{document_id}/access-grants",
+    handlers.replace_document_access_grants,
+    ["PUT"],
+    "replace",
+    "document_access_grants",
 )
 _document(
     "/api/v1/documents/{document_id}/structure",

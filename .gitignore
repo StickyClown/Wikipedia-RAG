@@ -17,6 +17,7 @@ services/ui/test-results/
 .DS_Store
 .idea/
 .vscode/
+.serena/
 artifacts/
 RRNCB/
 data/
@@ -26,6 +27,7 @@ models/
 *.gguf
 uploads/
 secrets/
+infra/keycloak/smoke-secrets/
 *.pem
 *.key
 zip/

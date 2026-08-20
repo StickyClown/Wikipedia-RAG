@@ -4,11 +4,15 @@ from typing import Any, cast
 
 import pytest
 
-from wikipediarag.auth import KnowledgeBaseRole
 from wikipediarag.config import Settings
-from wikipediarag.document_access import DocumentAccessScope
 from wikipediarag.schemas import Evidence, FilterExpression, SearchFilters, SearchRequest
-from wikipediarag.search_service import _opensearch_filter_payload, run_public_search
+from wikipediarag.search_service import (
+    _confirm_workspace_search_results,
+    _opensearch_filter_payload,
+    _search_fingerprint,
+    run_public_search,
+)
+from wikipediarag.workspace_access import PlatformRole
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +62,77 @@ def _evidence(
         scores={"rerank": score, "fusion": score / 2},
         ranks={"rerank": 1},
         metadata=metadata,
+    )
+
+
+async def test_workspace_candidate_confirmation_removes_revoked_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    class Repository:
+        def __init__(self, _conn: object) -> None:
+            pass
+
+        async def authorized_document_ids(self, **kwargs: Any) -> frozenset[str]:
+            calls.append(kwargs["document_ids"])
+            return frozenset({"doc:visible"})
+
+    monkeypatch.setattr("wikipediarag.search_service.WorkspaceGrantRepository", Repository)
+    results = [
+        _search_result_for_workspace("doc:visible"),
+        _search_result_for_workspace("doc:revoked"),
+    ]
+
+    filtered = await _confirm_workspace_search_results(
+        cast(Any, object()),
+        results,
+        actor_user_id="user",
+        actor_platform_role=PlatformRole.user,
+    )
+
+    assert calls == [["doc:visible", "doc:revoked"]]
+    assert [item.document_id for item in filtered] == ["doc:visible"]
+
+
+def test_workspace_cache_marker_partitions_equivalent_searches() -> None:
+    payload = SearchRequest(query="verification")
+    shared = (["kb"], "documents")
+
+    assert _search_fingerprint(
+        payload,
+        knowledge_base_ids=shared[0],
+        document_scope_marker=shared[1],
+        workspace_access_marker="user-a|group-a|8",
+    ) != _search_fingerprint(
+        payload,
+        knowledge_base_ids=shared[0],
+        document_scope_marker=shared[1],
+        workspace_access_marker="user-b|group-a|8",
+    )
+    assert _search_fingerprint(
+        payload,
+        knowledge_base_ids=shared[0],
+        document_scope_marker=shared[1],
+        workspace_access_marker="user-a|group-a|8",
+    ) != _search_fingerprint(
+        payload,
+        knowledge_base_ids=shared[0],
+        document_scope_marker=shared[1],
+        workspace_access_marker="user-a|group-a|9",
+    )
+
+
+def _search_result_for_workspace(document_id: str) -> Any:
+    from wikipediarag.schemas import SearchResult
+
+    return SearchResult(
+        chunk_id=f"chunk:{document_id}",
+        document_id=document_id,
+        knowledge_base_id="kb",
+        title="Report",
+        snippet="safe",
+        source_url="http://localhost/doc",
+        source_type="upload_document",
+        score=1.0,
     )
 
 
@@ -184,13 +259,10 @@ async def test_public_search_applies_simple_and_typed_filters(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_public_search_trims_restricted_documents_for_unauthorized_viewer(
+async def test_public_search_ignores_legacy_document_access_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[dict[str, Any]] = []
-
     async def fake_retrieve(*_args: Any, **kwargs: Any) -> Any:
-        calls.append(kwargs)
         from wikipediarag.schemas import RetrievalResult
 
         return RetrievalResult(
@@ -208,8 +280,6 @@ async def test_public_search_trims_restricted_documents_for_unauthorized_viewer(
         )
 
     monkeypatch.setattr("wikipediarag.search_service.retrieve", fake_retrieve)
-    scope = DocumentAccessScope(user_id="viewer-user", kb_role=KnowledgeBaseRole.viewer, group_ids=frozenset())
-
     response = await run_public_search(
         cast(Any, object()),
         SearchRequest(
@@ -220,15 +290,13 @@ async def test_public_search_trims_restricted_documents_for_unauthorized_viewer(
         tenant_id="11111111-1111-4111-8111-111111111111",
         knowledge_base_ids=["33333333-3333-4333-8333-333333333333"],
         settings=Settings(),
-        document_access_scopes={"33333333-3333-4333-8333-333333333333": scope},
     )
 
-    assert calls[0]["search_filters"]["document_access_scopes"] == {"33333333-3333-4333-8333-333333333333": scope}
-    assert [item.chunk_id for item in response.results] == ["chunk:open"]
+    assert [item.chunk_id for item in response.results] == ["chunk:open", "chunk:restricted"]
 
 
 @pytest.mark.asyncio
-async def test_public_search_allows_tenant_document_without_kb_role(
+async def test_public_search_does_not_interpret_legacy_tenant_document_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fake_retrieve(*_args: Any, **_kwargs: Any) -> Any:
@@ -260,19 +328,13 @@ async def test_public_search_allows_tenant_document_without_kb_role(
         tenant_id="11111111-1111-4111-8111-111111111111",
         knowledge_base_ids=["33333333-3333-4333-8333-333333333333"],
         settings=Settings(),
-        document_access_scopes={
-            "33333333-3333-4333-8333-333333333333": DocumentAccessScope(
-                tenant_id="11111111-1111-4111-8111-111111111111",
-                user_id="viewer-user",
-            )
-        },
     )
 
-    assert [item.chunk_id for item in response.results] == ["chunk:tenant"]
+    assert [item.chunk_id for item in response.results] == ["chunk:kb", "chunk:tenant"]
 
 
 @pytest.mark.asyncio
-async def test_public_search_allows_restricted_documents_for_matching_group(
+async def test_public_search_does_not_interpret_legacy_group_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fake_retrieve(*_args: Any, **_kwargs: Any) -> Any:
@@ -303,12 +365,6 @@ async def test_public_search_allows_restricted_documents_for_matching_group(
         tenant_id="11111111-1111-4111-8111-111111111111",
         knowledge_base_ids=["33333333-3333-4333-8333-333333333333"],
         settings=Settings(),
-        document_access_scopes={
-            "33333333-3333-4333-8333-333333333333": DocumentAccessScope(
-                user_id="viewer-user",
-                group_ids=frozenset({"group:1"}),
-            )
-        },
     )
 
     assert [item.chunk_id for item in response.results] == ["chunk:restricted"]

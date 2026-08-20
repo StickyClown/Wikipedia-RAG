@@ -4,7 +4,7 @@ TEST ?=
 PROVIDER ?= mock
 EVAL_COUNT ?= 150
 
-.PHONY: bootstrap up dev-up down migrate lint format-check typecheck test-unit test-integration test-e2e test-functional-retrieval test-functional-ui test-functional-reliability test-functional-model-runtime test-architecture functional-up smoke eval eval-smoke eval-generate eval-full eval-document-prepare eval-document-ingest eval-document-run eval-document-status eval-quality-scaffold eval-quality-prepare eval-quality-review eval-quality-freeze eval-quality-ingest eval-quality-run eval-quality-status eval-quality-report check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload reliability-smoke verify-document-corpus verify-cross-tenant-hardening verify-live-http-authorization-matrix verify-provider-acl-revocation deep-research-smoke deep-research-hard-smoke deep-research-hard-gate deep-research-matrix deep-research-tool-matrix
+.PHONY: bootstrap up dev-up down migrate workspace-reset lint format-check typecheck test-unit test-integration test-e2e test-functional-retrieval test-functional-ui test-functional-reliability test-functional-model-runtime test-architecture functional-up smoke eval eval-smoke eval-generate eval-full eval-document-prepare eval-document-ingest eval-document-run eval-document-status eval-quality-scaffold eval-quality-prepare eval-quality-review eval-quality-freeze eval-quality-ingest eval-quality-run eval-quality-status eval-quality-report check-all import-wiki-small import-wiki-full import-zim-small smoke-models release-gate demo-release-gate verify-document-upload reliability-smoke verify-document-corpus verify-cross-tenant-hardening verify-live-http-authorization-matrix verify-provider-acl-revocation deep-research-smoke deep-research-hard-smoke deep-research-hard-gate deep-research-matrix deep-research-tool-matrix
 
 bootstrap:
 	uv sync --all-groups
@@ -20,6 +20,11 @@ down:
 
 migrate:
 	docker compose run --rm api python -m wikipediarag.migrate
+
+# Dry-run by default. Apply requires WORKSPACE_RESET_ENABLED=true plus
+# --apply --all-data-confirmed in WORKSPACE_RESET_ARGS.
+workspace-reset:
+	uv run python -m wikipediarag.cli workspace-reset $(WORKSPACE_RESET_ARGS)
 
 lint:
 	uv run ruff check .

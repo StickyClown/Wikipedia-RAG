@@ -29,12 +29,6 @@ import { interpolate, Locale, useLocale } from "./i18n";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
-const DEFAULT_DOCUMENT_ACCESS: DocumentAccess = {
-  policy: "kb",
-  user_ids: [],
-  group_ids: [],
-};
-
 const SOURCE_KINDS = [
   "confluence_dc",
   "jira_dc",
@@ -314,8 +308,6 @@ type UploadItemState = {
 type AuthSession = {
   authenticated: boolean;
   csrf_token?: string | null;
-  active_tenant_id?: string | null;
-  tenant_role?: string | null;
   user?: {
     id: string;
     username?: string | null;
@@ -343,35 +335,6 @@ type RetrievalProfileCatalog = {
   scope_error_code?: string | null;
 };
 
-type DocumentAccessPolicy = "kb" | "tenant" | "restricted";
-
-type DocumentAccess = {
-  policy: DocumentAccessPolicy;
-  user_ids: string[];
-  group_ids: string[];
-};
-
-type AccessGroup = {
-  id: string;
-  name: string;
-  group_type: string;
-  external_id?: string | null;
-};
-
-type DocumentAccessResponse = {
-  document_id: string;
-  knowledge_base_id: string;
-  document_access: DocumentAccess;
-  document_access_origin: string;
-};
-
-type SourceAccessResponse = {
-  source_id: string;
-  knowledge_base_id: string;
-  document_access_default: DocumentAccess;
-  updated_documents: number;
-};
-
 type SourceResponse = {
   id: string;
   knowledge_base_id: string;
@@ -380,7 +343,6 @@ type SourceResponse = {
   status: string;
   config: Record<string, unknown>;
   metadata: Record<string, unknown>;
-  document_access_default: DocumentAccess;
   refresh_interval_seconds?: number | null;
   last_sync_run_id?: string | null;
   last_sync_status?: string | null;
@@ -514,8 +476,33 @@ type DocumentStructure = {
   source_url?: string | null;
   sections: DocumentSection[];
   public_metadata?: Record<string, unknown>;
-  document_access: DocumentAccess;
-  document_access_origin?: string | null;
+  inherits_kb_access: boolean;
+  write_access: boolean;
+  share_access: boolean;
+  owned_by_current_user: boolean;
+};
+
+type AccessGroup = {
+  id: string;
+  name: string;
+  group_type: string;
+};
+
+type AccessGrant = {
+  id?: string;
+  principal_type: "USER" | "GROUP";
+  principal_id: string;
+  permission: "READ" | "WRITE";
+};
+
+type AccessGrantList = {
+  access_grants: AccessGrant[];
+  inherits_kb_access?: boolean | null;
+};
+
+type WorkspaceGroup = AccessGroup & {
+  description?: string | null;
+  member_user_ids: string[];
 };
 
 type DocumentContextChunk = {
@@ -841,11 +828,6 @@ export function App() {
   const [sourcesError, setSourcesError] = useState("");
   const [sourceStatus, setSourceStatus] = useState("");
   const [sourceBusy, setSourceBusy] = useState<Record<string, boolean>>({});
-  const [accessGroups, setAccessGroups] = useState<AccessGroup[]>([]);
-  const [canManageAccess, setCanManageAccess] = useState(false);
-  const [sourceAccess, setSourceAccess] = useState<DocumentAccess>(
-    DEFAULT_DOCUMENT_ACCESS,
-  );
   const [sourceRuns, setSourceRuns] = useState<
     Record<string, SourceSyncRunResponse>
   >({});
@@ -885,8 +867,19 @@ export function App() {
   >([]);
   const [viewerBusy, setViewerBusy] = useState(false);
   const [viewerSearchBusy, setViewerSearchBusy] = useState(false);
-  const [viewerAccessBusy, setViewerAccessBusy] = useState(false);
   const [viewerError, setViewerError] = useState("");
+  const [viewerAccess, setViewerAccess] = useState<AccessGrantList | null>(
+    null,
+  );
+  const [viewerAccessGroups, setViewerAccessGroups] = useState<AccessGroup[]>(
+    [],
+  );
+  const [viewerAccessBusy, setViewerAccessBusy] = useState(false);
+  const [workspaceGroups, setWorkspaceGroups] = useState<WorkspaceGroup[]>([]);
+  const [groupName, setGroupName] = useState("");
+  const [groupDescription, setGroupDescription] = useState("");
+  const [groupMembers, setGroupMembers] = useState("");
+  const [groupStatus, setGroupStatus] = useState("");
   const [researchTopic, setResearchTopic] = useState(
     "Сделай глубокое исследование по выбранной базе знаний",
   );
@@ -911,6 +904,17 @@ export function App() {
     useState<ResearchRunDetail | null>(null);
   const [researchBusy, setResearchBusy] = useState(false);
   const [researchError, setResearchError] = useState("");
+
+  useEffect(() => {
+    if (
+      session.authenticated &&
+      session.user?.platform_role === "PLATFORM_ADMIN"
+    ) {
+      void loadWorkspaceGroups();
+    } else {
+      setWorkspaceGroups([]);
+    }
+  }, [session.authenticated, session.user?.platform_role]);
 
   useEffect(() => {
     fetch(`${API_BASE}/ready`)
@@ -969,8 +973,6 @@ export function App() {
   useEffect(() => {
     if (!session.authenticated || !selectedKnowledgeBaseId) {
       setSources([]);
-      setAccessGroups([]);
-      setCanManageAccess(false);
       setSourcesLoading(false);
       setSourcesError("");
       return;
@@ -997,34 +999,7 @@ export function App() {
         if (!cancelled) setSourcesLoading(false);
       }
     }
-    async function loadSelectedAccessGroups() {
-      try {
-        const response = await fetch(
-          `${API_BASE}/api/v1/knowledge-bases/${encodeURIComponent(selectedKnowledgeBaseId)}/access-groups`,
-          { credentials: "include" },
-        );
-        if (response.status === 403) {
-          if (!cancelled) {
-            setAccessGroups([]);
-            setCanManageAccess(false);
-          }
-          return;
-        }
-        if (!response.ok) throw new Error(await response.text());
-        const payload = (await response.json()) as AccessGroup[];
-        if (!cancelled) {
-          setAccessGroups(payload);
-          setCanManageAccess(true);
-        }
-      } catch {
-        if (!cancelled) {
-          setAccessGroups([]);
-          setCanManageAccess(false);
-        }
-      }
-    }
     void loadSelectedSources();
-    void loadSelectedAccessGroups();
     return () => {
       cancelled = true;
     };
@@ -1480,6 +1455,73 @@ export function App() {
       setResearchKnowledgeBaseIds([items[0].id]);
   }
 
+  async function loadWorkspaceGroups() {
+    if (session.user?.platform_role !== "PLATFORM_ADMIN") return;
+    const response = await apiFetch("/api/v1/groups");
+    if (!response.ok) {
+      setGroupStatus(await response.text());
+      return;
+    }
+    setWorkspaceGroups((await response.json()) as WorkspaceGroup[]);
+  }
+
+  async function createWorkspaceGroup(event: FormEvent) {
+    event.preventDefault();
+    if (!groupName.trim()) return;
+    setGroupStatus("");
+    const member_user_ids = groupMembers
+      .split(/[\s,]+/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const response = await apiFetch("/api/v1/groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: groupName.trim(),
+        description: groupDescription.trim() || null,
+        member_user_ids,
+      }),
+    });
+    if (!response.ok) {
+      setGroupStatus(await response.text());
+      return;
+    }
+    setGroupName("");
+    setGroupDescription("");
+    setGroupMembers("");
+    setGroupStatus(locale === "ru" ? "Группа создана" : "Group created");
+    await loadWorkspaceGroups();
+  }
+
+  async function updateWorkspaceGroup(group: WorkspaceGroup) {
+    if (group.group_type !== "LOCAL") return;
+    const description = window.prompt(locale === "ru" ? "Описание группы" : "Group description", group.description ?? "");
+    if (description === null) return;
+    const members = window.prompt(
+      locale === "ru" ? "ID участников через запятую" : "Member IDs, comma-separated",
+      group.member_user_ids.join(", "),
+    );
+    if (members === null) return;
+    const response = await apiFetch(`/api/v1/groups/${encodeURIComponent(group.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        description: description.trim() || null,
+        member_user_ids: members.split(/[\s,]+/).map((value) => value.trim()).filter(Boolean),
+      }),
+    });
+    setGroupStatus(response.ok ? (locale === "ru" ? "Группа обновлена" : "Group updated") : await response.text());
+    if (response.ok) await loadWorkspaceGroups();
+  }
+
+  async function deleteWorkspaceGroup(group: WorkspaceGroup) {
+    if (group.group_type !== "LOCAL") return;
+    if (!window.confirm(locale === "ru" ? `Удалить группу «${group.name}»?` : `Delete group “${group.name}”?`)) return;
+    const response = await apiFetch(`/api/v1/groups/${encodeURIComponent(group.id)}`, { method: "DELETE" });
+    setGroupStatus(response.ok ? (locale === "ru" ? "Группа удалена" : "Group deleted") : await response.text());
+    if (response.ok) await loadWorkspaceGroups();
+  }
+
   async function loadSources(kbId = selectedKnowledgeBaseId) {
     if (!kbId) return;
     setSourcesLoading(true);
@@ -1553,7 +1595,6 @@ export function App() {
             config: parseJsonObject("config", sourceConfigText),
             credentials: parseJsonObject("credentials", sourceCredentialsText),
             refresh_interval_seconds: refreshInterval,
-            document_access_default: sourceAccess,
             metadata: { ui_created: true },
           }),
         },
@@ -1636,34 +1677,6 @@ export function App() {
       setSourcesError(error instanceof Error ? error.message : String(error));
     } finally {
       setSourceBusy((busy) => ({ ...busy, [source.id]: false }));
-    }
-  }
-
-  async function patchSourceAccess(
-    source: SourceResponse,
-    documentAccess: DocumentAccess,
-  ) {
-    setSourceBusy((busy) => ({ ...busy, [`${source.id}:access`]: true }));
-    setSourcesError("");
-    try {
-      const response = await apiFetch(
-        `/api/v1/knowledge-bases/${encodeURIComponent(source.knowledge_base_id)}/sources/${encodeURIComponent(source.id)}/access`,
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...documentAccess, apply_to_existing: true }),
-        },
-      );
-      if (!response.ok) throw new Error(await response.text());
-      const payload = (await response.json()) as SourceAccessResponse;
-      setSourceStatus(
-        `${source.name}: access updated for ${payload.updated_documents} documents`,
-      );
-      await loadSources(source.knowledge_base_id);
-    } catch (error) {
-      setSourcesError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setSourceBusy((busy) => ({ ...busy, [`${source.id}:access`]: false }));
     }
   }
 
@@ -2371,11 +2384,36 @@ export function App() {
       }
       const structure = (await structureResponse.json()) as DocumentStructure;
       setViewerStructure(structure);
+      if (structure.share_access) {
+        setViewerAccessBusy(true);
+        const [grantsResponse, groupsResponse] = await Promise.all([
+          apiFetch(
+            `/api/v1/documents/${encodeURIComponent(item.document_id)}/access-grants`,
+          ),
+          apiFetch(
+            `/api/v1/knowledge-bases/${encodeURIComponent(structure.knowledge_base_id)}/access-groups`,
+          ),
+        ]);
+        if (!grantsResponse.ok || !groupsResponse.ok) {
+          throw new Error(
+            locale === "ru"
+              ? "Не удалось загрузить настройки доступа"
+              : "Unable to load access settings",
+          );
+        }
+        setViewerAccess((await grantsResponse.json()) as AccessGrantList);
+        setViewerAccessGroups((await groupsResponse.json()) as AccessGroup[]);
+        setViewerAccessBusy(false);
+      } else {
+        setViewerAccess(null);
+        setViewerAccessGroups([]);
+      }
       await loadDocumentContext(item.document_id, { chunkId: item.chunk_id });
     } catch (error) {
       setViewerError(error instanceof Error ? error.message : String(error));
     } finally {
       setViewerBusy(false);
+      setViewerAccessBusy(false);
     }
   }
 
@@ -2446,17 +2484,36 @@ export function App() {
     }
   }
 
-  async function patchViewerAccess(documentAccess: DocumentAccess) {
+  function closeDocumentViewer() {
+    setViewerStructure(null);
+    setViewerContext(null);
+    setViewerSearchResults([]);
+    setViewerSearchQuery("");
+    setViewerError("");
+    setViewerAccess(null);
+    setViewerAccessGroups([]);
+  }
+
+  async function replaceViewerAccess(next: AccessGrantList) {
     if (!viewerStructure) return;
     setViewerAccessBusy(true);
     setViewerError("");
     try {
       const response = await apiFetch(
-        `/api/v1/documents/${encodeURIComponent(viewerStructure.document_id)}/access`,
+        `/api/v1/documents/${encodeURIComponent(viewerStructure.document_id)}/access-grants`,
         {
-          method: "PATCH",
+          method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(documentAccess),
+          body: JSON.stringify({
+            access_grants: next.access_grants.map(
+              ({ principal_type, principal_id, permission }) => ({
+                principal_type,
+                principal_id,
+                permission,
+              }),
+            ),
+            inherits_kb_access: next.inherits_kb_access ?? true,
+          }),
         },
       );
       if (!response.ok) {
@@ -2464,25 +2521,12 @@ export function App() {
           await responseErrorMessage(response, t, "request_failed"),
         );
       }
-      const payload = (await response.json()) as DocumentAccessResponse;
-      setViewerStructure({
-        ...viewerStructure,
-        document_access: payload.document_access,
-        document_access_origin: payload.document_access_origin,
-      });
+      setViewerAccess((await response.json()) as AccessGrantList);
     } catch (error) {
       setViewerError(error instanceof Error ? error.message : String(error));
     } finally {
       setViewerAccessBusy(false);
     }
-  }
-
-  function closeDocumentViewer() {
-    setViewerStructure(null);
-    setViewerContext(null);
-    setViewerSearchResults([]);
-    setViewerSearchQuery("");
-    setViewerError("");
   }
 
   async function loadDebugger() {
@@ -2704,7 +2748,6 @@ export function App() {
             <>
               <span className="session-label">
                 {session.user?.username ?? session.user?.id}
-                {session.active_tenant_id ? "" : " · no tenant"}
               </span>
               <div
                 className="locale-switch"
@@ -2899,6 +2942,77 @@ export function App() {
             aria-labelledby="tab-knowledge"
             hidden={activeTab !== "knowledge"}
           >
+            {session.user?.platform_role === "PLATFORM_ADMIN" && (
+              <section className="band">
+                <div className="panel">
+                  <h2>
+                    {locale === "ru" ? "Локальные группы" : "Local groups"}
+                  </h2>
+                  <form className="row" onSubmit={createWorkspaceGroup}>
+                    <input
+                      value={groupName}
+                      onChange={(event) => setGroupName(event.target.value)}
+                      placeholder={locale === "ru" ? "Название" : "Name"}
+                    />
+                    <input
+                      value={groupDescription}
+                      onChange={(event) =>
+                        setGroupDescription(event.target.value)
+                      }
+                      placeholder={locale === "ru" ? "Описание" : "Description"}
+                    />
+                    <input
+                      value={groupMembers}
+                      onChange={(event) => setGroupMembers(event.target.value)}
+                      placeholder={
+                        locale === "ru"
+                          ? "ID участников через запятую"
+                          : "Member IDs, comma-separated"
+                      }
+                    />
+                    <button type="submit">{t("create")}</button>
+                    <button
+                      type="button"
+                      onClick={() => void loadWorkspaceGroups()}
+                    >
+                      {t("refresh")}
+                    </button>
+                  </form>
+                  {groupStatus && <p className="status">{groupStatus}</p>}
+                  <ul>
+                    {workspaceGroups.map((group) => (
+                      <li key={group.id}>
+                        {group.name} ({group.group_type}) ·{" "}
+                        {group.member_user_ids.length}
+                        {group.description ? ` — ${group.description}` : ""}
+                        {group.group_type === "LOCAL" ? (
+                          <>
+                            {" "}
+                            <button
+                              type="button"
+                              onClick={() => void updateWorkspaceGroup(group)}
+                            >
+                              {locale === "ru" ? "Изменить" : "Edit"}
+                            </button>{" "}
+                            <button
+                              type="button"
+                              onClick={() => void deleteWorkspaceGroup(group)}
+                            >
+                              {locale === "ru" ? "Удалить" : "Delete"}
+                            </button>
+                          </>
+                        ) : (
+                          <span className="muted">
+                            {" "}
+                            {locale === "ru" ? "Управляется OIDC" : "OIDC managed"}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </section>
+            )}
             <section className="band grid">
               <div className="panel">
                 <h2>
@@ -3092,18 +3206,6 @@ export function App() {
                         />
                       </label>
                     </details>
-                    {canManageAccess && (
-                      <details className="source-permissions source-wide">
-                        <summary>{t("permissions")}</summary>
-                        <AccessEditor
-                          value={sourceAccess}
-                          groups={accessGroups}
-                          locale={locale}
-                          disabled={sourceBusy.create}
-                          onChange={setSourceAccess}
-                        />
-                      </details>
-                    )}
                     <div className="source-wide row">
                       <button
                         type="submit"
@@ -3148,12 +3250,6 @@ export function App() {
                               </span>
                               <span>{statusLabel(source.status, locale)}</span>
                               <span>
-                                {accessLabel(
-                                  source.document_access_default,
-                                  locale,
-                                )}
-                              </span>
-                              <span>
                                 {source.refresh_interval_seconds
                                   ? `${source.refresh_interval_seconds}s`
                                   : "manual"}
@@ -3189,23 +3285,6 @@ export function App() {
                             </dd>
                           </div>
                         </dl>
-                        {canManageAccess && (
-                          <details className="source-permissions">
-                            <summary>{t("permissions")}</summary>
-                            <AccessEditor
-                              value={normalizeDocumentAccess(
-                                source.document_access_default,
-                              )}
-                              groups={accessGroups}
-                              locale={locale}
-                              disabled={sourceBusy[`${source.id}:access`]}
-                              saveLabel={t("apply_access")}
-                              onSave={(access) =>
-                                void patchSourceAccess(source, access)
-                              }
-                            />
-                          </details>
-                        )}
                         {run && (
                           <div className="source-run">
                             <ShieldCheck size={15} />
@@ -3788,11 +3867,11 @@ export function App() {
                   busy={viewerBusy}
                   searchBusy={viewerSearchBusy}
                   error={viewerError}
-                  accessGroups={accessGroups}
-                  canManageAccess={canManageAccess}
+                  access={viewerAccess}
+                  accessGroups={viewerAccessGroups}
                   accessBusy={viewerAccessBusy}
                   onClose={closeDocumentViewer}
-                  onUpdateAccess={(access) => void patchViewerAccess(access)}
+                  onReplaceAccess={(next) => void replaceViewerAccess(next)}
                   onSearchQueryChange={setViewerSearchQuery}
                   onSearch={submitDocumentSearch}
                   onOpenChunk={(chunkId) =>
@@ -4927,181 +5006,140 @@ function statusLabel(value: string | null | undefined, locale: Locale = "en") {
   return labels[status] ?? status;
 }
 
-function normalizeDocumentAccess(raw: unknown): DocumentAccess {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return DEFAULT_DOCUMENT_ACCESS;
-  }
-  const value = raw as Record<string, unknown>;
-  const policy =
-    value.policy === "tenant" || value.policy === "restricted"
-      ? value.policy
-      : "kb";
-  return {
-    policy,
-    user_ids: stringList(value.user_ids),
-    group_ids: stringList(value.group_ids),
-  };
-}
-
-function stringList(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.map((item) => String(item).trim()).filter(Boolean);
-}
-
-function parseIdList(text: string): string[] {
-  return text
-    .split(/[\s,]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function accessLabel(
-  access: DocumentAccess | undefined,
-  locale: Locale = "en",
-) {
-  const normalized = normalizeDocumentAccess(access);
-  if (normalized.policy === "tenant")
-    return locale === "ru" ? "Тенант" : "Tenant";
-  if (normalized.policy === "restricted")
-    return locale === "ru" ? "Ограниченный" : "Restricted";
-  return locale === "ru" ? "База" : "KB";
-}
-
-function AccessEditor({
+function GrantEditor({
   value,
   groups,
-  locale = "en",
+  locale,
   disabled,
-  saveLabel,
-  onChange,
   onSave,
 }: {
-  value: DocumentAccess;
+  value: AccessGrantList;
   groups: AccessGroup[];
-  locale?: Locale;
-  disabled?: boolean;
-  saveLabel?: string;
-  onChange?: (access: DocumentAccess) => void;
-  onSave?: (access: DocumentAccess) => void;
+  locale: Locale;
+  disabled: boolean;
+  onSave: (next: AccessGrantList) => void;
 }) {
-  const [policy, setPolicy] = useState<DocumentAccessPolicy>(
-    normalizeDocumentAccess(value).policy,
-  );
-  const [userIdsText, setUserIdsText] = useState(
-    normalizeDocumentAccess(value).user_ids.join(", "),
-  );
-  const [groupIds, setGroupIds] = useState<string[]>(
-    normalizeDocumentAccess(value).group_ids,
-  );
+  const [grants, setGrants] = useState<AccessGrant[]>(value.access_grants);
+  const [inherits, setInherits] = useState(value.inherits_kb_access ?? true);
+  const [userId, setUserId] = useState("");
+  const [groupId, setGroupId] = useState("");
+  const [permission, setPermission] = useState<"READ" | "WRITE">("READ");
 
   useEffect(() => {
-    const normalized = normalizeDocumentAccess(value);
-    setPolicy(normalized.policy);
-    setUserIdsText(normalized.user_ids.join(", "));
-    setGroupIds(normalized.group_ids);
+    setGrants(value.access_grants);
+    setInherits(value.inherits_kb_access ?? true);
   }, [value]);
 
-  const currentAccess = (): DocumentAccess => {
-    if (policy !== "restricted") {
-      return { policy, user_ids: [], group_ids: [] };
-    }
-    return {
-      policy,
-      user_ids: parseIdList(userIdsText),
-      group_ids: groupIds,
-    };
-  };
-
-  function emit(
-    nextPolicy: DocumentAccessPolicy,
-    nextUserIdsText = userIdsText,
-    nextGroupIds = groupIds,
-  ) {
-    const nextAccess =
-      nextPolicy === "restricted"
-        ? {
-            policy: nextPolicy,
-            user_ids: parseIdList(nextUserIdsText),
-            group_ids: nextGroupIds,
-          }
-        : { policy: nextPolicy, user_ids: [], group_ids: [] };
-    onChange?.(nextAccess);
+  function add(principal_type: "USER" | "GROUP", principal_id: string) {
+    const id = principal_id.trim();
+    if (
+      !id ||
+      grants.some(
+        (grant) =>
+          grant.principal_type === principal_type &&
+          grant.principal_id === id &&
+          grant.permission === permission,
+      )
+    )
+      return;
+    setGrants([...grants, { principal_type, principal_id: id, permission }]);
+    if (principal_type === "USER") setUserId("");
+    else setGroupId("");
   }
 
   return (
-    <div className="access-editor">
+    <details className="access-editor">
+      <summary>
+        {locale === "ru" ? "Доступ к документу" : "Document access"}
+      </summary>
       <label>
-        {locale === "ru" ? "Видимость" : "Visibility"}
-        <select
-          value={policy}
+        <input
+          type="checkbox"
+          checked={inherits}
           disabled={disabled}
-          onChange={(event) => {
-            const nextPolicy = event.target.value as DocumentAccessPolicy;
-            setPolicy(nextPolicy);
-            emit(nextPolicy);
-          }}
-        >
-          <option value="kb">KB</option>
-          <option value="tenant">
-            {locale === "ru" ? "Тенант" : "Tenant"}
-          </option>
-          <option value="restricted">
-            {locale === "ru" ? "Ограниченный" : "Restricted"}
-          </option>
-        </select>
+          onChange={(event) => setInherits(event.target.checked)}
+        />{" "}
+        {locale === "ru"
+          ? "Наследовать доступ от базы знаний"
+          : "Inherit access from knowledge base"}
       </label>
-      {policy === "restricted" && (
-        <>
-          <label>
-            {locale === "ru" ? "Группы" : "Groups"}
-            <select
-              multiple
-              value={groupIds}
-              disabled={disabled}
-              onChange={(event) => {
-                const nextGroupIds = Array.from(
-                  event.currentTarget.selectedOptions,
-                ).map((option) => option.value);
-                setGroupIds(nextGroupIds);
-                emit(policy, userIdsText, nextGroupIds);
-              }}
-            >
-              {groups.map((group) => (
-                <option key={group.id} value={group.id}>
-                  {group.name} ({group.group_type})
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            {locale === "ru" ? "ID пользователей" : "User IDs"}
-            <input
-              value={userIdsText}
-              disabled={disabled}
-              onChange={(event) => {
-                setUserIdsText(event.target.value);
-                emit(policy, event.target.value, groupIds);
-              }}
-              placeholder={
-                locale === "ru"
-                  ? "user-id, другой-user-id"
-                  : "user-id, another-user-id"
-              }
-            />
-          </label>
-        </>
-      )}
-      {onSave && (
+      <div className="row">
+        <input
+          value={userId}
+          disabled={disabled}
+          onChange={(event) => setUserId(event.target.value)}
+          placeholder={locale === "ru" ? "ID пользователя" : "User ID"}
+        />
+        <select
+          value={permission}
+          disabled={disabled}
+          onChange={(event) =>
+            setPermission(event.target.value as "READ" | "WRITE")
+          }
+        >
+          <option value="READ">READ</option>
+          <option value="WRITE">WRITE</option>
+        </select>
         <button
           type="button"
-          disabled={disabled}
-          onClick={() => onSave(currentAccess())}
+          disabled={disabled || !userId.trim()}
+          onClick={() => add("USER", userId)}
         >
-          <ShieldCheck size={15} />{" "}
-          {saveLabel ?? (locale === "ru" ? "Сохранить доступ" : "Save access")}
+          {locale === "ru" ? "Добавить пользователя" : "Add user"}
         </button>
-      )}
-    </div>
+      </div>
+      <div className="row">
+        <select
+          value={groupId}
+          disabled={disabled}
+          onChange={(event) => setGroupId(event.target.value)}
+        >
+          <option value="">
+            {locale === "ru" ? "Выберите группу" : "Select group"}
+          </option>
+          {groups.map((group) => (
+            <option key={group.id} value={group.id}>
+              {group.name} ({group.group_type})
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          disabled={disabled || !groupId}
+          onClick={() => add("GROUP", groupId)}
+        >
+          {locale === "ru" ? "Добавить группу" : "Add group"}
+        </button>
+      </div>
+      <ul>
+        {grants.map((grant, index) => (
+          <li
+            key={`${grant.principal_type}-${grant.principal_id}-${grant.permission}`}
+          >
+            {grant.principal_type}: {grant.principal_id} ({grant.permission})
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() =>
+                setGrants(grants.filter((_, candidate) => candidate !== index))
+              }
+            >
+              {locale === "ru" ? "Удалить" : "Remove"}
+            </button>
+          </li>
+        ))}
+      </ul>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() =>
+          onSave({ access_grants: grants, inherits_kb_access: inherits })
+        }
+      >
+        <ShieldCheck size={15} />{" "}
+        {locale === "ru" ? "Сохранить доступ" : "Save access"}
+      </button>
+    </details>
   );
 }
 
@@ -5114,11 +5152,11 @@ function DocumentViewer({
   busy,
   searchBusy,
   error,
+  access,
   accessGroups,
-  canManageAccess,
   accessBusy,
   onClose,
-  onUpdateAccess,
+  onReplaceAccess,
   onSearchQueryChange,
   onSearch,
   onOpenChunk,
@@ -5132,11 +5170,11 @@ function DocumentViewer({
   busy: boolean;
   searchBusy: boolean;
   error: string;
+  access: AccessGrantList | null;
   accessGroups: AccessGroup[];
-  canManageAccess: boolean;
   accessBusy: boolean;
   onClose: () => void;
-  onUpdateAccess: (access: DocumentAccess) => void;
+  onReplaceAccess: (next: AccessGrantList) => void;
   onSearchQueryChange: (value: string) => void;
   onSearch: (event: FormEvent) => void;
   onOpenChunk: (chunkId: string) => void;
@@ -5158,10 +5196,6 @@ function DocumentViewer({
             {structure.document_version_id && (
               <span>{structure.document_version_id}</span>
             )}
-            <span>{accessLabel(structure.document_access, locale)}</span>
-            {structure.document_access_origin && (
-              <span>{structure.document_access_origin}</span>
-            )}
           </div>
         </div>
         <div className="row">
@@ -5176,18 +5210,13 @@ function DocumentViewer({
           </button>
         </div>
       </div>
-      {canManageAccess && (
-        <AccessEditor
-          value={normalizeDocumentAccess(structure.document_access)}
+      {structure.share_access && access && (
+        <GrantEditor
+          value={access}
           groups={accessGroups}
           locale={locale}
           disabled={accessBusy}
-          saveLabel={
-            locale === "ru"
-              ? "Сохранить доступ к документу"
-              : "Save document access"
-          }
-          onSave={onUpdateAccess}
+          onSave={onReplaceAccess}
         />
       )}
       {error && (
